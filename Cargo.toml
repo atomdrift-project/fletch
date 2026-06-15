@@ -1,0 +1,82 @@
+[package]
+name = "fletch"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Find and fetch external references (packages and URLs) discovered in analyzed files"
+repository = "https://codeberg.org/atomdrift/fletch"
+
+# Lint policy mirrors cleave's workspace lints (fletch is a standalone package,
+# so they live here directly rather than via `workspace = true`). Keep in sync.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_must_use = "deny"
+unused_imports = "deny"
+unused_mut = "deny"
+dead_code = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+noop_method_call = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unimplemented = "deny"
+todo = "deny"
+unreachable = "deny"
+result_unit_err = "deny"
+result_large_err = "deny"
+missing_safety_doc = "warn"
+must_use_candidate = "warn"
+needless_pass_by_value = "warn"
+unnecessary_wraps = "warn"
+match_same_arms = "warn"
+redundant_closure_for_method_calls = "warn"
+manual_let_else = "warn"
+dbg_macro = "deny"
+large_futures = "warn"
+map_err_ignore = "warn"
+wildcard_imports = "warn"
+significant_drop_in_scrutinee = "warn"
+significant_drop_tightening = "warn"
+too_many_arguments = "warn"
+type_complexity = "allow"
+module_name_repetitions = "allow"
+similar_names = "allow"
+single_match_else = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[dependencies]
+# The reference vocabulary (ExternalRef/RefLocator/PinnedHash) + the parsed
+# facts `find` consumes. Path dep during local development; switch to git +
+# a published release once filefacts ships the reference types.
+filefacts = { path = "../filefacts" }
+
+# HTTPS client. rustls-tls avoids a system OpenSSL dependency; blocking keeps
+# the fetcher off any async runtime.
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { version = "0.10", features = ["asm-aarch64"] }
+base64 = "0.22"
+hex = "0.4"
+zstd = "0.13"
+thiserror = "2"
+tracing = "0.1"
+anyhow = "1"
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"

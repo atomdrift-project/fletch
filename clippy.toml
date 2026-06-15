@@ -1,0 +1,22 @@
+# Clippy configuration for fletch — mirrors cleave's thresholds. Keep in sync.
+
+# Cognitive complexity threshold - warn if a function is too complex
+cognitive-complexity-threshold = 30
+
+# Maximum number of lines for a function before warning
+too-many-lines-threshold = 150
+
+# Warn on functions with many arguments
+too-many-arguments-threshold = 8
+
+# Type complexity threshold
+type-complexity-threshold = 500
+
+# Warn on single character variable names (except common ones like i, j, x, y)
+single-char-binding-names-threshold = 4
+
+# Disallowed methods - methods that should never be used. Keep minimal.
+disallowed-methods = []
+
+# Disallowed types - types that should not be used. Keep minimal.
+disallowed-types = []
