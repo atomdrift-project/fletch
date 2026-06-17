@@ -103,6 +103,12 @@ pub struct FetchRecord {
     /// endpoint. Stamped by [`fetch_references`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_sha256: String,
+    /// Byte offset of the declaring reference in the source file — the
+    /// citation anchor, so a finding derived from what was fetched can be
+    /// pinned to the exact reference site. Stamped by [`fetch_references`]
+    /// alongside `source_sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_offset: Option<u64>,
     /// The reference's locator (PURL/URL) as emitted by filefacts.
     pub locator: String,
     /// The URL the locator resolved to. Empty when unresolved/skipped.
@@ -150,6 +156,7 @@ impl FetchRecord {
     fn terminal(locator: String, outcome: Outcome) -> Self {
         Self {
             source_sha256: String::new(),
+            source_offset: None,
             locator,
             resolved_url: String::new(),
             final_url: None,
@@ -279,7 +286,10 @@ pub fn fetch_ref(r: &ExternalRef, net: &dyn Fetch, cache: &BlobCache) -> FetchRe
     if !r.is_fetch_target() {
         return FetchRecord::terminal(locator, Outcome::Skipped);
     }
-    let Some(url) = resolved_url(&r.locator, net) else {
+    // Resolution may refine the locator: a versionless npm PURL (a manifest
+    // range/tag) becomes the concrete `name@<resolved>` it currently points at,
+    // so the cache key and the recorded edge name the version actually fetched.
+    let Some((locator, url)) = resolved_target(&r.locator, net) else {
         return FetchRecord::terminal(locator, Outcome::Unresolved);
     };
 
@@ -372,6 +382,7 @@ pub fn fetch_references(
             rec
         };
         rec.source_sha256 = source_sha256.to_string();
+        rec.source_offset = Some(r.offset);
         records.push(rec);
     }
     records
@@ -407,6 +418,7 @@ fn record(
     };
     FetchRecord {
         source_sha256: String::new(),
+        source_offset: None,
         locator,
         resolved_url,
         final_url: Some(meta.final_url.clone()),
@@ -491,23 +503,60 @@ fn resolve_purl(purl: &str) -> Option<String> {
     }
 }
 
-/// Resolve a reference to a fetchable URL. Most ecosystems are a pure
-/// name+version → URL mapping ([`resolve`]); PyPI and Composer are the
-/// exceptions — they have no derivable artifact URL, so each takes a registry
-/// round-trip over `net`.
-fn resolved_url(locator: &RefLocator, net: &dyn Fetch) -> Option<String> {
+/// Resolve a reference to `(canonical locator, fetchable URL)`. Most ecosystems
+/// are a pure name+version → URL mapping ([`resolve`]), and the locator passes
+/// through unchanged. The exceptions take a registry round-trip over `net`:
+/// PyPI and Composer have no derivable artifact URL, and a versionless npm PURL
+/// (a manifest range/tag) is *refined* to the concrete `name@version` it
+/// currently points at — that refined locator is returned so it keys the cache
+/// and names the fetch edge. `None` when the ecosystem can't be resolved.
+fn resolved_target(locator: &RefLocator, net: &dyn Fetch) -> Option<(String, String)> {
     if let RefLocator::Purl(p) = locator
         && let Some(body) = p.strip_prefix("pkg:")
         && let Some((ty, rest)) = body.split_once('/')
-        && let Some((path, version)) = rest.rsplit_once('@')
     {
-        match ty {
-            "pypi" => return resolve_pypi(path, version, net),
-            "composer" => return resolve_composer(path, version, net),
-            _ => {}
+        // A scope is `%40`, so a literal `@` only ever separates the version;
+        // its absence means the npm dependency named no version.
+        if ty == "npm" && !rest.contains('@') {
+            return resolve_npm_unversioned(rest, net);
+        }
+        if let Some((path, version)) = rest.rsplit_once('@') {
+            match ty {
+                "pypi" => return resolve_pypi(path, version, net).map(|u| (p.clone(), u)),
+                "composer" => return resolve_composer(path, version, net).map(|u| (p.clone(), u)),
+                _ => {}
+            }
         }
     }
-    resolve(locator)
+    resolve(locator).map(|u| (locator_string(locator), u))
+}
+
+// TODO(fetch-latest): a versionless npm dependency (a manifest range/tag/
+// wildcard like `^1.11.21`) is resolved to the registry's current
+// `dist-tags.latest`, not the highest version the declared range admits.
+// Implementing npm's semver range algebra (caret/tilde/comparators/unions/
+// hyphen/wildcards) would pull in a semver matcher and a long tail of edge
+// cases. For threat assessment the relevant, most-conservative answer is "what
+// does this name serve right now" — the attacker-controlled current release —
+// and the declared range is preserved as the reference's evidence. Revisit if
+// range-accurate resolution is ever needed.
+/// Resolve a versionless npm PURL path (`left-pad`, `%40scope/util`) to the
+/// concrete `(pkg:npm/<path>@<latest>, tarball URL)` it currently points at, by
+/// reading the registry packument's `dist-tags.latest`. The registry's own
+/// tarball URL is preferred over the derived one. `None` if the packument can't
+/// be fetched/parsed or names no latest version.
+fn resolve_npm_unversioned(path: &str, net: &dyn Fetch) -> Option<(String, String)> {
+    let name = path.replace("%40", "@");
+    let packument = net.get(&format!("https://registry.npmjs.org/{name}")).ok()?;
+    let doc: serde_json::Value = serde_json::from_slice(&packument.bytes).ok()?;
+    let latest = doc.pointer("/dist-tags/latest")?.as_str()?;
+    let locator = format!("pkg:npm/{path}@{latest}");
+    let url = doc
+        .pointer(&format!("/versions/{latest}/dist/tarball"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| resolve_purl(&locator))?;
+    Some((locator, url))
 }
 
 /// PyPI publishes no deterministic download URL (the `files.pythonhosted.org`
@@ -820,6 +869,39 @@ impl Fetch for Fixtures {
 mod tests {
     use super::*;
     use filefacts::RefKind;
+
+    #[test]
+    fn resolve_npm_unversioned_picks_latest_tarball() {
+        // The packument names a current release; resolution refines the
+        // versionless locator to it and returns the registry's tarball URL.
+        let packument = br#"{
+            "dist-tags": { "latest": "1.12.0" },
+            "versions": {
+                "1.11.21": { "dist": { "tarball": "https://registry.npmjs.org/easy-day-js/-/easy-day-js-1.11.21.tgz" } },
+                "1.12.0":  { "dist": { "tarball": "https://registry.npmjs.org/easy-day-js/-/easy-day-js-1.12.0.tgz" } }
+            }
+        }"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/easy-day-js", packument);
+        assert_eq!(
+            resolve_npm_unversioned("easy-day-js", &net),
+            Some((
+                "pkg:npm/easy-day-js@1.12.0".to_string(),
+                "https://registry.npmjs.org/easy-day-js/-/easy-day-js-1.12.0.tgz".to_string()
+            ))
+        );
+        // Scoped name: the `%40` encoding survives into the refined locator.
+        let scoped = br#"{"dist-tags":{"latest":"2.0.0"},"versions":{"2.0.0":{"dist":{"tarball":"https://registry.npmjs.org/@scope/util/-/util-2.0.0.tgz"}}}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/@scope/util", scoped);
+        assert_eq!(
+            resolve_npm_unversioned("%40scope/util", &net),
+            Some((
+                "pkg:npm/%40scope/util@2.0.0".to_string(),
+                "https://registry.npmjs.org/@scope/util/-/util-2.0.0.tgz".to_string()
+            ))
+        );
+        // Registry unreachable / unknown package → unresolved.
+        assert_eq!(resolve_npm_unversioned("nope", &Fixtures::default()), None);
+    }
 
     #[test]
     fn resolve_pypi_prefers_sdist_via_json_api() {
