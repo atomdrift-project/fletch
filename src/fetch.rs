@@ -12,6 +12,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use filefacts::{ExternalRef, HashAlgo, PinnedHash, RefLocator};
@@ -349,38 +350,105 @@ impl Default for FetchBudget {
     fn default() -> Self {
         Self {
             max_count: 256,
-            max_bytes: 512 * 1024 * 1024,
+            // 5 GiB retrieved per whole run (every hop, every file) — the safety
+            // ceiling against a crafted reference chain, not a per-fetch limit
+            // (that is `MAX_FETCH_BYTES`).
+            max_bytes: 5 * 1024 * 1024 * 1024,
         }
     }
 }
 
-/// Fetch every selectable reference, in order, under `budget`, returning one
-/// [`FetchRecord`] edge per attempt (including budget-skipped ones), each
-/// stamped with `source_sha256` (the file that declared the references) so it
-/// is a self-contained hash→hash edge. `fetch_urls` enables raw-URL targets;
-/// without it only registry packages (PURLs) are fetched. Identity references
-/// (a repository) are never fetched.
+/// Per-call ceiling on concurrent fetches. Fetching is network-bound, so this
+/// is independent of the CPU pool; it scales with the host and is clamped so a
+/// long reference list can't spawn an unbounded number of sockets, while a
+/// small host still parallelizes. Uses scoped OS threads rather than a shared
+/// rayon/CPU pool so a fetching worker never starves concurrent analysis.
+fn fetch_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4)
+        .clamp(2, 16)
+}
+
+/// Fetch every selectable reference, in declaration order, under `budget`,
+/// returning one [`FetchRecord`] edge per attempt (including budget-skipped
+/// ones), each stamped with `source_sha256` (the file that declared the
+/// references) so it is a self-contained hash→hash edge. `fetch_urls` enables
+/// raw-URL targets; without it only registry packages (PURLs) are fetched.
+/// Identity references (a repository) are never fetched.
+///
+/// Fetches run concurrently across a bounded pool ([`fetch_concurrency`]); the
+/// returned order is always declaration order regardless of completion order.
+/// The `max_count` cap is exact and deterministic. The `max_bytes` cap is
+/// enforced best-effort — once retrieved bytes cross it, no further fetch is
+/// dispatched and the remaining references are recorded as `BudgetExceeded` —
+/// so the byte total may overshoot by at most one in-flight batch. (Live
+/// fetches are not reproducible anyway, so which references win a contested
+/// byte ceiling is not a determinism guarantee.)
 #[must_use]
 pub fn fetch_references(
     refs: &[ExternalRef],
     source_sha256: &str,
     fetch_urls: bool,
-    net: &dyn Fetch,
+    net: &(dyn Fetch + Sync),
     cache: &BlobCache,
     budget: FetchBudget,
 ) -> Vec<FetchRecord> {
-    let mut records = Vec::new();
-    let mut count = 0usize;
-    let mut bytes = 0u64;
-    for r in refs.iter().filter(|r| selected(r, fetch_urls)) {
-        let mut rec = if count >= budget.max_count || bytes >= budget.max_bytes {
+    // Selectable references, in declaration order. The count cap is applied up
+    // front (it is known without fetching); the byte cap is enforced live below.
+    let targets: Vec<&ExternalRef> = refs.iter().filter(|r| selected(r, fetch_urls)).collect();
+    let fetch_n = if budget.max_bytes == 0 {
+        0
+    } else {
+        targets.len().min(budget.max_count)
+    };
+
+    // Fetch targets[0..fetch_n] across a bounded thread pool. Each worker pulls
+    // the next index from a shared cursor and stops early once the byte budget
+    // is spent; results land in per-index slots so output order is stable.
+    let mut slots: Vec<Option<FetchRecord>> = (0..fetch_n).map(|_| None).collect();
+    if fetch_n > 0 {
+        let cursor = AtomicUsize::new(0);
+        let bytes_used = AtomicU64::new(0);
+        let workers = fetch_concurrency().min(fetch_n);
+        let collected: Vec<Vec<(usize, FetchRecord)>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut local = Vec::new();
+                        loop {
+                            if bytes_used.load(Ordering::Relaxed) >= budget.max_bytes {
+                                break;
+                            }
+                            let i = cursor.fetch_add(1, Ordering::Relaxed);
+                            if i >= fetch_n {
+                                break;
+                            }
+                            let rec = fetch_ref(targets[i], net, cache);
+                            bytes_used.fetch_add(rec.size.unwrap_or(0), Ordering::Relaxed);
+                            local.push((i, rec));
+                        }
+                        local
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        for chunk in collected {
+            for (i, rec) in chunk {
+                slots[i] = Some(rec);
+            }
+        }
+    }
+
+    // Reassemble in declaration order: the fetched record where one exists, a
+    // `BudgetExceeded` edge for indices past the count cap or skipped by the
+    // byte cap. Every record carries its source so it stands alone as an edge.
+    let mut records = Vec::with_capacity(targets.len());
+    for (i, r) in targets.iter().enumerate() {
+        let mut rec = slots.get_mut(i).and_then(Option::take).unwrap_or_else(|| {
             FetchRecord::terminal(locator_string(&r.locator), Outcome::BudgetExceeded)
-        } else {
-            let rec = fetch_ref(r, net, cache);
-            count += 1;
-            bytes += rec.size.unwrap_or(0);
-            rec
-        };
+        });
         rec.source_sha256 = source_sha256.to_string();
         rec.source_offset = Some(r.offset);
         records.push(rec);
@@ -1122,6 +1190,28 @@ mod tests {
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[1].outcome, Outcome::BudgetExceeded);
         assert_eq!(recs[1].source_sha256, "trigsha");
+    }
+
+    #[test]
+    fn fetch_references_preserves_declaration_order_under_concurrency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path().to_path_buf());
+        // Enough refs to span several concurrent workers, so completion order
+        // differs from declaration order — the result must still be in order.
+        let n = 20usize;
+        let mut net = Fixtures::default();
+        let mut refs = Vec::new();
+        for i in 0..n {
+            let url = format!("https://registry.npmjs.org/p{i}/-/p{i}-1.0.0.tgz");
+            net = net.with(&url, format!("PKG{i}").as_bytes());
+            refs.push(dep(RefLocator::Purl(format!("pkg:npm/p{i}@1.0.0")), None));
+        }
+        let recs = fetch_references(&refs, "sha", false, &net, &cache, FetchBudget::default());
+        assert_eq!(recs.len(), n);
+        for (i, rec) in recs.iter().enumerate() {
+            assert_eq!(rec.locator, format!("pkg:npm/p{i}@1.0.0"));
+            assert_eq!(rec.outcome, Outcome::Ok);
+        }
     }
 
     #[test]
