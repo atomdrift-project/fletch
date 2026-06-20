@@ -349,7 +349,10 @@ pub struct FetchBudget {
 impl Default for FetchBudget {
     fn default() -> Self {
         Self {
-            max_count: 256,
+            // A real dependency closure routinely exceeds 256 (a single Rust
+            // crate's Cargo.lock can name 400+), so cap at 512 to cover the
+            // common case without unbounding a crafted reference fan-out.
+            max_count: 512,
             // 5 GiB retrieved per whole run (every hop, every file) — the safety
             // ceiling against a crafted reference chain, not a per-fetch limit
             // (that is `MAX_FETCH_BYTES`).
