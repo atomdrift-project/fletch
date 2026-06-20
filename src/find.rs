@@ -59,14 +59,13 @@ pub fn references_from_facts(
     found.refs
 }
 
-/// URLs recovered from the file's extracted strings — including ones stng
-/// decoded out of base64 / url-encoding / hex, which the raw byte hunt can never
-/// see. The decoded value carries the URL; the original encoded form (`raw`) is
-/// the evidence, so the citation points at the bytes that actually appear.
+/// URLs recovered from the file's byte-scan extracted strings. These are the
+/// verbatim printable/UTF-16LE runs (the `strings(1)` tier), so the string
+/// value is itself the on-disk evidence the citation points at.
 fn extracted_refs(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
     for s in parsed.text().iter() {
         for url in extract_urls(&s.value) {
-            let evidence = s.raw.clone().unwrap_or_else(|| s.value.clone());
+            let evidence = s.value.clone();
             out.push(
                 RefLocator::Url(url.to_string()),
                 RefKind::UrlFetch,
