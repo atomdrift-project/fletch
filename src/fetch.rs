@@ -618,7 +618,9 @@ fn resolved_target(locator: &RefLocator, net: &dyn Fetch) -> Option<(String, Str
 /// be fetched/parsed or names no latest version.
 fn resolve_npm_unversioned(path: &str, net: &dyn Fetch) -> Option<(String, String)> {
     let name = path.replace("%40", "@");
-    let packument = net.get(&format!("https://registry.npmjs.org/{name}")).ok()?;
+    let packument = net
+        .get(&format!("https://registry.npmjs.org/{name}"))
+        .ok()?;
     let doc: serde_json::Value = serde_json::from_slice(&packument.bytes).ok()?;
     let latest = doc.pointer("/dist-tags/latest")?.as_str()?;
     let locator = format!("pkg:npm/{path}@{latest}");
