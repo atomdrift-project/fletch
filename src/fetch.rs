@@ -278,6 +278,36 @@ impl BlobCache {
     }
 }
 
+/// Fetch a registry *metadata* document through the blob cache. Used by
+/// [`provenance`](crate::provenance) so a package's facts (publish date, author,
+/// downloads) cost one round-trip per cache window and are free on a hit.
+///
+/// Metadata is small and a release's facts are effectively immutable, so the
+/// pinned TTL bounds staleness for the few moving fields (dist-tags, download
+/// counts) without re-fetching every scan. A network failure with no cached
+/// copy yields `None`; the caller treats that as "unknown".
+pub(crate) fn cached_metadata(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Vec<u8>> {
+    let key = sha256_hex(format!("meta:{url}").as_bytes());
+    if let Some((bytes, _)) = cache.fresh(&key, TTL_PINNED) {
+        return Some(bytes);
+    }
+    match net.get(url) {
+        Ok(f) => {
+            let meta = CachedMeta {
+                fetched_at: now(),
+                status: f.status,
+                final_url: f.final_url,
+                redirects: f.redirects,
+                headers: f.headers,
+            };
+            cache.put(&key, &f.bytes, &meta);
+            Some(f.bytes)
+        }
+        // Source unreachable: a stale metadata answer still beats none.
+        Err(_) => cache.any(&key).map(|(bytes, _)| bytes),
+    }
+}
+
 /// Resolve, fetch (or serve from cache), verify, and record provenance for
 /// one reference. Never panics; every path yields a [`FetchRecord`].
 #[must_use]
@@ -570,6 +600,14 @@ fn resolve_purl(purl: &str) -> Option<String> {
                 "https://rubygems.org/downloads/{path}-{version}.gem"
             ))
         }
+        "chrome" => {
+            // The CRX download service redirects to the current packed
+            // extension; `id` is the last path segment (a slug may precede it).
+            let id = path.rsplit('/').next().unwrap_or(path);
+            Some(format!(
+                "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=120&acceptformat=crx2,crx3&x=id%3D{id}%26installsource%3Dondemand%26uc"
+            ))
+        }
         _ => None,
     }
 }
@@ -836,13 +874,21 @@ impl Fetch for HttpFetch {
             let status = resp.status();
 
             if status.is_redirection() {
+                // Some servers (e.g. the Chrome Web Store) send a non-ASCII
+                // `Location` with raw UTF-8 in the path; `to_str()` rejects that,
+                // so fall back to a lossy decode and let `Url::join` percent-
+                // encode it. The per-hop https + SSRF checks above still run.
                 let location = resp
                     .headers()
                     .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
+                    .map(|v| {
+                        v.to_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|_| String::from_utf8_lossy(v.as_bytes()).into_owned())
+                    })
                     .ok_or_else(|| FetchError::Transport("redirect without location".into()))?;
                 let next = current
-                    .join(location)
+                    .join(&location)
                     .map_err(|e| FetchError::Transport(e.to_string()))?;
                 redirects.push(current.to_string());
                 current = next;

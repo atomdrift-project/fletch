@@ -6,11 +6,16 @@
 //! references (a `curl … | sh`, an `npm install` in a `RUN`, a URL stashed in a
 //! shell variable) and the *retrieval* of every reference, declared or not.
 //!
-//! Two modules, deliberately walled apart so the dangerous half stays auditable:
+//! Three modules, deliberately walled apart so the dangerous half stays
+//! auditable:
 //! - [`find`] — recognition over filefacts facts. Heuristic, evolving.
 //! - [`fetch`] — resolve a reference to a URL, retrieve it through an
 //!   SSRF-guarded client, cache it, verify any pin, record provenance. Pure
 //!   mechanism; no recognition logic ever leaks in here.
+//! - [`registry`] — look up and normalize a package's *registry metadata*
+//!   (publish date, author, downloads, rating) across ecosystems into a
+//!   [`filefacts::Registry`], so a consumer can judge a dependency before paying
+//!   to fetch and scan its bytes.
 //!
 //! Consumers compose: analyze a file (cleave) → [`find`] its references →
 //! [`fetch`] them → analyze what came back. fletch never analyzes; it finds and
@@ -18,7 +23,9 @@
 
 pub mod fetch;
 pub mod find;
+pub mod registry;
 
 // The reference vocabulary fletch's public API speaks, re-exported so consumers
 // (e.g. scan) need not depend on filefacts directly just to name these types.
-pub use filefacts::{ExternalRef, HashAlgo, PinnedHash, RefKind, RefLocator};
+pub use filefacts::{ExternalRef, HashAlgo, PinnedHash, RefKind, RefLocator, Registry};
+pub use registry::registry;
