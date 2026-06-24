@@ -21,6 +21,7 @@
 //! [`fetch`] them → analyze what came back. fletch never analyzes; it finds and
 //! fetches.
 
+pub mod distro;
 pub mod fetch;
 pub mod find;
 pub mod registry;

@@ -73,6 +73,12 @@ sha2 = { version = "0.10", features = ["asm-aarch64"] }
 base64 = "0.22"
 hex = "0.4"
 zstd = "0.13"
+# Decompressors for OS-distro package indices (Alpine APKINDEX, Debian
+# Packages, openSUSE primary.xml, BSD catalogs). Both are pure Rust — flate2
+# defaults to the miniz_oxide backend — so the binary stays fully static with no
+# system liblzma/zlib linkage. zstd (above) covers the third index codec.
+flate2 = "1"
+lzma-rs = "0.3"
 thiserror = "2"
 tracing = "0.1"
 anyhow = "1"

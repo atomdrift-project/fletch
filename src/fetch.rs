@@ -36,6 +36,15 @@ pub trait Fetch {
     /// Retrieve the bytes at `url`, following redirects.
     fn get(&self, url: &str) -> Result<Fetched, FetchError>;
 
+    /// Retrieve the bytes at `url` with extra request `headers`, following
+    /// redirects. Defaults to a plain [`get`](Self::get) — a backend overrides
+    /// it only when a registry mandates a request header on a GET (e.g. the Snap
+    /// Store, which 400s without `Snap-Device-Series`). Test backends that key on
+    /// URL alone inherit the default unchanged.
+    fn get_with(&self, url: &str, _headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
+        self.get(url)
+    }
+
     /// POST `body` with the given `(name, value)` headers and return the
     /// response. Defaults to unsupported; a backend overrides it only when a
     /// registry needs it — e.g. the VS Code Marketplace's JSON-RPC query, which
@@ -302,11 +311,33 @@ impl BlobCache {
 /// counts) without re-fetching every scan. A network failure with no cached
 /// copy yields `None`; the caller treats that as "unknown".
 pub(crate) fn cached_metadata(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Vec<u8>> {
-    let key = sha256_hex(format!("meta:{url}").as_bytes());
+    cached_metadata_with(url, &[], net, cache)
+}
+
+/// Like [`cached_metadata`] but attaches request `headers` to the GET, for a
+/// registry that mandates one (e.g. the Snap Store's `Snap-Device-Series`). The
+/// headers fold into the cache key so a different header set is a distinct
+/// entry; an empty set reuses [`cached_metadata`]'s key exactly.
+pub(crate) fn cached_metadata_with(
+    url: &str,
+    headers: &[(&str, &str)],
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Vec<u8>> {
+    let key = if headers.is_empty() {
+        sha256_hex(format!("meta:{url}").as_bytes())
+    } else {
+        let joined = headers
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        sha256_hex(format!("meta:{url}:{joined}").as_bytes())
+    };
     if let Some((bytes, _)) = cache.fresh(&key, TTL_PINNED) {
         return Some(bytes);
     }
-    match net.get(url) {
+    match net.get_with(url, headers) {
         Ok(f) => {
             let meta = CachedMeta {
                 fetched_at: now(),
@@ -948,8 +979,12 @@ impl HttpFetch {
     }
 }
 
-impl Fetch for HttpFetch {
-    fn get(&self, url: &str) -> Result<Fetched, FetchError> {
+impl HttpFetch {
+    /// The shared GET path: per-hop https + SSRF enforcement, redirect following,
+    /// and the response-size cap. `headers` are attached to every hop. Both
+    /// [`Fetch::get`] and [`Fetch::get_with`] funnel through here so the security
+    /// floor is defined exactly once.
+    fn get_inner(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
         let mut current =
             reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
         let mut redirects = Vec::new();
@@ -977,11 +1012,11 @@ impl Fetch for HttpFetch {
                 }
                 None => return Err(FetchError::Refused("missing host".into())),
             }
-            let resp = self
-                .client
-                .get(current.clone())
-                .send()
-                .map_err(map_send_err)?;
+            let mut req = self.client.get(current.clone());
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            let resp = req.send().map_err(map_send_err)?;
             let status = resp.status();
 
             if status.is_redirection() {
@@ -1034,6 +1069,16 @@ impl Fetch for HttpFetch {
             });
         }
         Err(FetchError::Refused("too many redirects".into()))
+    }
+}
+
+impl Fetch for HttpFetch {
+    fn get(&self, url: &str) -> Result<Fetched, FetchError> {
+        self.get_inner(url, &[])
+    }
+
+    fn get_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
+        self.get_inner(url, headers)
     }
 
     fn post(

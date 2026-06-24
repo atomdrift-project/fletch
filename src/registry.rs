@@ -15,7 +15,10 @@
 
 use serde_json::Value;
 
-use crate::fetch::{BlobCache, Fetch, cached_metadata, cached_post, goproxy_escape};
+use crate::distro;
+use crate::fetch::{
+    BlobCache, Fetch, cached_metadata, cached_metadata_with, cached_post, goproxy_escape,
+};
 use filefacts::{RefLocator, Registry};
 
 /// Look up and normalize the registry metadata for a dependency `locator`.
@@ -44,9 +47,52 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // A `pkg:github/<owner>/<repo>` source: the repo *is* the upstream. Its
         // metadata is the closest thing to a registry record.
         "github" => github(&path, net, cache),
-        // Arch deps surface as `pkg:alpm/arch/<name>`; the AUR is the
-        // user-contributed, attacker-reachable half worth provenancing.
-        "alpm" => aur(path.rsplit('/').next().unwrap_or(&path), net, cache),
+        // Language registries with a clean JSON API: one GET mapped onto the
+        // common shape.
+        "nuget" => nuget(&path, version, net, cache),
+        "maven" => maven(&path, version, net, cache),
+        "hex" => hex_pm(&path, version, net, cache),
+        "cran" => cran(last_seg(&path), net, cache),
+        "cpan" => cpan(last_seg(&path), net, cache),
+        "pub" => pub_dev(last_seg(&path), version, net, cache),
+        "conda" => conda(last_seg(&path), version, net, cache),
+        "clojars" => clojars(&path, net, cache),
+        // JSR ships through npm-compatible mirrors, but its own API carries the
+        // richer record (score, repo, per-version dates).
+        "jsr" => jsr(&path, version, net, cache),
+        // OS package registries each get their own PURL type so a scan can name
+        // `pkg:fedora/curl` vs `pkg:arch/pacman` directly. The package name is
+        // the last path segment (any vendor namespace is dropped).
+        "arch" => arch(last_seg(&path), net, cache),
+        "fedora" => fedora(last_seg(&path), net, cache),
+        // The AUR is the user-contributed, attacker-reachable half of Arch.
+        // `pkg:alpm` (the SBOM-standard spelling) routes by namespace: an `aur`
+        // namespace to the AUR RPC, any other (official repo) to archlinux.org.
+        "aur" => aur(last_seg(&path), net, cache),
+        "alpm" => match path.split_once('/') {
+            Some(("aur", name)) => aur(name, net, cache),
+            Some((_, name)) => arch(name, net, cache),
+            None => arch(&path, net, cache),
+        },
+        // Distro registries with no JSON API: each metadata lookup fetches a
+        // compressed index/catalog and scans it. See [`crate::distro`].
+        "alpine" => distro::alpine(last_seg(&path), net, cache),
+        "wolfi" => distro::wolfi(last_seg(&path), net, cache),
+        "debian" => distro::debian(last_seg(&path), net, cache),
+        "ubuntu" => distro::ubuntu(last_seg(&path), net, cache),
+        "opensuse" => distro::opensuse(last_seg(&path), net, cache),
+        "rpmfusion" => distro::rpmfusion(last_seg(&path), net, cache),
+        "netbsd" => distro::netbsd(last_seg(&path), net, cache),
+        "freebsd" => distro::freebsd(last_seg(&path), net, cache),
+        "openbsd" => distro::openbsd(last_seg(&path), net, cache),
+        // Package managers and app stores.
+        "homebrew" => homebrew(last_seg(&path), net, cache),
+        "snap" => snap(last_seg(&path), net, cache),
+        "wordpress" => wordpress(last_seg(&path), net, cache),
+        // Browser-extension / plugin marketplaces — the same listing shape as
+        // the Chrome and VS Code stores (rating, downloads, recency).
+        "firefox" => firefox(last_seg(&path), net, cache),
+        "jetbrains" => jetbrains(last_seg(&path), net, cache),
         // Browser extensions: `pkg:chrome/<extension-id>`. The store's risk
         // signals (reach, rating, recency, the developer's own description of
         // what it harvests) live on the listing, not in a manifest.
@@ -719,6 +765,864 @@ fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     })
 }
 
+/// NuGet: the registration index is gzip-encoded (which this client doesn't
+/// decode), so the uncompressed search API supplies the facts — version,
+/// downloads, custody, links. It carries no publish time, so age stays unknown.
+fn nuget(
+    path: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    let id = path.to_lowercase();
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!(
+            "https://azuresearch-usnc.nuget.org/query?q=packageid:{id}&prerelease=true&semVerLevel=2.0.0"
+        ),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let d = doc.pointer("/data/0")?;
+    let latest = d.get("version").and_then(Value::as_str);
+    // Honor a requested version only if the registry lists it; metadata below is
+    // the latest release's regardless (the search API exposes no per-version doc).
+    let version = version
+        .filter(|v| {
+            d.get("versions")
+                .and_then(Value::as_array)
+                .is_some_and(|vs| {
+                    vs.iter()
+                        .any(|e| e.get("version").and_then(Value::as_str) == Some(*v))
+                })
+        })
+        .or(latest)
+        .unwrap_or_default();
+
+    Some(Registry {
+        ecosystem: "nuget".into(),
+        name: d
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(path)
+            .to_string(),
+        version: version.to_string(),
+        latest_version: latest.map(str::to_string),
+        author: d
+            .pointer("/authors/0")
+            .and_then(Value::as_str)
+            .or_else(|| d.get("authors").and_then(Value::as_str))
+            .map(str::to_string),
+        description: d
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        homepage: d
+            .get("projectUrl")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        downloads_total: d.get("totalDownloads").and_then(Value::as_u64),
+        ..Default::default()
+    })
+}
+
+/// Maven Central: the solrsearch `gav` core returns one document per release
+/// with its publish `timestamp` (ms). `path` is `<group>/<artifact>`; results
+/// sort newest-first, so the first doc (or the version match) is the answer.
+fn maven(
+    path: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    let (group, artifact) = path.split_once('/')?;
+    let mut q = format!("g:%22{group}%22+AND+a:%22{artifact}%22");
+    if let Some(v) = version {
+        q.push_str(&format!("+AND+v:%22{v}%22"));
+    }
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://search.maven.org/solrsearch/select?q={q}&core=gav&rows=20&wt=json"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let d = doc.pointer("/response/docs/0")?;
+
+    Some(Registry {
+        ecosystem: "maven".into(),
+        name: format!("{group}:{artifact}"),
+        version: d
+            .get("v")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        published_at: d
+            .get("timestamp")
+            .and_then(Value::as_u64)
+            .map(|ms| ms / 1000),
+        // With a version filter the result set is that one version, so "latest"
+        // is only meaningful for an unversioned query.
+        latest_version: if version.is_none() {
+            d.get("v").and_then(Value::as_str).map(str::to_string)
+        } else {
+            None
+        },
+        ..Default::default()
+    })
+}
+
+/// hex.pm: a clean JSON API. The package doc carries downloads and links; each
+/// entry in the release list has its own `inserted_at` publish time.
+fn hex_pm(
+    name: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://hex.pm/api/packages/{name}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let latest = doc
+        .get("latest_stable_version")
+        .or_else(|| doc.get("latest_version"))
+        .and_then(Value::as_str);
+    let version = version.or(latest).unwrap_or_default();
+    let published_at = doc
+        .get("releases")
+        .and_then(Value::as_array)
+        .and_then(|rs| {
+            rs.iter()
+                .find(|r| r.get("version").and_then(Value::as_str) == Some(version))
+                .or_else(|| rs.first())?
+                .get("inserted_at")
+                .and_then(Value::as_str)
+                .and_then(parse_ts)
+        })
+        .or_else(|| {
+            doc.get("inserted_at")
+                .and_then(Value::as_str)
+                .and_then(parse_ts)
+        });
+    let meta = doc.get("meta");
+
+    Some(Registry {
+        ecosystem: "hex".into(),
+        name: name.to_string(),
+        version: version.to_string(),
+        published_at,
+        latest_version: latest.map(str::to_string),
+        description: meta
+            .and_then(|m| m.get("description"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        license: meta
+            .and_then(|m| m.pointer("/licenses/0"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        repository: meta.and_then(|m| m.get("links")).and_then(links_repo),
+        downloads_total: doc.pointer("/downloads/all").and_then(Value::as_u64),
+        downloads_recent: doc.pointer("/downloads/recent").and_then(Value::as_u64),
+        ..Default::default()
+    })
+}
+
+/// CRAN: the crandb mirror serves one JSON document per package with the
+/// description, license, maintainer, and the `Date/Publication` of the release.
+fn cran(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://crandb.r-pkg.org/{name}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+
+    Some(Registry {
+        ecosystem: "cran".into(),
+        name: doc
+            .get("Package")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_string(),
+        version: doc
+            .get("Version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        published_at: doc
+            .get("Date/Publication")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
+        author: doc
+            .get("Maintainer")
+            .and_then(Value::as_str)
+            .map(strip_email),
+        description: doc.get("Title").and_then(Value::as_str).map(str::to_string),
+        homepage: doc.get("URL").and_then(Value::as_str).and_then(first_line),
+        license: doc
+            .get("License")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ..Default::default()
+    })
+}
+
+/// CPAN: MetaCPAN's release endpoint returns the latest release of a
+/// distribution with its date, author (PAUSE id), abstract, and resources.
+fn cpan(dist: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://fastapi.metacpan.org/v1/release/{dist}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+
+    Some(Registry {
+        ecosystem: "cpan".into(),
+        name: doc
+            .get("distribution")
+            .and_then(Value::as_str)
+            .unwrap_or(dist)
+            .to_string(),
+        version: doc
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        // MetaCPAN dates are naive ISO (no zone); treat as UTC.
+        published_at: doc.get("date").and_then(Value::as_str).and_then(parse_ts),
+        author: doc
+            .get("author")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        description: doc
+            .get("abstract")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        homepage: doc
+            .pointer("/resources/homepage")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        repository: doc
+            .pointer("/resources/repository/url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        license: doc
+            .pointer("/license/0")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        deprecated: (doc.get("status").and_then(Value::as_str) == Some("backpan"))
+            .then(|| "removed from CPAN".to_string()),
+        ..Default::default()
+    })
+}
+
+/// pub.dev: the package endpoint carries the latest release inline and every
+/// version under `versions[]`, each with its `published` time and pubspec.
+fn pub_dev(
+    name: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://pub.dev/api/packages/{name}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let latest = doc.pointer("/latest/version").and_then(Value::as_str);
+    let rel = match version.or(latest) {
+        Some(w) => doc
+            .get("versions")
+            .and_then(Value::as_array)
+            .and_then(|vs| {
+                vs.iter()
+                    .find(|v| v.get("version").and_then(Value::as_str) == Some(w))
+            })
+            .or_else(|| doc.get("latest")),
+        None => doc.get("latest"),
+    };
+    let spec = rel.and_then(|r| r.get("pubspec"));
+
+    Some(Registry {
+        ecosystem: "pub".into(),
+        name: name.to_string(),
+        version: rel
+            .and_then(|r| r.get("version"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        published_at: rel
+            .and_then(|r| r.get("published"))
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
+        latest_version: latest.map(str::to_string),
+        description: spec
+            .and_then(|s| s.get("description"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        homepage: spec
+            .and_then(|s| s.get("homepage"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        repository: spec
+            .and_then(|s| s.get("repository"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ..Default::default()
+    })
+}
+
+/// conda (Anaconda.org, conda-forge channel): the package doc lists every file
+/// with its upload time and downloads; the channel has no per-version record, so
+/// the earliest upload of the matching version is its publish time.
+fn conda(
+    name: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://api.anaconda.org/package/conda-forge/{name}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let latest = doc.get("latest_version").and_then(Value::as_str);
+    let version = version.or(latest).unwrap_or_default();
+    let published_at = doc
+        .get("files")
+        .and_then(Value::as_array)
+        .and_then(|fs| {
+            fs.iter()
+                .filter(|f| f.get("version").and_then(Value::as_str) == Some(version))
+                .filter_map(|f| {
+                    f.get("upload_time")
+                        .and_then(Value::as_str)
+                        .and_then(parse_ts)
+                })
+                .min()
+        })
+        .or_else(|| {
+            doc.get("created_at")
+                .and_then(Value::as_str)
+                .and_then(parse_ts)
+        });
+
+    Some(Registry {
+        ecosystem: "conda".into(),
+        name: name.to_string(),
+        version: version.to_string(),
+        published_at,
+        latest_version: latest.map(str::to_string),
+        description: doc
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        homepage: doc.get("home").and_then(Value::as_str).map(str::to_string),
+        repository: doc
+            .get("source_git_url")
+            .and_then(Value::as_str)
+            .or_else(|| doc.get("dev_url").and_then(Value::as_str))
+            .map(str::to_string),
+        license: doc
+            .get("license")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        downloads_total: doc.get("ndownloads").and_then(Value::as_u64),
+        ..Default::default()
+    })
+}
+
+/// Clojars: the artifacts API returns lifetime downloads, the SCM link, and the
+/// license, but no publish date — so `published_at` stays unknown.
+fn clojars(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://clojars.org/api/artifacts/{path}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let group = doc.get("group_name").and_then(Value::as_str);
+    let jar = doc.get("jar_name").and_then(Value::as_str);
+    let name = match (group, jar) {
+        (Some(g), Some(j)) if g != j => format!("{g}/{j}"),
+        (_, Some(j)) => j.to_string(),
+        _ => path.to_string(),
+    };
+
+    Some(Registry {
+        ecosystem: "clojars".into(),
+        name,
+        version: doc
+            .get("latest_release")
+            .or_else(|| doc.get("latest_version"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        latest_version: doc
+            .get("latest_version")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        description: doc
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        homepage: doc
+            .get("homepage")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        repository: doc
+            .pointer("/scm/url")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        license: doc
+            .pointer("/licenses/0/name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        downloads_total: doc.get("downloads").and_then(Value::as_u64),
+        ..Default::default()
+    })
+}
+
+/// JSR: the native API's package record (description, score, repo, latest) plus
+/// the versions list (each with a `createdAt` publish time). `path` is the
+/// `@scope/name` the locator carries, percent-encoded (`%40` is `@`).
+fn jsr(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let decoded = path.replace("%40", "@");
+    let (scope, pkg) = decoded.trim_start_matches('@').split_once('/')?;
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let latest = doc.get("latestVersion").and_then(Value::as_str);
+    let want = version.or(latest).unwrap_or_default();
+
+    // Per-version publish time comes from the versions list.
+    let published_at = cached_metadata(
+        &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}/versions"),
+        net,
+        cache,
+    )
+    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    .and_then(|vs| {
+        let arr = vs.as_array()?;
+        arr.iter()
+            .find(|v| v.get("version").and_then(Value::as_str) == Some(want))
+            .or_else(|| arr.first())?
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .and_then(parse_ts)
+    });
+    let repository = doc.get("githubRepository").and_then(|g| {
+        let owner = g.get("owner").and_then(Value::as_str)?;
+        let repo = g.get("name").and_then(Value::as_str)?;
+        Some(format!("https://github.com/{owner}/{repo}"))
+    });
+
+    Some(Registry {
+        ecosystem: "jsr".into(),
+        name: format!("@{scope}/{pkg}"),
+        version: want.to_string(),
+        published_at,
+        latest_version: latest.map(str::to_string),
+        description: doc
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        repository,
+        // JSR's 0–100 quality score is its popularity analogue.
+        rating: doc.get("score").and_then(Value::as_f64).map(|f| f as f32),
+        ..Default::default()
+    })
+}
+
+/// Arch Linux official repositories: the packages site exposes a JSON search.
+/// Recency comes from `last_update`; an out-of-date flag is the deprecation
+/// analogue. AUR-only packages aren't here, so they return `None`.
+fn arch(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://archlinux.org/packages/search/json/?name={name}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let r = doc.pointer("/results/0")?;
+    let version = match (
+        r.get("pkgver").and_then(Value::as_str),
+        r.get("pkgrel").and_then(Value::as_str),
+    ) {
+        (Some(v), Some(rel)) => format!("{v}-{rel}"),
+        (Some(v), None) => v.to_string(),
+        _ => String::new(),
+    };
+
+    Some(Registry {
+        ecosystem: "arch".into(),
+        name: r
+            .get("pkgname")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_string(),
+        version,
+        published_at: r
+            .get("last_update")
+            .and_then(Value::as_str)
+            .or_else(|| r.get("build_date").and_then(Value::as_str))
+            .and_then(parse_ts),
+        author: r
+            .get("packager")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        description: r.get("pkgdesc").and_then(Value::as_str).map(str::to_string),
+        homepage: r.get("url").and_then(Value::as_str).map(str::to_string),
+        license: r
+            .pointer("/licenses/0")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        maintainers: r
+            .get("maintainers")
+            .and_then(Value::as_array)
+            .map(|m| m.len() as u32),
+        deprecated: r
+            .get("flag_date")
+            .and_then(Value::as_str)
+            .map(|_| "flagged out-of-date".to_string()),
+        ..Default::default()
+    })
+}
+
+/// Fedora (Rawhide via mdapi): the per-package record carries the version,
+/// summary, and homepage. mdapi reports no build time, so age stays unknown.
+fn fedora(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://mdapi.fedoraproject.org/rawhide/pkg/{name}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let version = match (
+        doc.get("version").and_then(Value::as_str),
+        doc.get("release").and_then(Value::as_str),
+    ) {
+        (Some(v), Some(rel)) => format!("{v}-{rel}"),
+        (Some(v), None) => v.to_string(),
+        _ => String::new(),
+    };
+
+    Some(Registry {
+        ecosystem: "fedora".into(),
+        name: doc
+            .get("basename")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_string(),
+        version,
+        description: doc
+            .get("summary")
+            .and_then(Value::as_str)
+            .or_else(|| doc.get("description").and_then(Value::as_str))
+            .map(str::to_string),
+        homepage: doc.get("url").and_then(Value::as_str).map(str::to_string),
+        license: doc
+            .get("license")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        ..Default::default()
+    })
+}
+
+/// Homebrew: the formula JSON carries the stable version, description, license,
+/// and 30-day install analytics. It records no publish date.
+fn homebrew(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://formulae.brew.sh/api/formula/{name}.json"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+
+    Some(Registry {
+        ecosystem: "homebrew".into(),
+        name: doc
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_string(),
+        version: doc
+            .pointer("/versions/stable")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        description: doc.get("desc").and_then(Value::as_str).map(str::to_string),
+        homepage: doc
+            .get("homepage")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        license: doc
+            .get("license")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        // The 30-day analytics map counts installs per invocation; sum them.
+        downloads_recent: doc
+            .pointer("/analytics/install/30d")
+            .and_then(Value::as_object)
+            .map(|m| m.values().filter_map(Value::as_u64).sum::<u64>()),
+        deprecated: deprecation_flag(&doc, "deprecated", "deprecated")
+            .or_else(|| deprecation_flag(&doc, "disabled", "disabled")),
+        ..Default::default()
+    })
+}
+
+/// Snap Store: the v2 info endpoint (which requires the `Snap-Device-Series`
+/// header) returns the publisher and per-channel releases. The latest stable
+/// channel's release time and version are the supply-chain-relevant facts.
+fn snap(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let url = format!(
+        "https://api.snapcraft.io/v2/snaps/info/{name}\
+         ?fields=title,summary,description,license,publisher,store-url,website,version"
+    );
+    let doc: Value = serde_json::from_slice(&cached_metadata_with(
+        &url,
+        &[("Snap-Device-Series", "16")],
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let s = doc.get("snap")?;
+    // Prefer the latest/stable channel; fall back to the first mapping.
+    let chan = doc
+        .get("channel-map")
+        .and_then(Value::as_array)
+        .and_then(|cm| {
+            cm.iter()
+                .find(|c| {
+                    c.pointer("/channel/track").and_then(Value::as_str) == Some("latest")
+                        && c.pointer("/channel/risk").and_then(Value::as_str) == Some("stable")
+                })
+                .or_else(|| cm.first())
+        });
+
+    Some(Registry {
+        ecosystem: "snap".into(),
+        name: name.to_string(),
+        version: chan
+            .and_then(|c| c.get("version"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        published_at: chan
+            .and_then(|c| c.pointer("/channel/released-at"))
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
+        author: s
+            .pointer("/publisher/display-name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        title: s.get("title").and_then(Value::as_str).map(str::to_string),
+        description: s
+            .get("summary")
+            .and_then(Value::as_str)
+            .or_else(|| s.get("description").and_then(Value::as_str))
+            .map(str::to_string),
+        homepage: s
+            .get("website")
+            .and_then(Value::as_str)
+            .filter(|w| !w.is_empty())
+            .or_else(|| s.get("store-url").and_then(Value::as_str))
+            .map(str::to_string),
+        license: s
+            .get("license")
+            .and_then(Value::as_str)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string),
+        ..Default::default()
+    })
+}
+
+/// WordPress plugin directory: the info API carries installs, rating (0–100),
+/// the author (as an HTML anchor), and the last-updated date.
+fn wordpress(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://api.wordpress.org/plugins/info/1.0/{slug}.json"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+
+    Some(Registry {
+        ecosystem: "wordpress".into(),
+        name: doc
+            .get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or(slug)
+            .to_string(),
+        version: doc
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        // `last_updated` is `2026-04-23 10:34pm GMT`; keep the date.
+        published_at: doc
+            .get("last_updated")
+            .and_then(Value::as_str)
+            .and_then(parse_ymd),
+        author: doc.get("author").and_then(Value::as_str).map(strip_html),
+        title: doc.get("name").and_then(Value::as_str).map(str::to_string),
+        homepage: doc
+            .get("homepage")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        downloads_total: doc.get("downloaded").and_then(Value::as_u64),
+        // The directory reports rating as a 0–100 percentage; scale to 5 stars.
+        rating: doc
+            .get("rating")
+            .and_then(Value::as_f64)
+            .map(|r| (r / 20.0) as f32),
+        rating_count: doc.get("num_ratings").and_then(Value::as_u64),
+        ..Default::default()
+    })
+}
+
+/// Firefox Add-ons (addons.mozilla.org v5): the same marketplace shape as the
+/// Chrome and VS Code stores — localized name/summary, rating, weekly installs,
+/// and the current version with its review date.
+fn firefox(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+
+    Some(Registry {
+        ecosystem: "firefox".into(),
+        name: doc
+            .get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or(slug)
+            .to_string(),
+        version: doc
+            .pointer("/current_version/version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        // `reviewed` (the current version's approval) is the supply-chain recency.
+        published_at: doc
+            .pointer("/current_version/reviewed")
+            .and_then(Value::as_str)
+            .or_else(|| doc.get("last_updated").and_then(Value::as_str))
+            .and_then(parse_ts),
+        author: doc
+            .pointer("/authors/0/name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        title: doc.get("name").and_then(localized),
+        description: doc.get("summary").and_then(localized),
+        homepage: doc.pointer("/homepage/url").and_then(localized),
+        license: doc
+            .pointer("/current_version/license/name")
+            .and_then(localized),
+        downloads_recent: doc.get("weekly_downloads").and_then(Value::as_u64),
+        rating: doc
+            .pointer("/ratings/average")
+            .and_then(Value::as_f64)
+            .map(|f| f as f32),
+        rating_count: doc.pointer("/ratings/count").and_then(Value::as_u64),
+        deprecated: deprecation_flag(&doc, "is_disabled", "disabled"),
+        ..Default::default()
+    })
+}
+
+/// JetBrains Marketplace: resolve the plugin id (numeric, or an `xmlId` via
+/// search), then read its listing plus latest update — the same marketplace
+/// shape as the editor stores (rating, downloads, the update's publish date).
+fn jetbrains(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    // A numeric path is the plugin id directly; otherwise resolve the xmlId.
+    let id = if !path.is_empty() && path.bytes().all(|b| b.is_ascii_digit()) {
+        path.to_string()
+    } else {
+        let search: Value = serde_json::from_slice(&cached_metadata(
+            &format!("https://plugins.jetbrains.com/api/searchPlugins?search={path}&max=20"),
+            net,
+            cache,
+        )?)
+        .ok()?;
+        search
+            .get("plugins")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|p| p.get("xmlId").and_then(Value::as_str) == Some(path))
+            .and_then(|p| p.get("id"))
+            .and_then(Value::as_u64)?
+            .to_string()
+    };
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://plugins.jetbrains.com/api/plugins/{id}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    // The latest update carries the released version and its publish time.
+    let updates = cached_metadata(
+        &format!("https://plugins.jetbrains.com/api/plugins/{id}/updates?size=1"),
+        net,
+        cache,
+    )
+    .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let update = updates
+        .as_ref()
+        .and_then(|u| u.as_array())
+        .and_then(|a| a.first());
+
+    Some(Registry {
+        ecosystem: "jetbrains".into(),
+        name: doc
+            .get("xmlId")
+            .and_then(Value::as_str)
+            .unwrap_or(path)
+            .to_string(),
+        version: update
+            .and_then(|u| u.get("version"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        published_at: update.and_then(|u| u.get("cdate")).and_then(parse_millis),
+        // `vendor` is a bare string here, an object in search results.
+        author: doc.get("vendor").and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.get("name").and_then(Value::as_str).map(str::to_string))
+        }),
+        title: doc.get("name").and_then(Value::as_str).map(str::to_string),
+        description: doc
+            .get("preview")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        homepage: doc
+            .pointer("/urls/url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        repository: doc
+            .pointer("/urls/sourceCodeUrl")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        downloads_total: doc.get("downloads").and_then(Value::as_u64),
+        rating: doc.get("rating").and_then(Value::as_f64).map(|f| f as f32),
+        ..Default::default()
+    })
+}
+
 // --- HTML scraping helpers --------------------------------------------------
 
 /// Extract a `<meta property="og:NAME" content="VALUE">` value.
@@ -830,6 +1734,114 @@ fn deprecation(v: &Value) -> Option<String> {
         Value::Bool(true) => Some("deprecated".to_string()),
         _ => None,
     }
+}
+
+/// The final path segment — the bare package name, dropping any vendor/namespace
+/// prefix an OS-package locator carries (`pkg:aur/foo`, `pkg:alpm/arch/foo`).
+fn last_seg(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// A boolean deprecation flag → its `label` when set, else `None`.
+fn deprecation_flag(doc: &Value, key: &str, label: &str) -> Option<String> {
+    doc.get(key)
+        .and_then(Value::as_bool)
+        .and_then(|f| f.then(|| label.to_string()))
+}
+
+/// Resolve an addons.mozilla.org localized field: a bare string, or a
+/// `{ lang: text }` map from which `en-US` (else any non-empty value) is taken.
+fn localized(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => (!s.is_empty()).then(|| s.clone()),
+        Value::Object(map) => map
+            .get("en-US")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                map.values()
+                    .filter_map(Value::as_str)
+                    .find(|s| !s.is_empty())
+            })
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Pick a source-repository URL from a registry's free-form links map (hex.pm),
+/// preferring a forge link, else any value.
+fn links_repo(links: &Value) -> Option<String> {
+    let map = links.as_object()?;
+    for key in [
+        "GitHub",
+        "Github",
+        "github",
+        "GitLab",
+        "Repository",
+        "Source",
+    ] {
+        if let Some(u) = map.get(key).and_then(Value::as_str) {
+            return Some(u.to_string());
+        }
+    }
+    map.values()
+        .filter_map(Value::as_str)
+        .next()
+        .map(str::to_string)
+}
+
+/// `Name <email>` → `Name`; a bare name is returned unchanged.
+fn strip_email(s: &str) -> String {
+    s.split('<').next().unwrap_or(s).trim().to_string()
+}
+
+/// Drop HTML tags from a one-line field (WordPress wraps the author in an `<a>`).
+fn strip_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+/// The first non-empty line, trimmed — CRAN crowds several URLs into one field.
+fn first_line(s: &str) -> Option<String> {
+    s.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// Unix-millis (a JSON string or number, as JetBrains emits) → Unix seconds.
+fn parse_millis(v: &Value) -> Option<u64> {
+    let ms = match v {
+        Value::String(s) => s.parse::<u64>().ok()?,
+        Value::Number(n) => n.as_u64()?,
+        _ => return None,
+    };
+    Some(ms / 1000)
+}
+
+/// Parse a registry timestamp, tolerating a trailing zone word (`… UTC`, `…
+/// GMT`) that crandb and others append: retry on just the `YYYY-…-SS` core,
+/// which such a suffix always denotes as UTC.
+pub(crate) fn parse_ts(s: &str) -> Option<u64> {
+    parse_rfc3339_secs(s).or_else(|| s.get(..19).and_then(parse_rfc3339_secs))
+}
+
+/// Parse a leading `YYYY-MM-DD` to Unix seconds at UTC midnight, ignoring any
+/// trailing time/zone text (`2026-04-23 10:34pm GMT`).
+fn parse_ymd(s: &str) -> Option<u64> {
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let m: i64 = s.get(5..7)?.parse().ok()?;
+    let d: i64 = s.get(8..10)?.parse().ok()?;
+    u64::try_from(days_from_civil(y, m, d) * 86_400).ok()
 }
 
 /// Escape a JSON-pointer path segment (`~`→`~0`, `/`→`~1`) so a version string
@@ -1196,5 +2208,441 @@ mod tests {
         assert_eq!(r.rating_count, Some(122));
         assert_eq!(r.published_at, Some(1_780_963_200));
         assert!(r.description.is_some_and(|d| d.contains("数据采集")));
+    }
+
+    /// Build a fresh temp-dir blob cache keyed by a per-test name, purging any
+    /// entry a prior run left behind so a changed fixture is never masked by a
+    /// stale cached response.
+    fn test_cache(name: &str) -> BlobCache {
+        let dir = std::env::temp_dir().join(format!("fletch-reg-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        BlobCache::with_dir(dir)
+    }
+
+    #[test]
+    fn nuget_search_normalizes() {
+        let doc = serde_json::json!({"data": [{
+            "id": "Newtonsoft.Json", "version": "13.0.3",
+            "description": "Json.NET", "authors": ["James Newton-King"],
+            "projectUrl": "https://www.newtonsoft.com/json",
+            "totalDownloads": 8_537_565_389u64,
+            "versions": [{"version": "13.0.3"}, {"version": "13.0.2"}]
+        }]})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://azuresearch-usnc.nuget.org/query?q=packageid:newtonsoft.json&prerelease=true&semVerLevel=2.0.0",
+            doc.as_bytes(),
+        );
+        let r = nuget("Newtonsoft.Json", None, &net, &test_cache("nuget")).expect("registry");
+        assert_eq!(r.ecosystem, "nuget");
+        assert_eq!(r.name, "Newtonsoft.Json");
+        assert_eq!(r.version, "13.0.3");
+        assert_eq!(r.author.as_deref(), Some("James Newton-King"));
+        assert_eq!(r.downloads_total, Some(8_537_565_389));
+        assert_eq!(r.published_at, None); // search API carries no publish time
+    }
+
+    #[test]
+    fn maven_solrsearch_normalizes() {
+        let doc = serde_json::json!({"response": {"docs": [
+            {"g": "com.google.guava", "a": "guava", "v": "33.4.8-jre", "timestamp": 1_619_172_000_000u64}
+        ]}})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://search.maven.org/solrsearch/select?q=g:%22com.google.guava%22+AND+a:%22guava%22&core=gav&rows=20&wt=json",
+            doc.as_bytes(),
+        );
+        let r =
+            maven("com.google.guava/guava", None, &net, &test_cache("maven")).expect("registry");
+        assert_eq!(r.ecosystem, "maven");
+        assert_eq!(r.name, "com.google.guava:guava");
+        assert_eq!(r.version, "33.4.8-jre");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(r.latest_version.as_deref(), Some("33.4.8-jre"));
+    }
+
+    #[test]
+    fn hex_api_normalizes() {
+        let doc = serde_json::json!({
+            "latest_stable_version": "1.20.1",
+            "downloads": {"all": 159_722_813u64, "recent": 3_812_427u64},
+            "meta": {"description": "Compose web applications", "licenses": ["Apache-2.0"],
+                     "links": {"GitHub": "https://github.com/elixir-plug/plug"}},
+            "releases": [{"version": "1.20.1", "inserted_at": "2021-04-23T10:00:00.000000Z"}]
+        })
+        .to_string();
+        let net = Fixtures::default().with("https://hex.pm/api/packages/plug", doc.as_bytes());
+        let r = hex_pm("plug", None, &net, &test_cache("hex")).expect("registry");
+        assert_eq!(r.ecosystem, "hex");
+        assert_eq!(r.version, "1.20.1");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(r.license.as_deref(), Some("Apache-2.0"));
+        assert_eq!(
+            r.repository.as_deref(),
+            Some("https://github.com/elixir-plug/plug")
+        );
+        assert_eq!(r.downloads_total, Some(159_722_813));
+    }
+
+    #[test]
+    fn cran_crandb_normalizes() {
+        let doc = serde_json::json!({
+            "Package": "jsonlite", "Version": "2.0.0",
+            "Title": "A Simple and Robust JSON Parser", "License": "MIT + file LICENSE",
+            "Maintainer": "Jeroen Ooms <jeroenooms@gmail.com>",
+            "URL": "https://jeroen.r-universe.dev/jsonlite\nhttps://arxiv.org/abs/1403.2805",
+            "Date/Publication": "2021-04-23 10:00:00 UTC"
+        })
+        .to_string();
+        let net = Fixtures::default().with("https://crandb.r-pkg.org/jsonlite", doc.as_bytes());
+        let r = cran("jsonlite", &net, &test_cache("cran")).expect("registry");
+        assert_eq!(r.ecosystem, "cran");
+        assert_eq!(r.version, "2.0.0");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(r.author.as_deref(), Some("Jeroen Ooms"));
+        assert_eq!(
+            r.homepage.as_deref(),
+            Some("https://jeroen.r-universe.dev/jsonlite")
+        );
+    }
+
+    #[test]
+    fn cpan_release_normalizes() {
+        let doc = serde_json::json!({
+            "distribution": "Moose", "version": "2.4000", "date": "2021-04-23T10:00:00",
+            "author": "ETHER", "abstract": "A postmodern object system for Perl 5",
+            "license": ["perl_5"], "status": "latest",
+            "resources": {"homepage": "https://metacpan.org/pod/Moose",
+                          "repository": {"url": "https://github.com/moose/Moose"}}
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://fastapi.metacpan.org/v1/release/Moose",
+            doc.as_bytes(),
+        );
+        let r = cpan("Moose", &net, &test_cache("cpan")).expect("registry");
+        assert_eq!(r.ecosystem, "cpan");
+        assert_eq!(r.version, "2.4000");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(r.author.as_deref(), Some("ETHER"));
+        assert_eq!(r.license.as_deref(), Some("perl_5"));
+        assert_eq!(
+            r.repository.as_deref(),
+            Some("https://github.com/moose/Moose")
+        );
+    }
+
+    #[test]
+    fn pub_dev_normalizes() {
+        let doc = serde_json::json!({
+            "name": "http",
+            "latest": {"version": "1.6.0", "published": "2021-04-23T10:00:00.000000Z",
+                       "pubspec": {"description": "Future-based HTTP requests",
+                                   "repository": "https://github.com/dart-lang/http"}},
+            "versions": [{"version": "1.6.0", "published": "2021-04-23T10:00:00.000000Z",
+                          "pubspec": {"description": "Future-based HTTP requests",
+                                      "repository": "https://github.com/dart-lang/http"}}]
+        })
+        .to_string();
+        let net = Fixtures::default().with("https://pub.dev/api/packages/http", doc.as_bytes());
+        let r = pub_dev("http", None, &net, &test_cache("pub")).expect("registry");
+        assert_eq!(r.ecosystem, "pub");
+        assert_eq!(r.version, "1.6.0");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(
+            r.repository.as_deref(),
+            Some("https://github.com/dart-lang/http")
+        );
+    }
+
+    #[test]
+    fn conda_anaconda_normalizes() {
+        let doc = serde_json::json!({
+            "latest_version": "1.9.3", "summary": "Scientific computing",
+            "license": "BSD-3-Clause", "home": "https://numpy.org",
+            "dev_url": "https://github.com/numpy/numpy", "source_git_url": null,
+            "ndownloads": 138_106_777u64,
+            "files": [{"version": "1.9.3", "upload_time": "2021-04-23T10:00:00.000Z"}]
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://api.anaconda.org/package/conda-forge/numpy",
+            doc.as_bytes(),
+        );
+        let r = conda("numpy", None, &net, &test_cache("conda")).expect("registry");
+        assert_eq!(r.ecosystem, "conda");
+        assert_eq!(r.version, "1.9.3");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(
+            r.repository.as_deref(),
+            Some("https://github.com/numpy/numpy")
+        );
+        assert_eq!(r.downloads_total, Some(138_106_777));
+    }
+
+    #[test]
+    fn clojars_artifacts_normalizes() {
+        let doc = serde_json::json!({
+            "group_name": "ring", "jar_name": "ring", "latest_release": "1.15.5",
+            "latest_version": "1.15.5", "description": "A Clojure web library",
+            "homepage": "https://github.com/ring-clojure/ring", "downloads": 11_285_905u64,
+            "scm": {"url": "https://github.com/ring-clojure/ring"},
+            "licenses": [{"name": "The MIT License"}]
+        })
+        .to_string();
+        let net =
+            Fixtures::default().with("https://clojars.org/api/artifacts/ring", doc.as_bytes());
+        let r = clojars("ring", &net, &test_cache("clojars")).expect("registry");
+        assert_eq!(r.ecosystem, "clojars");
+        assert_eq!(r.name, "ring");
+        assert_eq!(r.version, "1.15.5");
+        assert_eq!(r.license.as_deref(), Some("The MIT License"));
+        assert_eq!(r.downloads_total, Some(11_285_905));
+        assert_eq!(r.published_at, None);
+    }
+
+    #[test]
+    fn jsr_api_normalizes() {
+        let pkg = serde_json::json!({
+            "scope": "std", "name": "path", "description": "File-path utilities",
+            "latestVersion": "1.1.5", "score": 100,
+            "githubRepository": {"owner": "denoland", "name": "std"}
+        })
+        .to_string();
+        let versions = serde_json::json!([
+            {"version": "1.1.5", "createdAt": "2021-04-23T10:00:00.000Z", "yanked": false}
+        ])
+        .to_string();
+        let net = Fixtures::default()
+            .with(
+                "https://api.jsr.io/scopes/std/packages/path",
+                pkg.as_bytes(),
+            )
+            .with(
+                "https://api.jsr.io/scopes/std/packages/path/versions",
+                versions.as_bytes(),
+            );
+        let r = jsr("%40std/path", None, &net, &test_cache("jsr")).expect("registry");
+        assert_eq!(r.ecosystem, "jsr");
+        assert_eq!(r.name, "@std/path");
+        assert_eq!(r.version, "1.1.5");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(
+            r.repository.as_deref(),
+            Some("https://github.com/denoland/std")
+        );
+        assert_eq!(r.rating, Some(100.0));
+    }
+
+    #[test]
+    fn arch_packages_normalizes() {
+        let doc = serde_json::json!({"results": [{
+            "pkgname": "pacman", "pkgver": "7.1.0", "pkgrel": "2",
+            "pkgdesc": "A library-based package manager", "url": "https://archlinux.org/pacman/",
+            "licenses": ["GPL-2.0-or-later"], "packager": "eworm",
+            "maintainers": ["anthraxx", "Foxboron"],
+            "last_update": "2021-04-23T10:00:00.379Z", "flag_date": null
+        }]})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://archlinux.org/packages/search/json/?name=pacman",
+            doc.as_bytes(),
+        );
+        let r = arch("pacman", &net, &test_cache("arch")).expect("registry");
+        assert_eq!(r.ecosystem, "arch");
+        assert_eq!(r.version, "7.1.0-2");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(r.author.as_deref(), Some("eworm"));
+        assert_eq!(r.maintainers, Some(2));
+        assert_eq!(r.deprecated, None);
+    }
+
+    #[test]
+    fn fedora_mdapi_normalizes() {
+        let doc = serde_json::json!({
+            "basename": "curl", "version": "8.21.0", "release": "3.fc45",
+            "summary": "A command line tool for transferring data", "license": "curl",
+            "url": "https://curl.se/"
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://mdapi.fedoraproject.org/rawhide/pkg/curl",
+            doc.as_bytes(),
+        );
+        let r = fedora("curl", &net, &test_cache("fedora")).expect("registry");
+        assert_eq!(r.ecosystem, "fedora");
+        assert_eq!(r.version, "8.21.0-3.fc45");
+        assert_eq!(r.homepage.as_deref(), Some("https://curl.se/"));
+        assert_eq!(r.published_at, None);
+    }
+
+    #[test]
+    fn homebrew_formula_normalizes() {
+        let doc = serde_json::json!({
+            "name": "wget", "desc": "Internet file retriever",
+            "homepage": "https://www.gnu.org/software/wget/", "license": "GPL-3.0-or-later",
+            "versions": {"stable": "1.25.0"}, "deprecated": false, "disabled": false,
+            "analytics": {"install": {"30d": {"wget": 20_568u64, "wget --HEAD": 26u64}}}
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://formulae.brew.sh/api/formula/wget.json",
+            doc.as_bytes(),
+        );
+        let r = homebrew("wget", &net, &test_cache("homebrew")).expect("registry");
+        assert_eq!(r.ecosystem, "homebrew");
+        assert_eq!(r.version, "1.25.0");
+        assert_eq!(r.license.as_deref(), Some("GPL-3.0-or-later"));
+        assert_eq!(r.downloads_recent, Some(20_594));
+        assert_eq!(r.deprecated, None);
+    }
+
+    #[test]
+    fn snap_info_normalizes() {
+        let doc = serde_json::json!({
+            "snap": {"title": "hello", "summary": "GNU Hello", "license": "GPL-3.0",
+                     "publisher": {"display-name": "Canonical"},
+                     "store-url": "https://snapcraft.io/hello", "website": null},
+            "channel-map": [{
+                "channel": {"track": "latest", "risk": "stable", "released-at": "2021-04-23T10:00:00+00:00"},
+                "version": "2.10"
+            }]
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://api.snapcraft.io/v2/snaps/info/hello?fields=title,summary,description,license,publisher,store-url,website,version",
+            doc.as_bytes(),
+        );
+        let r = snap("hello", &net, &test_cache("snap")).expect("registry");
+        assert_eq!(r.ecosystem, "snap");
+        assert_eq!(r.version, "2.10");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(r.author.as_deref(), Some("Canonical"));
+        assert_eq!(r.homepage.as_deref(), Some("https://snapcraft.io/hello"));
+    }
+
+    #[test]
+    fn wordpress_plugin_normalizes() {
+        let doc = serde_json::json!({
+            "name": "Akismet Anti-spam", "slug": "akismet", "version": "5.7",
+            "author": "<a href=\"https://profiles.wordpress.org/automattic/\">Automattic</a>",
+            "homepage": "https://akismet.com/", "last_updated": "2021-04-23 10:34pm GMT",
+            "downloaded": 395_330_422u64, "rating": 94, "num_ratings": 1184
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://api.wordpress.org/plugins/info/1.0/akismet.json",
+            doc.as_bytes(),
+        );
+        let r = wordpress("akismet", &net, &test_cache("wordpress")).expect("registry");
+        assert_eq!(r.ecosystem, "wordpress");
+        assert_eq!(r.version, "5.7");
+        assert_eq!(r.author.as_deref(), Some("Automattic"));
+        assert_eq!(r.published_at, Some(1_619_136_000)); // date floored to UTC midnight
+        assert_eq!(r.downloads_total, Some(395_330_422));
+        assert_eq!(r.rating, Some(4.7));
+        assert_eq!(r.rating_count, Some(1184));
+    }
+
+    #[test]
+    fn firefox_amo_normalizes() {
+        let doc = serde_json::json!({
+            "slug": "ublock-origin",
+            "name": {"en-US": "uBlock Origin"}, "summary": {"en-US": "An efficient blocker"},
+            "homepage": {"url": {"en-US": "https://github.com/gorhill/uBlock"}},
+            "authors": [{"name": "Raymond Hill"}],
+            "ratings": {"average": 4.7997, "count": 21_850u64}, "weekly_downloads": 123_456u64,
+            "is_disabled": false,
+            "current_version": {"version": "1.66.4", "reviewed": "2021-04-23T10:00:00Z",
+                                "license": {"name": {"en-US": "GPL-3.0-only"}}}
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://addons.mozilla.org/api/v5/addons/addon/ublock-origin/",
+            doc.as_bytes(),
+        );
+        let r = firefox("ublock-origin", &net, &test_cache("firefox")).expect("registry");
+        assert_eq!(r.ecosystem, "firefox");
+        assert_eq!(r.title.as_deref(), Some("uBlock Origin"));
+        assert_eq!(r.version, "1.66.4");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(
+            r.homepage.as_deref(),
+            Some("https://github.com/gorhill/uBlock")
+        );
+        assert_eq!(r.license.as_deref(), Some("GPL-3.0-only"));
+        assert_eq!(r.rating, Some(4.7997));
+        assert_eq!(r.rating_count, Some(21_850));
+    }
+
+    #[test]
+    fn jetbrains_plugin_normalizes() {
+        let plugin = serde_json::json!({
+            "id": 22407, "xmlId": "com.jetbrains.rust", "name": "Rust",
+            "preview": "Rust support", "vendor": "JetBrains s.r.o.",
+            "downloads": 1_964_675u64, "rating": 2.78,
+            "urls": {"url": "", "sourceCodeUrl": "https://github.com/intellij-rust/intellij-rust"}
+        })
+        .to_string();
+        let updates = serde_json::json!([
+            {"version": "262.8117.29", "cdate": "1619172000000"}
+        ])
+        .to_string();
+        let net = Fixtures::default()
+            .with(
+                "https://plugins.jetbrains.com/api/plugins/22407",
+                plugin.as_bytes(),
+            )
+            .with(
+                "https://plugins.jetbrains.com/api/plugins/22407/updates?size=1",
+                updates.as_bytes(),
+            );
+        let r = jetbrains("22407", &net, &test_cache("jetbrains")).expect("registry");
+        assert_eq!(r.ecosystem, "jetbrains");
+        assert_eq!(r.name, "com.jetbrains.rust");
+        assert_eq!(r.version, "262.8117.29");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(r.author.as_deref(), Some("JetBrains s.r.o."));
+        assert_eq!(
+            r.repository.as_deref(),
+            Some("https://github.com/intellij-rust/intellij-rust")
+        );
+        assert_eq!(r.downloads_total, Some(1_964_675));
+    }
+
+    #[test]
+    fn alpm_namespace_routes_aur_vs_official() {
+        // `pkg:alpm/aur/<name>` → AUR RPC; any other namespace → official repos.
+        let aur_rpc = serde_json::json!({
+            "resultcount": 1,
+            "results": [{"Name": "yay", "Version": "12.0.0-1", "Maintainer": "jverify",
+                         "LastModified": 1_619_172_000u64, "OutOfDate": serde_json::Value::Null}]
+        })
+        .to_string();
+        let arch_json = serde_json::json!({"results": [{
+            "pkgname": "pacman", "pkgver": "7.1.0", "pkgrel": "2", "packager": "eworm",
+            "last_update": "2021-04-23T10:00:00Z"
+        }]})
+        .to_string();
+        let net = Fixtures::default()
+            .with(
+                "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=yay",
+                aur_rpc.as_bytes(),
+            )
+            .with(
+                "https://archlinux.org/packages/search/json/?name=pacman",
+                arch_json.as_bytes(),
+            );
+        let cache = test_cache("alpm");
+        let from_aur = registry(&RefLocator::Purl("pkg:alpm/aur/yay".into()), &net, &cache)
+            .expect("aur registry");
+        assert_eq!(from_aur.ecosystem, "aur");
+        let from_official = registry(
+            &RefLocator::Purl("pkg:alpm/core/pacman".into()),
+            &net,
+            &cache,
+        )
+        .expect("arch registry");
+        assert_eq!(from_official.ecosystem, "arch");
     }
 }
