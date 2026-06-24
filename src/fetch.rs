@@ -35,6 +35,21 @@ const MAX_REDIRECTS: u32 = 10;
 pub trait Fetch {
     /// Retrieve the bytes at `url`, following redirects.
     fn get(&self, url: &str) -> Result<Fetched, FetchError>;
+
+    /// POST `body` with the given `(name, value)` headers and return the
+    /// response. Defaults to unsupported; a backend overrides it only when a
+    /// registry needs it — e.g. the VS Code Marketplace's JSON-RPC query, which
+    /// has no GET form. POST is not redirect-followed.
+    fn post(
+        &self,
+        _url: &str,
+        _body: &[u8],
+        _headers: &[(&str, &str)],
+    ) -> Result<Fetched, FetchError> {
+        Err(FetchError::Refused(
+            "POST not supported by this backend".into(),
+        ))
+    }
 }
 
 /// A successful fetch with the provenance the transport observed.
@@ -304,6 +319,36 @@ pub(crate) fn cached_metadata(url: &str, net: &dyn Fetch, cache: &BlobCache) -> 
             Some(f.bytes)
         }
         // Source unreachable: a stale metadata answer still beats none.
+        Err(_) => cache.any(&key).map(|(bytes, _)| bytes),
+    }
+}
+
+/// Like [`cached_metadata`] but for a JSON-RPC `POST` query — the VS Code
+/// Marketplace's `extensionquery` has no GET form. Cached by URL + body so a
+/// distinct query is a distinct entry.
+pub(crate) fn cached_post(
+    url: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Vec<u8>> {
+    let key = sha256_hex(format!("post:{url}:{}", sha256_hex(body)).as_bytes());
+    if let Some((bytes, _)) = cache.fresh(&key, TTL_PINNED) {
+        return Some(bytes);
+    }
+    match net.post(url, body, headers) {
+        Ok(f) => {
+            let meta = CachedMeta {
+                fetched_at: now(),
+                status: f.status,
+                final_url: f.final_url,
+                redirects: f.redirects,
+                headers: f.headers,
+            };
+            cache.put(&key, &f.bytes, &meta);
+            Some(f.bytes)
+        }
         Err(_) => cache.any(&key).map(|(bytes, _)| bytes),
     }
 }
@@ -629,6 +674,16 @@ fn resolved_target(locator: &RefLocator, net: &dyn Fetch) -> Option<(String, Str
         if ty == "npm" && !rest.contains('@') {
             return resolve_npm_unversioned(rest, net);
         }
+        // Open VSX publishes the exact `.vsix` URL in its API for both a pinned
+        // and the latest version, so resolve through it rather than guessing.
+        if ty == "openvsx" {
+            return resolve_openvsx(rest, net).map(|u| (p.clone(), u));
+        }
+        // The VS Code Marketplace's `.vsix` lives at a well-known gallery URL,
+        // but the latest version (when unpinned) comes from the query API.
+        if ty == "vscode" {
+            return resolve_vscode(rest, net).map(|u| (p.clone(), u));
+        }
         if let Some((path, version)) = rest.rsplit_once('@') {
             match ty {
                 "pypi" => return resolve_pypi(path, version, net).map(|u| (p.clone(), u)),
@@ -688,6 +743,62 @@ fn resolve_pypi(name: &str, version: &str, net: &dyn Fetch) -> Option<String> {
         .map(String::from)
 }
 
+/// Open VSX publishes the `.vsix` download URL in its JSON API. `rest` is
+/// `<namespace>/<name>[@<version>]`; without a version the API returns the
+/// latest release. Returns the `files.download` URL — the exact artifact a
+/// client would install.
+fn resolve_openvsx(rest: &str, net: &dyn Fetch) -> Option<String> {
+    let (path, version) = rest
+        .rsplit_once('@')
+        .map_or((rest, None), |(p, v)| (p, Some(v)));
+    let (ns, name) = path.split_once('/')?;
+    let api = match version {
+        Some(v) => format!("https://open-vsx.org/api/{ns}/{name}/{v}"),
+        None => format!("https://open-vsx.org/api/{ns}/{name}"),
+    };
+    let resp = net.get(&api).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes).ok()?;
+    json.pointer("/files/download")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
+}
+
+/// The VS Code Marketplace `.vsix` lives at a deterministic gallery URL once the
+/// version is known. `rest` is `<publisher>/<name>[@<version>]`; an unpinned
+/// reference resolves the latest version through the JSON-RPC query first.
+fn resolve_vscode(rest: &str, net: &dyn Fetch) -> Option<String> {
+    let (path, version) = rest
+        .rsplit_once('@')
+        .map_or((rest, None), |(p, v)| (p, Some(v.to_string())));
+    let (publisher, name) = path.split_once('/')?;
+    let version = match version {
+        Some(v) => v,
+        None => {
+            let body = format!(
+                r#"{{"filters":[{{"criteria":[{{"filterType":7,"value":"{publisher}.{name}"}}]}}],"flags":914}}"#
+            );
+            let headers = [
+                ("Content-Type", "application/json"),
+                ("Accept", "application/json;api-version=3.0-preview.1"),
+            ];
+            let resp = net
+                .post(
+                    "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery",
+                    body.as_bytes(),
+                    &headers,
+                )
+                .ok()?;
+            let json: serde_json::Value = serde_json::from_slice(&resp.bytes).ok()?;
+            json.pointer("/results/0/extensions/0/versions/0/version")
+                .and_then(serde_json::Value::as_str)?
+                .to_string()
+        }
+    };
+    Some(format!(
+        "https://{publisher}.gallery.vsassets.io/_apis/public/gallery/publisher/{publisher}/extension/{name}/{version}/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage"
+    ))
+}
+
 /// Composer's download URL lives in Packagist's per-package metadata, not a
 /// derivable path. Fetch the v2 metadata, find the matching version, and return
 /// its `dist.url` (the exact artifact Composer would install). `name` is
@@ -712,7 +823,7 @@ fn resolve_composer(name: &str, version: &str, net: &dyn Fetch) -> Option<String
 /// GOPROXY case-encoding: every uppercase ASCII letter becomes `!` followed by
 /// its lowercase form, so module paths can't collide on case-insensitive file
 /// systems (`github.com/BurntSushi/toml` → `github.com/!burnt!sushi/toml`).
-fn goproxy_escape(s: &str) -> String {
+pub(crate) fn goproxy_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c.is_ascii_uppercase() {
@@ -924,6 +1035,77 @@ impl Fetch for HttpFetch {
         }
         Err(FetchError::Refused("too many redirects".into()))
     }
+
+    fn post(
+        &self,
+        url: &str,
+        body: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Fetched, FetchError> {
+        let target = reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
+        guard_host(&target)?;
+        let mut req = self.client.post(target.clone()).body(body.to_vec());
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let resp = req.send().map_err(map_send_err)?;
+        let status = resp.status();
+        // POST is not redirect-followed: a redirected query endpoint is an error
+        // here, not a silent re-POST to another host.
+        if !status.is_success() {
+            return Err(FetchError::Status(status.as_u16()));
+        }
+        let resp_headers = resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|val| (k.as_str().to_string(), val.into()))
+            })
+            .collect();
+        let mut bytes = Vec::new();
+        resp.take(MAX_FETCH_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| FetchError::Transport(e.to_string()))?;
+        if bytes.len() as u64 > MAX_FETCH_BYTES {
+            return Err(FetchError::TooLarge);
+        }
+        Ok(Fetched {
+            bytes,
+            final_url: target.to_string(),
+            status: status.as_u16(),
+            headers: resp_headers,
+            redirects: Vec::new(),
+        })
+    }
+}
+
+/// The pre-connect floor shared by GET and POST: https only, and refuse a
+/// literal-IP host the DNS resolver never sees (the SSRF resolver guards
+/// hostname targets; a bare IP must be checked directly).
+fn guard_host(url: &reqwest::Url) -> Result<(), FetchError> {
+    if url.scheme() != "https" {
+        return Err(FetchError::Refused(format!(
+            "non-https scheme: {}",
+            url.scheme()
+        )));
+    }
+    match url.host_str() {
+        Some(host) => {
+            let bare = host
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(host);
+            if let Ok(ip) = bare.parse::<IpAddr>()
+                && is_blocked_ip(ip)
+            {
+                return Err(FetchError::Refused(format!("non-public host: {host}")));
+            }
+            Ok(())
+        }
+        None => Err(FetchError::Refused("missing host".into())),
+    }
 }
 
 // Used as `map_err(map_send_err)`, so it must take the error by value even
@@ -980,6 +1162,17 @@ impl Fetch for Fixtures {
             .get(url)
             .cloned()
             .ok_or_else(|| FetchError::Transport(format!("no fixture for {url}")))
+    }
+
+    /// A query's response is deterministic for its endpoint, so fixtures key on
+    /// the URL and ignore the body.
+    fn post(
+        &self,
+        url: &str,
+        _body: &[u8],
+        _headers: &[(&str, &str)],
+    ) -> Result<Fetched, FetchError> {
+        self.get(url)
     }
 }
 
