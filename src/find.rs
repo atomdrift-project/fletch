@@ -565,16 +565,27 @@ fn scan_shell(text: Option<&str>, source: &str, out: &mut Found<'_>) {
 /// continuations, and matches the invocation anywhere in a segment.
 fn commands(scan: &str, source: &str, out: &mut Found<'_>) {
     let joined = scan.replace("\\\r\n", " ").replace("\\\n", " ");
+    let dockerfile = source == "dockerfile";
+    // A Dockerfile `FROM` sets the stage's base distro, which disambiguates the
+    // cross-distro package managers (`apt` → debian/ubuntu, `apk` →
+    // alpine/wolfi) in the `RUN`s that follow it. A bare shell script has no such
+    // context and falls back to each manager's dominant distro.
+    let mut distro: Option<&'static str> = None;
     for seg in joined.split([';', '&', '|', '\n', '\r']) {
         let seg = seg.trim();
         if seg.is_empty() {
             continue;
         }
         let toks: Vec<&str> = seg.split_whitespace().collect();
+        if dockerfile && toks.first().is_some_and(|t| t.eq_ignore_ascii_case("FROM")) {
+            distro = from_image(&toks[1..]).and_then(image_distro);
+            continue;
+        }
         for i in 0..toks.len() {
-            let Some((eco, consumed)) = match_pm(&toks[i..]) else {
+            let Some((family, consumed)) = match_pm(&toks[i..]) else {
                 continue;
             };
+            let eco = distro_eco(family, distro);
             for arg in &toks[i + consumed..] {
                 if arg.starts_with('>') || arg.starts_with('<') || *arg == "{" {
                     break; // a redirect, or an options-object `{`, ends the list
@@ -585,6 +596,76 @@ fn commands(scan: &str, source: &str, out: &mut Found<'_>) {
             }
             break; // the rest of the segment is this command's arguments
         }
+    }
+}
+
+/// The image reference in a Dockerfile `FROM`'s tokens (those after `FROM`),
+/// skipping `--platform=`-style flags. `None` for a build-arg placeholder
+/// (`$BASE`) or `scratch`, which carry no distro.
+fn from_image<'a>(after_from: &[&'a str]) -> Option<&'a str> {
+    after_from
+        .iter()
+        .copied()
+        .find(|t| !t.starts_with('-'))
+        .filter(|t| !t.starts_with('$') && *t != "scratch")
+}
+
+/// Classify a Dockerfile base image to the distro whose package manager its
+/// `RUN`s will use. Both the repository and the tag carry the signal
+/// (`python:3.12-slim` is Debian, `node:20-alpine` is Alpine). `None` when the
+/// image is unrecognized — the manager then falls back to its dominant distro.
+fn image_distro(image: &str) -> Option<&'static str> {
+    let img = image.to_ascii_lowercase();
+    let has = |n: &str| img.contains(n);
+    if has("wolfi") || has("chainguard") {
+        Some("wolfi")
+    } else if has("alpine") {
+        Some("alpine")
+    } else if has("ubuntu")
+        || ["focal", "jammy", "noble", "mantic", "lunar"]
+            .iter()
+            .any(|c| has(c))
+    {
+        Some("ubuntu")
+    } else if has("opensuse") || has("/suse") || img.starts_with("suse") {
+        Some("opensuse")
+    } else if has("fedora") {
+        Some("fedora")
+    } else if has("archlinux") || img == "arch" || img.starts_with("arch:") {
+        Some("arch")
+    } else if has("debian")
+        || [
+            "bookworm", "bullseye", "trixie", "buster", "-slim", "/slim", "sid",
+        ]
+        .iter()
+        .any(|c| has(c))
+    {
+        Some("debian")
+    } else {
+        None
+    }
+}
+
+/// Resolve a cross-distro package-manager family to a concrete ecosystem using
+/// the base image, defaulting to the dominant member when it is unknown (`apt` →
+/// Debian, `apk` → Alpine). Every unambiguous family passes straight through.
+fn distro_eco(family: &'static str, distro: Option<&str>) -> &'static str {
+    match family {
+        "apt" => {
+            if distro == Some("ubuntu") {
+                "ubuntu"
+            } else {
+                "debian"
+            }
+        }
+        "apk" => {
+            if distro == Some("wolfi") {
+                "wolfi"
+            } else {
+                "alpine"
+            }
+        }
+        other => other,
     }
 }
 
@@ -607,30 +688,62 @@ fn urls(text: &str, source: &str, out: &mut Found<'_>) {
 /// returning its ecosystem and how many tokens the invocation spans
 /// (`npm install` → 2, `uv pip install` → 3).
 fn match_pm(toks: &[&str]) -> Option<(&'static str, usize)> {
+    // A subcommand verb that tolerates global flags between the command and the
+    // verb (`apt-get -y install`, `apk --no-cache add`, `npm --global install`):
+    // skip leading option flags, then require the next token to be one of
+    // `verbs`. Returns the consumed-token count up to and including the verb.
+    // Flag-skipping (vs a blind window) keeps a later arg that merely equals a
+    // short verb — `npm run x` — from being read as an install.
+    let after = |verbs: &[&str]| -> Option<usize> {
+        let mut i = 1;
+        while toks.get(i).is_some_and(|t| t.starts_with('-')) {
+            i += 1;
+        }
+        verbs.contains(toks.get(i)?).then_some(i + 1)
+    };
     match *toks.first()? {
         // One-shot remote runners fetch-and-run a package without declaring it
         // (`npx pkg`, `bunx pkg`, `uvx pkg`); the package follows immediately.
         "npx" | "bunx" => Some(("npm", 1)),
         "uvx" => Some(("pypi", 1)),
         // install/add, plus `pnpm dlx` / `yarn dlx` / `bun x` which run a
-        // package (fetching it if absent) without declaring it.
+        // package without declaring it, and `yarn global add <pkg>`.
         "npm" | "pnpm" | "yarn" | "bun" => {
-            matches!(*toks.get(1)?, "install" | "i" | "add" | "a" | "dlx" | "x")
-                .then_some(("npm", 2))
+            if toks.get(1) == Some(&"global") && toks.get(2) == Some(&"add") {
+                Some(("npm", 3)) // `yarn global add <pkg>`
+            } else {
+                after(&["install", "i", "add", "a", "dlx", "x"]).map(|c| ("npm", c))
+            }
         }
         // CLI `pip install`, and the programmatic forms `pip.main(["install",…])`
         // / `pip._internal.main(["install",…])` — once scan_source flattens the
-        // punctuation these read as `pip … install <pkg>`, so accept `install`
-        // within the next few tokens, not only at position 1.
+        // punctuation these read as `pip main install <pkg>` (a non-flag token
+        // sits between), so scan a short window rather than skip only flags.
         "pip" | "pip3" => toks
             .get(1..)?
             .iter()
             .take(3)
             .position(|t| *t == "install")
             .map(|i| ("pypi", i + 2)),
+        // `python -m pip install <pkg>` — the module form of the same.
+        "python" | "python3" => {
+            if toks.get(1) == Some(&"-m") && toks.get(2) == Some(&"pip") {
+                toks.get(3..)?
+                    .iter()
+                    .take(3)
+                    .position(|t| *t == "install")
+                    .map(|i| ("pypi", i + 4))
+            } else {
+                None
+            }
+        }
         "pipx" => matches!(*toks.get(1)?, "install" | "run").then_some(("pypi", 2)),
+        "pipenv" => after(&["install"]).map(|c| ("pypi", c)),
+        // `poetry add` / `pdm add` / `rye add <pkg>` (their `install` reads the
+        // manifest, so it stays declared-only).
+        "poetry" | "pdm" | "rye" => after(&["add"]).map(|c| ("pypi", c)),
         "uv" => match *toks.get(1)? {
-            "pip" if toks.get(2) == Some(&"install") => Some(("pypi", 3)),
+            "pip" | "tool" if toks.get(2) == Some(&"install") => Some(("pypi", 3)),
             "add" => Some(("pypi", 2)),
             _ => None,
         },
@@ -641,16 +754,85 @@ fn match_pm(toks: &[&str]) -> Option<(&'static str, usize)> {
         "deno" => {
             matches!(*toks.get(1)?, "install" | "add" | "cache" | "run").then_some(("deno", 2))
         }
-        // `go get`/`go install <module>@<version>` and `cargo install <crate>`
-        // resolve to fetchable artifacts; gem/composer/apt are recorded for now.
         "go" => matches!(*toks.get(1)?, "get" | "install").then_some(("golang", 2)),
-        "cargo" => (*toks.get(1)? == "install").then_some(("cargo", 2)),
-        "gem" => (*toks.get(1)? == "install").then_some(("gem", 2)),
-        "conda" | "mamba" | "micromamba" => (*toks.get(1)? == "install").then_some(("conda", 2)),
-        "composer" => (*toks.get(1)? == "require").then_some(("composer", 2)),
-        "apt-get" | "apt" | "aptitude" => (*toks.get(1)? == "install").then_some(("deb", 2)),
+        // `cargo install`/`cargo binstall` (a binary) and `cargo add` (a manifest
+        // dependency) all name a crate.
+        "cargo" => after(&["install", "add", "binstall"]).map(|c| ("cargo", c)),
+        "gem" => after(&["install"]).map(|c| ("gem", c)),
+        "bundle" | "bundler" => after(&["add"]).map(|c| ("gem", c)),
+        "conda" | "mamba" | "micromamba" => after(&["install"]).map(|c| ("conda", c)),
+        // `composer require` and `composer global require <vendor/pkg>`.
+        "composer" => {
+            if toks.get(1) == Some(&"require") {
+                Some(("composer", 2))
+            } else if toks.get(1) == Some(&"global") && toks.get(2) == Some(&"require") {
+                Some(("composer", 3))
+            } else {
+                None
+            }
+        }
+        // Cross-distro families: the concrete ecosystem (debian vs ubuntu, alpine
+        // vs wolfi) is resolved from the Dockerfile base image in `distro_eco`.
+        "apt-get" | "apt" | "aptitude" => after(&["install"]).map(|c| ("apt", c)),
+        "apk" => after(&["add"]).map(|c| ("apk", c)),
+        // Single-distro managers map straight to their registry ecosystem.
+        "dnf" | "dnf5" | "yum" | "microdnf" | "tdnf" => after(&["install"]).map(|c| ("fedora", c)),
+        "zypper" => after(&["install", "in"]).map(|c| ("opensuse", c)),
+        // `pacman -S`/`yay -S` and friends: an install sync flag (not search `-Ss`
+        // or info `-Si`), possibly after a global flag.
+        "pacman" => toks
+            .get(1..)?
+            .iter()
+            .take(4)
+            .position(|t| is_pacman_sync(t))
+            .map(|i| ("arch", i + 2)),
+        "yay" | "paru" | "pikaur" | "trizen" => toks
+            .get(1..)?
+            .iter()
+            .take(4)
+            .position(|t| is_pacman_sync(t))
+            .map(|i| ("aur", i + 2)),
+        "brew" => after(&["install", "reinstall"]).map(|c| ("homebrew", c)),
+        "snap" => after(&["install"]).map(|c| ("snap", c)),
+        "pkg" => after(&["install", "add"]).map(|c| ("freebsd", c)),
+        "pkgin" => after(&["install"]).map(|c| ("netbsd", c)),
+        "pkg_add" => Some(("openbsd", 1)),
+        // .NET: `dotnet add package <Id>`, `dotnet tool install -g <Id>`,
+        // `nuget install <Id>`, `paket add <Id>`.
+        "dotnet" => {
+            let v = (toks.get(1), toks.get(2));
+            (v == (Some(&"add"), Some(&"package")) || v == (Some(&"tool"), Some(&"install")))
+                .then_some(("nuget", 3))
+        }
+        "nuget" => after(&["install"]).map(|c| ("nuget", c)),
+        "paket" => after(&["add"]).map(|c| ("nuget", c)),
+        // Perl: `cpanm <Dist>`, `cpan [install] <Dist>`.
+        "cpanm" => Some(("cpan", 1)),
+        "cpan" => Some((
+            "cpan",
+            if toks.get(1) == Some(&"install") {
+                2
+            } else {
+                1
+            },
+        )),
+        // Dart/Flutter: `dart pub add <pkg>`, `flutter pub add <pkg>`.
+        "dart" | "flutter" => {
+            (*toks.get(1)? == "pub" && toks.get(2) == Some(&"add")).then_some(("pub", 3))
+        }
         _ => None,
     }
+}
+
+/// Whether a pacman/AUR-helper flag requests an install sync (`-S`, `-Sy`,
+/// `-Syu`, `-Su`, `-Sw`, `--sync`) rather than a search (`-Ss`) or query
+/// (`-Si`, `-Sl`, …), so a `pacman -Ss <term>` search isn't read as an install.
+fn is_pacman_sync(t: &str) -> bool {
+    t == "-S"
+        || t == "--sync"
+        || t.starts_with("-Sy")
+        || t.starts_with("-Su")
+        || t.starts_with("-Sw")
 }
 
 /// A command argument as a package locator, or `None` if it is a flag, file,
@@ -664,14 +846,43 @@ fn pm_token_locator(eco: &str, tok: &str) -> Option<RefLocator> {
         "pypi" => pypi_purl_token(tok)?,
         "golang" => version_purl_token("golang", tok, '@')?,
         "cargo" => version_purl_token("cargo", tok, '@')?,
-        "deb" => version_purl_token("deb", tok, '=')?,
         "gem" => (!tok.is_empty()).then(|| format!("pkg:gem/{tok}"))?,
         "conda" => conda_purl_token(tok)?,
         "deno" => deno_purl_token(tok)?,
         "composer" => composer_purl_token(tok)?,
+        // OS-package ecosystems: a bare name, with an apt/apk `=version` pin kept.
+        "debian" | "ubuntu" | "alpine" | "wolfi" | "fedora" | "opensuse" | "arch" | "aur"
+        | "freebsd" | "netbsd" | "openbsd" => distro_purl_token(eco, tok)?,
+        // App stores / managers: a bare name (a version arrives as a separate
+        // flag, or after a `:`/`@` we drop), keeping NuGet `.` and CPAN `::`.
+        "homebrew" | "snap" | "pub" => {
+            named_purl(eco, tok.split([':', '=', '@']).next().unwrap_or(tok))?
+        }
+        "nuget" | "cpan" => named_purl(eco, tok)?,
         _ => return None,
     };
     Some(RefLocator::Purl(purl))
+}
+
+/// `pkg:<eco>/<name>` for an OS-package token: strips an apt architecture
+/// qualifier (`libc6:amd64`) and keeps only a clean `name=version` pin (apt,
+/// apk); a range constraint (`>=`, `<`, `~`) keeps just the name.
+fn distro_purl_token(eco: &str, tok: &str) -> Option<String> {
+    let tok = tok.split(':').next().unwrap_or(tok);
+    if let Some((name, ver)) = tok.split_once('=')
+        && !name.is_empty()
+        && !name.ends_with(['<', '>', '~', '!'])
+        && ver.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return Some(format!("pkg:{eco}/{name}@{ver}"));
+    }
+    let name = tok.split(['=', '<', '>', '~']).next().unwrap_or(tok);
+    (!name.is_empty()).then(|| format!("pkg:{eco}/{name}"))
+}
+
+/// `pkg:<eco>/<name>`, or `None` for an empty name.
+fn named_purl(eco: &str, name: &str) -> Option<String> {
+    (!name.is_empty()).then(|| format!("pkg:{eco}/{name}"))
 }
 
 /// Whether a command argument looks like a named package rather than a flag, a
@@ -990,8 +1201,148 @@ mod tests {
         assert!(purls.contains(&"pkg:cargo/badcrate"), "{purls:?}");
         assert!(purls.contains(&"pkg:gem/evilgem"), "{purls:?}");
         assert!(purls.contains(&"pkg:composer/evil/pkg"), "{purls:?}");
-        assert!(purls.contains(&"pkg:deb/sneakydeb"), "{purls:?}");
-        assert!(purls.contains(&"pkg:deb/nginx@1.18.0"), "{purls:?}");
+        // A bare shell script has no Dockerfile FROM, so apt defaults to Debian.
+        assert!(purls.contains(&"pkg:debian/sneakydeb"), "{purls:?}");
+        assert!(purls.contains(&"pkg:debian/nginx@1.18.0"), "{purls:?}");
+    }
+
+    #[test]
+    fn dockerfile_from_context_disambiguates_distro() {
+        // Each stage's `FROM` decides whether apt is debian/ubuntu and apk is
+        // alpine/wolfi for the `RUN`s beneath it.
+        let df = "FROM ubuntu:22.04\n\
+            RUN apt-get install -y nginx\n\
+            FROM python:3.12-slim AS build\n\
+            RUN apt-get install -y libpq-dev\n\
+            FROM node:20-alpine\n\
+            RUN apk add --no-cache curl\n\
+            FROM cgr.dev/chainguard/wolfi-base\n\
+            RUN apk add wget\n\
+            FROM fedora:40\n\
+            RUN dnf install -y httpd\n";
+        let mut out = Found {
+            refs: Vec::new(),
+            text: Some(df),
+        };
+        scan_shell(out.text, "dockerfile", &mut out);
+        let purls = purls_of(&out.refs);
+        for want in [
+            "pkg:ubuntu/nginx",     // FROM ubuntu → apt → ubuntu
+            "pkg:debian/libpq-dev", // FROM python:*-slim → apt → debian
+            "pkg:alpine/curl",      // FROM node:*-alpine → apk → alpine
+            "pkg:wolfi/wget",       // FROM chainguard/wolfi → apk → wolfi
+            "pkg:fedora/httpd",     // dnf → fedora regardless of base
+        ] {
+            assert!(purls.iter().any(|p| p == want), "want {want} in {purls:?}");
+        }
+    }
+
+    #[test]
+    fn recognizes_arch_aur_bsd_and_store_installs() {
+        // AUR-helper scripts and other distro/app managers, all outside a
+        // Dockerfile (no FROM), each mapping to its registry ecosystem.
+        let script = "#!/bin/sh\n\
+            pacman -Syu --noconfirm base-devel\n\
+            yay -S some-aur-helper\n\
+            zypper -n install vim\n\
+            brew install wget\n\
+            snap install code\n\
+            dotnet add package Newtonsoft.Json\n\
+            cpanm Mojolicious\n\
+            dart pub add http\n\
+            pkg install curl\n\
+            pkg_add tmux\n";
+        let mut out = Found {
+            refs: Vec::new(),
+            text: Some(script),
+        };
+        scan_shell(out.text, "shell", &mut out);
+        let purls = purls_of(&out.refs);
+        for want in [
+            "pkg:arch/base-devel",
+            "pkg:aur/some-aur-helper",
+            "pkg:opensuse/vim",
+            "pkg:homebrew/wget",
+            "pkg:snap/code",
+            "pkg:nuget/Newtonsoft.Json",
+            "pkg:cpan/Mojolicious",
+            "pkg:pub/http",
+            "pkg:freebsd/curl",
+            "pkg:openbsd/tmux",
+        ] {
+            assert!(purls.iter().any(|p| p == want), "want {want} in {purls:?}");
+        }
+    }
+
+    #[test]
+    fn pacman_search_is_not_an_install() {
+        // `pacman -Ss <term>` is a search; its argument must not become a package.
+        let mut out = Found {
+            refs: Vec::new(),
+            text: Some("pacman -Ss firefox\n"),
+        };
+        scan_shell(out.text, "shell", &mut out);
+        assert!(purls_of(&out.refs).is_empty(), "{:?}", out.refs);
+    }
+
+    #[test]
+    fn recognizes_install_with_flags_before_subcommand() {
+        // A global flag between the command and its verb (`apt-get -y install`)
+        // must not hide the install.
+        let script = "#!/bin/sh\n\
+            apt-get -y install nginx\n\
+            apk --no-cache add curl\n\
+            dnf -y install httpd\n\
+            npm --global install typescript\n";
+        let mut out = Found {
+            refs: Vec::new(),
+            text: Some(script),
+        };
+        scan_shell(out.text, "shell", &mut out);
+        let purls = purls_of(&out.refs);
+        for want in [
+            "pkg:debian/nginx", // no FROM → apt defaults to debian
+            "pkg:alpine/curl",
+            "pkg:fedora/httpd",
+            "pkg:npm/typescript",
+        ] {
+            assert!(purls.iter().any(|p| p == want), "want {want} in {purls:?}");
+        }
+    }
+
+    #[test]
+    fn recognizes_additional_manager_subcommands() {
+        // The install forms beyond the canonical verb, each resolvable with an
+        // existing registry handler.
+        let script = "#!/bin/sh\n\
+            python3 -m pip install flask\n\
+            poetry add requests\n\
+            pipenv install django\n\
+            uv tool install ruff\n\
+            yarn global add prettier\n\
+            dotnet tool install -g dotnetsay\n\
+            bundle add rails\n\
+            composer global require phpunit/phpunit\n\
+            cargo add serde\n";
+        let mut out = Found {
+            refs: Vec::new(),
+            text: Some(script),
+        };
+        scan_shell(out.text, "shell", &mut out);
+        let purls = purls_of(&out.refs);
+        for want in [
+            "pkg:pypi/flask",
+            "pkg:pypi/requests",
+            "pkg:pypi/django",
+            "pkg:pypi/ruff",
+            "pkg:npm/prettier",
+            "pkg:nuget/dotnetsay",
+            "pkg:gem/rails",
+            "pkg:composer/phpunit/phpunit",
+            "pkg:cargo/serde",
+        ] {
+            assert!(purls.iter().any(|p| p == want), "want {want} in {purls:?}");
+        }
     }
 
     #[test]
@@ -1030,6 +1381,27 @@ mod tests {
             urls.contains(&"https://example.com/index.html"),
             "expected the RUN url; got {refs:?}"
         );
+    }
+
+    #[test]
+    fn references_in_bytes_emits_distro_purls_from_dockerfile() {
+        // End-to-end through the public entry: a `Dockerfile`-typed file routes to
+        // the shell scanner with FROM context, so its installs become distro PURLs.
+        let df = b"FROM node:20-alpine AS web\n\
+            RUN apk add --no-cache curl\n\
+            FROM ubuntu:24.04\n\
+            RUN apt-get update && apt-get install -y nginx libpq-dev=16.1-1\n\
+            RUN pip install requests && npm install -g typescript\n";
+        let purls = purls_of(&references_in_bytes(df, "Dockerfile"));
+        for want in [
+            "pkg:alpine/curl",
+            "pkg:ubuntu/nginx",
+            "pkg:ubuntu/libpq-dev@16.1-1",
+            "pkg:pypi/requests",
+            "pkg:npm/typescript",
+        ] {
+            assert!(purls.iter().any(|p| p == want), "want {want} in {purls:?}");
+        }
     }
 
     /// Collect the PURL strings from a reference list, for test assertions.
