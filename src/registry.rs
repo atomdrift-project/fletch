@@ -36,6 +36,15 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         return None;
     };
     let (ty, path, version) = parse_purl(purl)?;
+    // A versioned PURL is an immutable release — cache its metadata forever; a
+    // versionless one tracks a moving tag, so bound staleness to the unpinned
+    // window. Selected here, the one place that knows the PURL's version-ness,
+    // and carried on the cache rather than threaded through every ecosystem fn.
+    let cache = &cache.with_meta_ttl(if version.is_some() {
+        crate::fetch::META_TTL_PINNED
+    } else {
+        crate::fetch::META_TTL_UNPINNED
+    });
     let version = version.as_deref();
     match ty.as_str() {
         "npm" => npm(&path, version, net, cache),
@@ -173,10 +182,21 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
             .map(str::to_string),
         license: field_str(v, &doc, "license"),
         deprecated: v.and_then(|v| v.get("deprecated")).and_then(deprecation),
-        maintainers: doc
-            .get("maintainers")
-            .and_then(Value::as_array)
-            .map(|m| m.len() as u32),
+        // npm always lists at least one maintainer for a live package, so a
+        // missing/null/empty array is the anomaly itself — record it as zero
+        // rather than "unknown" so a custody trait can fire on it.
+        maintainers: Some(
+            doc.get("maintainers")
+                .and_then(Value::as_array)
+                .map_or(0, |m| m.len() as u32),
+        ),
+        // npm replaces a taken-down malicious package with a stub whose
+        // description is exactly `security holding package`. That tombstone is
+        // the registry's own verdict — surface it.
+        security_hold: Some(
+            doc.get("description").and_then(Value::as_str)
+                == Some("security holding package"),
+        ),
         ..Default::default()
     };
 
@@ -2242,6 +2262,27 @@ mod tests {
         assert_eq!(p.unpacked_size, Some(4096));
         assert_eq!(p.file_count, Some(7));
         assert_eq!(p.has_install_script, Some(true));
+        // A normal package is not a security-hold tombstone.
+        assert_eq!(p.security_hold, Some(false));
+    }
+
+    #[test]
+    fn npm_maintainerless_and_security_hold_tombstone() {
+        // A taken-down package: npm's stub description, and a null maintainers
+        // field (a live npm package always lists at least one).
+        let stub = serde_json::json!({
+            "dist-tags": {"latest": "0.0.1-security"},
+            "description": "security holding package",
+            "maintainers": serde_json::Value::Null,
+            "time": {"0.0.1-security": "2026-06-20T00:00:00.000Z"},
+            "versions": {"0.0.1-security": {"description": "security holding package"}}
+        })
+        .to_string();
+        let net = Fixtures::default().with("https://registry.npmjs.org/evilpkg", stub.as_bytes());
+        let p = npm("evilpkg", Some("0.0.1-security"), &net, &BlobCache::disabled())
+            .expect("provenance");
+        assert_eq!(p.security_hold, Some(true), "npm tombstone description detected");
+        assert_eq!(p.maintainers, Some(0), "null maintainers recorded as zero, not unknown");
     }
 
     #[test]

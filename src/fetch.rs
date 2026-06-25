@@ -25,6 +25,15 @@ const TTL_PINNED: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Cache lifetime for an unpinned reference — `@latest`/mutable tags can
 /// move, so staleness is bounded.
 const TTL_UNPINNED: Duration = Duration::from_secs(12 * 3600);
+
+/// Registry-*metadata* cache lifetimes, distinct from the artifact TTLs above
+/// and selected by [`registry`](crate::registry::registry) per PURL. A versioned
+/// PURL names an immutable release — its facts (publish date, author, size)
+/// never change, so cache them indefinitely. A versionless PURL tracks a moving
+/// target (`latest`/dist-tags, download counts), so bound staleness to the
+/// unpinned TTL.
+pub(crate) const META_TTL_PINNED: Duration = Duration::MAX;
+pub(crate) const META_TTL_UNPINNED: Duration = TTL_UNPINNED;
 /// Default per-fetch byte ceiling — a single response is abandoned past this
 /// unless [`set_max_fetch_bytes`] adjusts it for the process.
 pub const DEFAULT_MAX_FETCH_BYTES: u64 = 40 * 1024 * 1024;
@@ -244,6 +253,11 @@ pub struct BlobCache {
     /// When false, every read misses and every write is a no-op — the cache is
     /// inert. Used to force always-fresh fetches and to keep tests hermetic.
     enabled: bool,
+    /// Staleness tolerance for registry-*metadata* reads
+    /// ([`cached_metadata`], [`cached_metadata_with`], [`cached_post`]).
+    /// [`registry`](crate::registry::registry) overrides it per PURL via
+    /// [`with_meta_ttl`](Self::with_meta_ttl); artifact fetches ignore it.
+    meta_ttl: Duration,
 }
 
 impl BlobCache {
@@ -259,7 +273,23 @@ impl BlobCache {
     /// Open a cache rooted at an explicit directory (created on first write).
     #[must_use]
     pub fn with_dir(dir: PathBuf) -> Self {
-        Self { dir, enabled: true }
+        Self {
+            dir,
+            enabled: true,
+            meta_ttl: TTL_PINNED,
+        }
+    }
+
+    /// A clone whose registry-*metadata* reads tolerate up to `ttl` of staleness
+    /// — [`Duration::MAX`] caches indefinitely. Only [`cached_metadata`],
+    /// [`cached_metadata_with`], and [`cached_post`] consult it; artifact fetches
+    /// keep their own pinned/unpinned TTLs.
+    #[must_use]
+    pub(crate) fn with_meta_ttl(&self, ttl: Duration) -> Self {
+        Self {
+            meta_ttl: ttl,
+            ..self.clone()
+        }
     }
 
     /// A cache that never touches disk: every lookup misses and every store is a
@@ -271,6 +301,7 @@ impl BlobCache {
         Self {
             dir: PathBuf::new(),
             enabled: false,
+            meta_ttl: TTL_PINNED,
         }
     }
 
@@ -374,7 +405,7 @@ pub(crate) fn cached_metadata_with(
             .join(";");
         sha256_hex(format!("meta:{url}:{joined}").as_bytes())
     };
-    if let Some((bytes, _)) = cache.fresh(&key, TTL_PINNED) {
+    if let Some((bytes, _)) = cache.fresh(&key, cache.meta_ttl) {
         return Some(bytes);
     }
     match net.get_with(url, headers) {
@@ -405,7 +436,7 @@ pub(crate) fn cached_post(
     cache: &BlobCache,
 ) -> Option<Vec<u8>> {
     let key = sha256_hex(format!("post:{url}:{}", sha256_hex(body)).as_bytes());
-    if let Some((bytes, _)) = cache.fresh(&key, TTL_PINNED) {
+    if let Some((bytes, _)) = cache.fresh(&key, cache.meta_ttl) {
         return Some(bytes);
     }
     match net.post(url, body, headers) {
