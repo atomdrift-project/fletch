@@ -243,9 +243,25 @@ struct CachedMeta {
     headers: Vec<(String, String)>,
 }
 
-/// Shared sink of recorded `(url, raw-bytes)` metadata documents, populated by a
-/// recording [`BlobCache`]. See [`BlobCache::recording`].
-pub type RawSink = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+/// One raw provider document a registry lookup read, captured by a recording
+/// [`BlobCache`] — the verbatim bytes plus the transport facts (`status`,
+/// `content_type`) observed when they were first fetched. The re-parsing backup a
+/// consumer archives alongside the normalized record.
+#[derive(Debug, Clone)]
+pub struct RecordedSource {
+    /// The URL the document was fetched from.
+    pub url: String,
+    /// HTTP status observed at fetch time (carried through the cache sidecar).
+    pub status: u16,
+    /// `Content-Type` header at fetch time, when present.
+    pub content_type: Option<String>,
+    /// The document bytes, verbatim.
+    pub bytes: Vec<u8>,
+}
+
+/// Shared sink of [`RecordedSource`]s, populated by a recording [`BlobCache`].
+/// See [`BlobCache::recording`].
+pub type RawSink = Arc<Mutex<Vec<RecordedSource>>>;
 
 /// Content-addressed cache of fetched responses — bytes (`<key>.zst`) plus a
 /// provenance sidecar (`<key>.json`), keyed by `sha256(locator)`. Two
@@ -306,11 +322,16 @@ impl BlobCache {
     }
 
     /// Append a served metadata document to the recorder, if one is installed.
-    fn record(&self, url: &str, bytes: &[u8]) {
+    fn record(&self, url: &str, status: u16, content_type: Option<&str>, bytes: &[u8]) {
         if let Some(sink) = &self.recorder
             && let Ok(mut sources) = sink.lock()
         {
-            sources.push((url.to_string(), bytes.to_vec()));
+            sources.push(RecordedSource {
+                url: url.to_string(),
+                status,
+                content_type: content_type.map(str::to_string),
+                bytes: bytes.to_vec(),
+            });
         }
     }
 
@@ -408,6 +429,14 @@ impl BlobCache {
     }
 }
 
+/// The `Content-Type` header value (case-insensitive), if any.
+fn content_type_of(headers: &[(String, String)]) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+}
+
 /// Fetch a registry *metadata* document through the blob cache. Used by
 /// [`provenance`](crate::provenance) so a package's facts (publish date, author,
 /// downloads) cost one round-trip per cache window and are free on a hit.
@@ -440,8 +469,8 @@ pub(crate) fn cached_metadata_with(
             .join(";");
         sha256_hex(format!("meta:{url}:{joined}").as_bytes())
     };
-    if let Some((bytes, _)) = cache.fresh(&key, cache.meta_ttl) {
-        cache.record(url, &bytes);
+    if let Some((bytes, meta)) = cache.fresh(&key, cache.meta_ttl) {
+        cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
         return Some(bytes);
     }
     match net.get_with(url, headers) {
@@ -454,12 +483,12 @@ pub(crate) fn cached_metadata_with(
                 headers: f.headers,
             };
             cache.put(&key, &f.bytes, &meta);
-            cache.record(url, &f.bytes);
+            cache.record(url, meta.status, content_type_of(&meta.headers), &f.bytes);
             Some(f.bytes)
         }
         // Source unreachable: a stale metadata answer still beats none.
-        Err(_) => cache.any(&key).map(|(bytes, _)| {
-            cache.record(url, &bytes);
+        Err(_) => cache.any(&key).map(|(bytes, meta)| {
+            cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
             bytes
         }),
     }
@@ -476,8 +505,8 @@ pub(crate) fn cached_post(
     cache: &BlobCache,
 ) -> Option<Vec<u8>> {
     let key = sha256_hex(format!("post:{url}:{}", sha256_hex(body)).as_bytes());
-    if let Some((bytes, _)) = cache.fresh(&key, cache.meta_ttl) {
-        cache.record(url, &bytes);
+    if let Some((bytes, meta)) = cache.fresh(&key, cache.meta_ttl) {
+        cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
         return Some(bytes);
     }
     match net.post(url, body, headers) {
@@ -490,11 +519,11 @@ pub(crate) fn cached_post(
                 headers: f.headers,
             };
             cache.put(&key, &f.bytes, &meta);
-            cache.record(url, &f.bytes);
+            cache.record(url, meta.status, content_type_of(&meta.headers), &f.bytes);
             Some(f.bytes)
         }
-        Err(_) => cache.any(&key).map(|(bytes, _)| {
-            cache.record(url, &bytes);
+        Err(_) => cache.any(&key).map(|(bytes, meta)| {
+            cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
             bytes
         }),
     }

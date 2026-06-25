@@ -17,7 +17,8 @@ use serde_json::Value;
 
 use crate::distro;
 use crate::fetch::{
-    BlobCache, Fetch, cached_metadata, cached_metadata_with, cached_post, goproxy_escape,
+    BlobCache, Fetch, RecordedSource, cached_metadata, cached_metadata_with, cached_post,
+    goproxy_escape,
 };
 use filefacts::{RefLocator, Registry};
 
@@ -131,7 +132,7 @@ pub fn registry_with_sources(
     locator: &RefLocator,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> (Option<Registry>, Vec<(String, Vec<u8>)>) {
+) -> (Option<Registry>, Vec<RecordedSource>) {
     let (recording, sink) = cache.recording();
     let record = registry(locator, net, &recording);
     let sources = sink
@@ -219,6 +220,17 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         security_hold: Some(
             doc.get("description").and_then(Value::as_str)
                 == Some("security holding package"),
+        ),
+        // An unpublished version keeps its `time` entry (and npm records a
+        // `time.unpublished` block) but loses its `versions` object. A live
+        // package always lists its versions, so "timestamped but gone from
+        // versions" is a removal — for a fresh package, almost always a malware
+        // takedown.
+        version_removed: Some(
+            v.is_none()
+                && doc
+                    .pointer(&format!("/time/{}", json_ptr_escape(version)))
+                    .is_some(),
         ),
         ..Default::default()
     };
@@ -2206,6 +2218,41 @@ mod tests {
     use crate::fetch::{BlobCache, Fixtures};
 
     #[test]
+    fn registry_with_sources_returns_record_and_raw_documents() {
+        let packument = serde_json::json!({
+            "dist-tags": {"latest": "1.3.0"},
+            "versions": {"1.3.0": {"license": "MIT"}},
+            "time": {"1.3.0": "2021-04-23T10:00:00.000Z"},
+            "maintainers": [{"name": "una"}],
+        })
+        .to_string();
+        let net = Fixtures::default().with_headers(
+            "https://registry.npmjs.org/left-pad",
+            packument.as_bytes(),
+            &[("Content-Type", "application/json")],
+        );
+        // Disabled cache: every read is a fresh fetch through the recorder.
+        let (record, sources) = registry_with_sources(
+            &RefLocator::Purl("pkg:npm/left-pad@1.3.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        );
+
+        let record = record.expect("record");
+        assert_eq!(record.ecosystem, "npm");
+        assert_eq!(record.name, "left-pad");
+
+        // The raw packument is captured verbatim, with its transport facts — the
+        // downloads endpoint isn't in the fixtures, so it fails and isn't recorded.
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].url, "https://registry.npmjs.org/left-pad");
+        assert_eq!(sources[0].status, 200);
+        assert_eq!(sources[0].content_type.as_deref(), Some("application/json"));
+        let body: serde_json::Value = serde_json::from_slice(&sources[0].bytes).unwrap();
+        assert_eq!(body["dist-tags"]["latest"], "1.3.0");
+    }
+
+    #[test]
     fn rfc3339_shapes_parse_to_unix_seconds() {
         // 2021-04-23T10:00:00Z == 1619172000.
         assert_eq!(
@@ -2306,6 +2353,29 @@ mod tests {
             .expect("provenance");
         assert_eq!(p.security_hold, Some(true), "npm tombstone description detected");
         assert_eq!(p.maintainers, Some(0), "null maintainers recorded as zero, not unknown");
+        assert_eq!(p.version_removed, Some(false), "stub version still listed");
+    }
+
+    #[test]
+    fn npm_unpublished_version_is_flagged_removed() {
+        // An unpublished version: its `time` entry survives (plus a `time
+        // .unpublished` block) but it is gone from `versions` and `dist-tags`.
+        let doc = serde_json::json!({
+            "dist-tags": serde_json::Value::Null,
+            "versions": {},
+            "time": {
+                "created": "2026-06-22T00:00:00.000Z",
+                "modified": "2026-06-24T12:04:37.146Z",
+                "1.0.0": "2026-06-22T00:00:00.000Z",
+                "unpublished": {"time": "2026-06-24T12:04:37.146Z", "versions": ["1.0.0"]}
+            }
+        })
+        .to_string();
+        let net = Fixtures::default().with("https://registry.npmjs.org/evilpkg", doc.as_bytes());
+        let p = npm("evilpkg", Some("1.0.0"), &net, &BlobCache::disabled()).expect("provenance");
+        assert_eq!(p.version_removed, Some(true), "in `time`, gone from `versions` => removed");
+        // The surviving timestamp still gives us the publish date / age signals.
+        assert_eq!(p.published_at, parse_rfc3339_secs("2026-06-22T00:00:00.000Z"));
     }
 
     #[test]
