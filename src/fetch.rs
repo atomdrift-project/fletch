@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use filefacts::{ExternalRef, HashAlgo, PinnedHash, RefLocator};
+use filefacts::{HashAlgo, PinnedHash, RefLocator, Reference};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 
@@ -387,7 +387,7 @@ pub(crate) fn cached_post(
 /// Resolve, fetch (or serve from cache), verify, and record provenance for
 /// one reference. Never panics; every path yields a [`FetchRecord`].
 #[must_use]
-pub fn fetch_ref(r: &ExternalRef, net: &dyn Fetch, cache: &BlobCache) -> FetchRecord {
+pub fn fetch_ref(r: &Reference, net: &dyn Fetch, cache: &BlobCache) -> FetchRecord {
     let locator = locator_string(&r.locator);
 
     if !r.is_fetch_target() {
@@ -496,7 +496,7 @@ fn fetch_concurrency() -> usize {
 /// byte ceiling is not a determinism guarantee.)
 #[must_use]
 pub fn fetch_references(
-    refs: &[ExternalRef],
+    refs: &[Reference],
     source_sha256: &str,
     fetch_urls: bool,
     net: &(dyn Fetch + Sync),
@@ -505,7 +505,7 @@ pub fn fetch_references(
 ) -> Vec<FetchRecord> {
     // Selectable references, in declaration order. The count cap is applied up
     // front (it is known without fetching); the byte cap is enforced live below.
-    let targets: Vec<&ExternalRef> = refs.iter().filter(|r| selected(r, fetch_urls)).collect();
+    let targets: Vec<&Reference> = refs.iter().filter(|r| selected(r, fetch_urls)).collect();
     let fetch_n = if budget.max_bytes == 0 {
         0
     } else {
@@ -567,18 +567,20 @@ pub fn fetch_references(
 
 /// Whether a reference should be fetched: a fetch target whose locator is a
 /// package (always) or a raw URL (only with `fetch_urls`).
-fn selected(r: &ExternalRef, fetch_urls: bool) -> bool {
+fn selected(r: &Reference, fetch_urls: bool) -> bool {
     r.is_fetch_target()
         && match r.locator {
             RefLocator::Purl(_) => true,
             RefLocator::Url(_) => fetch_urls,
+            // An intra-artifact path is resolved against sibling files, not fetched.
+            RefLocator::Path(_) => false,
         }
 }
 
 /// Build a record for bytes in hand (network or cache), verifying the pin
 /// and choosing the outcome.
 fn record(
-    r: &ExternalRef,
+    r: &Reference,
     locator: String,
     resolved_url: String,
     bytes: &[u8],
@@ -615,8 +617,7 @@ fn record(
 /// The canonical locator string (the PURL or URL).
 fn locator_string(locator: &RefLocator) -> String {
     match locator {
-        RefLocator::Purl(p) => p.clone(),
-        RefLocator::Url(u) => u.clone(),
+        RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
     }
 }
 
@@ -627,6 +628,9 @@ pub fn resolve(locator: &RefLocator) -> Option<String> {
     match locator {
         RefLocator::Url(u) => Some(u.clone()),
         RefLocator::Purl(p) => resolve_purl(p),
+        // An intra-artifact file reference is resolved against the bundle's
+        // other files by a consumer, never fetched.
+        RefLocator::Path(_) => None,
     }
 }
 
@@ -1336,8 +1340,8 @@ mod tests {
         );
     }
 
-    fn dep(locator: RefLocator, pin: Option<PinnedHash>) -> ExternalRef {
-        ExternalRef {
+    fn dep(locator: RefLocator, pin: Option<PinnedHash>) -> Reference {
+        Reference {
             locator,
             kind: RefKind::Dependency,
             source: "test".into(),
@@ -1436,11 +1440,11 @@ mod tests {
 
         let refs = vec![
             dep(RefLocator::Purl("pkg:npm/foo@1.0.0".into()), None),
-            ExternalRef {
+            Reference {
                 kind: RefKind::UrlFetch,
                 ..dep(RefLocator::Url(raw_url.into()), None)
             },
-            ExternalRef {
+            Reference {
                 kind: RefKind::Repository,
                 ..dep(RefLocator::Purl("pkg:github/o/r".into()), None)
             },
@@ -1540,7 +1544,7 @@ mod tests {
         let cache = BlobCache::with_dir(dir.path().to_path_buf());
         let net = Fixtures::default();
 
-        let repo = ExternalRef {
+        let repo = Reference {
             kind: RefKind::Repository,
             ..dep(RefLocator::Purl("pkg:github/o/r".into()), None)
         };

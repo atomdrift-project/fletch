@@ -5,18 +5,18 @@
 //! on [`ParsedFile::references`]. This module returns those **plus** the
 //! *undeclared / imperative* ones hunted out of command streams and decoded
 //! text: a `curl … | sh`, an `npm install` in a `Dockerfile RUN`, a URL stashed
-//! in a shell variable. The result is one unified list of [`ExternalRef`]s; the
+//! in a shell variable. The result is one unified list of [`Reference`]s; the
 //! caller hands it to [`crate::fetch`].
 //!
 //! Recognition is fuzzy by nature, so it lives here — away from filefacts'
 //! deterministic format parsers and from the auditable fetch boundary.
 
-use filefacts::{Arg, ExternalRef, FileType, ParsedFile, RefKind, RefLocator, Symbol};
+use filefacts::{Arg, FileType, ParsedFile, RefKind, RefLocator, Reference, Symbol};
 
 /// All external references a file points at: filefacts' declared dependencies,
 /// plus the imperative ones recognized here.
 #[must_use]
-pub fn references(parsed: &ParsedFile<'_>) -> Vec<ExternalRef> {
+pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
     let mut found = Found {
         refs: parsed.references().to_vec(),
         text: std::str::from_utf8(parsed.bytes()).ok(),
@@ -50,10 +50,7 @@ pub fn references(parsed: &ParsedFile<'_>) -> Vec<ExternalRef> {
 /// text-driven recognizers (shell/Dockerfile command streams) are *not* covered
 /// here — they need the bytes; use [`references`] when those are in hand.
 #[must_use]
-pub fn references_from_facts(
-    values: &serde_json::Value,
-    declared: &[ExternalRef],
-) -> Vec<ExternalRef> {
+pub fn references_from_facts(values: &serde_json::Value, declared: &[Reference]) -> Vec<Reference> {
     let mut found = Found {
         refs: declared.to_vec(),
         text: None,
@@ -83,12 +80,11 @@ fn extracted_refs(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
 /// Drop references whose locator already appeared, keeping the first. The same
 /// URL or package legitimately surfaces through more than one recognizer
 /// (declared, npm hook, decoded string, command stream).
-fn dedup(refs: &mut Vec<ExternalRef>) {
+fn dedup(refs: &mut Vec<Reference>) {
     let mut seen = std::collections::HashSet::new();
     refs.retain(|r| {
         seen.insert(match &r.locator {
-            RefLocator::Purl(p) => p.clone(),
-            RefLocator::Url(u) => u.clone(),
+            RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
         })
     });
 }
@@ -98,7 +94,7 @@ fn dedup(refs: &mut Vec<ExternalRef>) {
 /// a root sample on disk). Returns an empty list when filefacts can't parse the
 /// input — discovery is best-effort, never an error.
 #[must_use]
-pub fn references_in_bytes(data: &[u8], filename: &str) -> Vec<ExternalRef> {
+pub fn references_in_bytes(data: &[u8], filename: &str) -> Vec<Reference> {
     match filefacts::open_with_path(std::path::Path::new(filename), data) {
         Ok(parsed) => references(&parsed),
         Err(_) => Vec::new(),
@@ -120,7 +116,7 @@ pub fn references_in_bytes(data: &[u8], filename: &str) -> Vec<ExternalRef> {
 /// `None`) or non-literal argument yields nothing; relative paths and language
 /// builtins are skipped by [`import_locator`].
 #[must_use]
-pub fn import_calls(symbols: &[Symbol]) -> Vec<ExternalRef> {
+pub fn import_calls(symbols: &[Symbol]) -> Vec<Reference> {
     let mut refs = Vec::new();
     for sym in symbols {
         let Symbol::Call {
@@ -140,7 +136,7 @@ pub fn import_calls(symbols: &[Symbol]) -> Vec<ExternalRef> {
             continue;
         };
         if let Some((locator, kind)) = import_locator(eco, value) {
-            refs.push(ExternalRef {
+            refs.push(Reference {
                 locator,
                 kind,
                 source: "ast-call".into(),
@@ -168,7 +164,7 @@ pub fn import_calls(symbols: &[Symbol]) -> Vec<ExternalRef> {
 /// Pass the references for one package (root manifest + members) collected into
 /// a single slice; a per-file call cannot see the manifest's declarations.
 #[must_use]
-pub fn undeclared_packages(refs: &[ExternalRef]) -> Vec<&ExternalRef> {
+pub fn undeclared_packages(refs: &[Reference]) -> Vec<&Reference> {
     let declared: std::collections::HashSet<&str> = refs
         .iter()
         .filter(|r| r.kind == RefKind::Dependency)
@@ -187,14 +183,14 @@ pub fn undeclared_packages(refs: &[ExternalRef]) -> Vec<&ExternalRef> {
 fn purl_coordinate(loc: &RefLocator) -> Option<&str> {
     match loc {
         RefLocator::Purl(p) => Some(p.rsplit_once('@').map_or(p.as_str(), |(base, _)| base)),
-        RefLocator::Url(_) => None,
+        RefLocator::Url(_) | RefLocator::Path(_) => None,
     }
 }
 
 /// Accumulator that carries the file text so each pushed reference gets a
 /// citable byte offset.
 struct Found<'a> {
-    refs: Vec<ExternalRef>,
+    refs: Vec<Reference>,
     text: Option<&'a str>,
 }
 
@@ -216,7 +212,7 @@ impl Found<'_> {
                     .or_else(|| t.find(&anchor_from_locator(&locator)))
             })
             .unwrap_or(0) as u64;
-        self.refs.push(ExternalRef {
+        self.refs.push(Reference {
             locator,
             kind,
             source: source.into(),
@@ -1037,7 +1033,7 @@ fn pypi_purl_token(tok: &str) -> Option<String> {
 /// stripped).
 fn anchor_from_locator(loc: &RefLocator) -> String {
     match loc {
-        RefLocator::Url(u) => u.clone(),
+        RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
         RefLocator::Purl(p) => {
             let body = p.strip_prefix("pkg:").unwrap_or(p);
             let body = body.split_once('/').map_or(body, |(_, rest)| rest); // drop type
@@ -1109,7 +1105,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.as_str()),
-                RefLocator::Url(_) => None,
+                RefLocator::Url(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert!(purls.contains(&"pkg:npm/evil-pkg"));
@@ -1120,7 +1116,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) => None,
+                RefLocator::Purl(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert!(url_refs.contains(&"https://web.stanford.edu/~pseay/pliant/et"));
@@ -1158,7 +1154,7 @@ mod tests {
             .iter()
             .map(|r| match &r.locator {
                 RefLocator::Url(u) => u.as_str(),
-                RefLocator::Purl(p) => p.as_str(),
+                RefLocator::Purl(p) | RefLocator::Path(p) => p.as_str(),
             })
             .collect();
         assert!(
@@ -1191,7 +1187,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.as_str()),
-                RefLocator::Url(_) => None,
+                RefLocator::Url(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert!(
@@ -1357,7 +1353,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) => None,
+                RefLocator::Purl(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert!(
@@ -1374,7 +1370,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) => None,
+                RefLocator::Purl(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert!(
@@ -1405,11 +1401,11 @@ mod tests {
     }
 
     /// Collect the PURL strings from a reference list, for test assertions.
-    fn purls_of(refs: &[ExternalRef]) -> Vec<String> {
+    fn purls_of(refs: &[Reference]) -> Vec<String> {
         refs.iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.clone()),
-                RefLocator::Url(_) => None,
+                RefLocator::Url(_) | RefLocator::Path(_) => None,
             })
             .collect()
     }
@@ -1537,7 +1533,7 @@ mod tests {
             .filter(|r| r.kind == RefKind::Repository)
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) => None,
+                RefLocator::Purl(_) | RefLocator::Path(_) => None,
             })
             .collect();
         // git_refs classifies clone targets (incl. SSH `git@`, which the http-only
@@ -1553,7 +1549,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) => None,
+                RefLocator::Purl(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert!(
@@ -1636,7 +1632,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) => None,
+                RefLocator::Purl(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert!(
@@ -1657,8 +1653,8 @@ mod tests {
     }
 
     /// Build a package reference of a given kind from a PURL string.
-    fn pkg_ref(kind: RefKind, purl: &str) -> ExternalRef {
-        ExternalRef {
+    fn pkg_ref(kind: RefKind, purl: &str) -> Reference {
+        Reference {
             locator: RefLocator::Purl(purl.to_string()),
             kind,
             source: "test".into(),
@@ -1744,7 +1740,7 @@ mod tests {
             pkg_ref(RefKind::Dependency, "pkg:npm/%40scope/pkg"),
             // Same scoped package with a version pin: still declared.
             pkg_ref(RefKind::Command, "pkg:npm/%40scope/pkg@2.0"),
-            ExternalRef {
+            Reference {
                 locator: RefLocator::Url("https://evil.test/x".into()),
                 kind: RefKind::UrlFetch,
                 source: "test".into(),
@@ -1787,7 +1783,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.as_str()),
-                RefLocator::Url(_) => None,
+                RefLocator::Url(_) | RefLocator::Path(_) => None,
             })
             .collect();
         assert_eq!(purls, ["pkg:pypi/realpkg"]);
