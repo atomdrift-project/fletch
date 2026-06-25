@@ -241,6 +241,9 @@ struct CachedMeta {
 #[derive(Debug, Clone)]
 pub struct BlobCache {
     dir: PathBuf,
+    /// When false, every read misses and every write is a no-op — the cache is
+    /// inert. Used to force always-fresh fetches and to keep tests hermetic.
+    enabled: bool,
 }
 
 impl BlobCache {
@@ -256,7 +259,19 @@ impl BlobCache {
     /// Open a cache rooted at an explicit directory (created on first write).
     #[must_use]
     pub fn with_dir(dir: PathBuf) -> Self {
-        Self { dir }
+        Self { dir, enabled: true }
+    }
+
+    /// A cache that never touches disk: every lookup misses and every store is a
+    /// no-op. The caller always falls through to the network (or its test
+    /// fixture), so there is no cross-run or cross-test state — the hermetic
+    /// choice for tests, and the way to force an uncached fetch.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            dir: PathBuf::new(),
+            enabled: false,
+        }
     }
 
     fn blob_path(&self, key: &str) -> PathBuf {
@@ -270,6 +285,9 @@ impl BlobCache {
     /// Read a cache entry and its age, regardless of freshness. A missing
     /// sidecar yields default provenance.
     fn read(&self, key: &str) -> Option<(Vec<u8>, CachedMeta, Duration)> {
+        if !self.enabled {
+            return None;
+        }
         let blob = self.blob_path(key);
         let age = std::fs::metadata(&blob)
             .ok()?
@@ -309,6 +327,9 @@ impl BlobCache {
     /// Store `bytes` and `meta` for `key`. Best-effort — a write failure is
     /// non-fatal (the next run re-fetches).
     fn put(&self, key: &str, bytes: &[u8], meta: &CachedMeta) {
+        if !self.enabled {
+            return;
+        }
         if std::fs::create_dir_all(&self.dir).is_err() {
             return;
         }
@@ -790,8 +811,12 @@ fn resolved_target(locator: &RefLocator, net: &dyn Fetch) -> Option<(String, Str
             return resolve_vscode(rest, net).map(|u| (p.clone(), u));
         }
         if let Some((path, version)) = rest.rsplit_once('@') {
+            // Split any PURL `?qualifiers` off the version. `kind` (`wheel` /
+            // `sdist`) lets a PyPI PURL pick the artifact; the bare version is
+            // what every download API actually wants.
+            let (version, kind) = split_version_kind(version);
             match ty {
-                "pypi" => return resolve_pypi(path, version, net).map(|u| (p.clone(), u)),
+                "pypi" => return resolve_pypi(path, version, kind, net).map(|u| (p.clone(), u)),
                 "composer" => return resolve_composer(path, version, net).map(|u| (p.clone(), u)),
                 _ => {}
             }
@@ -830,22 +855,79 @@ fn resolve_npm_unversioned(path: &str, net: &dyn Fetch) -> Option<(String, Strin
     Some((locator, url))
 }
 
+/// Split a PURL version field on its `?` qualifier string, returning the bare
+/// version and the value of the `kind` qualifier if present. PURL qualifiers are
+/// `?key=value(&key=value)*`; only `kind` (`wheel`/`sdist`) is consulted, the
+/// rest are ignored. `1.2.3?kind=wheel` → `("1.2.3", Some("wheel"))`.
+fn split_version_kind(version: &str) -> (&str, Option<&str>) {
+    let (bare, qualifiers) = version.split_once('?').unwrap_or((version, ""));
+    let kind = qualifiers
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("kind="));
+    (bare, kind)
+}
+
 /// PyPI publishes no deterministic download URL (the `files.pythonhosted.org`
-/// path carries an undrivable hash segment), so ask the JSON API and prefer the
-/// source distribution — there is exactly one per version and it carries the
-/// actual source, the supply-chain attack surface.
-fn resolve_pypi(name: &str, version: &str, net: &dyn Fetch) -> Option<String> {
+/// path carries an undrivable hash segment), so ask the JSON API and pick an
+/// artifact from the version's files.
+///
+/// Default is wheel-first with an sdist fallback, mirroring what a modern `pip
+/// install` actually runs on the victim's machine; `?kind=sdist` flips the
+/// preference to the source distribution (one per version, carrying `setup.py` /
+/// `pyproject.toml` — the install-hook attack surface), and `?kind=wheel` is the
+/// default's explicit form. Whichever is preferred, the other is the fallback so
+/// a package that ships only one kind still resolves.
+fn resolve_pypi(name: &str, version: &str, kind: Option<&str>, net: &dyn Fetch) -> Option<String> {
     let api = format!("https://pypi.org/pypi/{name}/{version}/json");
     let resp = net.get(&api).ok()?;
     let json: serde_json::Value = serde_json::from_slice(&resp.bytes).ok()?;
     let urls = json.get("urls")?.as_array()?;
-    let pick = urls
-        .iter()
-        .find(|u| u.get("packagetype").and_then(serde_json::Value::as_str) == Some("sdist"))
-        .or_else(|| urls.first())?;
+    let pick = match kind {
+        // Explicit source-distribution request: sdist first, wheel as fallback.
+        Some("sdist") => pick_sdist(urls).or_else(|| pick_wheel(urls)),
+        // Default and explicit `kind=wheel`: wheel first, sdist as fallback.
+        _ => pick_wheel(urls).or_else(|| pick_sdist(urls)),
+    }
+    // Last resort: an unusual files list with neither a recognized wheel nor
+    // sdist — take whatever is first rather than resolving to nothing.
+    .or_else(|| urls.first())?;
     pick.get("url")
         .and_then(serde_json::Value::as_str)
         .map(String::from)
+}
+
+/// The one source distribution among a PyPI version's files (there is at most
+/// one per version), or `None` if this version publishes only wheels.
+fn pick_sdist(urls: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    urls.iter()
+        .find(|u| u.get("packagetype").and_then(serde_json::Value::as_str) == Some("sdist"))
+}
+
+/// The most representative wheel among a PyPI version's files. A version may
+/// publish anywhere from zero wheels (sdist-only) to dozens (one per
+/// platform/Python ABI), so the choice is deterministic: prefer the universal
+/// pure-Python `py3-none-any` wheel (a single platform-agnostic artifact), then
+/// any other `none-any` wheel, then the first platform wheel. `None` if this
+/// version publishes no wheel at all.
+fn pick_wheel(urls: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    let is_wheel = |u: &&serde_json::Value| {
+        u.get("packagetype").and_then(serde_json::Value::as_str) == Some("bdist_wheel")
+    };
+    let filename = |u: &serde_json::Value| -> String {
+        u.get("filename")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    urls.iter()
+        .filter(is_wheel)
+        .find(|u| filename(u).ends_with("-py3-none-any.whl"))
+        .or_else(|| {
+            urls.iter()
+                .filter(is_wheel)
+                .find(|u| filename(u).contains("-none-any."))
+        })
+        .or_else(|| urls.iter().find(is_wheel))
 }
 
 /// Open VSX publishes the `.vsix` download URL in its JSON API. `rest` is
@@ -1346,19 +1428,72 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pypi_prefers_sdist_via_json_api() {
+    fn resolve_pypi_defaults_to_wheel_with_sdist_fallback() {
         let api = "https://pypi.org/pypi/requests/2.28.1/json";
         let body = br#"{"urls":[
-            {"packagetype":"bdist_wheel","url":"https://files.pythonhosted.org/w/requests-2.28.1-py3-none-any.whl"},
-            {"packagetype":"sdist","url":"https://files.pythonhosted.org/s/requests-2.28.1.tar.gz"}
+            {"packagetype":"bdist_wheel","filename":"requests-2.28.1-py3-none-any.whl","url":"https://files.pythonhosted.org/w/requests-2.28.1-py3-none-any.whl"},
+            {"packagetype":"sdist","filename":"requests-2.28.1.tar.gz","url":"https://files.pythonhosted.org/s/requests-2.28.1.tar.gz"}
+        ]}"#;
+        let net = Fixtures::default().with(api, body);
+        let wheel = "https://files.pythonhosted.org/w/requests-2.28.1-py3-none-any.whl".to_string();
+        let sdist = "https://files.pythonhosted.org/s/requests-2.28.1.tar.gz".to_string();
+        // Default: wheel-first, mirroring `pip install`.
+        assert_eq!(resolve_pypi("requests", "2.28.1", None, &net), Some(wheel.clone()));
+        // `?kind=wheel` is the default's explicit form.
+        assert_eq!(resolve_pypi("requests", "2.28.1", Some("wheel"), &net), Some(wheel));
+        // `?kind=sdist` flips to the source distribution.
+        assert_eq!(resolve_pypi("requests", "2.28.1", Some("sdist"), &net), Some(sdist));
+        // No fixture (registry unreachable / unknown package) → unresolved.
+        assert_eq!(resolve_pypi("nope", "9.9.9", None, &Fixtures::default()), None);
+    }
+
+    #[test]
+    fn resolve_pypi_picks_universal_wheel_and_falls_back_each_way() {
+        // A compiled package: many platform wheels plus the universal one. The
+        // universal `py3-none-any` wheel must win over the platform wheels.
+        let api = "https://pypi.org/pypi/widget/1.0.0/json";
+        let body = br#"{"urls":[
+            {"packagetype":"bdist_wheel","filename":"widget-1.0.0-cp311-cp311-manylinux_x86_64.whl","url":"https://x/plat.whl"},
+            {"packagetype":"bdist_wheel","filename":"widget-1.0.0-py3-none-any.whl","url":"https://x/universal.whl"},
+            {"packagetype":"sdist","filename":"widget-1.0.0.tar.gz","url":"https://x/widget.tar.gz"}
         ]}"#;
         let net = Fixtures::default().with(api, body);
         assert_eq!(
-            resolve_pypi("requests", "2.28.1", &net),
-            Some("https://files.pythonhosted.org/s/requests-2.28.1.tar.gz".to_string())
+            resolve_pypi("widget", "1.0.0", None, &net),
+            Some("https://x/universal.whl".to_string())
         );
-        // No fixture (registry unreachable / unknown package) → unresolved.
-        assert_eq!(resolve_pypi("nope", "9.9.9", &Fixtures::default()), None);
+
+        // sdist-only version: wheel-first default falls back to the sdist.
+        let sonly = "https://pypi.org/pypi/srconly/1.0.0/json";
+        let sbody = br#"{"urls":[{"packagetype":"sdist","filename":"srconly-1.0.0.tar.gz","url":"https://x/src.tar.gz"}]}"#;
+        let net = Fixtures::default().with(sonly, sbody);
+        assert_eq!(
+            resolve_pypi("srconly", "1.0.0", None, &net),
+            Some("https://x/src.tar.gz".to_string())
+        );
+
+        // wheel-only version: explicit `kind=sdist` falls back to the wheel.
+        let wonly = "https://pypi.org/pypi/wheelonly/1.0.0/json";
+        let wbody = br#"{"urls":[{"packagetype":"bdist_wheel","filename":"wheelonly-1.0.0-py3-none-any.whl","url":"https://x/w.whl"}]}"#;
+        let net = Fixtures::default().with(wonly, wbody);
+        assert_eq!(
+            resolve_pypi("wheelonly", "1.0.0", Some("sdist"), &net),
+            Some("https://x/w.whl".to_string())
+        );
+    }
+
+    #[test]
+    fn split_version_kind_parses_purl_qualifiers() {
+        assert_eq!(split_version_kind("1.2.3"), ("1.2.3", None));
+        assert_eq!(split_version_kind("1.2.3?kind=wheel"), ("1.2.3", Some("wheel")));
+        assert_eq!(split_version_kind("1.2.3?kind=sdist"), ("1.2.3", Some("sdist")));
+        // Other qualifiers are tolerated; `kind` is found regardless of order.
+        assert_eq!(
+            split_version_kind("1.2.3?foo=bar&kind=wheel"),
+            ("1.2.3", Some("wheel"))
+        );
+        // A `?` with no `kind` qualifier strips cleanly to the bare version.
+        assert_eq!(split_version_kind("1.2.3?foo=bar"), ("1.2.3", None));
     }
 
     #[test]

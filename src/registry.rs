@@ -117,6 +117,13 @@ fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
     let (path, version) = rest
         .rsplit_once('@')
         .map_or((rest, None), |(p, v)| (p, Some(v.to_string())));
+    // A registry record is the same whichever artifact a PURL `?qualifiers`
+    // string selects (e.g. `?kind=wheel`), so drop it — a query string glued to
+    // the version would otherwise corrupt the metadata API URL.
+    let version = version.map(|v| match v.split_once('?') {
+        Some((bare, _)) => bare.to_string(),
+        None => v,
+    });
     Some((ty.to_string(), path.to_string(), version))
 }
 
@@ -173,6 +180,66 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         ..Default::default()
     };
 
+    // Release timeline from the packument `time` map: every entry but the
+    // `created`/`modified` bookkeeping keys is `version → publish time`. The
+    // counts derive from this; `with_age` later turns it into the 24h/48h burst
+    // metrics relative to the scan clock.
+    if let Some(time) = doc.get("time").and_then(Value::as_object) {
+        let mut times: Vec<u64> = time
+            .iter()
+            .filter(|(k, _)| k.as_str() != "created" && k.as_str() != "modified")
+            .filter_map(|(_, v)| v.as_str().and_then(parse_rfc3339_secs))
+            .collect();
+        times.sort_unstable();
+        p.release_count = Some(times.len() as u32);
+        p.first_published_at = time
+            .get("created")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_secs)
+            .or_else(|| times.first().copied());
+        if let Some(this) = p.published_at {
+            p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
+        }
+        p.release_times = times;
+    }
+
+    // Custody: the account that pushed *this* version (`_npmUser`) and whether
+    // it is among the listed maintainers — a publisher outside that set is the
+    // account-takeover tell.
+    let publisher = v
+        .and_then(|v| v.pointer("/_npmUser/name"))
+        .and_then(Value::as_str);
+    p.publisher = publisher.map(str::to_string);
+    p.publisher_email_domain = v
+        .and_then(|v| v.pointer("/_npmUser/email"))
+        .and_then(Value::as_str)
+        .and_then(email_domain);
+    if let Some(name) = publisher {
+        p.publisher_in_maintainers = doc.get("maintainers").and_then(Value::as_array).map(|ms| {
+            ms.iter()
+                .any(|m| m.get("name").and_then(Value::as_str) == Some(name))
+        });
+    }
+
+    // Artifact shape and the registry's own install-hook flag.
+    p.unpacked_size = v
+        .and_then(|v| v.pointer("/dist/unpackedSize"))
+        .and_then(Value::as_u64);
+    p.file_count = v
+        .and_then(|v| v.pointer("/dist/fileCount"))
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    p.has_install_script = v.map(|v| {
+        v.get("hasInstallScript")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || v.get("scripts").and_then(Value::as_object).is_some_and(|s| {
+                s.contains_key("install")
+                    || s.contains_key("preinstall")
+                    || s.contains_key("postinstall")
+            })
+    });
+
     // Best-effort popularity: last-month downloads from the stats endpoint.
     if let Some(d) = cached_metadata(
         &format!("https://api.npmjs.org/downloads/point/last-month/{name}"),
@@ -185,6 +252,22 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         p.downloads_recent = Some(d);
     }
     Some(p)
+}
+
+/// The domain half of an email address (`a@b.com` → `b.com`), lowercased.
+/// `None` when there is no `@` or the domain is empty. Tolerates the
+/// `Display Name <user@domain>` form PyPI uses by keeping only the leading run
+/// of valid domain characters after the `@` (so a trailing `>` or comment is
+/// dropped). A freemail/disposable domain behind a sensitive package is a weak
+/// custody signal; the local-part is dropped so no per-user identifier is kept.
+fn email_domain(email: &str) -> Option<String> {
+    let after = email.rsplit_once('@')?.1;
+    let domain: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    (!domain.is_empty()).then_some(domain)
 }
 
 /// crates.io: the per-crate API returns custody-free but rich popularity and
@@ -254,32 +337,57 @@ fn crates(
     })
 }
 
-/// PyPI: the JSON API's `info` block plus the per-version upload times.
+/// PyPI: the package-level JSON API carries the `info` block, the full
+/// `releases` timeline (every version's files and upload times), `ownership`
+/// (the owning accounts), and the version's known `vulnerabilities` — all in one
+/// document, so the per-version endpoint is unnecessary. The requested version's
+/// own publish time and yank status come from its `releases` entry; identity
+/// text falls back to the latest release's `info`.
 fn pypi(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let url = match version {
-        Some(v) => format!("https://pypi.org/pypi/{path}/{v}/json"),
-        None => format!("https://pypi.org/pypi/{path}/json"),
-    };
-    let doc: Value = serde_json::from_slice(&cached_metadata(&url, net, cache)?).ok()?;
+    let doc: Value =
+        serde_json::from_slice(&cached_metadata(&format!("https://pypi.org/pypi/{path}/json"), net, cache)?)
+            .ok()?;
     let info = doc.get("info")?;
+    let releases = doc.get("releases").and_then(Value::as_object);
 
-    // The earliest upload across this version's files is its publish time.
-    let published_at = doc.get("urls").and_then(Value::as_array).and_then(|urls| {
-        urls.iter()
+    // Target version: the one requested, else the registry's latest.
+    let latest = info.get("version").and_then(Value::as_str);
+    let target = version.or(latest).unwrap_or_default();
+
+    // The earliest upload across a version's files is its publish time. Prefer
+    // the target version's files from `releases`; fall back to `urls` (the
+    // latest version's files) when the timeline omits it.
+    let publish_time = |files: &[Value]| {
+        files
+            .iter()
             .filter_map(|u| u.get("upload_time_iso_8601").and_then(Value::as_str))
             .filter_map(parse_rfc3339_secs)
             .min()
+    };
+    let target_files = releases
+        .and_then(|r| r.get(target))
+        .and_then(Value::as_array)
+        .or_else(|| doc.get("urls").and_then(Value::as_array));
+    let published_at = target_files.map(Vec::as_slice).and_then(publish_time);
+    // Per-version yank status (a specific version can be yanked while latest is
+    // not), with the per-version reason where the file records carry one.
+    let yanked_reason = target_files.and_then(|fs| {
+        fs.iter()
+            .any(|f| f.get("yanked").and_then(Value::as_bool).unwrap_or(false))
+            .then(|| {
+                fs.iter()
+                    .find_map(|f| f.get("yanked_reason").and_then(Value::as_str))
+                    .unwrap_or("yanked")
+                    .to_string()
+            })
     });
 
-    Some(Registry {
+    let mut p = Registry {
         ecosystem: "pypi".into(),
         name: path.to_string(),
-        version: info
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        version: target.to_string(),
         published_at,
+        latest_version: latest.map(str::to_string),
         author: info
             .get("author")
             .and_then(Value::as_str)
@@ -304,16 +412,52 @@ fn pypi(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
-        deprecated: info.get("yanked").and_then(Value::as_bool).and_then(|y| {
-            y.then(|| {
-                info.get("yanked_reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("yanked")
-                    .to_string()
-            })
-        }),
+        deprecated: yanked_reason,
+        vulnerability_count: doc
+            .get("vulnerabilities")
+            .and_then(Value::as_array)
+            .map(|a| a.len() as u32),
         ..Default::default()
-    })
+    };
+
+    // Release timeline: one publish time per version (the earliest of its files).
+    if let Some(rel) = releases {
+        let mut times: Vec<u64> = rel
+            .values()
+            .filter_map(|files| files.as_array().and_then(|fs| publish_time(fs)))
+            .collect();
+        times.sort_unstable();
+        p.release_count = Some(times.len() as u32);
+        p.first_published_at = times.first().copied();
+        if let Some(this) = p.published_at {
+            p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
+        }
+        p.release_times = times;
+    }
+
+    // Custody: the owning account (PyPI exposes roles, not a per-version
+    // publisher), and the email domain from the package's author/maintainer.
+    p.publisher = doc
+        .get("ownership")
+        .and_then(|o| o.get("roles"))
+        .and_then(Value::as_array)
+        .and_then(|roles| {
+            roles
+                .iter()
+                .find(|r| r.get("role").and_then(Value::as_str) == Some("Owner"))
+                .or_else(|| roles.first())
+        })
+        .and_then(|r| r.get("user"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    p.publisher_email_domain = info
+        .get("author_email")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or_else(|| info.get("maintainer_email").and_then(Value::as_str))
+        .and_then(email_domain);
+
+    Some(p)
 }
 
 /// Composer/Packagist: the package endpoint carries lifetime downloads and a
@@ -570,7 +714,21 @@ fn aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
             .to_string(),
         // LastModified is a Unix-seconds integer already.
         published_at: r.get("LastModified").and_then(Value::as_u64),
+        // FirstSubmitted is the package's birth; the gap to LastModified is the
+        // dormancy a revived abandoned package would show.
+        first_published_at: r.get("FirstSubmitted").and_then(Value::as_u64),
+        // The primary maintainer plus any co-maintainers — the custody set.
+        maintainers: Some(
+            u32::from(r.get("Maintainer").and_then(Value::as_str).is_some())
+                + r.get("CoMaintainers")
+                    .and_then(Value::as_array)
+                    .map_or(0, |c| c.len() as u32),
+        ),
         author: r
+            .get("Maintainer")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        publisher: r
             .get("Maintainer")
             .and_then(Value::as_str)
             .map(str::to_string),
@@ -664,6 +822,22 @@ fn openvsx(
             .pointer("/publishedBy/loginName")
             .and_then(Value::as_str)
             .map(str::to_string),
+        publisher: doc
+            .pointer("/publishedBy/loginName")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        // `allVersions` maps every published version to its URL — its size is the
+        // release count, free in this one response (timestamps need the versions
+        // endpoint). A `restricted` namespace is owner-controlled; a `public` one
+        // is open for anyone to publish under, so it is *not* verified custody.
+        release_count: doc
+            .get("allVersions")
+            .and_then(Value::as_object)
+            .map(|v| v.len() as u32),
+        publisher_verified: doc
+            .get("namespaceAccess")
+            .and_then(Value::as_str)
+            .map(|a| a.eq_ignore_ascii_case("restricted")),
         title: doc
             .get("displayName")
             .and_then(Value::as_str)
@@ -705,8 +879,12 @@ fn openvsx(
 /// shape as Open VSX, over a different transport.
 fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     let ext_id = path.replace('/', ".");
+    // flags 403 = IncludeVersions(1) | IncludeFiles(2) | IncludeVersionProperties(16)
+    // | IncludeAssetUri(128) | IncludeStatistics(256). Dropping IncludeLatestVersionOnly
+    // (512, what 914 set) returns the *full* version array in the same request, so the
+    // release timeline costs no extra round-trip; `versions[0]` is still the latest.
     let body = format!(
-        r#"{{"filters":[{{"criteria":[{{"filterType":7,"value":"{ext_id}"}}]}}],"flags":914}}"#
+        r#"{{"filters":[{{"criteria":[{{"filterType":7,"value":"{ext_id}"}}]}}],"flags":403}}"#
     );
     let headers = [
         ("Content-Type", "application/json"),
@@ -732,7 +910,7 @@ fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
             .as_f64()
     };
 
-    Some(Registry {
+    let mut p = Registry {
         ecosystem: "vscode".into(),
         name: ext_id,
         version: ext
@@ -746,10 +924,22 @@ fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
             .get("lastUpdated")
             .and_then(Value::as_str)
             .and_then(parse_rfc3339_secs),
+        // `publishedDate` is the extension's birth — the package-age signal.
+        first_published_at: ext
+            .get("publishedDate")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_secs),
         author: ext
             .pointer("/publisher/displayName")
             .and_then(Value::as_str)
             .map(str::to_string),
+        // The unique publisher account, and whether the marketplace verified its
+        // domain — an unverified publisher is one anyone could have registered.
+        publisher: ext
+            .pointer("/publisher/publisherName")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        publisher_verified: ext.pointer("/publisher/isDomainVerified").and_then(Value::as_bool),
         title: ext
             .get("displayName")
             .and_then(Value::as_str)
@@ -762,7 +952,28 @@ fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
         rating: stat("averagerating").map(|v| v as f32),
         rating_count: stat("ratingcount").map(|v| v as u64),
         ..Default::default()
-    })
+    };
+
+    // The full version array (one entry per published version) yields the release
+    // timeline — its size is the release count, and `with_age` turns the times
+    // into the 24h/48h burst metrics.
+    if let Some(versions) = ext.get("versions").and_then(Value::as_array) {
+        let mut times: Vec<u64> = versions
+            .iter()
+            .filter_map(|v| v.get("lastUpdated").and_then(Value::as_str))
+            .filter_map(parse_rfc3339_secs)
+            .collect();
+        times.sort_unstable();
+        if !times.is_empty() {
+            p.release_count = Some(times.len() as u32);
+            if let Some(this) = p.published_at {
+                p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
+            }
+            p.release_times = times;
+        }
+    }
+
+    Some(p)
 }
 
 /// NuGet: the registration index is gzip-encoded (which this client doesn't
@@ -1503,7 +1714,7 @@ fn firefox(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     )?)
     .ok()?;
 
-    Some(Registry {
+    let mut p = Registry {
         ecosystem: "firefox".into(),
         name: doc
             .get("slug")
@@ -1521,16 +1732,26 @@ fn firefox(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
             .and_then(Value::as_str)
             .or_else(|| doc.get("last_updated").and_then(Value::as_str))
             .and_then(parse_ts),
+        // `created` is the add-on's first listing — the package-age signal.
+        first_published_at: doc.get("created").and_then(Value::as_str).and_then(parse_ts),
         author: doc
             .pointer("/authors/0/name")
             .and_then(Value::as_str)
             .map(str::to_string),
+        // The author set is the custody signal AMO exposes.
+        maintainers: doc
+            .get("authors")
+            .and_then(Value::as_array)
+            .map(|a| a.len() as u32),
         title: doc.get("name").and_then(localized),
         description: doc.get("summary").and_then(localized),
         homepage: doc.pointer("/homepage/url").and_then(localized),
         license: doc
             .pointer("/current_version/license/name")
             .and_then(localized),
+        // `average_daily_users` is the install base (a lifetime-reach analogue);
+        // `weekly_downloads` stays the recent-window figure.
+        downloads_total: doc.get("average_daily_users").and_then(Value::as_u64),
         downloads_recent: doc.get("weekly_downloads").and_then(Value::as_u64),
         rating: doc
             .pointer("/ratings/average")
@@ -1539,7 +1760,39 @@ fn firefox(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
         rating_count: doc.pointer("/ratings/count").and_then(Value::as_u64),
         deprecated: deprecation_flag(&doc, "is_disabled", "disabled"),
         ..Default::default()
-    })
+    };
+
+    // One extra GET to the versions endpoint yields the release timeline (each
+    // version's `reviewed` approval time) for the cadence metrics. Best-effort:
+    // a failure leaves the package-age signal (from `created`) intact.
+    if let Some(versions) = cached_metadata(
+        &format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/versions/?page_size=50"),
+        net,
+        cache,
+    )
+    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    .and_then(|d| d.get("results").and_then(Value::as_array).cloned())
+    {
+        let mut times: Vec<u64> = versions
+            .iter()
+            .filter_map(|v| {
+                v.get("reviewed")
+                    .or_else(|| v.get("created"))
+                    .and_then(Value::as_str)
+                    .and_then(parse_ts)
+            })
+            .collect();
+        times.sort_unstable();
+        if !times.is_empty() {
+            p.release_count = Some(times.len() as u32);
+            if let Some(this) = p.published_at {
+                p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
+            }
+            p.release_times = times;
+        }
+    }
+
+    Some(p)
 }
 
 /// JetBrains Marketplace: resolve the plugin id (numeric, or an `xmlId` via
@@ -1945,20 +2198,29 @@ mod tests {
             "dist-tags": {"latest": "1.3.0"},
             "author": {"name": "Una"},
             "maintainers": [{"name": "Una"}, {"name": "Bob"}],
-            "time": {"1.3.0": "2021-04-23T10:00:00.000Z"},
+            "time": {
+                "created": "2019-01-01T00:00:00.000Z",
+                "modified": "2021-04-23T10:00:00.000Z",
+                "1.0.0": "2019-01-01T00:00:00.000Z",
+                "1.2.0": "2021-04-22T10:00:00.000Z",
+                "1.3.0": "2021-04-23T10:00:00.000Z"
+            },
             "versions": {
                 "1.3.0": {
                     "description": "pad it",
                     "homepage": "https://example.test",
                     "license": "MIT",
-                    "repository": {"url": "git+https://github.test/x.git"}
+                    "repository": {"url": "git+https://github.test/x.git"},
+                    "_npmUser": {"name": "mallory", "email": "mallory@gmail.com"},
+                    "dist": {"unpackedSize": 4096, "fileCount": 7},
+                    "scripts": {"postinstall": "node steal.js"}
                 }
             }
         })
         .to_string();
         let net =
             Fixtures::default().with("https://registry.npmjs.org/left-pad", packument.as_bytes());
-        let cache = BlobCache::with_dir(std::env::temp_dir().join("fletch-prov-npm-test"));
+        let cache = BlobCache::disabled();
         let p = npm("left-pad", Some("1.3.0"), &net, &cache).expect("provenance");
         assert_eq!(p.ecosystem, "npm");
         assert_eq!(p.published_at, Some(1_619_172_000));
@@ -1966,6 +2228,63 @@ mod tests {
         assert_eq!(p.author.as_deref(), Some("Una"));
         assert_eq!(p.license.as_deref(), Some("MIT"));
         assert_eq!(p.maintainers, Some(2));
+        // Release history: three versions, born at `time.created`, prior release
+        // is 1.2.0 (the latest strictly before this one).
+        assert_eq!(p.release_count, Some(3));
+        assert_eq!(p.first_published_at, Some(1_546_300_800)); // 2019-01-01
+        assert_eq!(p.previous_published_at, Some(1_619_085_600)); // 2021-04-22
+        assert_eq!(p.release_times.len(), 3);
+        // Custody: the publisher of this version is NOT a listed maintainer.
+        assert_eq!(p.publisher.as_deref(), Some("mallory"));
+        assert_eq!(p.publisher_email_domain.as_deref(), Some("gmail.com"));
+        assert_eq!(p.publisher_in_maintainers, Some(false));
+        // Artifact shape + the postinstall hook.
+        assert_eq!(p.unpacked_size, Some(4096));
+        assert_eq!(p.file_count, Some(7));
+        assert_eq!(p.has_install_script, Some(true));
+    }
+
+    #[test]
+    fn pypi_releases_yield_cadence_and_custody() {
+        let doc = serde_json::json!({
+            "info": {
+                "version": "0.3.0",
+                "summary": "a tool",
+                "author_email": "Huw <huw@evil.example>",
+                "license": "MIT"
+            },
+            "ownership": {"organization": null, "roles": [{"role": "Owner", "user": "hoo29"}]},
+            "vulnerabilities": [{"id": "PYSEC-1"}],
+            "urls": [
+                {"packagetype": "sdist", "upload_time_iso_8601": "2021-04-23T10:00:00Z", "yanked": false}
+            ],
+            "releases": {
+                "0.1.0": [{"upload_time_iso_8601": "2021-01-01T00:00:00Z", "yanked": false}],
+                "0.2.0": [{"upload_time_iso_8601": "2021-04-22T10:00:00Z", "yanked": false}],
+                "0.3.0": [{"upload_time_iso_8601": "2021-04-23T10:00:00Z", "yanked": false}]
+            }
+        })
+        .to_string();
+        let net = Fixtures::default().with("https://pypi.org/pypi/widget/json", doc.as_bytes());
+        let cache = BlobCache::disabled();
+        let p = pypi("widget", Some("0.3.0"), &net, &cache).expect("provenance");
+
+        assert_eq!(p.ecosystem, "pypi");
+        assert_eq!(p.version, "0.3.0");
+        assert_eq!(p.published_at, Some(1_619_172_000)); // 2021-04-23
+        assert_eq!(p.latest_version.as_deref(), Some("0.3.0"));
+        // Cadence from the full `releases` timeline.
+        assert_eq!(p.release_count, Some(3));
+        assert_eq!(p.first_published_at, Some(1_609_459_200)); // 2021-01-01
+        assert_eq!(p.previous_published_at, Some(1_619_085_600)); // 2021-04-22
+        // Custody: the owning account, and the domain from the author email
+        // (the `Name <user@domain>` form is parsed cleanly).
+        assert_eq!(p.publisher.as_deref(), Some("hoo29"));
+        assert_eq!(p.publisher_email_domain.as_deref(), Some("evil.example"));
+        assert_eq!(p.vulnerability_count, Some(1));
+        // PyPI exposes no per-version publisher account or unpacked size.
+        assert_eq!(p.publisher_in_maintainers, None);
+        assert_eq!(p.unpacked_size, None);
     }
 
     #[test]
@@ -1975,7 +2294,9 @@ mod tests {
             "results": [{
                 "Name": "yay", "Version": "12.0.0-1", "Description": "AUR helper",
                 "URL": "https://github.test/yay", "Maintainer": "jverify",
-                "NumVotes": 1234, "Popularity": 42.5, "LastModified": 1_619_172_000u64,
+                "CoMaintainers": ["alice", "bob"],
+                "NumVotes": 1234, "Popularity": 42.5,
+                "FirstSubmitted": 1_600_000_000u64, "LastModified": 1_619_172_000u64,
                 "OutOfDate": serde_json::Value::Null
             }]
         })
@@ -1984,11 +2305,15 @@ mod tests {
             "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=yay",
             rpc.as_bytes(),
         );
-        let cache = BlobCache::with_dir(std::env::temp_dir().join("fletch-prov-aur-test"));
+        let cache = BlobCache::disabled();
         let p = aur("yay", &net, &cache).expect("provenance");
         assert_eq!(p.ecosystem, "aur");
         assert_eq!(p.published_at, Some(1_619_172_000));
+        assert_eq!(p.first_published_at, Some(1_600_000_000));
+        // Primary maintainer + two co-maintainers = a custody set of three.
+        assert_eq!(p.maintainers, Some(3));
         assert_eq!(p.author.as_deref(), Some("jverify"));
+        assert_eq!(p.publisher.as_deref(), Some("jverify"));
         assert_eq!(p.rating, Some(42.5));
         assert_eq!(p.rating_count, Some(1234));
         assert_eq!(p.deprecated, None);
@@ -1997,7 +2322,7 @@ mod tests {
     #[test]
     fn unsupported_locator_is_none() {
         let net = Fixtures::default();
-        let cache = BlobCache::with_dir(std::env::temp_dir().join("fletch-prov-none-test"));
+        let cache = BlobCache::disabled();
         assert!(
             registry(
                 &RefLocator::Url("https://x.test/a.tgz".into()),
@@ -2040,7 +2365,7 @@ mod tests {
                 "https://rubygems.org/api/v1/versions/rails.json",
                 versions.as_bytes(),
             );
-        let cache = BlobCache::with_dir(std::env::temp_dir().join("fletch-prov-gem-test"));
+        let cache = BlobCache::disabled();
         let r = gem("rails", None, &net, &cache).expect("registry");
         assert_eq!(r.ecosystem, "gem");
         assert_eq!(r.version, "8.1.3");
@@ -2061,7 +2386,7 @@ mod tests {
             "https://proxy.golang.org/github.com/gin-gonic/gin/@latest",
             info.as_bytes(),
         );
-        let cache = BlobCache::with_dir(std::env::temp_dir().join("fletch-prov-go-test"));
+        let cache = BlobCache::disabled();
         let r = golang("github.com/gin-gonic/gin", None, &net, &cache).expect("registry");
         assert_eq!(r.ecosystem, "golang");
         assert_eq!(r.version, "v1.12.0");
@@ -2086,7 +2411,7 @@ mod tests {
             "https://api.github.com/repos/gin-gonic/gin",
             repo.as_bytes(),
         );
-        let cache = BlobCache::with_dir(std::env::temp_dir().join("fletch-prov-gh-test"));
+        let cache = BlobCache::disabled();
         let r = github("gin-gonic/gin", &net, &cache).expect("registry");
         assert_eq!(r.ecosystem, "github");
         assert_eq!(r.published_at, Some(1_619_172_000));
@@ -2102,9 +2427,14 @@ mod tests {
             "results": [{"extensions": [{
                 "displayName": "Language Support for Java",
                 "shortDescription": "Java tooling",
-                "publisher": {"displayName": "Red Hat", "publisherName": "redhat"},
+                "publisher": {"displayName": "Red Hat", "publisherName": "redhat", "isDomainVerified": true},
+                "publishedDate": "2017-01-01T00:00:00Z",
                 "lastUpdated": "2026-06-23T09:30:32.957Z",
-                "versions": [{"version": "1.55.0"}],
+                "versions": [
+                    {"version": "1.55.0", "lastUpdated": "2026-06-23T09:30:32.957Z"},
+                    {"version": "1.54.0", "lastUpdated": "2026-06-20T09:30:32.957Z"},
+                    {"version": "1.53.0", "lastUpdated": "2026-05-01T09:30:32.957Z"}
+                ],
                 "statistics": [
                     {"statisticName": "install", "value": 55_043_274.0},
                     {"statisticName": "averagerating", "value": 3.315},
@@ -2118,7 +2448,7 @@ mod tests {
             "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery",
             resp.as_bytes(),
         );
-        let cache = BlobCache::with_dir(std::env::temp_dir().join("fletch-prov-vscode-test"));
+        let cache = BlobCache::disabled();
         let r = vscode("redhat/java", &net, &cache).expect("registry");
         assert_eq!(r.ecosystem, "vscode");
         assert_eq!(r.name, "redhat.java");
@@ -2129,6 +2459,14 @@ mod tests {
         assert_eq!(r.rating, Some(3.315));
         assert_eq!(r.rating_count, Some(184));
         assert!(r.published_at.is_some());
+        // Custody + history: verified publisher domain, first-seen date, and the
+        // full three-version timeline (with the prior release before this one).
+        assert_eq!(r.publisher.as_deref(), Some("redhat"));
+        assert_eq!(r.publisher_verified, Some(true));
+        assert!(r.first_published_at.is_some());
+        assert_eq!(r.release_count, Some(3));
+        assert_eq!(r.release_times.len(), 3);
+        assert_eq!(r.previous_published_at, parse_rfc3339_secs("2026-06-20T09:30:32.957Z"));
     }
 
     #[test]
@@ -2144,7 +2482,7 @@ mod tests {
         })
         .to_string();
         let net = Fixtures::default().with("https://open-vsx.org/api/redhat/java", api.as_bytes());
-        let cache = BlobCache::with_dir(std::env::temp_dir().join("fletch-prov-ovsx-test"));
+        let cache = BlobCache::disabled();
         let r = openvsx("redhat/java", None, &net, &cache).expect("registry");
         assert_eq!(r.ecosystem, "openvsx");
         assert_eq!(r.name, "redhat.java");
@@ -2199,7 +2537,7 @@ mod tests {
             &format!("https://chromewebstore.google.com/detail/{id}"),
             html.as_bytes(),
         );
-        let cache = BlobCache::with_dir(std::env::temp_dir().join("fletch-prov-chrome-test"));
+        let cache = BlobCache::disabled();
         let r = chrome(id, &net, &cache).expect("registry");
         assert_eq!(r.ecosystem, "chrome");
         assert_eq!(r.title.as_deref(), Some("社媒助手 - 数据采集工具"));
@@ -2213,10 +2551,10 @@ mod tests {
     /// Build a fresh temp-dir blob cache keyed by a per-test name, purging any
     /// entry a prior run left behind so a changed fixture is never masked by a
     /// stale cached response.
-    fn test_cache(name: &str) -> BlobCache {
-        let dir = std::env::temp_dir().join(format!("fletch-reg-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        BlobCache::with_dir(dir)
+    fn test_cache(_name: &str) -> BlobCache {
+        // Hermetic: an inert cache so every lookup goes straight to the fixture,
+        // with no shared on-disk state across tests or runs.
+        BlobCache::disabled()
     }
 
     #[test]
@@ -2550,17 +2888,33 @@ mod tests {
             "slug": "ublock-origin",
             "name": {"en-US": "uBlock Origin"}, "summary": {"en-US": "An efficient blocker"},
             "homepage": {"url": {"en-US": "https://github.com/gorhill/uBlock"}},
-            "authors": [{"name": "Raymond Hill"}],
-            "ratings": {"average": 4.7997, "count": 21_850u64}, "weekly_downloads": 123_456u64,
+            "authors": [{"name": "Raymond Hill"}, {"name": "co-author"}],
+            "created": "2015-04-25T07:26:22Z",
+            "ratings": {"average": 4.7997, "count": 21_850u64},
+            "weekly_downloads": 123_456u64, "average_daily_users": 8_000_000u64,
             "is_disabled": false,
             "current_version": {"version": "1.66.4", "reviewed": "2021-04-23T10:00:00Z",
                                 "license": {"name": {"en-US": "GPL-3.0-only"}}}
         })
         .to_string();
-        let net = Fixtures::default().with(
-            "https://addons.mozilla.org/api/v5/addons/addon/ublock-origin/",
-            doc.as_bytes(),
-        );
+        // The versions endpoint (one extra GET) supplies the release timeline.
+        let versions = serde_json::json!({
+            "results": [
+                {"version": "1.66.4", "reviewed": "2021-04-23T10:00:00Z"},
+                {"version": "1.66.3", "reviewed": "2021-04-20T10:00:00Z"},
+                {"version": "1.66.2", "reviewed": "2021-03-01T10:00:00Z"}
+            ]
+        })
+        .to_string();
+        let net = Fixtures::default()
+            .with(
+                "https://addons.mozilla.org/api/v5/addons/addon/ublock-origin/",
+                doc.as_bytes(),
+            )
+            .with(
+                "https://addons.mozilla.org/api/v5/addons/addon/ublock-origin/versions/?page_size=50",
+                versions.as_bytes(),
+            );
         let r = firefox("ublock-origin", &net, &test_cache("firefox")).expect("registry");
         assert_eq!(r.ecosystem, "firefox");
         assert_eq!(r.title.as_deref(), Some("uBlock Origin"));
@@ -2573,6 +2927,12 @@ mod tests {
         assert_eq!(r.license.as_deref(), Some("GPL-3.0-only"));
         assert_eq!(r.rating, Some(4.7997));
         assert_eq!(r.rating_count, Some(21_850));
+        // New: first-listing date, install base, author count, release timeline.
+        assert!(r.first_published_at.is_some()); // `created`
+        assert_eq!(r.downloads_total, Some(8_000_000)); // average_daily_users
+        assert_eq!(r.maintainers, Some(2)); // two authors
+        assert_eq!(r.release_count, Some(3));
+        assert_eq!(r.previous_published_at, parse_rfc3339_secs("2021-04-20T10:00:00Z"));
     }
 
     #[test]

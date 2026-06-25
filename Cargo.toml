@@ -87,3 +87,9 @@ dirs = "6"
 [dev-dependencies]
 tempfile = "3"
 filetime = "0.2"
+
+# Temporary local patch for cross-repo development of the Registry struct
+# (release-history / custody fields). Uncomment to build fletch against local
+# filefacts; keep commented so a merge points at the published filefacts rev.
+#[patch."https://codeberg.org/atomdrift/filefacts.git"]
+#filefacts = { path = "../filefacts" }
