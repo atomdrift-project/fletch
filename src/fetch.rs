@@ -25,8 +25,27 @@ const TTL_PINNED: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Cache lifetime for an unpinned reference — `@latest`/mutable tags can
 /// move, so staleness is bounded.
 const TTL_UNPINNED: Duration = Duration::from_secs(12 * 3600);
-/// Per-fetch byte ceiling — the response is abandoned past this.
-pub const MAX_FETCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Default per-fetch byte ceiling — a single response is abandoned past this
+/// unless [`set_max_fetch_bytes`] adjusts it for the process.
+pub const DEFAULT_MAX_FETCH_BYTES: u64 = 40 * 1024 * 1024;
+
+/// Process-wide per-fetch byte ceiling. Fetching is process-global (one
+/// invocation, one policy), so the limit lives in a single atomic set once at
+/// startup rather than threaded through every `get`/`fetch_ref` call — the same
+/// shape as the shared HTTP client and blob cache.
+static MAX_FETCH_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_FETCH_BYTES);
+
+/// Set the per-fetch byte ceiling for the process. Call once at startup, before
+/// any fetch; subsequent fetches read the new value.
+pub fn set_max_fetch_bytes(limit: u64) {
+    MAX_FETCH_BYTES.store(limit, Ordering::Relaxed);
+}
+
+/// The current per-fetch byte ceiling.
+#[must_use]
+pub fn max_fetch_bytes() -> u64 {
+    MAX_FETCH_BYTES.load(Ordering::Relaxed)
+}
 /// Redirect-chain cap.
 const MAX_REDIRECTS: u32 = 10;
 
@@ -388,6 +407,32 @@ pub(crate) fn cached_post(
 /// one reference. Never panics; every path yields a [`FetchRecord`].
 #[must_use]
 pub fn fetch_ref(r: &Reference, net: &dyn Fetch, cache: &BlobCache) -> FetchRecord {
+    fetch_ref_inner(r, net, cache, || true)
+}
+
+/// Whether a record represents a live network fetch — so it counts against the
+/// [`FetchBudget::max_count`] ceiling. A cache hit (fresh or stale-served), an
+/// unresolved locator, a non-target, and a budget-skipped edge do not count, so
+/// a re-run over a warm cache is never throttled.
+#[must_use]
+pub fn counts_against_budget(rec: &FetchRecord) -> bool {
+    !rec.cached && matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch | Outcome::Failed(_))
+}
+
+/// [`fetch_ref`], with a `claim_fetch` gate consulted **only on a cache miss**,
+/// just before the network is touched. It returns `true` to permit the live
+/// fetch (and, in [`fetch_references`], to claim a slot of the count budget) or
+/// `false` to record [`Outcome::BudgetExceeded`] instead. Consulting it lazily —
+/// after the cache check — is what keeps a cache hit entirely free of the
+/// budget: a hit returns before `claim_fetch` is ever called, so it can neither
+/// be counted nor (under concurrency) transiently hold a slot from a real miss.
+#[must_use]
+fn fetch_ref_inner(
+    r: &Reference,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+    claim_fetch: impl FnOnce() -> bool,
+) -> FetchRecord {
     let locator = locator_string(&r.locator);
 
     if !r.is_fetch_target() {
@@ -409,6 +454,14 @@ pub fn fetch_ref(r: &Reference, net: &dyn Fetch, cache: &BlobCache) -> FetchReco
 
     if let Some((bytes, meta)) = cache.fresh(&key, max_age) {
         return record(r, locator, url, &bytes, true, false, &meta);
+    }
+
+    if !claim_fetch() {
+        // Count budget spent: record the edge without fetching so the cap is
+        // never a silent truncation, and a later run can still pick it up.
+        let mut rec = FetchRecord::terminal(locator, Outcome::BudgetExceeded);
+        rec.resolved_url = url;
+        return rec;
     }
 
     match net.get(&url) {
@@ -488,12 +541,14 @@ fn fetch_concurrency() -> usize {
 ///
 /// Fetches run concurrently across a bounded pool ([`fetch_concurrency`]); the
 /// returned order is always declaration order regardless of completion order.
-/// The `max_count` cap is exact and deterministic. The `max_bytes` cap is
-/// enforced best-effort — once retrieved bytes cross it, no further fetch is
-/// dispatched and the remaining references are recorded as `BudgetExceeded` —
-/// so the byte total may overshoot by at most one in-flight batch. (Live
-/// fetches are not reproducible anyway, so which references win a contested
-/// byte ceiling is not a determinism guarantee.)
+/// `max_count` bounds *live* fetches only: a slot is claimed atomically the
+/// moment a cache miss is about to hit the network, so the live total never
+/// exceeds the cap, while cache hits are served before any slot is claimed and
+/// so are never counted — a warm re-run is never throttled. Which references win
+/// a contested cap is not guaranteed (two equal-priority misses race for the
+/// last slot, and live fetches aren't reproducible anyway). `max_bytes` is
+/// best-effort: once retrieved bytes cross it the sweep stops and the remaining
+/// references are recorded as `BudgetExceeded`.
 #[must_use]
 pub fn fetch_references(
     refs: &[Reference],
@@ -503,22 +558,22 @@ pub fn fetch_references(
     cache: &BlobCache,
     budget: FetchBudget,
 ) -> Vec<FetchRecord> {
-    // Selectable references, in declaration order. The count cap is applied up
-    // front (it is known without fetching); the byte cap is enforced live below.
+    // Selectable references, in declaration order. Every target is visited; the
+    // caps are enforced live below — the byte cap stops the sweep, the count cap
+    // gates only *network* fetches (cache hits are always served, never counted).
     let targets: Vec<&Reference> = refs.iter().filter(|r| selected(r, fetch_urls)).collect();
-    let fetch_n = if budget.max_bytes == 0 {
-        0
-    } else {
-        targets.len().min(budget.max_count)
-    };
+    let fetch_n = if budget.max_bytes == 0 { 0 } else { targets.len() };
 
-    // Fetch targets[0..fetch_n] across a bounded thread pool. Each worker pulls
-    // the next index from a shared cursor and stops early once the byte budget
-    // is spent; results land in per-index slots so output order is stable.
+    // Sweep targets[0..fetch_n] across a bounded thread pool. Each worker pulls
+    // the next index from a shared cursor and stops once the byte budget is
+    // spent; results land in per-index slots so output order is stable.
     let mut slots: Vec<Option<FetchRecord>> = (0..fetch_n).map(|_| None).collect();
     if fetch_n > 0 {
         let cursor = AtomicUsize::new(0);
         let bytes_used = AtomicU64::new(0);
+        // Live fetches issued so far. A cache hit never bumps this, so a warm
+        // re-run serves every reference regardless of `max_count`.
+        let net_used = AtomicUsize::new(0);
         let workers = fetch_concurrency().min(fetch_n);
         let collected: Vec<Vec<(usize, FetchRecord)>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..workers)
@@ -533,7 +588,22 @@ pub fn fetch_references(
                             if i >= fetch_n {
                                 break;
                             }
-                            let rec = fetch_ref(targets[i], net, cache);
+                            // Claim a live-fetch slot atomically, but only when
+                            // the ref turns out to be a cache miss — the gate is
+                            // consulted inside `fetch_ref_inner`, after the cache
+                            // check. So a cache hit never touches `net_used`
+                            // (served free), and concurrent workers can never
+                            // claim more than `max_count` slots: the live total
+                            // is an exact ceiling, not best-effort.
+                            let rec = fetch_ref_inner(targets[i], net, cache, || {
+                                net_used
+                                    .fetch_update(
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                        |n| (n < budget.max_count).then_some(n + 1),
+                                    )
+                                    .is_ok()
+                            });
                             bytes_used.fetch_add(rec.size.unwrap_or(0), Ordering::Relaxed);
                             local.push((i, rec));
                         }
@@ -551,8 +621,8 @@ pub fn fetch_references(
     }
 
     // Reassemble in declaration order: the fetched record where one exists, a
-    // `BudgetExceeded` edge for indices past the count cap or skipped by the
-    // byte cap. Every record carries its source so it stands alone as an edge.
+    // `BudgetExceeded` edge for any index the byte cap cut short. Every record
+    // carries its source so it stands alone as an edge.
     let mut records = Vec::with_capacity(targets.len());
     for (i, r) in targets.iter().enumerate() {
         let mut rec = slots.get_mut(i).and_then(Option::take).unwrap_or_else(|| {
@@ -983,6 +1053,29 @@ impl HttpFetch {
     }
 }
 
+/// Read a response body under the per-fetch byte ceiling ([`max_fetch_bytes`]).
+/// A declared `Content-Length` over the cap is rejected before a single body
+/// byte is read — the common case for an oversize artifact, which a registry or
+/// CDN sizes honestly — so we don't pull tens of MB only to discard them. The
+/// streaming `take` cap remains the authoritative backstop for a missing or
+/// dishonest header.
+fn read_body_capped(resp: reqwest::blocking::Response) -> Result<Vec<u8>, FetchError> {
+    let limit = max_fetch_bytes();
+    if let Some(len) = resp.content_length()
+        && len > limit
+    {
+        return Err(FetchError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    resp.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| FetchError::Transport(e.to_string()))?;
+    if bytes.len() as u64 > limit {
+        return Err(FetchError::TooLarge);
+    }
+    Ok(bytes)
+}
+
 impl HttpFetch {
     /// The shared GET path: per-hop https + SSRF enforcement, redirect following,
     /// and the response-size cap. `headers` are attached to every hop. Both
@@ -1057,13 +1150,7 @@ impl HttpFetch {
                         .map(|val| (k.as_str().to_string(), val.into()))
                 })
                 .collect();
-            let mut bytes = Vec::new();
-            resp.take(MAX_FETCH_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| FetchError::Transport(e.to_string()))?;
-            if bytes.len() as u64 > MAX_FETCH_BYTES {
-                return Err(FetchError::TooLarge);
-            }
+            let bytes = read_body_capped(resp)?;
             return Ok(Fetched {
                 bytes,
                 final_url: current.to_string(),
@@ -1113,13 +1200,7 @@ impl Fetch for HttpFetch {
                     .map(|val| (k.as_str().to_string(), val.into()))
             })
             .collect();
-        let mut bytes = Vec::new();
-        resp.take(MAX_FETCH_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| FetchError::Transport(e.to_string()))?;
-        if bytes.len() as u64 > MAX_FETCH_BYTES {
-            return Err(FetchError::TooLarge);
-        }
+        let bytes = read_body_capped(resp)?;
         Ok(Fetched {
             bytes,
             final_url: target.to_string(),
@@ -1468,21 +1549,221 @@ mod tests {
         let recs = fetch_references(&refs, "trigsha", true, &net, &cache, FetchBudget::default());
         assert_eq!(recs.len(), 2);
 
-        // A budget of one: the second selectable ref is recorded, not dropped.
+        // A budget of one live fetch over a *cold* cache: exactly one ref is
+        // fetched and the other is recorded as `BudgetExceeded`, never dropped.
+        // (A fresh cache — the prior calls warmed `cache`, and cache hits are
+        // served free of the budget, which the next test covers.) Both misses
+        // are equal priority, so which one wins the slot isn't guaranteed under
+        // the concurrent sweep — assert the multiset, not order.
+        let cold_dir = tempfile::tempdir().expect("tempdir");
+        let cold_cache = BlobCache::with_dir(cold_dir.path().to_path_buf());
         let recs = fetch_references(
             &refs,
             "trigsha",
             true,
             &net,
-            &cache,
+            &cold_cache,
             FetchBudget {
                 max_count: 1,
                 max_bytes: u64::MAX,
             },
         );
         assert_eq!(recs.len(), 2);
-        assert_eq!(recs[1].outcome, Outcome::BudgetExceeded);
-        assert_eq!(recs[1].source_sha256, "trigsha");
+        assert_eq!(
+            recs.iter().filter(|r| r.outcome == Outcome::Ok).count(),
+            1,
+            "exactly one live fetch is allowed by the budget"
+        );
+        assert_eq!(
+            recs.iter()
+                .filter(|r| r.outcome == Outcome::BudgetExceeded)
+                .count(),
+            1,
+            "the ref past the budget is recorded, not dropped"
+        );
+        assert!(recs.iter().all(|r| r.source_sha256 == "trigsha"));
+    }
+
+    #[test]
+    fn cached_references_are_served_free_of_the_count_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path().to_path_buf());
+        let npm_url = "https://registry.npmjs.org/foo/-/foo-1.0.0.tgz";
+        let raw_url = "https://evil.test/x.sh";
+        let net = Fixtures::default()
+            .with(npm_url, b"PKG")
+            .with(raw_url, b"SH");
+        let refs = vec![
+            dep(RefLocator::Purl("pkg:npm/foo@1.0.0".into()), None),
+            Reference {
+                kind: RefKind::UrlFetch,
+                ..dep(RefLocator::Url(raw_url.into()), None)
+            },
+        ];
+
+        // Warm the cache with a generous budget: both are live fetches.
+        let warm = fetch_references(&refs, "s", true, &net, &cache, FetchBudget::default());
+        assert_eq!(warm.len(), 2);
+        assert!(
+            warm.iter().all(|r| r.outcome == Outcome::Ok && !r.cached),
+            "cold run should fetch both live"
+        );
+
+        // Re-run with zero live-fetch budget: cache hits don't count, so both
+        // are still served from cache rather than recorded as BudgetExceeded.
+        let warm = fetch_references(
+            &refs,
+            "s",
+            true,
+            &net,
+            &cache,
+            FetchBudget {
+                max_count: 0,
+                max_bytes: u64::MAX,
+            },
+        );
+        assert_eq!(
+            warm.iter()
+                .filter(|r| r.cached && r.outcome == Outcome::Ok)
+                .count(),
+            2,
+            "a warm re-run is never throttled by the count budget"
+        );
+    }
+
+    /// A `Fetch` backend that counts how many live network gets are issued, so
+    /// tests can assert the count budget exactly against real network activity
+    /// rather than inferring it from record outcomes.
+    struct CountingFetch {
+        inner: Fixtures,
+        gets: AtomicUsize,
+    }
+
+    impl Fetch for CountingFetch {
+        fn get(&self, url: &str) -> Result<Fetched, FetchError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(url)
+        }
+        fn post(
+            &self,
+            url: &str,
+            body: &[u8],
+            headers: &[(&str, &str)],
+        ) -> Result<Fetched, FetchError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.post(url, body, headers)
+        }
+    }
+
+    // Build `n` distinct versioned-npm refs (resolved offline, so each fetch is
+    // exactly one content `get`) and a matching fixture set.
+    fn numbered_npm_refs(n: usize) -> (Fixtures, Vec<Reference>) {
+        let mut fx = Fixtures::default();
+        let mut refs = Vec::new();
+        for i in 0..n {
+            let url = format!("https://registry.npmjs.org/p{i}/-/p{i}-1.0.0.tgz");
+            fx = fx.with(&url, format!("PKG{i}").as_bytes());
+            refs.push(dep(RefLocator::Purl(format!("pkg:npm/p{i}@1.0.0")), None));
+        }
+        (fx, refs)
+    }
+
+    #[test]
+    fn live_fetch_count_is_an_exact_ceiling_under_concurrency() {
+        // Many cold-cache targets, a small budget, run repeatedly: the
+        // reserve-on-miss gate must issue *exactly* `max_count` live gets every
+        // time — never more (the race would overshoot the cap) and never fewer
+        // (a lost wakeup would strand the budget) — with the rest recorded, in
+        // declaration order, as BudgetExceeded.
+        let n = 64usize;
+        let max_count = 10usize;
+        for attempt in 0..50 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cache = BlobCache::with_dir(dir.path().to_path_buf());
+            let (fx, refs) = numbered_npm_refs(n);
+            let net = CountingFetch {
+                inner: fx,
+                gets: AtomicUsize::new(0),
+            };
+            let recs = fetch_references(
+                &refs,
+                "sha",
+                false,
+                &net,
+                &cache,
+                FetchBudget {
+                    max_count,
+                    max_bytes: u64::MAX,
+                },
+            );
+
+            assert_eq!(recs.len(), n);
+            for (i, rec) in recs.iter().enumerate() {
+                assert_eq!(rec.locator, format!("pkg:npm/p{i}@1.0.0"));
+            }
+            let gets = net.gets.load(Ordering::SeqCst);
+            assert_eq!(
+                gets, max_count,
+                "attempt {attempt}: issued {gets} live fetches for a budget of {max_count}"
+            );
+            let ok = recs.iter().filter(|r| r.outcome == Outcome::Ok).count();
+            let exceeded = recs
+                .iter()
+                .filter(|r| r.outcome == Outcome::BudgetExceeded)
+                .count();
+            assert_eq!(ok, max_count, "attempt {attempt}");
+            assert_eq!(exceeded, n - max_count, "attempt {attempt}");
+        }
+    }
+
+    #[test]
+    fn cache_hits_never_consume_the_budget_under_concurrency() {
+        // Half the targets are pre-cached and interleaved with cold ones. Cache
+        // hits must be served free — never blocking a cold ref from the budget,
+        // even transiently — so a budget of `max_count` still yields *exactly*
+        // `max_count` live gets while every cached ref is served.
+        let n = 64usize;
+        let max_count = 12usize;
+        for attempt in 0..50 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cache = BlobCache::with_dir(dir.path().to_path_buf());
+            let (fx, refs) = numbered_npm_refs(n);
+            // Warm the even-indexed refs into the cache with an unmetered run.
+            let warm: Vec<Reference> = refs.iter().step_by(2).cloned().collect();
+            let warmed = fetch_references(&warm, "sha", false, &fx, &cache, FetchBudget::default());
+            assert!(warmed.iter().all(|r| r.outcome == Outcome::Ok && !r.cached));
+
+            let net = CountingFetch {
+                inner: fx,
+                gets: AtomicUsize::new(0),
+            };
+            let recs = fetch_references(
+                &refs,
+                "sha",
+                false,
+                &net,
+                &cache,
+                FetchBudget {
+                    max_count,
+                    max_bytes: u64::MAX,
+                },
+            );
+
+            assert_eq!(recs.len(), n);
+            // Every pre-cached (even) ref is served from cache, regardless of budget.
+            for even in (0..n).step_by(2) {
+                assert!(
+                    recs[even].cached && recs[even].outcome == Outcome::Ok,
+                    "attempt {attempt}: cached ref {even} should be served free"
+                );
+            }
+            // Live gets are exactly the budget — cache hits neither count nor block.
+            let gets = net.gets.load(Ordering::SeqCst);
+            assert_eq!(
+                gets, max_count,
+                "attempt {attempt}: cache hits perturbed the live-fetch budget"
+            );
+        }
     }
 
     #[test]
