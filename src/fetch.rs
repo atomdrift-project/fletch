@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use filefacts::{HashAlgo, PinnedHash, RefLocator, Reference};
@@ -243,6 +243,10 @@ struct CachedMeta {
     headers: Vec<(String, String)>,
 }
 
+/// Shared sink of recorded `(url, raw-bytes)` metadata documents, populated by a
+/// recording [`BlobCache`]. See [`BlobCache::recording`].
+pub type RawSink = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
 /// Content-addressed cache of fetched responses — bytes (`<key>.zst`) plus a
 /// provenance sidecar (`<key>.json`), keyed by `sha256(locator)`. Two
 /// manifests naming the same package share one entry. TTL is the caller's
@@ -258,6 +262,11 @@ pub struct BlobCache {
     /// [`registry`](crate::registry::registry) overrides it per PURL via
     /// [`with_meta_ttl`](Self::with_meta_ttl); artifact fetches ignore it.
     meta_ttl: Duration,
+    /// When set, every metadata document this cache serves — from a hit or a
+    /// fresh fetch — is appended to the sink as `(url, bytes)`, so a caller can
+    /// recover the raw provider documents a registry lookup consumed without
+    /// re-deriving fletch's per-ecosystem fetch recipe. `None` = no recording.
+    recorder: Option<RawSink>,
 }
 
 impl BlobCache {
@@ -277,6 +286,31 @@ impl BlobCache {
             dir,
             enabled: true,
             meta_ttl: TTL_PINNED,
+            recorder: None,
+        }
+    }
+
+    /// A clone that records every metadata document it serves (cache hit or fresh
+    /// fetch), returning it alongside the shared sink to read them back. Powers
+    /// [`registry_with_sources`](crate::registry::registry_with_sources): the raw
+    /// provider responses a lookup consumed, captured from the warm cache with no
+    /// extra fetch.
+    #[must_use]
+    pub fn recording(&self) -> (Self, RawSink) {
+        let sink: RawSink = Arc::new(Mutex::new(Vec::new()));
+        let cache = Self {
+            recorder: Some(Arc::clone(&sink)),
+            ..self.clone()
+        };
+        (cache, sink)
+    }
+
+    /// Append a served metadata document to the recorder, if one is installed.
+    fn record(&self, url: &str, bytes: &[u8]) {
+        if let Some(sink) = &self.recorder
+            && let Ok(mut sources) = sink.lock()
+        {
+            sources.push((url.to_string(), bytes.to_vec()));
         }
     }
 
@@ -302,6 +336,7 @@ impl BlobCache {
             dir: PathBuf::new(),
             enabled: false,
             meta_ttl: TTL_PINNED,
+            recorder: None,
         }
     }
 
@@ -406,6 +441,7 @@ pub(crate) fn cached_metadata_with(
         sha256_hex(format!("meta:{url}:{joined}").as_bytes())
     };
     if let Some((bytes, _)) = cache.fresh(&key, cache.meta_ttl) {
+        cache.record(url, &bytes);
         return Some(bytes);
     }
     match net.get_with(url, headers) {
@@ -418,10 +454,14 @@ pub(crate) fn cached_metadata_with(
                 headers: f.headers,
             };
             cache.put(&key, &f.bytes, &meta);
+            cache.record(url, &f.bytes);
             Some(f.bytes)
         }
         // Source unreachable: a stale metadata answer still beats none.
-        Err(_) => cache.any(&key).map(|(bytes, _)| bytes),
+        Err(_) => cache.any(&key).map(|(bytes, _)| {
+            cache.record(url, &bytes);
+            bytes
+        }),
     }
 }
 
@@ -437,6 +477,7 @@ pub(crate) fn cached_post(
 ) -> Option<Vec<u8>> {
     let key = sha256_hex(format!("post:{url}:{}", sha256_hex(body)).as_bytes());
     if let Some((bytes, _)) = cache.fresh(&key, cache.meta_ttl) {
+        cache.record(url, &bytes);
         return Some(bytes);
     }
     match net.post(url, body, headers) {
@@ -449,9 +490,13 @@ pub(crate) fn cached_post(
                 headers: f.headers,
             };
             cache.put(&key, &f.bytes, &meta);
+            cache.record(url, &f.bytes);
             Some(f.bytes)
         }
-        Err(_) => cache.any(&key).map(|(bytes, _)| bytes),
+        Err(_) => cache.any(&key).map(|(bytes, _)| {
+            cache.record(url, &bytes);
+            bytes
+        }),
     }
 }
 

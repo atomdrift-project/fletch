@@ -118,6 +118,29 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
     }
 }
 
+/// Like [`registry`], but also returns the raw provider documents the lookup
+/// consumed: the `(url, bytes)` of every metadata response it read, from the warm
+/// cache or a fresh fetch. A consumer that archives provenance (scan's `--upload`)
+/// keeps these as the re-parsing backup beside the normalized record, without
+/// re-deriving which endpoints an ecosystem needs. The record is `None` on the
+/// same conditions as [`registry`]; `sources` is then whatever was read before
+/// the lookup gave up (often empty). Order matches read order — the primary
+/// registry document first.
+#[must_use]
+pub fn registry_with_sources(
+    locator: &RefLocator,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> (Option<Registry>, Vec<(String, Vec<u8>)>) {
+    let (recording, sink) = cache.recording();
+    let record = registry(locator, net, &recording);
+    let sources = sink
+        .lock()
+        .map(|mut s| std::mem::take(&mut *s))
+        .unwrap_or_default();
+    (record, sources)
+}
+
 /// Split a PURL into `(type, name-path, version?)`, mirroring `fetch`'s
 /// resolver: the version follows a literal `@` (a scope is `%40`).
 fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {

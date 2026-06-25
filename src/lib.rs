@@ -29,4 +29,4 @@ pub mod registry;
 // The reference vocabulary fletch's public API speaks, re-exported so consumers
 // (e.g. scan) need not depend on filefacts directly just to name these types.
 pub use filefacts::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference, Registry};
-pub use registry::registry;
+pub use registry::{registry, registry_with_sources};
