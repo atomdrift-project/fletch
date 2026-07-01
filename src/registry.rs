@@ -115,6 +115,36 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // Its data lives behind a JSON-RPC `POST` query — same marketplace shape
         // as Open VSX, just a different transport.
         "vscode" => vscode(&path, net, cache),
+        // Spec-form aliases (purl-spec / common practice) for the same registries,
+        // so a PURL generated per spec fetches identically to our legacy spelling.
+        // `chrome-extension` and `vscode-extension` are the ratified types; the
+        // OS types carry the distro in the namespace (`pkg:deb/debian/curl`).
+        "chrome-extension" => chrome(path.rsplit('/').next().unwrap_or(&path), net, cache),
+        // vscode-extension covers both stores; Open VSX is flagged by the
+        // `repository_url` qualifier (dropped by parse_purl, so read off the raw).
+        "vscode-extension" => {
+            if purl.contains("open-vsx.org") {
+                openvsx(&path, version, net, cache)
+            } else {
+                vscode(&path, net, cache)
+            }
+        }
+        "deb" => match path.split_once('/') {
+            Some(("ubuntu", name)) => distro::ubuntu(last_seg(name), net, cache),
+            Some((_, name)) => distro::debian(last_seg(name), net, cache),
+            None => distro::debian(&path, net, cache),
+        },
+        "rpm" => match path.split_once('/') {
+            Some(("opensuse", name)) => distro::opensuse(last_seg(name), net, cache),
+            Some(("rpmfusion", name)) => distro::rpmfusion(last_seg(name), net, cache),
+            Some((_, name)) => fedora(last_seg(name), net, cache),
+            None => fedora(&path, net, cache),
+        },
+        "apk" => match path.split_once('/') {
+            Some(("wolfi", name)) => distro::wolfi(last_seg(name), net, cache),
+            Some((_, name)) => distro::alpine(last_seg(name), net, cache),
+            None => distro::alpine(&path, net, cache),
+        },
         _ => None,
     }
 }
