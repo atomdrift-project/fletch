@@ -106,7 +106,10 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // Browser extensions: `pkg:chrome/<extension-id>`. The store's risk
         // signals (reach, rating, recency, the developer's own description of
         // what it harvests) live on the listing, not in a manifest.
-        "chrome" => chrome(path.rsplit('/').next().unwrap_or(&path), net, cache),
+        // `chrome-extension` is the ratified purl-spec spelling of the same type.
+        "chrome" | "chrome-extension" => {
+            chrome(path.rsplit('/').next().unwrap_or(&path), net, cache)
+        }
         // VS Code / editor extensions: `pkg:openvsx/<namespace>/<name>`. Open
         // VSX exposes a clean JSON API, so no scraping — the same marketplace
         // shape (rating, downloads, publisher, recency) as the Chrome store.
@@ -117,9 +120,8 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         "vscode" => vscode(&path, net, cache),
         // Spec-form aliases (purl-spec / common practice) for the same registries,
         // so a PURL generated per spec fetches identically to our legacy spelling.
-        // `chrome-extension` and `vscode-extension` are the ratified types; the
-        // OS types carry the distro in the namespace (`pkg:deb/debian/curl`).
-        "chrome-extension" => chrome(path.rsplit('/').next().unwrap_or(&path), net, cache),
+        // `vscode-extension` is the ratified type; the OS types carry the distro
+        // in the namespace (`pkg:deb/debian/curl`).
         // vscode-extension covers both stores; Open VSX is flagged by the
         // `repository_url` qualifier (dropped by parse_purl, so read off the raw).
         "vscode-extension" => {
