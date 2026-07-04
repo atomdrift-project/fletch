@@ -36,7 +36,7 @@ pub(crate) const META_TTL_PINNED: Duration = Duration::MAX;
 pub(crate) const META_TTL_UNPINNED: Duration = TTL_UNPINNED;
 /// Default per-fetch byte ceiling — a single response is abandoned past this
 /// unless [`set_max_fetch_bytes`] adjusts it for the process.
-pub const DEFAULT_MAX_FETCH_BYTES: u64 = 40 * 1024 * 1024;
+pub const DEFAULT_MAX_FETCH_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Process-wide per-fetch byte ceiling. Fetching is process-global (one
 /// invocation, one policy), so the limit lives in a single atomic set once at
