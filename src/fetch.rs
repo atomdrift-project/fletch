@@ -684,6 +684,26 @@ pub fn fetch_references(
     cache: &BlobCache,
     budget: FetchBudget,
 ) -> Vec<FetchRecord> {
+    fetch_references_with(refs, source_sha256, fetch_urls, net, cache, budget, &|_, _| {})
+}
+
+/// [`fetch_references`] with a per-completion callback. `on_fetched` fires once
+/// for each target the moment its fetch resolves — from whichever pool worker
+/// handled it, so it is invoked concurrently and must be `Sync`. It receives the
+/// original reference (the caller's own key, before any locator refinement) and
+/// the freshly built record, letting a caller drive live progress as each
+/// download lands rather than only after the whole batch returns. Budget-clipped
+/// targets never fetch, so the callback never fires for them; they surface only
+/// in the returned `BudgetExceeded` edges.
+pub fn fetch_references_with(
+    refs: &[Reference],
+    source_sha256: &str,
+    fetch_urls: bool,
+    net: &(dyn Fetch + Sync),
+    cache: &BlobCache,
+    budget: FetchBudget,
+    on_fetched: &(dyn Fn(&Reference, &FetchRecord) + Sync),
+) -> Vec<FetchRecord> {
     // Selectable references, in declaration order. Every target is visited; the
     // caps are enforced live below — the byte cap stops the sweep, the count cap
     // gates only *network* fetches (cache hits are always served, never counted).
@@ -731,6 +751,11 @@ pub fn fetch_references(
                                     .is_ok()
                             });
                             bytes_used.fetch_add(rec.size.unwrap_or(0), Ordering::Relaxed);
+                            // Signal completion before the record is buffered, so
+                            // a live progress view advances as each fetch lands
+                            // instead of all at once when the batch returns. Keyed
+                            // on the original reference (pre-refinement locator).
+                            on_fetched(targets[i], &rec);
                             local.push((i, rec));
                         }
                         local
