@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use filefacts::{HashAlgo, PinnedHash, RefLocator, Reference};
+use filefacts::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 
@@ -26,14 +26,57 @@ const TTL_PINNED: Duration = Duration::from_secs(7 * 24 * 3600);
 /// move, so staleness is bounded.
 const TTL_UNPINNED: Duration = Duration::from_secs(12 * 3600);
 
-/// Registry-*metadata* cache lifetimes, distinct from the artifact TTLs above
-/// and selected by [`registry`](crate::registry::registry) per PURL. A versioned
-/// PURL names an immutable release — its facts (publish date, author, size)
-/// never change, so cache them indefinitely. A versionless PURL tracks a moving
-/// target (`latest`/dist-tags, download counts), so bound staleness to the
-/// unpinned TTL.
-pub(crate) const META_TTL_PINNED: Duration = Duration::MAX;
-pub(crate) const META_TTL_UNPINNED: Duration = TTL_UNPINNED;
+/// Registry-*metadata* cache lifetimes, distinct from the artifact TTLs above.
+/// Keyed on the *resource's* mutability, not whether the PURL named a version:
+///
+/// - **Immutable** — a published version's file list (URLs, hashes, upload time)
+///   and content-addressed data never change, so cache them forever. This is the
+///   version-specific endpoint a download-URL resolution reads.
+/// - **Pinned** — the package-level *packument* behind a versioned lookup. The
+///   version's own facts are stable, but its yank status can flip after publish
+///   (and new siblings appear), so bound staleness to a few hours.
+/// - **Unpinned** — a `latest`/versionless lookup moves with every release, so a
+///   tighter bound.
+///
+/// The two mutable tiers are overridable per process via [`set_registry_ttl`];
+/// the immutable tier is never re-checked.
+pub(crate) const META_TTL_IMMUTABLE: Duration = Duration::MAX;
+const META_TTL_PINNED_DEFAULT: Duration = Duration::from_secs(4 * 3600);
+const META_TTL_UNPINNED_DEFAULT: Duration = Duration::from_secs(3600);
+
+/// Process-wide override for the two mutable metadata TTLs, in seconds. `0` means
+/// "unset" — the tiered defaults ([`META_TTL_PINNED_DEFAULT`]/
+/// [`META_TTL_UNPINNED_DEFAULT`]) apply. Any other value collapses both mutable
+/// tiers to that lifetime, so a large value effectively caches indefinitely
+/// (offline/air-gapped) and a small one revalidates aggressively.
+static REGISTRY_TTL_OVERRIDE_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Override both mutable registry-metadata TTLs for the process. `None` clears
+/// the override (the 4h-pinned / 1h-unpinned defaults resume). Call once at
+/// startup, before any registry lookup. The immutable tier is unaffected — a
+/// released version's file list is never re-fetched regardless.
+pub fn set_registry_ttl(ttl: Option<Duration>) {
+    let secs = ttl.map_or(0, |d| d.as_secs().max(1));
+    REGISTRY_TTL_OVERRIDE_SECS.store(secs, Ordering::Relaxed);
+}
+
+/// Metadata TTL for a pinned (versioned) lookup's mutable packument.
+#[must_use]
+pub(crate) fn meta_ttl_pinned() -> Duration {
+    match REGISTRY_TTL_OVERRIDE_SECS.load(Ordering::Relaxed) {
+        0 => META_TTL_PINNED_DEFAULT,
+        secs => Duration::from_secs(secs),
+    }
+}
+
+/// Metadata TTL for an unpinned (`latest`/versionless) lookup.
+#[must_use]
+pub(crate) fn meta_ttl_unpinned() -> Duration {
+    match REGISTRY_TTL_OVERRIDE_SECS.load(Ordering::Relaxed) {
+        0 => META_TTL_UNPINNED_DEFAULT,
+        secs => Duration::from_secs(secs),
+    }
+}
 /// Default per-fetch byte ceiling — a single response is abandoned past this
 /// unless [`set_max_fetch_bytes`] adjusts it for the process.
 pub const DEFAULT_MAX_FETCH_BYTES: u64 = 256 * 1024 * 1024;
@@ -567,7 +610,7 @@ fn fetch_ref_inner(
     // Resolution may refine the locator: a versionless npm PURL (a manifest
     // range/tag) becomes the concrete `name@<resolved>` it currently points at,
     // so the cache key and the recorded edge name the version actually fetched.
-    let Some((locator, url)) = resolved_target(&r.locator, net) else {
+    let Some((locator, url)) = resolved_target(&r.locator, net, cache) else {
         return FetchRecord::terminal(locator, Outcome::Unresolved);
     };
 
@@ -786,14 +829,22 @@ pub fn fetch_references_with(
     records
 }
 
-/// Whether a reference should be fetched: a fetch target whose locator is a
-/// package (always) or a raw URL (only with `fetch_urls`).
+/// Whether a reference should be fetched: a fetch target whose locator resolves
+/// to fetchable bytes. A package coordinate (PURL) is always fetched. A raw URL
+/// is fetched when it *is* a declared dependency or a commanded package — a
+/// PKGBUILD `source=()`, a lockfile URL entry — since those are genuine
+/// dependencies that merely lack a package coordinate, so they follow the
+/// deps/packages policy the caller already applied by [`RefKind`]. Only an
+/// opportunistic [`RefKind::UrlFetch`] (a script's `curl`/`wget`) is gated
+/// behind `fetch_urls`. An intra-artifact path is resolved against sibling
+/// files, not fetched.
 fn selected(r: &Reference, fetch_urls: bool) -> bool {
     r.is_fetch_target()
         && match r.locator {
             RefLocator::Purl(_) => true,
-            RefLocator::Url(_) => fetch_urls,
-            // An intra-artifact path is resolved against sibling files, not fetched.
+            RefLocator::Url(_) => {
+                matches!(r.kind, RefKind::Dependency | RefKind::Command) || fetch_urls
+            }
             RefLocator::Path(_) => false,
         }
 }
@@ -920,7 +971,11 @@ fn resolve_purl(purl: &str) -> Option<String> {
 /// (a manifest range/tag) is *refined* to the concrete `name@version` it
 /// currently points at — that refined locator is returned so it keys the cache
 /// and names the fetch edge. `None` when the ecosystem can't be resolved.
-fn resolved_target(locator: &RefLocator, net: &dyn Fetch) -> Option<(String, String)> {
+fn resolved_target(
+    locator: &RefLocator,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<(String, String)> {
     if let RefLocator::Purl(p) = locator
         && let Some(body) = p.strip_prefix("pkg:")
         && let Some((ty, rest)) = body.split_once('/')
@@ -946,7 +1001,9 @@ fn resolved_target(locator: &RefLocator, net: &dyn Fetch) -> Option<(String, Str
             // what every download API actually wants.
             let (version, kind) = split_version_kind(version);
             match ty {
-                "pypi" => return resolve_pypi(path, version, kind, net).map(|u| (p.clone(), u)),
+                "pypi" => {
+                    return resolve_pypi(path, version, kind, net, cache).map(|u| (p.clone(), u));
+                }
                 "composer" => return resolve_composer(path, version, net).map(|u| (p.clone(), u)),
                 _ => {}
             }
@@ -1007,10 +1064,22 @@ fn split_version_kind(version: &str) -> (&str, Option<&str>) {
 /// `pyproject.toml` — the install-hook attack surface), and `?kind=wheel` is the
 /// default's explicit form. Whichever is preferred, the other is the fallback so
 /// a package that ships only one kind still resolves.
-fn resolve_pypi(name: &str, version: &str, kind: Option<&str>, net: &dyn Fetch) -> Option<String> {
+fn resolve_pypi(
+    name: &str,
+    version: &str,
+    kind: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<String> {
     let api = format!("https://pypi.org/pypi/{name}/{version}/json");
-    let resp = net.get(&api).ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&resp.bytes).ok()?;
+    // A published version's file list is immutable, so cache it forever rather
+    // than re-fetching on every scan. Resolution reads only the download URL,
+    // which never changes — unlike the package-level packument `registry()`
+    // reads, this endpoint carries no mutable yank/latest fields. Without this a
+    // warm scan of a cached artifact still pays a pypi.org round-trip just to
+    // re-derive the download URL.
+    let bytes = cached_metadata(&api, net, &cache.with_meta_ttl(META_TTL_IMMUTABLE))?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let urls = json.get("urls")?.as_array()?;
     let pick = match kind {
         // Explicit source-distribution request: sdist first, wheel as fallback.
@@ -1567,14 +1636,28 @@ mod tests {
         let net = Fixtures::default().with(api, body);
         let wheel = "https://files.pythonhosted.org/w/requests-2.28.1-py3-none-any.whl".to_string();
         let sdist = "https://files.pythonhosted.org/s/requests-2.28.1.tar.gz".to_string();
+        // A disabled cache forces the fixture fetch, keeping the test hermetic.
+        let cache = BlobCache::disabled();
         // Default: wheel-first, mirroring `pip install`.
-        assert_eq!(resolve_pypi("requests", "2.28.1", None, &net), Some(wheel.clone()));
+        assert_eq!(
+            resolve_pypi("requests", "2.28.1", None, &net, &cache),
+            Some(wheel.clone())
+        );
         // `?kind=wheel` is the default's explicit form.
-        assert_eq!(resolve_pypi("requests", "2.28.1", Some("wheel"), &net), Some(wheel));
+        assert_eq!(
+            resolve_pypi("requests", "2.28.1", Some("wheel"), &net, &cache),
+            Some(wheel)
+        );
         // `?kind=sdist` flips to the source distribution.
-        assert_eq!(resolve_pypi("requests", "2.28.1", Some("sdist"), &net), Some(sdist));
+        assert_eq!(
+            resolve_pypi("requests", "2.28.1", Some("sdist"), &net, &cache),
+            Some(sdist)
+        );
         // No fixture (registry unreachable / unknown package) → unresolved.
-        assert_eq!(resolve_pypi("nope", "9.9.9", None, &Fixtures::default()), None);
+        assert_eq!(
+            resolve_pypi("nope", "9.9.9", None, &Fixtures::default(), &cache),
+            None
+        );
     }
 
     #[test]
@@ -1588,8 +1671,9 @@ mod tests {
             {"packagetype":"sdist","filename":"widget-1.0.0.tar.gz","url":"https://x/widget.tar.gz"}
         ]}"#;
         let net = Fixtures::default().with(api, body);
+        let cache = BlobCache::disabled();
         assert_eq!(
-            resolve_pypi("widget", "1.0.0", None, &net),
+            resolve_pypi("widget", "1.0.0", None, &net, &cache),
             Some("https://x/universal.whl".to_string())
         );
 
@@ -1598,7 +1682,7 @@ mod tests {
         let sbody = br#"{"urls":[{"packagetype":"sdist","filename":"srconly-1.0.0.tar.gz","url":"https://x/src.tar.gz"}]}"#;
         let net = Fixtures::default().with(sonly, sbody);
         assert_eq!(
-            resolve_pypi("srconly", "1.0.0", None, &net),
+            resolve_pypi("srconly", "1.0.0", None, &net, &cache),
             Some("https://x/src.tar.gz".to_string())
         );
 
@@ -1607,7 +1691,7 @@ mod tests {
         let wbody = br#"{"urls":[{"packagetype":"bdist_wheel","filename":"wheelonly-1.0.0-py3-none-any.whl","url":"https://x/w.whl"}]}"#;
         let net = Fixtures::default().with(wonly, wbody);
         assert_eq!(
-            resolve_pypi("wheelonly", "1.0.0", Some("sdist"), &net),
+            resolve_pypi("wheelonly", "1.0.0", Some("sdist"), &net, &cache),
             Some("https://x/w.whl".to_string())
         );
     }
@@ -1696,6 +1780,36 @@ mod tests {
             pinned_hash: pin,
             content_sha256: None,
         }
+    }
+
+    #[test]
+    fn selected_gates_urls_by_kind_not_just_locator() {
+        let with_kind = |locator: RefLocator, kind: RefKind| Reference {
+            locator,
+            kind,
+            source: "test".into(),
+            evidence: "test".into(),
+            offset: 0,
+            pinned_hash: None,
+            content_sha256: None,
+        };
+        let url = || RefLocator::Url("https://example.com/x.tar.gz".into());
+        let purl = || RefLocator::Purl("pkg:npm/left-pad@1.3.0".into());
+
+        // A declared dependency or a commanded package expressed as a raw URL (a
+        // PKGBUILD `source=()`, a lockfile URL entry) is a genuine fetch target
+        // regardless of `fetch_urls` — it follows the deps/packages policy.
+        assert!(selected(&with_kind(url(), RefKind::Dependency), false));
+        assert!(selected(&with_kind(url(), RefKind::Command), false));
+
+        // An opportunistic URL fetch (a script's curl/wget) stays behind the flag.
+        assert!(!selected(&with_kind(url(), RefKind::UrlFetch), false));
+        assert!(selected(&with_kind(url(), RefKind::UrlFetch), true));
+
+        // A package coordinate is always fetched; a repository is identity — its
+        // non-fetch-target kind short-circuits `selected` before the locator.
+        assert!(selected(&with_kind(purl(), RefKind::Dependency), false));
+        assert!(!selected(&with_kind(url(), RefKind::Repository), true));
     }
 
     #[test]

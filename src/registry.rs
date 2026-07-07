@@ -37,14 +37,18 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         return None;
     };
     let (ty, path, version) = parse_purl(purl)?;
-    // A versioned PURL is an immutable release — cache its metadata forever; a
-    // versionless one tracks a moving tag, so bound staleness to the unpinned
-    // window. Selected here, the one place that knows the PURL's version-ness,
-    // and carried on the cache rather than threaded through every ecosystem fn.
+    // This reads the package-level *packument*, which is mutable even for a
+    // versioned PURL: a release can be yanked after publish and new siblings
+    // appear. So bound staleness — a few hours for a pinned version (its facts
+    // are near-stable), tighter for a versionless lookup that tracks a moving
+    // `latest`. The truly immutable per-version file list is cached forever
+    // separately, at download-URL resolution. Selected here, the one place that
+    // knows the PURL's version-ness, and carried on the cache rather than
+    // threaded through every ecosystem fn.
     let cache = &cache.with_meta_ttl(if version.is_some() {
-        crate::fetch::META_TTL_PINNED
+        crate::fetch::meta_ttl_pinned()
     } else {
-        crate::fetch::META_TTL_UNPINNED
+        crate::fetch::meta_ttl_unpinned()
     });
     let version = version.as_deref();
     match ty.as_str() {
