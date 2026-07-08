@@ -20,8 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use serde::Serialize;
 
-use fletch::Registry;
 use fletch::RefLocator;
+use fletch::Registry;
 use fletch::fetch::{BlobCache, HttpFetch, RecordedSource};
 
 /// The CLI envelope: the normalized record scan consumes, alongside the raw

@@ -65,6 +65,9 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // common shape.
         "nuget" => nuget(&path, version, net, cache),
         "maven" => maven(&path, version, net, cache),
+        // Hugging Face model repos: `owner/model` (or a canonical bare `model`),
+        // the attacker-reachable half of the ML supply chain forager mirrors.
+        "huggingface" => huggingface(&path, version, net, cache),
         "hex" => hex_pm(&path, version, net, cache),
         "cran" => cran(last_seg(&path), net, cache),
         "cpan" => cpan(last_seg(&path), net, cache),
@@ -79,10 +82,16 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // the last path segment (any vendor namespace is dropped).
         "arch" => arch(last_seg(&path), net, cache),
         "fedora" => fedora(last_seg(&path), net, cache),
-        // The AUR is the user-contributed, attacker-reachable half of Arch.
-        // `pkg:alpm` (the SBOM-standard spelling) routes by namespace: an `aur`
-        // namespace to the AUR RPC, any other (official repo) to archlinux.org.
+        // The AUR is the user-contributed, attacker-reachable half of Arch. Three
+        // spellings reach it: the bare `pkg:aur/<name>` legacy type; the
+        // spec-compliant `pkg:alpm/arch/<name>?repository_url=https://aur.archlinux.org`,
+        // which keeps the `arch` vendor in the namespace (where the spec puts the
+        // vendor) and names the AUR in a qualifier; and the older `pkg:alpm/aur/<name>`,
+        // which put `aur` in the namespace slot. All route to the AUR RPC; any other
+        // alpm namespace is an official repo. The qualifier is stripped from `path`,
+        // so the spec form is detected on the raw purl.
         "aur" => aur(last_seg(&path), net, cache),
+        "alpm" if purl.contains("aur.archlinux.org") => aur(last_seg(&path), net, cache),
         "alpm" => match path.split_once('/') {
             Some(("aur", name)) => aur(name, net, cache),
             Some((_, name)) => arch(name, net, cache),
@@ -183,16 +192,16 @@ pub fn registry_with_sources(
 fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
     let body = purl.strip_prefix("pkg:")?;
     let (ty, rest) = body.split_once('/')?;
+    // A registry record is the same whichever artifact a PURL's `?qualifiers`
+    // select (`?kind=wheel`, `?repository_url=…`), so drop them up front. Splitting
+    // qualifiers off before the version keeps a versionless PURL from gluing the
+    // qualifier onto the name, and a qualifier value that itself contains `@` (a URL
+    // with userinfo) from corrupting the version. Qualifiers a lookup *does* need
+    // (the AUR's `repository_url`) are read off the raw purl, not here.
+    let rest = rest.split_once('?').map_or(rest, |(bare, _)| bare);
     let (path, version) = rest
         .rsplit_once('@')
         .map_or((rest, None), |(p, v)| (p, Some(v.to_string())));
-    // A registry record is the same whichever artifact a PURL `?qualifiers`
-    // string selects (e.g. `?kind=wheel`), so drop it — a query string glued to
-    // the version would otherwise corrupt the metadata API URL.
-    let version = version.map(|v| match v.split_once('?') {
-        Some((bare, _)) => bare.to_string(),
-        None => v,
-    });
     Some((ty.to_string(), path.to_string(), version))
 }
 
@@ -254,8 +263,7 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         // description is exactly `security holding package`. That tombstone is
         // the registry's own verdict — surface it.
         security_hold: Some(
-            doc.get("description").and_then(Value::as_str)
-                == Some("security holding package"),
+            doc.get("description").and_then(Value::as_str) == Some("security holding package"),
         ),
         // An unpublished version keeps its `time` entry (and npm records a
         // `time.unpublished` block) but loses its `versions` object. A live
@@ -324,11 +332,13 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         v.get("hasInstallScript")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            || v.get("scripts").and_then(Value::as_object).is_some_and(|s| {
-                s.contains_key("install")
-                    || s.contains_key("preinstall")
-                    || s.contains_key("postinstall")
-            })
+            || v.get("scripts")
+                .and_then(Value::as_object)
+                .is_some_and(|s| {
+                    s.contains_key("install")
+                        || s.contains_key("preinstall")
+                        || s.contains_key("postinstall")
+                })
     });
 
     // Best-effort popularity: last-month downloads from the stats endpoint.
@@ -435,9 +445,12 @@ fn crates(
 /// own publish time and yank status come from its `releases` entry; identity
 /// text falls back to the latest release's `info`.
 fn pypi(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value =
-        serde_json::from_slice(&cached_metadata(&format!("https://pypi.org/pypi/{path}/json"), net, cache)?)
-            .ok()?;
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://pypi.org/pypi/{path}/json"),
+        net,
+        cache,
+    )?)
+    .ok()?;
     let info = doc.get("info")?;
     let releases = doc.get("releases").and_then(Value::as_object);
 
@@ -1030,7 +1043,9 @@ fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
             .pointer("/publisher/publisherName")
             .and_then(Value::as_str)
             .map(str::to_string),
-        publisher_verified: ext.pointer("/publisher/isDomainVerified").and_then(Value::as_bool),
+        publisher_verified: ext
+            .pointer("/publisher/isDomainVerified")
+            .and_then(Value::as_bool),
         title: ext
             .get("displayName")
             .and_then(Value::as_str)
@@ -1794,6 +1809,74 @@ fn wordpress(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry>
     })
 }
 
+/// Hugging Face Hub model repository: the models API carries the author, creation
+/// and last-modified times, a rolling 30-day download count, and the like count —
+/// the same popularity/custody shape as the other marketplaces. `path` is
+/// `owner/model` (or a canonical bare `model`); `version` is a git revision.
+fn huggingface(
+    path: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://huggingface.co/api/models/{path}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+
+    let id = doc.get("id").and_then(Value::as_str).unwrap_or(path);
+    Some(Registry {
+        ecosystem: "huggingface".into(),
+        name: id.to_string(),
+        // No version in the locator → the current default-branch commit.
+        version: version
+            .map(str::to_string)
+            .or_else(|| doc.get("sha").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default(),
+        // `lastModified` is the latest commit's time; `createdAt` is the repo's
+        // birth — a long-dormant model that suddenly ships again is the hijack tell.
+        published_at: doc
+            .get("lastModified")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
+        first_published_at: doc
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
+        author: doc
+            .get("author")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        homepage: Some(format!("https://huggingface.co/{id}")),
+        license: hf_license(&doc),
+        // HF's `downloads` is a rolling 30-day count, not a lifetime total.
+        downloads_recent: doc.get("downloads").and_then(Value::as_u64),
+        // `likes` are the popularity/vote signal, like AUR's NumVotes.
+        rating_count: doc.get("likes").and_then(Value::as_u64),
+        ..Default::default()
+    })
+}
+
+/// Hugging Face exposes a model's license as a top-level field, under `cardData`,
+/// or as a `license:<id>` tag — try them in that order.
+fn hf_license(doc: &Value) -> Option<String> {
+    if let Some(l) = doc.get("license").and_then(Value::as_str) {
+        return Some(l.to_string());
+    }
+    if let Some(l) = doc.pointer("/cardData/license").and_then(Value::as_str) {
+        return Some(l.to_string());
+    }
+    doc.get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find_map(|t| t.strip_prefix("license:"))
+        .map(str::to_string)
+}
+
 /// Firefox Add-ons (addons.mozilla.org v5): the same marketplace shape as the
 /// Chrome and VS Code stores — localized name/summary, rating, weekly installs,
 /// and the current version with its review date.
@@ -1824,7 +1907,10 @@ fn firefox(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
             .or_else(|| doc.get("last_updated").and_then(Value::as_str))
             .and_then(parse_ts),
         // `created` is the add-on's first listing — the package-age signal.
-        first_published_at: doc.get("created").and_then(Value::as_str).and_then(parse_ts),
+        first_published_at: doc
+            .get("created")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
         author: doc
             .pointer("/authors/0/name")
             .and_then(Value::as_str)
@@ -2385,10 +2471,23 @@ mod tests {
         })
         .to_string();
         let net = Fixtures::default().with("https://registry.npmjs.org/evilpkg", stub.as_bytes());
-        let p = npm("evilpkg", Some("0.0.1-security"), &net, &BlobCache::disabled())
-            .expect("provenance");
-        assert_eq!(p.security_hold, Some(true), "npm tombstone description detected");
-        assert_eq!(p.maintainers, Some(0), "null maintainers recorded as zero, not unknown");
+        let p = npm(
+            "evilpkg",
+            Some("0.0.1-security"),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("provenance");
+        assert_eq!(
+            p.security_hold,
+            Some(true),
+            "npm tombstone description detected"
+        );
+        assert_eq!(
+            p.maintainers,
+            Some(0),
+            "null maintainers recorded as zero, not unknown"
+        );
         assert_eq!(p.version_removed, Some(false), "stub version still listed");
     }
 
@@ -2409,9 +2508,16 @@ mod tests {
         .to_string();
         let net = Fixtures::default().with("https://registry.npmjs.org/evilpkg", doc.as_bytes());
         let p = npm("evilpkg", Some("1.0.0"), &net, &BlobCache::disabled()).expect("provenance");
-        assert_eq!(p.version_removed, Some(true), "in `time`, gone from `versions` => removed");
+        assert_eq!(
+            p.version_removed,
+            Some(true),
+            "in `time`, gone from `versions` => removed"
+        );
         // The surviving timestamp still gives us the publish date / age signals.
-        assert_eq!(p.published_at, parse_rfc3339_secs("2026-06-22T00:00:00.000Z"));
+        assert_eq!(
+            p.published_at,
+            parse_rfc3339_secs("2026-06-22T00:00:00.000Z")
+        );
     }
 
     #[test]
@@ -2636,7 +2742,10 @@ mod tests {
         assert!(r.first_published_at.is_some());
         assert_eq!(r.release_count, Some(3));
         assert_eq!(r.release_times.len(), 3);
-        assert_eq!(r.previous_published_at, parse_rfc3339_secs("2026-06-20T09:30:32.957Z"));
+        assert_eq!(
+            r.previous_published_at,
+            parse_rfc3339_secs("2026-06-20T09:30:32.957Z")
+        );
     }
 
     #[test]
@@ -3030,6 +3139,36 @@ mod tests {
     }
 
     #[test]
+    fn huggingface_model_normalizes() {
+        // No version in the locator → the record carries the current commit sha;
+        // `downloads` maps to the 30-day recent count and `likes` to rating_count.
+        let doc = serde_json::json!({
+            "id": "microsoft/resnet-50", "author": "microsoft", "sha": "abc123def",
+            "createdAt": "2022-03-16T10:00:00.000Z", "lastModified": "2023-04-23T10:00:00.000Z",
+            "downloads": 1_234_567u64, "likes": 89u64, "license": "apache-2.0"
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://huggingface.co/api/models/microsoft/resnet-50",
+            doc.as_bytes(),
+        );
+        let r = registry(
+            &RefLocator::Purl("pkg:huggingface/microsoft/resnet-50".into()),
+            &net,
+            &test_cache("huggingface"),
+        )
+        .expect("huggingface registry");
+        assert_eq!(r.ecosystem, "huggingface");
+        assert_eq!(r.name, "microsoft/resnet-50");
+        assert_eq!(r.version, "abc123def");
+        assert_eq!(r.author.as_deref(), Some("microsoft"));
+        assert_eq!(r.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(r.downloads_recent, Some(1_234_567));
+        assert_eq!(r.rating_count, Some(89));
+        assert_eq!(r.first_published_at, Some(1_647_424_800)); // createdAt
+    }
+
+    #[test]
     fn wordpress_plugin_normalizes() {
         let doc = serde_json::json!({
             "name": "Akismet Anti-spam", "slug": "akismet", "version": "5.7",
@@ -3102,7 +3241,10 @@ mod tests {
         assert_eq!(r.downloads_total, Some(8_000_000)); // average_daily_users
         assert_eq!(r.maintainers, Some(2)); // two authors
         assert_eq!(r.release_count, Some(3));
-        assert_eq!(r.previous_published_at, parse_rfc3339_secs("2021-04-20T10:00:00Z"));
+        assert_eq!(
+            r.previous_published_at,
+            parse_rfc3339_secs("2021-04-20T10:00:00Z")
+        );
     }
 
     #[test]
@@ -3142,7 +3284,9 @@ mod tests {
 
     #[test]
     fn alpm_namespace_routes_aur_vs_official() {
-        // `pkg:alpm/aur/<name>` → AUR RPC; any other namespace → official repos.
+        // Both the legacy `pkg:alpm/aur/<name>` and the spec-compliant
+        // `pkg:alpm/arch/<name>?repository_url=…aur.archlinux.org` → AUR RPC; any
+        // other namespace → official repos.
         let aur_rpc = serde_json::json!({
             "resultcount": 1,
             "results": [{"Name": "yay", "Version": "12.0.0-1", "Maintainer": "jverify",
@@ -3167,6 +3311,15 @@ mod tests {
         let from_aur = registry(&RefLocator::Purl("pkg:alpm/aur/yay".into()), &net, &cache)
             .expect("aur registry");
         assert_eq!(from_aur.ecosystem, "aur");
+        // Spec-compliant form: arch vendor in the namespace, AUR named in a
+        // repository_url qualifier — still routes to the AUR RPC.
+        let from_spec = registry(
+            &RefLocator::Purl("pkg:alpm/arch/yay?repository_url=https://aur.archlinux.org".into()),
+            &net,
+            &cache,
+        )
+        .expect("aur spec registry");
+        assert_eq!(from_spec.ecosystem, "aur");
         let from_official = registry(
             &RefLocator::Purl("pkg:alpm/core/pacman".into()),
             &net,

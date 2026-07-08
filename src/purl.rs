@@ -144,7 +144,10 @@ fn maven(path: &str) -> Option<String> {
     if group.is_empty() {
         return None;
     }
-    Some(format!("pkg:maven/{}/{artifact}@{version}", group.join(".")))
+    Some(format!(
+        "pkg:maven/{}/{artifact}@{version}",
+        group.join(".")
+    ))
 }
 
 /// GitHub source archive: `{owner}/{repo}/{tar.gz|zip}/{ref}`.
@@ -153,8 +156,7 @@ fn github(path: &str) -> Option<String> {
     let [owner, repo, kind, reference, ..] = segs.as_slice() else {
         return None;
     };
-    matches!(*kind, "tar.gz" | "zip")
-        .then(|| format!("pkg:github/{owner}/{repo}@{reference}"))
+    matches!(*kind, "tar.gz" | "zip").then(|| format!("pkg:github/{owner}/{repo}@{reference}"))
 }
 
 /// Reverse [`fetch::goproxy_escape`](crate::fetch): `!x` → uppercase `X`.
@@ -300,10 +302,8 @@ mod tests {
     #[test]
     fn go_proxy_uppercase_escape_reversed() {
         assert_eq!(
-            url_to_purl(
-                "https://proxy.golang.org/github.com/!burnt!sushi/toml/@v/v1.0.0.zip"
-            )
-            .as_deref(),
+            url_to_purl("https://proxy.golang.org/github.com/!burnt!sushi/toml/@v/v1.0.0.zip")
+                .as_deref(),
             Some("pkg:golang/github.com/BurntSushi/toml@v1.0.0"),
         );
         // Metadata fetches (.mod/.info) are not package artifacts.
@@ -322,7 +322,13 @@ mod tests {
             None,
         );
         assert_eq!(url_to_purl("https://example.com/whatever.tgz"), None);
-        assert_eq!(url_to_purl("ftp://registry.npmjs.org/x/-/x-1.0.0.tgz"), None);
-        assert_eq!(url_to_purl("https://registry.npmjs.org/no-artifact-here"), None);
+        assert_eq!(
+            url_to_purl("ftp://registry.npmjs.org/x/-/x-1.0.0.tgz"),
+            None
+        );
+        assert_eq!(
+            url_to_purl("https://registry.npmjs.org/no-artifact-here"),
+            None
+        );
     }
 }

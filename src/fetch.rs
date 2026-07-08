@@ -585,7 +585,11 @@ pub fn fetch_ref(r: &Reference, net: &dyn Fetch, cache: &BlobCache) -> FetchReco
 /// a re-run over a warm cache is never throttled.
 #[must_use]
 pub fn counts_against_budget(rec: &FetchRecord) -> bool {
-    !rec.cached && matches!(rec.outcome, Outcome::Ok | Outcome::PinMismatch | Outcome::Failed(_))
+    !rec.cached
+        && matches!(
+            rec.outcome,
+            Outcome::Ok | Outcome::PinMismatch | Outcome::Failed(_)
+        )
 }
 
 /// [`fetch_ref`], with a `claim_fetch` gate consulted **only on a cache miss**,
@@ -727,7 +731,15 @@ pub fn fetch_references(
     cache: &BlobCache,
     budget: FetchBudget,
 ) -> Vec<FetchRecord> {
-    fetch_references_with(refs, source_sha256, fetch_urls, net, cache, budget, &|_, _| {})
+    fetch_references_with(
+        refs,
+        source_sha256,
+        fetch_urls,
+        net,
+        cache,
+        budget,
+        &|_, _| {},
+    )
 }
 
 /// [`fetch_references`] with a per-completion callback. `on_fetched` fires once
@@ -751,7 +763,11 @@ pub fn fetch_references_with(
     // caps are enforced live below — the byte cap stops the sweep, the count cap
     // gates only *network* fetches (cache hits are always served, never counted).
     let targets: Vec<&Reference> = refs.iter().filter(|r| selected(r, fetch_urls)).collect();
-    let fetch_n = if budget.max_bytes == 0 { 0 } else { targets.len() };
+    let fetch_n = if budget.max_bytes == 0 {
+        0
+    } else {
+        targets.len()
+    };
 
     // Sweep targets[0..fetch_n] across a bounded thread pool. Each worker pulls
     // the next index from a shared cursor and stops once the byte budget is
@@ -786,11 +802,9 @@ pub fn fetch_references_with(
                             // is an exact ceiling, not best-effort.
                             let rec = fetch_ref_inner(targets[i], net, cache, || {
                                 net_used
-                                    .fetch_update(
-                                        Ordering::Relaxed,
-                                        Ordering::Relaxed,
-                                        |n| (n < budget.max_count).then_some(n + 1),
-                                    )
+                                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                        (n < budget.max_count).then_some(n + 1)
+                                    })
                                     .is_ok()
                             });
                             bytes_used.fetch_add(rec.size.unwrap_or(0), Ordering::Relaxed);
@@ -1699,8 +1713,14 @@ mod tests {
     #[test]
     fn split_version_kind_parses_purl_qualifiers() {
         assert_eq!(split_version_kind("1.2.3"), ("1.2.3", None));
-        assert_eq!(split_version_kind("1.2.3?kind=wheel"), ("1.2.3", Some("wheel")));
-        assert_eq!(split_version_kind("1.2.3?kind=sdist"), ("1.2.3", Some("sdist")));
+        assert_eq!(
+            split_version_kind("1.2.3?kind=wheel"),
+            ("1.2.3", Some("wheel"))
+        );
+        assert_eq!(
+            split_version_kind("1.2.3?kind=sdist"),
+            ("1.2.3", Some("sdist"))
+        );
         // Other qualifiers are tolerated; `kind` is found regardless of order.
         assert_eq!(
             split_version_kind("1.2.3?foo=bar&kind=wheel"),
