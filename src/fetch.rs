@@ -205,6 +205,15 @@ pub struct FetchRecord {
     /// alongside `source_sha256`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_offset: Option<u64>,
+    /// The binding class of the declaring reference — how strongly the source
+    /// is tied to this content: a `dependency` declared in a manifest or
+    /// lockfile, a package named by an install `command`, or a raw
+    /// `url_fetch`. This is the trust statement a consumer groups by; a pinned
+    /// lockfile entry and a curl in a postinstall hook are different claims.
+    /// Stamped by [`fetch_ref`] / [`fetch_references`]; `undefined` on records
+    /// predating the field.
+    #[serde(default = "undefined_kind", skip_serializing_if = "kind_is_undefined")]
+    pub kind: RefKind,
     /// The reference's locator (PURL/URL) as emitted by filefacts.
     pub locator: String,
     /// The URL the locator resolved to. Empty when unresolved/skipped.
@@ -253,6 +262,7 @@ impl FetchRecord {
         Self {
             source_sha256: String::new(),
             source_offset: None,
+            kind: RefKind::Undefined,
             locator,
             resolved_url: String::new(),
             final_url: None,
@@ -273,6 +283,17 @@ impl FetchRecord {
 /// `skip_serializing_if` helper for a default-`false` flag.
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// `serde(default)` for [`FetchRecord::kind`] on records predating the field.
+fn undefined_kind() -> RefKind {
+    RefKind::Undefined
+}
+
+/// `skip_serializing_if` helper: an unclassified kind carries no information.
+#[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
+fn kind_is_undefined(k: &RefKind) -> bool {
+    *k == RefKind::Undefined
 }
 
 /// Cached provenance stored next to the bytes, so a cache hit reconstructs
@@ -576,7 +597,9 @@ pub(crate) fn cached_post(
 /// one reference. Never panics; every path yields a [`FetchRecord`].
 #[must_use]
 pub fn fetch_ref(r: &Reference, net: &dyn Fetch, cache: &BlobCache) -> FetchRecord {
-    fetch_ref_inner(r, net, cache, || true)
+    let mut rec = fetch_ref_inner(r, net, cache, || true);
+    rec.kind = r.kind;
+    rec
 }
 
 /// Whether a record represents a live network fetch — so it counts against the
@@ -838,6 +861,7 @@ pub fn fetch_references_with(
         });
         rec.source_sha256 = source_sha256.to_string();
         rec.source_offset = Some(r.offset);
+        rec.kind = r.kind;
         records.push(rec);
     }
     records
@@ -884,6 +908,7 @@ fn record(
     FetchRecord {
         source_sha256: String::new(),
         source_offset: None,
+        kind: r.kind,
         locator,
         resolved_url,
         final_url: Some(meta.final_url.clone()),
@@ -1941,12 +1966,23 @@ mod tests {
         );
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].locator, "pkg:npm/foo@1.0.0");
-        // Every edge is stamped with its source endpoint.
+        // Every edge is stamped with its source endpoint and binding class.
         assert_eq!(recs[0].source_sha256, "trigsha");
+        assert_eq!(recs[0].kind, RefKind::Dependency);
 
         // With fetch_urls: package + raw URL; the repository is never fetched.
         let recs = fetch_references(&refs, "trigsha", true, &net, &cache, FetchBudget::default());
         assert_eq!(recs.len(), 2);
+        // The raw URL's edge carries its own binding class, and it serializes
+        // (`kind` is how a consumer distinguishes a pinned lockfile entry from
+        // a curl in an install hook — the edge must say which claim it makes).
+        let url_rec = recs
+            .iter()
+            .find(|r| r.locator == raw_url)
+            .expect("raw URL edge");
+        assert_eq!(url_rec.kind, RefKind::UrlFetch);
+        let json = serde_json::to_value(url_rec).expect("serialize edge");
+        assert_eq!(json["kind"], serde_json::json!("url_fetch"));
 
         // A budget of one live fetch over a *cold* cache: exactly one ref is
         // fetched and the other is recorded as `BudgetExceeded`, never dropped.

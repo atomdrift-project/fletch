@@ -584,7 +584,6 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.2.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#617540d2cc3432394a0c80f85ad38d967d5d506d"
 dependencies = [
  "aho-corasick",
  "cfb",
@@ -695,6 +694,7 @@ dependencies = [
  "hex",
  "lzma-rs",
  "reqwest",
+ "roxmltree",
  "serde",
  "serde_json",
  "sha2",
@@ -2563,7 +2563,6 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://codeberg.org/atomdrift/filefacts.git#617540d2cc3432394a0c80f85ad38d967d5d506d"
 dependencies = [
  "cc",
  "tree-sitter",

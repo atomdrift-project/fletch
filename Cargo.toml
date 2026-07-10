@@ -79,6 +79,7 @@ zstd = "0.13"
 # system liblzma/zlib linkage. zstd (above) covers the third index codec.
 flate2 = "1"
 lzma-rs = "0.3"
+roxmltree = "0.21"
 thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
@@ -89,5 +90,7 @@ tempfile = "3"
 filetime = "0.2"
 
 # Temporary local patch for cross-repo development of the Registry struct
-# (release-history / custody fields). Uncomment to build fletch against local
-# filefacts; keep commented so a merge points at the published filefacts rev.
+# (release-history / custody fields, NuGet `repository_commit`). Points fletch at
+# local filefacts; restore to a published filefacts rev before merging.
+[patch."https://codeberg.org/atomdrift/filefacts.git"]
+filefacts = { path = "../filefacts" }
