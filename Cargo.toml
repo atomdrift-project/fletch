@@ -92,5 +92,3 @@ filetime = "0.2"
 # Temporary local patch for cross-repo development of the Registry struct
 # (release-history / custody fields, NuGet `repository_commit`). Points fletch at
 # local filefacts; restore to a published filefacts rev before merging.
-[patch."https://codeberg.org/atomdrift/filefacts.git"]
-filefacts = { path = "../filefacts" }

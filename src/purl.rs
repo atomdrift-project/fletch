@@ -218,6 +218,31 @@ mod tests {
     use super::*;
     use crate::RefLocator;
 
+    /// Every PURL recovered from a download URL is already canonical: a
+    /// provenance-side spelling and a generated spelling of the same package
+    /// must never differ, so `url_to_purl → normalize` is the identity.
+    #[test]
+    fn url_to_purl_outputs_are_canonical() {
+        for url in [
+            "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            "https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz",
+            "https://static.crates.io/crates/serde/serde-1.0.0.crate",
+            "https://files.pythonhosted.org/packages/ab/cd/Ruamel.Yaml-0.18.6.tar.gz",
+            "https://rubygems.org/downloads/rails-7.0.0.gem",
+            "https://proxy.golang.org/github.com/!burnt!sushi/toml/@v/v1.4.0.zip",
+            "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
+            "https://repo1.maven.org/maven2/org/apache/logging/log4j/2.0/log4j-2.0.jar",
+            "https://codeload.github.com/owner/repo/tar.gz/v1.0.0",
+        ] {
+            let purl = url_to_purl(url).unwrap_or_else(|| panic!("{url} must map"));
+            assert_eq!(
+                normalize(&purl).as_deref(),
+                Some(purl.as_str()),
+                "url_to_purl({url}) = {purl} is not canonical"
+            );
+        }
+    }
+
     /// Bi-directional check: for ecosystems whose download URL is a pure
     /// name+version function, `purl → URL → purl` is the identity.
     #[test]
@@ -436,6 +461,14 @@ pub fn normalize(raw: &str) -> Option<String> {
             path.to_ascii_lowercase(),
             add_qualifier(tail, "repository_url=https://open-vsx.org")
         ),
+        // PyPI treats `-`/`_`/`.` as one separator and names as
+        // case-insensitive — PEP 503 is the registry's own equivalence — so
+        // the canonical name is the PEP 503 normalization. (There is no
+        // namespace; the path is the name.) npm is deliberately NOT folded:
+        // legacy mixed-case names were grandfathered in and stay distinct.
+        "pypi" => format!("pkg:pypi/{}{tail}", normalize_pypi(path)),
+        // Composer names are case-insensitive per spec and lowercased.
+        "composer" => format!("pkg:composer/{}{tail}", path.to_ascii_lowercase()),
         "alpm" => {
             // The AUR is its own alpm namespace: `pkg:alpm/aur/<name>`. Fold
             // the vendor-plus-qualifier spelling this project generated before
@@ -647,9 +680,12 @@ mod normalize_tests {
     }
 
     #[test]
-    fn lowercases_scheme_and_type_only() {
+    fn scheme_and_type_fold_case_bodies_per_type() {
+        // Scheme and type always lowercase; the body's case rule is
+        // type-specific: npm keeps it (legacy mixed-case names are
+        // grandfathered and distinct), pypi folds per PEP 503.
         assert_eq!(norm("  PKG:NPM/Left-Pad@1.3.0 "), "pkg:npm/Left-Pad@1.3.0");
-        assert_eq!(norm("pkg:PyPI/Requests"), "pkg:pypi/Requests");
+        assert_eq!(norm("pkg:PyPI/Requests"), "pkg:pypi/requests");
     }
 
     #[test]
@@ -669,6 +705,14 @@ mod normalize_tests {
             (
                 "pkg:openvsx/jinryx/crontally@1.0.3",
                 "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https://open-vsx.org",
+            ),
+            // PyPI folds per PEP 503 (the registry's own equivalence:
+            // lowercase, separator runs collapse); composer lowercases.
+            ("pkg:pypi/Ruamel.Yaml@0.18.6", "pkg:pypi/ruamel-yaml@0.18.6"),
+            ("pkg:pypi/backports__zoneinfo", "pkg:pypi/backports-zoneinfo"),
+            (
+                "pkg:composer/Symfony/Console@6.4.0",
+                "pkg:composer/symfony/console@6.4.0",
             ),
             ("pkg:debian/curl", "pkg:deb/debian/curl"),
             ("pkg:arch/pacman@6.0", "pkg:alpm/arch/pacman@6.0"),
@@ -840,6 +884,8 @@ mod normalize_tests {
         let corpus = [
             "pkg:npm/lodash@4.17.21",
             "pkg:npm/%40babel/core@7.24.0",
+            "pkg:pypi/Ruamel.Yaml@0.18.6",
+            "pkg:composer/Symfony/Console@6.4.0",
             "pkg:golang/github.com/BurntSushi/toml@v1.4.0",
             "pkg:maven/org.apache.logging/log4j@2.0",
             "pkg:alpm/aur/yay@12.3.0-1?arch=x86_64",
