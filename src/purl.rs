@@ -14,6 +14,15 @@
 //! [`url_to_purl`] must return the original. The asymmetric ecosystems — PyPI
 //! (its `files.pythonhosted.org` path carries an undrivable content hash) and
 //! platform-tagged gems — cannot round-trip and are covered forward-only.
+//!
+//! This module also owns PURL **normalization**: [`normalize`] collapses every
+//! spelling this project has ever emitted onto one canonical form, and
+//! [`identity`] flattens that to the release-coordinate key the bloom filters
+//! use — scan calls both for lookups and its `scan-bloom-build` producer calls
+//! [`identity`] during generation, so the two sides can never drift. The Go
+//! twin is hopper's `pkgparse.CanonicalizePURL` (generation side); the
+//! `fletch purl` CLI probe and hopper's crosscheck tests hold the pair in
+//! lockstep.
 
 /// Map a registry artifact URL to its PURL, or `None` when the host/path isn't a
 /// recognized package download.
@@ -330,5 +339,570 @@ mod tests {
             url_to_purl("https://registry.npmjs.org/no-artifact-here"),
             None
         );
+    }
+}
+
+/// Normalize a PURL to its canonical string, or `None` when the input cannot
+/// denote a package.
+///
+/// This is the shared contract between the bloom producer (which builds the
+/// filter) and the scanner (which queries it): both **must** key on this exact
+/// form or lookups silently miss. It is also the entry-point normalizer for
+/// PURLs arriving from outside (the `purl` subcommand, pool records), so every
+/// downstream consumer — registry lookup, fetch, display, provenance — sees one
+/// spelling.
+///
+/// The `pkg` scheme and package *type* are case-insensitive per the PURL spec,
+/// so they are lowercased; the remainder is left untouched, since case
+/// significance is type-specific (the extension types and the deb/apk/alpm
+/// distro names are case-insensitive and lowercased; rpm names keep their
+/// case).
+///
+/// Folded spellings, so an old and a new spelling of the same package compare
+/// equal: `pkg:chrome`→`chrome-extension`, `pkg:vscode`/`pkg:openvsx`→
+/// `vscode-extension` (Open VSX keeping its `repository_url` qualifier), the
+/// bare distro types `pkg:debian`/`arch`/`fedora`/… → `deb`/`rpm`/`apk`/`alpm`
+/// with the distro as namespace, and every AUR spelling (bare `pkg:aur/<name>`,
+/// and the vendor-plus-qualifier
+/// `pkg:alpm/arch/<name>?repository_url=…aur.archlinux.org` this project
+/// generated before) → `pkg:alpm/aur/<name>`, the AUR as its own alpm
+/// namespace. The non-spec `?qualifiers@version` ordering older exports
+/// composed (`purl_base || '@' || version` glued the version after a
+/// qualifier-bearing base) is repaired to the spec `@version?qualifiers` order.
+/// For the spec distro types (deb/rpm/apk/alpm) the vendor namespace is
+/// lowercased, and a missing one is recovered from the `distro` qualifier
+/// (`pkg:rpm/curl?distro=fedora-25` → `pkg:rpm/fedora/curl?distro=fedora-25`).
+///
+/// `None` — never an empty or degenerate key — when the input has no `pkg:`
+/// scheme, an empty type, or an empty package name. Callers treat `None` as
+/// "not a package": the producer drops the record's PURL key, the scanner
+/// answers no-decision, the CLI reports the argument as invalid.
+#[must_use]
+pub fn normalize(raw: &str) -> Option<String> {
+    // The `pkg` scheme and type are case-insensitive; the shared splitter
+    // folds their case and trims. No scheme → not a PURL.
+    let (typ, rest) = scheme_type_rest(raw)?;
+    let typ = typ.as_str();
+    // Split the remainder into the coordinate path and the @version/?qualifier
+    // tail so the type can be re-keyed without disturbing either.
+    let (path, tail) = match rest.find(['@', '?']) {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    // An empty type or an empty name can only produce a degenerate key
+    // (`pkg:`, `pkg:npm/`) that would collide with every other degenerate
+    // input — refuse rather than emit one.
+    if typ.is_empty() || last_segment(path).is_empty() {
+        return None;
+    }
+    // Repair the non-spec `?qualifiers@version` ordering: move the trailing
+    // version back before the qualifiers. The chunk after the last `@` is only
+    // a version when it is free of `=`/`&`/`/`, any of which would mark it as
+    // part of a qualifier value (e.g. a repository_url with userinfo) instead.
+    let tail = match tail.strip_prefix('?').and_then(|q| q.rsplit_once('@')) {
+        Some((quals, v)) if !v.is_empty() && !v.contains(['=', '&', '/']) => {
+            format!("@{v}?{quals}")
+        }
+        _ => tail.to_string(),
+    };
+    let tail = tail.as_str();
+    // For the spec distro types, canonicalize the vendor namespace: it is
+    // case-insensitive per spec (lowercased in canonical form), and when
+    // missing it is recovered from a `distro=<vendor>-<release>` qualifier —
+    // the spec's rpm note says the repository is implied by `distro` — but
+    // only when the vendor prefix names a distro this project models
+    // (`fedora-25` → fedora; a bare deb codename like `jessie` never
+    // matches). The qualifier itself stays; [`identity`] strips it later.
+    let path = if matches!(typ, "deb" | "rpm" | "apk" | "alpm") {
+        distro_path(typ, path, tail)
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    };
+    let path = path.as_ref();
+
+    Some(match typ {
+        // Browser / editor extensions: case-insensitive bodies, ratified types.
+        "chrome" | "chrome-extension" => {
+            format!(
+                "pkg:chrome-extension/{}{tail}",
+                last_segment(path).to_ascii_lowercase()
+            )
+        }
+        "vscode" | "vscode-extension" => {
+            format!("pkg:vscode-extension/{}{tail}", path.to_ascii_lowercase())
+        }
+        "openvsx" => format!(
+            "pkg:vscode-extension/{}{}",
+            path.to_ascii_lowercase(),
+            add_qualifier(tail, "repository_url=https://open-vsx.org")
+        ),
+        "alpm" => {
+            // The AUR is its own alpm namespace: `pkg:alpm/aur/<name>`. Fold
+            // the vendor-plus-qualifier spelling this project generated before
+            // onto it, dropping that qualifier (others are kept). A
+            // repository_url naming anything else, and the other alpm
+            // namespaces (the official repos), stay as they are. alpm names
+            // are case-insensitive per spec, so the AUR name is lowercased.
+            if let Some((val, rest_tail)) = cut_qualifier(tail, "repository_url")
+                && val.contains("aur.archlinux.org")
+            {
+                format!(
+                    "pkg:alpm/aur/{}{rest_tail}",
+                    last_segment(path).to_ascii_lowercase()
+                )
+            } else if let Some(name) = path.strip_prefix("aur/") {
+                format!("pkg:alpm/aur/{}{tail}", name.to_ascii_lowercase())
+            } else {
+                format!("pkg:alpm/{path}{tail}")
+            }
+        }
+        other => {
+            if let Some((spec, ns)) = distro_spec(other) {
+                // deb/apk/alpm names are case-insensitive per spec and
+                // lowercase in canonical form; rpm names are case-sensitive.
+                let name = last_segment(path);
+                let name = if spec == "rpm" {
+                    name.to_string()
+                } else {
+                    name.to_ascii_lowercase()
+                };
+                // An AUR repository_url wins over the mapped vendor: a legacy
+                // bare type carrying it (`pkg:aur/x` redundantly, or
+                // `pkg:arch/x` pointing at the AUR) folds onto the aur
+                // namespace with the now-redundant qualifier dropped — the
+                // same fold the alpm arm applies, so a single pass converges
+                // to the fixed point.
+                let (ns, tail) = match cut_qualifier(tail, "repository_url") {
+                    Some((val, rest)) if spec == "alpm" && val.contains("aur.archlinux.org") => {
+                        ("aur", rest)
+                    }
+                    _ => (ns, tail.to_string()),
+                };
+                format!("pkg:{spec}/{ns}/{name}{tail}")
+            } else {
+                // Language/registry and unrecognized types: canonical type, body
+                // case preserved (significance is type-specific).
+                format!("pkg:{typ}/{path}{tail}")
+            }
+        }
+    })
+}
+
+/// The identity-key form of a PURL: [`normalize`], with artifact-selection
+/// qualifiers dropped. This — not the full normalized form — is what the bloom
+/// producer inserts and the scanner looks up.
+///
+/// Real-world distro PURLs (SBOM tools, OS package feeds) routinely stamp
+/// `?arch=…&distro=…` onto the coordinate, and a PyPI PURL may carry
+/// `?kind=…`: qualifiers that select *which artifact* of a release, not
+/// *which package* it is. Our pool is keyed by release coordinate (hopper's
+/// filename parser deliberately drops the architecture), so an arch-qualified
+/// spelling must collide with the bare one or every SBOM-derived lookup
+/// misses. Only `repository_url` survives, because it selects which registry
+/// the name lives in (Open VSX vs the Microsoft marketplace) — that *is*
+/// identity.
+///
+/// Fetching keeps the full [`normalize`]d form, where `kind=sdist` and friends
+/// legitimately steer artifact selection; only key derivation flattens.
+#[must_use]
+pub fn identity(raw: &str) -> Option<String> {
+    let full = normalize(raw)?;
+    let Some((head, quals)) = full.split_once('?') else {
+        return Some(full);
+    };
+    let kept: Vec<&str> = quals
+        .split('&')
+        .filter(|q| {
+            q.split('=')
+                .next()
+                .is_some_and(|k| k.eq_ignore_ascii_case("repository_url"))
+        })
+        .collect();
+    Some(if kept.is_empty() {
+        head.to_string()
+    } else {
+        format!("{head}?{}", kept.join("&"))
+    })
+}
+
+/// Split a raw PURL into its lowercased type and the untouched remainder after
+/// `pkg:<type>/`. The `pkg` scheme and the type are case-insensitive per spec,
+/// so this is the one place that folds their case; leading/trailing whitespace
+/// is trimmed. `None` when the string has no `pkg:` scheme or no `/`. Shared by
+/// the registry parser and the fetch resolver so both read any spelling
+/// [`normalize`] accepts.
+pub(crate) fn scheme_type_rest(purl: &str) -> Option<(String, &str)> {
+    let s = purl.trim();
+    // `get(..4)` (not a direct slice) so a multi-byte character at the
+    // boundary yields None instead of a panic.
+    let body = s
+        .get(..4)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("pkg:"))
+        .map(|_| &s[4..])?;
+    let (ty, rest) = body.split_once('/')?;
+    Some((ty.to_ascii_lowercase(), rest))
+}
+
+/// The final `/`-separated segment (the app-store and distro types drop any
+/// vendor path, matching `fletch`'s resolver and `hopper`'s builder).
+fn last_segment(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Canonicalize the vendor namespace of a spec distro type's coordinate path:
+/// lowercase an existing vendor, or recover a missing one from the `distro`
+/// qualifier when its `<vendor>-<release>` prefix names a distro this project
+/// models for that type. Mirrors `hopper`'s `pkgparse.distroPath`.
+fn distro_path<'a>(typ: &str, path: &'a str, tail: &str) -> std::borrow::Cow<'a, str> {
+    use std::borrow::Cow;
+    if let Some((ns, name)) = path.split_once('/') {
+        if ns.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Cow::Owned(format!("{}/{name}", ns.to_ascii_lowercase()));
+        }
+        return Cow::Borrowed(path);
+    }
+    if let Some((val, _)) = cut_qualifier(tail, "distro") {
+        let vendor = val.split('-').next().unwrap_or(&val).to_ascii_lowercase();
+        if let Some((spec, ns)) = distro_spec(&vendor)
+            && spec == typ
+            && ns == vendor
+        {
+            return Cow::Owned(format!("{vendor}/{path}"));
+        }
+    }
+    Cow::Borrowed(path)
+}
+
+/// Map a legacy bare-distro PURL type onto the spec type and namespace.
+fn distro_spec(typ: &str) -> Option<(&'static str, &'static str)> {
+    Some(match typ {
+        "debian" => ("deb", "debian"),
+        "ubuntu" => ("deb", "ubuntu"),
+        "fedora" => ("rpm", "fedora"),
+        "opensuse" => ("rpm", "opensuse"),
+        "rpmfusion" => ("rpm", "rpmfusion"),
+        "arch" => ("alpm", "arch"),
+        "aur" => ("alpm", "aur"),
+        "alpine" => ("apk", "alpine"),
+        "wolfi" => ("apk", "wolfi"),
+        _ => return None,
+    })
+}
+
+/// Remove the named qualifier from a PURL `@version`/`?qualifiers` tail,
+/// returning its value and the tail without it (the `?` goes too when it was
+/// the only qualifier). `None` when the key isn't present.
+fn cut_qualifier(tail: &str, key: &str) -> Option<(String, String)> {
+    let (ver, quals) = tail.split_once('?')?;
+    let mut value = None;
+    let kept: Vec<&str> = quals
+        .split('&')
+        .filter(|q| {
+            let (k, v) = q.split_once('=').unwrap_or((q, ""));
+            if value.is_none() && k.eq_ignore_ascii_case(key) {
+                value = Some(v.to_string());
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let value = value?;
+    let rest = if kept.is_empty() {
+        ver.to_string()
+    } else {
+        format!("{ver}?{}", kept.join("&"))
+    };
+    Some((value, rest))
+}
+
+/// Merge one qualifier into a PURL `@version`/`?qualifiers` tail, leaving an
+/// already-present key untouched.
+fn add_qualifier(tail: &str, qualifier: &str) -> String {
+    let key = qualifier.split('=').next().unwrap_or(qualifier);
+    match tail.split_once('?') {
+        None => format!("{tail}?{qualifier}"),
+        Some((ver, quals)) => {
+            if quals.split('&').any(|q| {
+                q.split('=')
+                    .next()
+                    .is_some_and(|k| k.eq_ignore_ascii_case(key))
+            }) {
+                tail.to_string()
+            } else {
+                format!("{ver}?{quals}&{qualifier}")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod normalize_tests {
+    use super::*;
+
+    /// `normalize` on input that must succeed.
+    fn norm(raw: &str) -> String {
+        normalize(raw).unwrap_or_else(|| panic!("{raw} must normalize"))
+    }
+
+    #[test]
+    fn lowercases_scheme_and_type_only() {
+        assert_eq!(norm("  PKG:NPM/Left-Pad@1.3.0 "), "pkg:npm/Left-Pad@1.3.0");
+        assert_eq!(norm("pkg:PyPI/Requests"), "pkg:pypi/Requests");
+    }
+
+    #[test]
+    fn folds_legacy_spellings_onto_canonical() {
+        // Legacy fletch spellings fold onto the spec/common-practice form, so a
+        // stored spec PURL and a scanned legacy PURL hit the same filter key.
+        let pairs = [
+            ("pkg:chrome/KhKimila", "pkg:chrome-extension/khkimila"),
+            (
+                "pkg:chrome/KhKimila@25.7.1",
+                "pkg:chrome-extension/khkimila@25.7.1",
+            ),
+            (
+                "pkg:vscode/Saoudrizwan/Claude-Dev",
+                "pkg:vscode-extension/saoudrizwan/claude-dev",
+            ),
+            (
+                "pkg:openvsx/jinryx/crontally@1.0.3",
+                "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https://open-vsx.org",
+            ),
+            ("pkg:debian/curl", "pkg:deb/debian/curl"),
+            ("pkg:arch/pacman@6.0", "pkg:alpm/arch/pacman@6.0"),
+            ("pkg:fedora/curl", "pkg:rpm/fedora/curl"),
+            ("pkg:alpine/musl", "pkg:apk/alpine/musl"),
+            // Every AUR spelling folds onto the aur-namespace form: the bare
+            // legacy type (with or without a redundant repository_url) and the
+            // vendor-plus-qualifier form generated before (its repository_url
+            // dropped, other qualifiers kept).
+            ("pkg:aur/yay", "pkg:alpm/aur/yay"),
+            ("pkg:aur/yay@12.0.0-1", "pkg:alpm/aur/yay@12.0.0-1"),
+            (
+                "pkg:aur/yay?repository_url=https://aur.archlinux.org",
+                "pkg:alpm/aur/yay",
+            ),
+            ("PKG:AUR/Yay@1.0-1", "pkg:alpm/aur/yay@1.0-1"),
+            ("pkg:alpm/aur/Foo-Bar@1.0-1", "pkg:alpm/aur/foo-bar@1.0-1"),
+            (
+                "pkg:alpm/arch/yay@12.3.0-1?arch=x86_64&repository_url=https://aur.archlinux.org",
+                "pkg:alpm/aur/yay@12.3.0-1?arch=x86_64",
+            ),
+            (
+                "pkg:alpm/arch/yay@12.3.0-1?repository_url=https://aur.archlinux.org&arch=x86_64",
+                "pkg:alpm/aur/yay@12.3.0-1?arch=x86_64",
+            ),
+        ];
+        for (legacy, spec) in pairs {
+            assert_eq!(norm(legacy), spec, "fold {legacy}");
+            // Idempotent: the canonical form normalizes to itself.
+            assert_eq!(norm(spec), spec, "idempotent {spec}");
+        }
+    }
+
+    #[test]
+    fn repairs_misplaced_version() {
+        // The non-spec `?qualifiers@version` ordering older hopper exports
+        // composed (purl_base || '@' || version onto a qualifier-bearing base)
+        // is repaired to spec order — and an AUR repository_url folds onto the
+        // aur namespace in the same pass.
+        assert_eq!(
+            norm(
+                "pkg:alpm/arch/claude-desktop-hardened-bin?repository_url=https://aur.archlinux.org@1.20186.0-1"
+            ),
+            "pkg:alpm/aur/claude-desktop-hardened-bin@1.20186.0-1"
+        );
+        assert_eq!(
+            norm("pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org@1.0.3"),
+            "pkg:vscode-extension/pub/name@1.0.3?repository_url=https://open-vsx.org"
+        );
+        // A qualifier value containing `@` (URL userinfo) is not a version, and
+        // a repository_url naming something other than the AUR is kept.
+        assert_eq!(
+            norm("pkg:alpm/arch/yay?repository_url=https://user@example.com/repo"),
+            "pkg:alpm/arch/yay?repository_url=https://user@example.com/repo"
+        );
+    }
+
+    #[test]
+    fn distro_namespace_canonicalizes_and_recovers() {
+        // The purl-spec rpm examples: an already-canonical purl is a fixed
+        // point; a namespace-less one recovers its vendor from the distro
+        // qualifier (the spec's rpm note: the repository is implied by
+        // `distro`). The vendor namespace is case-insensitive and lowercased;
+        // a distro value naming no vendor we model (a bare deb codename)
+        // never recovers.
+        let cases = [
+            (
+                "pkg:rpm/fedora/curl@7.50.3-1.fc25?arch=i386&distro=fedora-25",
+                "pkg:rpm/fedora/curl@7.50.3-1.fc25?arch=i386&distro=fedora-25",
+            ),
+            (
+                "pkg:rpm/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25",
+                "pkg:rpm/fedora/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25",
+            ),
+            ("pkg:rpm/Fedora/curl@1.0", "pkg:rpm/fedora/curl@1.0"),
+            (
+                "pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie",
+                "pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie",
+            ),
+            (
+                "pkg:deb/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04",
+                "pkg:deb/ubuntu/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(norm(input), want, "normalize {input}");
+            assert_eq!(norm(want), want, "idempotent {want}");
+        }
+        // Identity then flattens the artifact-selection qualifiers, so the
+        // spec example keys onto the pool's bare release coordinate.
+        assert_eq!(
+            identity("pkg:rpm/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25").as_deref(),
+            Some("pkg:rpm/fedora/centerim@4.22.10-1.el6")
+        );
+    }
+
+    #[test]
+    fn degenerate_inputs_never_yield_a_key() {
+        // No output may ever be empty or a bare `pkg:` prefix — a degenerate
+        // key would collide with every other degenerate input.
+        for junk in [
+            "",
+            "   ",
+            "pkg:",
+            "pkg:npm",           // no name at all
+            "pkg:npm/",          // empty name
+            "pkg:npm/@1.0.0",    // version but no name
+            "pkg:/lodash",       // empty type
+            "pkg:alpm/aur/",     // empty name behind a namespace
+            "npm/lodash@1.0.0",  // no pkg: scheme
+            "not-a-purl",
+            "https://example.com/x.tgz",
+        ] {
+            assert_eq!(normalize(junk), None, "{junk:?} must not normalize");
+        }
+        // The guards reject degenerate inputs, not unusual-but-real ones.
+        assert!(normalize("pkg:npm/%40scope/name@1.0.0").is_some());
+    }
+
+    #[test]
+    fn identity_drops_artifact_selection_qualifiers() {
+        // SBOM-style distro purls stamp arch/distro onto the coordinate; the
+        // pool keys are bare release coordinates, so identity must collapse
+        // the two. repository_url survives — it selects the registry.
+        let cases = [
+            (
+                "pkg:rpm/fedora/curl@7.50.3-1.fc25?arch=x86_64&distro=fedora-25",
+                "pkg:rpm/fedora/curl@7.50.3-1.fc25",
+            ),
+            (
+                "pkg:deb/debian/curl@7.50.3-1?arch=amd64",
+                "pkg:deb/debian/curl@7.50.3-1",
+            ),
+            (
+                "pkg:alpm/aur/yay@12.3.0-1?arch=x86_64",
+                "pkg:alpm/aur/yay@12.3.0-1",
+            ),
+            (
+                "pkg:apk/alpine/musl@1.2.4-r0?arch=aarch64",
+                "pkg:apk/alpine/musl@1.2.4-r0",
+            ),
+            ("pkg:pypi/requests@2.31.0?kind=sdist", "pkg:pypi/requests@2.31.0"),
+            (
+                "pkg:openvsx/pub/name@1.0.3",
+                "pkg:vscode-extension/pub/name@1.0.3?repository_url=https://open-vsx.org",
+            ),
+            // Folding and identity compose: the qualifier AUR form with an
+            // arch stamp lands on the bare aur-namespace coordinate.
+            (
+                "pkg:alpm/arch/yay@12.3.0-1?arch=x86_64&repository_url=https://aur.archlinux.org",
+                "pkg:alpm/aur/yay@12.3.0-1",
+            ),
+            // No qualifiers → identity is the normalized form itself.
+            ("pkg:npm/lodash@4.17.21", "pkg:npm/lodash@4.17.21"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(identity(input).as_deref(), Some(want), "identity {input}");
+        }
+        assert_eq!(identity("not-a-purl"), None);
+    }
+
+    #[test]
+    fn every_output_is_a_wellformed_fixed_point() {
+        // Structural invariants over a broad corpus — canonical, legacy,
+        // broken, junk: every `Some` output keeps the scheme, a non-empty type,
+        // and a non-empty name, and both functions are fixed points
+        // (f(f(x)) == f(x)) — the producer and the scanner can never disagree
+        // however many times a purl passes through.
+        let corpus = [
+            "pkg:npm/lodash@4.17.21",
+            "pkg:npm/%40babel/core@7.24.0",
+            "pkg:golang/github.com/BurntSushi/toml@v1.4.0",
+            "pkg:maven/org.apache.logging/log4j@2.0",
+            "pkg:alpm/aur/yay@12.3.0-1?arch=x86_64",
+            "pkg:alpm/core/pacman@6.0-1?arch=x86_64",
+            "pkg:deb/debian/curl@7.88",
+            "pkg:vscode-extension/pub/name@1.0.3?repository_url=https://open-vsx.org",
+            "pkg:chrome/KhKimila@25.7.1",
+            "pkg:vscode/Pub/Name",
+            "pkg:openvsx/pub/name@1.0.3",
+            "pkg:aur/yay",
+            "pkg:aur/yay?repository_url=https://aur.archlinux.org",
+            "pkg:alpm/aur/Foo-Bar",
+            "pkg:alpm/arch/yay@12.0-1?repository_url=https://aur.archlinux.org",
+            "PKG:AUR/Yay@1.0-1",
+            "pkg:debian/curl",
+            "pkg:ubuntu/curl",
+            "pkg:fedora/curl",
+            "pkg:opensuse/curl",
+            "pkg:rpmfusion/LibFoo",
+            "pkg:arch/pacman",
+            "pkg:alpine/musl",
+            "pkg:wolfi/musl",
+            "pkg:rpm/fedora/curl@7.50.3-1.fc25?arch=x86_64&distro=fedora-25",
+            "pkg:rpm/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25",
+            "pkg:rpm/Fedora/curl@1.0",
+            "pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie",
+            "pkg:alpm/arch/x?repository_url=https://aur.archlinux.org@1.0-1",
+            "pkg:alpm/arch/x?repository_url=https://aur.archlinux.org&arch=x86_64@1.0-1",
+            "pkg:alpm/arch/x?arch=x86_64&repository_url=https://aur.archlinux.org@1.0-1",
+            "pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org@1.0.3",
+            "pkg:npm/x@",
+            "pkg:npm/x?",
+            "pkg:npm/x@1.0#src/index.js",
+            "pkg:npm/x?repository_url=https://user@example.com/repo",
+            "",
+            "pkg:",
+            "pkg:npm/",
+            "pkg:/x",
+            "npm/x",
+            "not-a-purl",
+        ];
+        for raw in corpus {
+            for (name, f) in [
+                ("normalize", normalize as fn(&str) -> Option<String>),
+                ("identity", identity as fn(&str) -> Option<String>),
+            ] {
+                let Some(out) = f(raw) else { continue };
+                let body = out
+                    .strip_prefix("pkg:")
+                    .unwrap_or_else(|| panic!("{name}({raw:?}) = {out:?} lost the scheme"));
+                let (typ, rest) = body
+                    .split_once('/')
+                    .unwrap_or_else(|| panic!("{name}({raw:?}) = {out:?} has no name"));
+                assert!(!typ.is_empty(), "{name}({raw:?}) = {out:?}: empty type");
+                let coord = rest.split(['@', '?']).next().unwrap_or(rest);
+                let pkg = coord.rsplit('/').next().unwrap_or(coord);
+                assert!(!pkg.is_empty(), "{name}({raw:?}) = {out:?}: empty name");
+                assert_eq!(
+                    f(&out).as_deref(),
+                    Some(out.as_str()),
+                    "{name}({raw:?}) = {out:?} is not a fixed point"
+                );
+            }
+        }
     }
 }

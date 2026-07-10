@@ -1,6 +1,6 @@
 //! `fletch` — a thin command-line companion to the library.
 //!
-//! One subcommand today:
+//! Two subcommands today:
 //!
 //! - `registry <purl>` — resolve, fetch, and normalize a package's registry
 //!   metadata, printing a `{record, sources}` JSON envelope to stdout: the
@@ -9,6 +9,12 @@
 //!   archived and re-normalized later without a re-fetch. Exit `2` when the
 //!   ecosystem is unsupported or the registry can't be reached (empty stdout),
 //!   so a caller can tell "no record" from a usage error (exit `1`).
+//!
+//! - `purl <purl>` — report, without any network I/O, how fletch reads one
+//!   PURL: the parsed coordinates, the registry endpoint the type routes to,
+//!   and the artifact URL the fetcher resolves. This is the cross-tool
+//!   consistency surface hopper's `pkgparse` tests drive, so the generator and
+//!   this fetcher can never silently drift apart.
 //!
 //! This exists so a non-Rust collector (forager) can obtain exactly the record
 //! scan consumes, instead of maintaining a parallel, drifting metadata fetcher:
@@ -20,9 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use serde::Serialize;
 
-use fletch::RefLocator;
-use fletch::Registry;
 use fletch::fetch::{BlobCache, HttpFetch, RecordedSource};
+use fletch::{RefKind, RefLocator, Reference, Registry};
 
 /// The CLI envelope: the normalized record scan consumes, alongside the raw
 /// provider responses it was derived from (archived for forensics / re-parsing).
@@ -76,10 +81,153 @@ fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("usage: fletch registry <purl>"))?;
             run_registry(&purl)
         }
+        Some("purl") => {
+            let purl = args
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: fletch purl <purl> | fletch purl -"))?;
+            if purl == "-" {
+                run_purl_batch()
+            } else {
+                run_purl(&purl)
+            }
+        }
         _ => {
-            eprintln!("usage: fletch registry <purl>");
+            eprintln!("usage: fletch registry <purl> | fletch purl <purl>");
             std::process::exit(1);
         }
+    }
+}
+
+/// The `purl` probe report: how fletch reads one PURL, with no network I/O.
+/// `registry_url` is the first endpoint the registry lookup would contact
+/// (evidence of which registry the type routes to; absent when the type is
+/// unknown), `download_url` the artifact URL the fetcher resolved (absent when
+/// resolution itself needs a live registry round-trip, e.g. PyPI).
+#[derive(Serialize)]
+struct PurlProbe {
+    purl: String,
+    #[serde(rename = "type")]
+    typ: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// [`fletch::purl::normalize`]d spelling — the canonical form; hopper's
+    /// `pkgparse.CanonicalizePURL` must produce exactly this (crosscheck-tested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalized: Option<String>,
+    /// [`fletch::purl::identity`] key form — what the bloom filters key on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registry_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_url: Option<String>,
+}
+
+/// A [`fletch::fetch::Fetch`] backend that records every URL it is asked for
+/// and refuses it, so the probe can observe routing without touching the
+/// network.
+#[derive(Default)]
+struct ProbeNet(std::sync::Mutex<Vec<String>>);
+
+impl fletch::fetch::Fetch for ProbeNet {
+    fn get(&self, url: &str) -> Result<fletch::fetch::Fetched, fletch::fetch::FetchError> {
+        if let Ok(mut seen) = self.0.lock() {
+            seen.push(url.to_string());
+        }
+        Err(fletch::fetch::FetchError::Refused("probe".into()))
+    }
+
+    // The VS Code Marketplace query is a POST; record it too, so the probe
+    // reports that route instead of an empty answer.
+    fn post(
+        &self,
+        url: &str,
+        _body: &[u8],
+        _headers: &[(&str, &str)],
+    ) -> Result<fletch::fetch::Fetched, fletch::fetch::FetchError> {
+        if let Ok(mut seen) = self.0.lock() {
+            seen.push(url.to_string());
+        }
+        Err(fletch::fetch::FetchError::Refused("probe".into()))
+    }
+}
+
+/// Batch form of [`run_purl`]: one PURL per stdin line, one JSON probe per
+/// stdout line, in order. A line that doesn't parse still emits a probe (just
+/// the `purl` field) rather than aborting, so a differential sweep can push
+/// thousands of adversarial inputs through a single process.
+fn run_purl_batch() -> anyhow::Result<()> {
+    let stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    for line in std::io::BufRead::lines(stdin) {
+        let purl = line?;
+        let probe_out = probe_purl(&purl);
+        serde_json::to_writer(&mut stdout, &probe_out)?;
+        stdout.write_all(b"\n")?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Report how fletch parses, routes, and resolves one PURL — offline. Exit `2`
+/// (empty stdout) when the string doesn't parse as a PURL at all, so a caller
+/// can tell "not a purl" from a usage error (exit `1`).
+///
+/// This is the cross-tool consistency surface: hopper's `pkgparse` tests feed
+/// the PURLs it generates through this subcommand and assert fletch reads back
+/// the same coordinates and knows where to fetch them.
+fn run_purl(purl: &str) -> anyhow::Result<()> {
+    if fletch::registry::parse_purl(purl).is_none() {
+        std::process::exit(2);
+    }
+    let probe_out = probe_purl(purl);
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &probe_out)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Assemble the offline probe for one PURL. Every field but `purl` is empty or
+/// absent when the corresponding read fails, so batch callers see one probe
+/// per input no matter how malformed the input is.
+fn probe_purl(purl: &str) -> PurlProbe {
+    let (typ, path, version) = fletch::registry::parse_purl(purl).unwrap_or_default();
+    let cache = BlobCache::disabled();
+    let locator = RefLocator::Purl(purl.to_string());
+
+    // Route probe: the first URL the registry lookup asks for names the
+    // registry this type resolves to; the probe refuses it, so nothing is
+    // actually fetched.
+    let probe = ProbeNet::default();
+    let _ = fletch::registry(&locator, &probe, &cache);
+    let registry_url = probe.0.lock().ok().and_then(|seen| seen.first().cloned());
+
+    // Resolution probe: run the real fetch path against the refusing backend.
+    // A resolvable PURL surfaces its download URL on the (expectedly failed)
+    // record; `Unresolved` means the fetcher has no artifact mapping.
+    let reference = Reference {
+        locator,
+        kind: RefKind::Dependency,
+        source: "cli".to_string(),
+        evidence: String::new(),
+        offset: 0,
+        pinned_hash: None,
+        content_sha256: None,
+    };
+    let rec = fletch::fetch::fetch_ref(&reference, &ProbeNet::default(), &cache);
+    let download_url = (!rec.resolved_url.is_empty()).then(|| rec.resolved_url.clone());
+
+    PurlProbe {
+        purl: purl.to_string(),
+        typ,
+        path,
+        version,
+        normalized: fletch::purl::normalize(purl),
+        identity: fletch::purl::identity(purl),
+        registry_url,
+        download_url,
     }
 }
 

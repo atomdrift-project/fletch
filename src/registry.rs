@@ -190,20 +190,37 @@ pub fn registry_with_sources(
 }
 
 /// Split a PURL into `(type, name-path, version?)`, mirroring `fetch`'s
-/// resolver: the version follows a literal `@` (a scope is `%40`).
-fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
-    let body = purl.strip_prefix("pkg:")?;
-    let (ty, rest) = body.split_once('/')?;
+/// resolver: the version follows a literal `@` (a scope is `%40`). Public so a
+/// consumer (the CLI's `purl` probe, cross-tool consistency checks against
+/// hopper's generator) can see exactly the coordinates the registry lookup
+/// keys on.
+#[must_use]
+pub fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
+    // Scheme and type are case-insensitive per spec; the shared splitter folds
+    // their case and trims, so any spelling `purl::normalize` accepts parses.
+    let (ty, rest) = crate::purl::scheme_type_rest(purl)?;
     // A registry record is the same whichever artifact a PURL's `?qualifiers`
     // select (`?kind=wheel`, `?repository_url=…`), so drop them up front. Splitting
     // qualifiers off before the version keeps a versionless PURL from gluing the
     // qualifier onto the name, and a qualifier value that itself contains `@` (a URL
     // with userinfo) from corrupting the version. Qualifiers a lookup *does* need
     // (the AUR's `repository_url`) are read off the raw purl, not here.
-    let rest = rest.split_once('?').map_or(rest, |(bare, _)| bare);
-    let (path, version) = rest
+    let (bare, quals) = match rest.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (rest, None),
+    };
+    let (path, version) = bare
         .rsplit_once('@')
-        .map_or((rest, None), |(p, v)| (p, Some(v.to_string())));
+        .map_or((bare, None), |(p, v)| (p, Some(v.to_string())));
+    // Tolerate the non-spec `?qualifiers@version` ordering older hopper exports
+    // emitted (a version appended to a qualifier-bearing purl_base): a trailing
+    // `@<v>` inside the qualifier tail is the misplaced version when `<v>` is
+    // free of `=`/`&`/`/`, any of which would mark it as part of a qualifier
+    // value instead.
+    let version = version.or_else(|| {
+        let (_, v) = quals?.rsplit_once('@')?;
+        (!v.is_empty() && !v.contains(['=', '&', '/'])).then(|| v.to_string())
+    });
     Some((ty.to_string(), path.to_string(), version))
 }
 
@@ -3671,5 +3688,25 @@ mod tests {
         )
         .expect("arch registry");
         assert_eq!(from_official.ecosystem, "arch");
+    }
+
+    #[test]
+    fn parse_purl_tolerates_misplaced_version() {
+        // Spec order: `@version` before `?qualifiers`.
+        assert_eq!(
+            parse_purl("pkg:alpm/arch/yay@1.0-1?repository_url=https://aur.archlinux.org"),
+            Some(("alpm".into(), "arch/yay".into(), Some("1.0-1".into())))
+        );
+        // The non-spec `?qualifiers@version` ordering older hopper exports
+        // emitted: the trailing version is still recovered.
+        assert_eq!(
+            parse_purl("pkg:alpm/arch/yay?repository_url=https://aur.archlinux.org@1.0-1"),
+            Some(("alpm".into(), "arch/yay".into(), Some("1.0-1".into())))
+        );
+        // A qualifier value containing `@` (URL userinfo) is not a version.
+        assert_eq!(
+            parse_purl("pkg:alpm/arch/yay?repository_url=https://user@example.com/repo"),
+            Some(("alpm".into(), "arch/yay".into(), None))
+        );
     }
 }

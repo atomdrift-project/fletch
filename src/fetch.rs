@@ -933,7 +933,9 @@ fn locator_string(locator: &RefLocator) -> String {
 }
 
 /// Resolve a locator to a fetchable URL, or `None` if the ecosystem isn't
-/// supported yet (PyPI/Go/alpm need a registry round-trip — follow-ups).
+/// supported yet. Ecosystems that need a registry round-trip (PyPI, Composer,
+/// the AUR, an unversioned npm PURL) resolve in [`resolved_target`] instead;
+/// official-repo alpm (a mirror lookup) is a follow-up.
 #[must_use]
 pub fn resolve(locator: &RefLocator) -> Option<String> {
     match locator {
@@ -945,16 +947,36 @@ pub fn resolve(locator: &RefLocator) -> Option<String> {
     }
 }
 
+/// Split a PURL body (everything after `pkg:<type>/`) into its coordinate path
+/// and version, dropping any `?qualifiers`. The version follows the literal `@`
+/// (a scope is `%40`, not `@`). Tolerates the non-spec `?qualifiers@version`
+/// ordering older hopper exports emitted (a version appended to a
+/// qualifier-bearing purl_base): a trailing `@<v>` inside the qualifier tail is
+/// read as the misplaced version when `<v>` is free of `=`/`&`/`/`, any of
+/// which would mark it as part of a qualifier value instead.
+fn split_path_version(rest: &str) -> (&str, Option<&str>) {
+    let (bare, quals) = match rest.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (rest, None),
+    };
+    let (path, version) = bare
+        .rsplit_once('@')
+        .map_or((bare, None), |(p, v)| (p, Some(v)));
+    let version = version.or_else(|| {
+        let (_, v) = quals?.rsplit_once('@')?;
+        (!v.is_empty() && !v.contains(['=', '&', '/'])).then_some(v)
+    });
+    (path, version)
+}
+
 /// Map a PURL to a deterministic download URL for the computable
 /// ecosystems (npm, crates.io, GitHub archive).
 fn resolve_purl(purl: &str) -> Option<String> {
-    let body = purl.strip_prefix("pkg:")?;
-    let (ty, rest) = body.split_once('/')?;
-    // The version is after the literal `@` (a scope is `%40`, not `@`).
-    let (path, version) = rest
-        .rsplit_once('@')
-        .map_or((rest, None), |(p, v)| (p, Some(v)));
-    match ty {
+    // Scheme and type are case-insensitive per spec; the shared splitter folds
+    // their case and trims, so any spelling `purl::normalize` accepts resolves.
+    let (ty, rest) = crate::purl::scheme_type_rest(purl)?;
+    let (path, version) = split_path_version(rest);
+    match ty.as_str() {
         "npm" => {
             let name = path.replace("%40", "@");
             let base = name.rsplit('/').next().unwrap_or(name.as_str());
@@ -991,7 +1013,8 @@ fn resolve_purl(purl: &str) -> Option<String> {
                 "https://rubygems.org/downloads/{path}-{version}.gem"
             ))
         }
-        "chrome" => {
+        // `chrome-extension` is the ratified purl-spec spelling of the type.
+        "chrome" | "chrome-extension" => {
             // The CRX download service redirects to the current packed
             // extension; `id` is the last path segment (a slug may precede it).
             let id = path.rsplit('/').next().unwrap_or(path);
@@ -1016,9 +1039,9 @@ fn resolved_target(
     cache: &BlobCache,
 ) -> Option<(String, String)> {
     if let RefLocator::Purl(p) = locator
-        && let Some(body) = p.strip_prefix("pkg:")
-        && let Some((ty, rest)) = body.split_once('/')
+        && let Some((ty, rest)) = crate::purl::scheme_type_rest(p)
     {
+        let ty = ty.as_str();
         // A scope is `%40`, so a literal `@` only ever separates the version;
         // its absence means the npm dependency named no version.
         if ty == "npm" && !rest.contains('@') {
@@ -1033,6 +1056,32 @@ fn resolved_target(
         // but the latest version (when unpinned) comes from the query API.
         if ty == "vscode" {
             return resolve_vscode(rest, net).map(|u| (p.clone(), u));
+        }
+        // The ratified `vscode-extension` type covers both stores; Open VSX is
+        // flagged by its repository_url qualifier (read off the raw purl — the
+        // path/version split drops qualifiers).
+        if ty == "vscode-extension" {
+            return if p.contains("open-vsx.org") {
+                resolve_openvsx(rest, net).map(|u| (p.clone(), u))
+            } else {
+                resolve_vscode(rest, net).map(|u| (p.clone(), u))
+            };
+        }
+        // The AUR serves one artifact per package: the current PKGBUILD-tree
+        // snapshot, addressed by *pkgbase* (a split package's snapshot lives
+        // under its base, not its own name), which the RPC names exactly.
+        // Snapshots track HEAD only, so a pinned version can't select an older
+        // release — matching the github/HEAD and npm-latest stance of fetching
+        // what the name serves right now. Three spellings route here, the same
+        // set the registry lookup folds: `pkg:aur/<name>`, the spec
+        // `pkg:alpm/arch/<name>?repository_url=https://aur.archlinux.org`, and
+        // the legacy `pkg:alpm/aur/<name>`.
+        if ty == "aur"
+            || (ty == "alpm" && (p.contains("aur.archlinux.org") || rest.starts_with("aur/")))
+        {
+            let (path, _) = split_path_version(rest);
+            let name = path.rsplit('/').next().unwrap_or(path);
+            return Some((p.clone(), resolve_aur(name, net, cache)));
         }
         if let Some((path, version)) = rest.rsplit_once('@') {
             // Split any PURL `?qualifiers` off the version. `kind` (`wheel` /
@@ -1049,6 +1098,25 @@ fn resolved_target(
         }
     }
     resolve(locator).map(|u| (locator_string(locator), u))
+}
+
+/// The AUR snapshot URL for `name`: ask the (cached) RPC for the package's
+/// `URLPath`, which names the pkgbase snapshot. Falls back to the name-derived
+/// snapshot path — correct whenever pkgbase == name — when the RPC is
+/// unreachable or names no such package, so an RPC blip can't kill a fetch that
+/// would have succeeded; a genuinely absent package then 404s at the snapshot,
+/// recording a failed fetch rather than an unresolvable locator.
+fn resolve_aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> String {
+    let api = format!("https://aur.archlinux.org/rpc/v5/info?arg%5B%5D={name}");
+    cached_metadata(&api, net, cache)
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|doc| {
+            Some(format!(
+                "https://aur.archlinux.org{}",
+                doc.pointer("/results/0/URLPath")?.as_str()?
+            ))
+        })
+        .unwrap_or_else(|| format!("https://aur.archlinux.org/cgit/aur.git/snapshot/{name}.tar.gz"))
 }
 
 // TODO(fetch-latest): a versionless npm dependency (a manifest range/tag/
@@ -1173,9 +1241,7 @@ fn pick_wheel(urls: &[serde_json::Value]) -> Option<&serde_json::Value> {
 /// latest release. Returns the `files.download` URL — the exact artifact a
 /// client would install.
 fn resolve_openvsx(rest: &str, net: &dyn Fetch) -> Option<String> {
-    let (path, version) = rest
-        .rsplit_once('@')
-        .map_or((rest, None), |(p, v)| (p, Some(v)));
+    let (path, version) = split_path_version(rest);
     let (ns, name) = path.split_once('/')?;
     let api = match version {
         Some(v) => format!("https://open-vsx.org/api/{ns}/{name}/{v}"),
@@ -1192,9 +1258,8 @@ fn resolve_openvsx(rest: &str, net: &dyn Fetch) -> Option<String> {
 /// version is known. `rest` is `<publisher>/<name>[@<version>]`; an unpinned
 /// reference resolves the latest version through the JSON-RPC query first.
 fn resolve_vscode(rest: &str, net: &dyn Fetch) -> Option<String> {
-    let (path, version) = rest
-        .rsplit_once('@')
-        .map_or((rest, None), |(p, v)| (p, Some(v.to_string())));
+    let (path, version) = split_path_version(rest);
+    let version = version.map(str::to_string);
     let (publisher, name) = path.split_once('/')?;
     let version = match version {
         Some(v) => v,
@@ -2268,6 +2333,66 @@ mod tests {
 
         let pypi = dep(RefLocator::Purl("pkg:pypi/requests@2.0".into()), None);
         assert_eq!(fetch_ref(&pypi, &net, &cache).outcome, Outcome::Unresolved);
+    }
+
+    #[test]
+    fn split_path_version_tolerates_misplaced_version() {
+        // Spec order: version before qualifiers, qualifiers dropped.
+        assert_eq!(split_path_version("arch/yay@1.0-1"), ("arch/yay", Some("1.0-1")));
+        assert_eq!(
+            split_path_version("arch/yay@1.0-1?repository_url=https://aur.archlinux.org"),
+            ("arch/yay", Some("1.0-1"))
+        );
+        assert_eq!(split_path_version("arch/yay"), ("arch/yay", None));
+        // The non-spec `?qualifiers@version` ordering older hopper exports
+        // emitted: the trailing version is still found.
+        assert_eq!(
+            split_path_version("arch/yay?repository_url=https://aur.archlinux.org@1.0-1"),
+            ("arch/yay", Some("1.0-1"))
+        );
+        // A qualifier value containing `@` (URL userinfo) is not a version.
+        assert_eq!(
+            split_path_version("arch/yay?repository_url=https://user@example.com/repo"),
+            ("arch/yay", None)
+        );
+    }
+
+    #[test]
+    fn aur_purl_fetches_pkgbase_snapshot() {
+        let rpc = "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=yay";
+        // The RPC names the snapshot by *pkgbase* (here differing from the
+        // package name, the split-package case a derived URL would get wrong).
+        let rpc_body = br#"{"resultcount":1,"results":[{"Name":"yay","PackageBase":"yay-base","URLPath":"/cgit/aur.git/snapshot/yay-base.tar.gz"}]}"#;
+        let snapshot = "https://aur.archlinux.org/cgit/aur.git/snapshot/yay-base.tar.gz";
+        let net = Fixtures::default()
+            .with(rpc, rpc_body)
+            .with(snapshot, b"SNAPSHOT");
+
+        // All three AUR spellings resolve to the same snapshot, including the
+        // spec form carrying a version (snapshots track HEAD; the version
+        // can't pin) and the non-spec `?qualifiers@version` ordering older
+        // hopper exports emitted.
+        for purl in [
+            "pkg:aur/yay",
+            "pkg:alpm/aur/yay",
+            "pkg:alpm/arch/yay@12.0-1?repository_url=https://aur.archlinux.org",
+            "pkg:alpm/arch/yay?repository_url=https://aur.archlinux.org@12.0-1",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cache = BlobCache::with_dir(dir.path().to_path_buf());
+            let rec = fetch_ref(&dep(RefLocator::Purl(purl.into()), None), &net, &cache);
+            assert_eq!(rec.outcome, Outcome::Ok, "{purl}");
+            assert_eq!(rec.resolved_url, snapshot, "{purl}");
+        }
+
+        // RPC unreachable → the name-derived snapshot fallback still fetches.
+        let derived = "https://aur.archlinux.org/cgit/aur.git/snapshot/yay.tar.gz";
+        let net = Fixtures::default().with(derived, b"SNAPSHOT");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path().to_path_buf());
+        let rec = fetch_ref(&dep(RefLocator::Purl("pkg:aur/yay".into()), None), &net, &cache);
+        assert_eq!(rec.outcome, Outcome::Ok);
+        assert_eq!(rec.resolved_url, derived);
     }
 
     #[test]
