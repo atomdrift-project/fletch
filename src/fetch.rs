@@ -660,7 +660,28 @@ fn fetch_ref_inner(
         return rec;
     }
 
-    match net.get(&url) {
+    // The OCI distribution protocol (token + manifest + blob rounds) doesn't
+    // fit the single-URL Fetch backend, so `oci://` targets go to the puller,
+    // which enforces its own public-registry allowlist in place of the
+    // backend's SSRF guard. The recorded docker-content-digest header carries
+    // the image's content-addressed identity — stable across producers, where
+    // the flattened export bytes are not.
+    let fetched = if let Some(oci_ref) = url.strip_prefix("oci://") {
+        crate::oci::export(oci_ref)
+            .map(|(bytes, digest)| Fetched {
+                bytes,
+                final_url: url.clone(),
+                status: 200,
+                headers: digest
+                    .map(|d| vec![("docker-content-digest".to_string(), d)])
+                    .unwrap_or_default(),
+                redirects: Vec::new(),
+            })
+            .map_err(FetchError::Transport)
+    } else {
+        net.get(&url)
+    };
+    match fetched {
         Ok(f) => {
             let meta = CachedMeta {
                 fetched_at: now(),
@@ -970,11 +991,18 @@ fn split_path_version(rest: &str) -> (&str, Option<&str>) {
 }
 
 /// Map a PURL to a deterministic download URL for the computable
-/// ecosystems (npm, crates.io, GitHub archive).
+/// ecosystems (npm, crates.io, GitHub archive), or to the `oci://`
+/// pseudo-URL the OCI puller consumes.
 fn resolve_purl(purl: &str) -> Option<String> {
     // Scheme and type are case-insensitive per spec; the shared splitter folds
     // their case and trims, so any spelling `purl::normalize` accepts resolves.
     let (ty, rest) = crate::purl::scheme_type_rest(purl)?;
+    // pkg:oci carries its repository on a qualifier and splits version
+    // (digest) from tag (qualifier) per its type definition, so it parses
+    // `rest` itself rather than using the generic path@version split.
+    if ty == "oci" || ty == "docker" {
+        return resolve_oci_ref(rest);
+    }
     let (path, version) = split_path_version(rest);
     match ty.as_str() {
         "npm" => {
@@ -1022,8 +1050,96 @@ fn resolve_purl(purl: &str) -> Option<String> {
                 "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=120&acceptformat=crx2,crx3&x=id%3D{id}%26installsource%3Dondemand%26uc"
             ))
         }
+        "clawhub" => {
+            // ClawHub's download API takes the slug, plus the owner handle
+            // when the purl carries one (slugs are not unique across
+            // publishers; a bare shared slug 409s at the registry).
+            let (owner, slug) = path
+                .split_once('/')
+                .map_or(("", path), |(o, s)| (o, s));
+            let mut url = format!("https://clawhub.ai/api/v1/download?slug={slug}");
+            if !owner.is_empty() {
+                url.push_str("&ownerHandle=");
+                url.push_str(owner);
+            }
+            if let Some(v) = version {
+                url.push_str("&version=");
+                url.push_str(v);
+            }
+            Some(url)
+        }
         _ => None,
     }
+}
+
+/// Resolve a `pkg:oci` (or legacy `pkg:docker`) purl body to the `oci://`
+/// pseudo-URL the OCI puller consumes: `oci://<repo>[@sha256:…|:tag]`. The
+/// repository path rides the purl's percent-encoded `repository_url`
+/// qualifier; without one, Docker Hub's implied coordinates apply. A
+/// `sha256:…` version is the content-addressed digest and wins over any
+/// mutable `tag` qualifier; with neither, `latest` — matching what forager's
+/// crane path pulls for a bare reference.
+fn resolve_oci_ref(rest: &str) -> Option<String> {
+    let (bare, quals) = rest.split_once('?').map_or((rest, ""), |(b, q)| (b, q));
+    let (name, version) = bare
+        .rsplit_once('@')
+        .map_or((bare, None), |(n, v)| (n, Some(v)));
+    if name.is_empty() {
+        return None;
+    }
+    let mut repo = None;
+    let mut tag = None;
+    for q in quals.split('&') {
+        if let Some((k, v)) = q.split_once('=') {
+            match k {
+                "repository_url" => repo = Some(percent_decode(v)),
+                "tag" => tag = Some(v.to_string()),
+                _ => {}
+            }
+        }
+    }
+    let repo = repo.unwrap_or_else(|| {
+        // Host-less refs live on Docker Hub; single-segment ones under library/.
+        match name.split_once('/') {
+            Some((first, _)) if first.contains('.') || first.contains(':') => name.to_string(),
+            Some(_) => format!("docker.io/{name}"),
+            None => format!("docker.io/library/{name}"),
+        }
+    });
+    Some(match (version, tag.as_deref()) {
+        (Some(d), _) if d.starts_with("sha256:") => format!("oci://{repo}@{d}"),
+        // A legacy pkg:docker version slot may carry a plain tag.
+        (Some(t), _) | (None, Some(t)) => format!("oci://{repo}:{t}"),
+        (None, None) => format!("oci://{repo}:latest"),
+    })
+}
+
+/// Decode percent-escapes (`%2F` → '/'). Malformed escapes pass through
+/// literally rather than failing — a best-effort mirror of how lenient purl
+/// parsers treat them.
+pub(crate) fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let decoded = (b[i] == b'%' && i + 2 < b.len())
+            .then(|| {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok()?;
+                u8::from_str_radix(hex, 16).ok()
+            })
+            .flatten();
+        match decoded {
+            Some(c) => {
+                out.push(c);
+                i += 3;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Resolve a reference to `(canonical locator, fetchable URL)`. Most ecosystems
@@ -1827,6 +1943,52 @@ mod tests {
             Some("https://rubygems.org/downloads/rails-7.0.4.gem".to_string())
         );
         assert_eq!(resolve(&RefLocator::Purl("pkg:gem/rails".into())), None);
+    }
+
+    #[test]
+    fn resolve_clawhub_download_url() {
+        assert_eq!(
+            resolve(&RefLocator::Purl("pkg:clawhub/owner/cool-skill@1.0.2".into())),
+            Some(
+                "https://clawhub.ai/api/v1/download?slug=cool-skill&ownerHandle=owner&version=1.0.2"
+                    .to_string()
+            )
+        );
+        // A bare slug (no owner, no version) still resolves.
+        assert_eq!(
+            resolve(&RefLocator::Purl("pkg:clawhub/coolskill".into())),
+            Some("https://clawhub.ai/api/v1/download?slug=coolskill".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_oci_to_pseudo_url() {
+        // Tag from the qualifier, repository from the percent-encoded
+        // repository_url (the pkgparse canonical form).
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx&tag=1.25".into()
+            )),
+            Some("oci://docker.io/library/nginx:1.25".to_string())
+        );
+        // A sha256 digest is the version and wins over any tag.
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:oci/img@sha256:244fd47e07d10?repository_url=ghcr.io%2Fowner%2Fimg&tag=v1"
+                    .into()
+            )),
+            Some("oci://ghcr.io/owner/img@sha256:244fd47e07d10".to_string())
+        );
+        // No qualifier, no version: Docker Hub's implied coordinates, latest.
+        assert_eq!(
+            resolve(&RefLocator::Purl("pkg:oci/nginx".into())),
+            Some("oci://docker.io/library/nginx:latest".to_string())
+        );
+        // Legacy pkg:docker with namespace and a tag in the version slot.
+        assert_eq!(
+            resolve(&RefLocator::Purl("pkg:docker/smartentry/debian@dc437cc87d10".into())),
+            Some("oci://docker.io/smartentry/debian:dc437cc87d10".to_string())
+        );
     }
 
     #[test]

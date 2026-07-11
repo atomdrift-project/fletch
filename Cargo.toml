@@ -84,6 +84,10 @@ thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
 dirs = "6"
+oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1.52.3", features = ["rt"] }
+tar = "0.4.46"
+xz2 = "0.1.7"
 
 [dev-dependencies]
 tempfile = "3"

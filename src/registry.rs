@@ -114,6 +114,15 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         "homebrew" => homebrew(last_seg(&path), net, cache),
         "snap" => snap(last_seg(&path), net, cache),
         "wordpress" => wordpress(last_seg(&path), net, cache),
+        // Agent-skill registry: `pkg:clawhub/[owner/]slug`. The v1 API is
+        // search-shaped; the fetcher exact-matches the slug in the results.
+        "clawhub" => clawhub(last_seg(&path), net, cache),
+        // Container images: `pkg:oci/<name>?repository_url=<host%2Fpath>`,
+        // the ratified registry-agnostic type (`pkg:docker` is its legacy
+        // spelling — same repositories, so it routes identically). The
+        // registry host picks the metadata API; the qualifier is dropped by
+        // parse_purl, so it is read off the raw purl.
+        "oci" | "docker" => oci_meta(purl, &path, net, cache),
         // Browser-extension / plugin marketplaces — the same listing shape as
         // the Chrome and VS Code stores (rating, downloads, recency).
         "firefox" => firefox(last_seg(&path), net, cache),
@@ -1871,6 +1880,149 @@ fn fedora(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
 
 /// Homebrew: the formula JSON carries the stable version, description, license,
 /// and 30-day install analytics. It records no publish date.
+/// ClawHub agent-skill registry: `GET /api/v1/skills/{slug}` returns the one
+/// skill (404 for an unknown slug). The purl's optional owner namespace
+/// disambiguates *downloads* (slugs are not unique across publishers); the
+/// metadata endpoint is slug-keyed, so a shared slug resolves to the
+/// registry's primary holder of that slug.
+fn clawhub(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://clawhub.ai/api/v1/skills/{slug}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    let skill = doc.get("skill")?;
+    // Epoch-millisecond timestamps, occasionally fractional; fold to seconds.
+    let ms_to_secs = |v: &Value| {
+        v.as_u64()
+            .or_else(|| v.as_f64().map(|f| f as u64))
+            .map(|ms| ms / 1_000)
+    };
+    Some(Registry {
+        ecosystem: "clawhub".into(),
+        name: slug.to_string(),
+        version: skill
+            .pointer("/tags/latest")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        published_at: skill.get("updatedAt").and_then(ms_to_secs),
+        first_published_at: skill.get("createdAt").and_then(ms_to_secs),
+        title: skill
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        description: skill
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        downloads_total: skill.pointer("/stats/downloads").and_then(Value::as_u64),
+        rating_count: skill.pointer("/stats/stars").and_then(Value::as_u64),
+        release_count: skill
+            .pointer("/stats/versions")
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok()),
+        ..Default::default()
+    })
+}
+
+/// Container-image metadata. The purl carries the registry-qualified
+/// repository path on its percent-encoded `repository_url` qualifier
+/// (`pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx`); the host
+/// picks the metadata API. Docker Hub and Quay expose anonymous repository
+/// JSON; ghcr.io does not (a token dance for a thin manifest), so its refs
+/// resolve no record and the caller fails open like any unreachable registry.
+fn oci_meta(purl: &str, path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let repo = purl
+        .split_once('?')
+        .and_then(|(_, quals)| {
+            quals.split('&').find_map(|q| {
+                let (k, v) = q.split_once('=')?;
+                (k == "repository_url" && !v.is_empty())
+                    .then(|| crate::fetch::percent_decode(v))
+            })
+        })
+        .unwrap_or_else(|| format!("docker.io/library/{}", last_seg(path)));
+    let (host, image) = repo.split_once('/')?;
+    match host {
+        "docker.io" => docker_hub(image, net, cache),
+        "quay.io" => quay(image, net, cache),
+        _ => None,
+    }
+}
+
+/// Docker Hub repository metadata: anonymous JSON with pulls, stars, the
+/// publishing namespace, and registration/update times.
+fn docker_hub(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://hub.docker.com/v2/repositories/{image}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    Some(Registry {
+        ecosystem: "oci".into(),
+        name: doc
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(last_seg(image))
+            .to_string(),
+        published_at: doc
+            .get("last_updated")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
+        first_published_at: doc
+            .get("date_registered")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
+        author: doc
+            .get("namespace")
+            .or_else(|| doc.get("user"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        description: doc
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string),
+        downloads_total: doc.get("pull_count").and_then(Value::as_u64),
+        rating_count: doc.get("star_count").and_then(Value::as_u64),
+        ..Default::default()
+    })
+}
+
+/// Quay repository metadata: anonymous JSON with the description, the owning
+/// namespace, and a Unix-seconds last-modified time.
+fn quay(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let doc: Value = serde_json::from_slice(&cached_metadata(
+        &format!("https://quay.io/api/v1/repository/{image}"),
+        net,
+        cache,
+    )?)
+    .ok()?;
+    Some(Registry {
+        ecosystem: "oci".into(),
+        name: doc
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(last_seg(image))
+            .to_string(),
+        published_at: doc.get("last_modified").and_then(Value::as_u64),
+        author: doc
+            .get("namespace")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        description: doc
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string),
+        rating_count: doc.get("popularity").and_then(Value::as_u64),
+        ..Default::default()
+    })
+}
+
 fn homebrew(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     let doc: Value = serde_json::from_slice(&cached_metadata(
         &format!("https://formulae.brew.sh/api/formula/{name}.json"),
@@ -3047,6 +3199,80 @@ mod tests {
         // Hermetic: an inert cache so every lookup goes straight to the fixture,
         // with no shared on-disk state across tests or runs.
         BlobCache::disabled()
+    }
+
+    #[test]
+    fn clawhub_skill_normalizes() {
+        let doc = serde_json::json!({"skill": {
+            "slug": "cool-skill", "displayName": "Cool Skill",
+            "summary": "Does cool things.",
+            "tags": {"latest": "1.0.2"},
+            "stats": {"downloads": 357u64, "stars": 4u64, "versions": 12u64},
+            "createdAt": 1_782_654_274_836u64,
+            "updatedAt": 1_783_710_964_189u64
+        }})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://clawhub.ai/api/v1/skills/cool-skill",
+            doc.as_bytes(),
+        );
+        let r = clawhub("cool-skill", &net, &test_cache("clawhub")).expect("registry");
+        assert_eq!(r.ecosystem, "clawhub");
+        assert_eq!(r.name, "cool-skill");
+        assert_eq!(r.version, "1.0.2");
+        assert_eq!(r.published_at, Some(1_783_710_964));
+        assert_eq!(r.first_published_at, Some(1_782_654_274));
+        assert_eq!(r.downloads_total, Some(357));
+        assert_eq!(r.rating_count, Some(4));
+        assert_eq!(r.release_count, Some(12));
+    }
+
+    #[test]
+    fn oci_docker_hub_normalizes() {
+        let doc = serde_json::json!({
+            "name": "nginx", "namespace": "library",
+            "description": "Official build of Nginx.",
+            "star_count": 20_000u64, "pull_count": 1_000_000_000u64,
+            "last_updated": "2026-06-01T10:00:00.123456Z",
+            "date_registered": "2014-06-05T19:14:13Z"
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://hub.docker.com/v2/repositories/library/nginx",
+            doc.as_bytes(),
+        );
+        // Through the purl-facing entry so the percent-encoded qualifier is
+        // exercised end-to-end.
+        let r = oci_meta(
+            "pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx",
+            "nginx",
+            &net,
+            &test_cache("oci"),
+        )
+        .expect("registry");
+        assert_eq!(r.ecosystem, "oci");
+        assert_eq!(r.name, "nginx");
+        assert_eq!(r.author.as_deref(), Some("library"));
+        assert_eq!(r.downloads_total, Some(1_000_000_000));
+        assert_eq!(r.rating_count, Some(20_000));
+        assert!(r.published_at.is_some());
+        assert!(r.first_published_at.is_some());
+    }
+
+    #[test]
+    fn oci_unknown_registry_resolves_no_record() {
+        // ghcr has no anonymous metadata API; the lookup fails open (None)
+        // without touching the network.
+        let net = Fixtures::default();
+        assert!(
+            oci_meta(
+                "pkg:oci/img?repository_url=ghcr.io%2Fowner%2Fimg",
+                "img",
+                &net,
+                &test_cache("oci-ghcr"),
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@
 pub mod distro;
 pub mod fetch;
 pub mod find;
+mod oci;
 pub mod purl;
 pub mod registry;
 
