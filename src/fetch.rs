@@ -130,6 +130,17 @@ pub trait Fetch {
             "POST not supported by this backend".into(),
         ))
     }
+
+    /// Whether an `oci://` target may be pulled. The OCI distribution protocol
+    /// (token + manifest + blob rounds) runs on the puller's own HTTP stack,
+    /// not through this backend — so a backend that exists to refuse or replay
+    /// traffic (the `purl` probe, test fixtures) must not have containers
+    /// pulled behind its back. Default `false`: only the backend that owns
+    /// real network policy ([`HttpFetch`]) opts in, and the puller's
+    /// public-registry allowlist stands in for its SSRF guard.
+    fn allows_oci(&self) -> bool {
+        false
+    }
 }
 
 /// A successful fetch with the provenance the transport observed.
@@ -663,21 +674,30 @@ fn fetch_ref_inner(
     // The OCI distribution protocol (token + manifest + blob rounds) doesn't
     // fit the single-URL Fetch backend, so `oci://` targets go to the puller,
     // which enforces its own public-registry allowlist in place of the
-    // backend's SSRF guard. The recorded docker-content-digest header carries
-    // the image's content-addressed identity — stable across producers, where
-    // the flattened export bytes are not.
+    // backend's SSRF guard — but only when the backend consents
+    // (`allows_oci`), so a refusing/replaying backend (the `purl` probe, test
+    // fixtures) keeps its no-network guarantee. The recorded
+    // docker-content-digest header carries the image's content-addressed
+    // identity — stable across producers, where the flattened export bytes
+    // are not.
     let fetched = if let Some(oci_ref) = url.strip_prefix("oci://") {
-        crate::oci::export(oci_ref)
-            .map(|(bytes, digest)| Fetched {
-                bytes,
-                final_url: url.clone(),
-                status: 200,
-                headers: digest
-                    .map(|d| vec![("docker-content-digest".to_string(), d)])
-                    .unwrap_or_default(),
-                redirects: Vec::new(),
-            })
-            .map_err(FetchError::Transport)
+        if net.allows_oci() {
+            crate::oci::export(oci_ref)
+                .map(|(bytes, digest)| Fetched {
+                    bytes,
+                    final_url: url.clone(),
+                    status: 200,
+                    headers: digest
+                        .map(|d| vec![("docker-content-digest".to_string(), d)])
+                        .unwrap_or_default(),
+                    redirects: Vec::new(),
+                })
+                .map_err(FetchError::Transport)
+        } else {
+            Err(FetchError::Refused(
+                "oci pull not permitted by this fetch backend".into(),
+            ))
+        }
     } else {
         net.get(&url)
     };
@@ -1710,6 +1730,13 @@ impl Fetch for HttpFetch {
             redirects: Vec::new(),
         })
     }
+
+    // The real-network backend is the one place container pulls are welcome:
+    // the puller's public-registry allowlist covers the SSRF posture that
+    // guard_host provides for plain URL fetches.
+    fn allows_oci(&self) -> bool {
+        true
+    }
 }
 
 /// The pre-connect floor shared by GET and POST: https only, and refuse a
@@ -1959,6 +1986,29 @@ mod tests {
             resolve(&RefLocator::Purl("pkg:clawhub/coolskill".into())),
             Some("https://clawhub.ai/api/v1/download?slug=coolskill".to_string())
         );
+    }
+
+    #[test]
+    fn oci_pull_requires_backend_consent() {
+        // A backend that hasn't opted in (allows_oci defaults to false) must
+        // never have a container pulled behind its back: the reference still
+        // resolves (the probe's download_url), but the fetch is refused
+        // rather than routed around the backend to the live registry.
+        let r = Reference {
+            locator: RefLocator::Purl("pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx".into()),
+            kind: RefKind::Dependency,
+            source: "test".into(),
+            evidence: String::new(),
+            offset: 0,
+            pinned_hash: None,
+            content_sha256: None,
+        };
+        let rec = fetch_ref(&r, &Fixtures::default(), &BlobCache::disabled());
+        assert_eq!(rec.resolved_url, "oci://docker.io/library/nginx:latest");
+        match &rec.outcome {
+            Outcome::Failed(e) => assert!(e.contains("not permitted"), "{e}"),
+            other => panic!("want refused-without-network, got {other:?}"),
+        }
     }
 
     #[test]
