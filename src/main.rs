@@ -73,6 +73,11 @@ fn source_from_recorded(s: RecordedSource) -> Source {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Reclaim stale/oversized blob-cache entries on a detached thread. Cheap and
+    // self-gated to once a day; the cache is populated by consumers (scan), but
+    // any process that links fletch can reclaim it.
+    fletch::cache_sweep::cleanup();
+
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("registry") => {

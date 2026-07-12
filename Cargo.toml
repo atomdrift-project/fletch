@@ -91,7 +91,6 @@ xz2 = "0.1.7"
 
 [dev-dependencies]
 tempfile = "3"
-filetime = "0.2"
 
 # Temporary local patch for cross-repo development of the Registry struct
 # (release-history / custody fields, NuGet `repository_commit`). Points fletch at

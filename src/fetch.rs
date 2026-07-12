@@ -360,13 +360,17 @@ pub struct BlobCache {
     recorder: Option<RawSink>,
 }
 
+/// The blob cache root (`…/fletch/refs`), or `None` when no OS cache directory
+/// can be determined. This is the directory [`crate::cache_sweep`] reclaims.
+#[must_use]
+pub fn refs_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("fletch").join("refs"))
+}
+
 impl BlobCache {
     /// Open the cache under the OS cache directory (`…/fletch/refs`).
     pub fn open() -> anyhow::Result<Self> {
-        let dir = dirs::cache_dir()
-            .ok_or_else(|| anyhow::anyhow!("no OS cache directory"))?
-            .join("fletch")
-            .join("refs");
+        let dir = refs_dir().ok_or_else(|| anyhow::anyhow!("no OS cache directory"))?;
         Ok(Self::with_dir(dir))
     }
 
@@ -444,25 +448,46 @@ impl BlobCache {
         self.dir.join(format!("{key}.json"))
     }
 
-    /// Read a cache entry and its age, regardless of freshness. A missing
-    /// sidecar yields default provenance.
+    /// Read a cache entry and its age, regardless of freshness. Both the blob
+    /// and its `.json` sidecar must be present and valid; a missing or
+    /// unreadable sidecar is a cache miss rather than fabricated default
+    /// provenance (a blob can outlive its sidecar — e.g. a partial write, or the
+    /// cache sweep evicting one of the pair — and serving `status: 0`,
+    /// `final_url: ""` provenance would silently falsify a `FetchRecord`).
+    ///
+    /// Freshness (`age`) is measured from the recorded `fetched_at`, not the file
+    /// mtime. That leaves the mtime free to record *last access* — bumped on each
+    /// hit by [`mark_accessed`] — so the eviction sweep retains an entry that is
+    /// still in use rather than one merely fetched recently.
     fn read(&self, key: &str) -> Option<(Vec<u8>, CachedMeta, Duration)> {
         if !self.enabled {
             return None;
         }
         let blob = self.blob_path(key);
-        let age = std::fs::metadata(&blob)
-            .ok()?
-            .modified()
-            .ok()?
-            .elapsed()
-            .ok()?;
+        let blob_mtime = std::fs::metadata(&blob).ok()?.modified().ok()?;
         let bytes = zstd::decode_all(std::fs::read(&blob).ok()?.as_slice()).ok()?;
-        let meta = std::fs::read(self.meta_path(key))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let meta: CachedMeta = serde_json::from_slice(&std::fs::read(self.meta_path(key)).ok()?).ok()?;
+        let age = Duration::from_secs(now().saturating_sub(meta.fetched_at));
+        self.mark_accessed(key, blob_mtime);
         Some((bytes, meta, age))
+    }
+
+    /// Record that this entry was just used, so the eviction sweep (which ages by
+    /// mtime) keeps it while it is in use. Rewrites the mtime of both the blob and
+    /// its sidecar to now, but only when the current mtime is already a day stale,
+    /// to avoid a metadata write on every cache hit. Best-effort; a failure just
+    /// means the entry ages from its previous access instead.
+    fn mark_accessed(&self, key: &str, blob_mtime: SystemTime) {
+        const TOUCH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+        if blob_mtime.elapsed().is_ok_and(|age| age < TOUCH_INTERVAL) {
+            return; // touched within the last day
+        }
+        let now = SystemTime::now();
+        for path in [self.blob_path(key), self.meta_path(key)] {
+            if let Ok(file) = std::fs::File::options().write(true).open(&path) {
+                let _ = file.set_modified(now);
+            }
+        }
     }
 
     /// Cached bytes + provenance for `key`, if present and younger than
@@ -2511,11 +2536,15 @@ mod tests {
         let ok = Fixtures::default().with(url, b"CACHED");
         assert!(!fetch_ref(&r, &ok, &cache).cached);
 
-        // Age the entry well past the 12h unpinned TTL.
+        // Age the entry past the 12h unpinned TTL by backdating the recorded
+        // fetch time — freshness is measured from `fetched_at`, not the file
+        // mtime (which now tracks last access for the eviction sweep).
         let key = sha256_hex(b"pkg:npm/foo@1.0.0");
-        let blob = dir.path().join(format!("{key}.zst"));
-        let old = SystemTime::now() - Duration::from_secs(48 * 3600);
-        filetime::set_file_mtime(&blob, filetime::FileTime::from_system_time(old)).expect("mtime");
+        let meta_path = dir.path().join(format!("{key}.json"));
+        let mut meta: CachedMeta =
+            serde_json::from_slice(&std::fs::read(&meta_path).expect("read meta")).expect("parse");
+        meta.fetched_at = now() - 48 * 3600;
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).expect("serialize")).expect("write");
 
         // The source is now unreachable (no fixture): serve the stale copy.
         let rec = fetch_ref(&r, &Fixtures::default(), &cache);
@@ -2529,6 +2558,43 @@ mod tests {
         let rec = fetch_ref(&r, &Fixtures::default(), &empty);
         assert!(matches!(rec.outcome, Outcome::Failed(_)));
         assert!(!rec.stale);
+    }
+
+    #[test]
+    fn cache_hit_refreshes_last_access_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path().to_path_buf());
+        let key = "abc123";
+        cache.put(
+            key,
+            b"payload",
+            &CachedMeta {
+                fetched_at: now(),
+                ..Default::default()
+            },
+        );
+
+        // Backdate both files so the entry looks two days idle to the sweep.
+        let old = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
+        for ext in ["zst", "json"] {
+            let p = dir.path().join(format!("{key}.{ext}"));
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .expect("open")
+                .set_modified(old)
+                .expect("mtime");
+        }
+
+        // A cache hit marks the entry accessed, so the eviction sweep (which ages
+        // by mtime) treats it as recently used rather than two days old.
+        assert!(cache.any(key).is_some(), "entry is served");
+        let blob = dir.path().join(format!("{key}.zst"));
+        let mtime = std::fs::metadata(&blob).unwrap().modified().unwrap();
+        assert!(
+            mtime.elapsed().unwrap() < Duration::from_secs(120),
+            "the cache hit refreshed the last-access mtime"
+        );
     }
 
     #[test]
