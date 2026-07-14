@@ -107,7 +107,16 @@ pub fn references_in_bytes(data: &[u8], filename: &str) -> Vec<Reference> {
 /// analysis extracted and discarded: the `Call` symbols survive on the report.
 /// A `require("pkg")` / `import("pkg")` (npm) or `__import__("pkg")` /
 /// `importlib.import_module("pkg")` (PyPI) with a string-literal specifier is
-/// emitted as the loaded package — the load verb implies the ecosystem.
+/// emitted as the loaded package — the load verb *and the source language*
+/// together imply the ecosystem.
+///
+/// The language gate is load-bearing: `require` is not Node-specific. Ruby
+/// spells a library load `require "faraday"` / `require "date"`, so treating a
+/// bare `require` as npm fabricates a phantom npm dependency for every Ruby
+/// `require` — including Ruby stdlib (`date`, `singleton`, `forwardable`) and
+/// the gem's own name — and then fetches an unrelated npm package that merely
+/// shares the name. Ruby's real dependencies come from its gemspec/`Gemfile.lock`
+/// manifest, not from `require`, so a non-JS/TS `require` yields nothing here.
 ///
 /// Diffing the result against the manifest's declared deps (see
 /// [`undeclared_packages`]) surfaces a load of an *undeclared* package — a
@@ -116,7 +125,7 @@ pub fn references_in_bytes(data: &[u8], filename: &str) -> Vec<Reference> {
 /// `None`) or non-literal argument yields nothing; relative paths and language
 /// builtins are skipped by [`import_locator`].
 #[must_use]
-pub fn import_calls(symbols: &[Symbol]) -> Vec<Reference> {
+pub fn import_calls(file_type: &str, symbols: &[Symbol]) -> Vec<Reference> {
     let mut refs = Vec::new();
     for sym in symbols {
         let Symbol::Call {
@@ -127,9 +136,13 @@ pub fn import_calls(symbols: &[Symbol]) -> Vec<Reference> {
         else {
             continue;
         };
-        let eco = match target.as_str() {
-            "require" | "import" => "npm",
-            "__import__" | "import_module" | "importlib.import_module" => "pypi",
+        // The load verb names the ecosystem only within its own language:
+        // `require`/`import` are npm in JS/TS, the `__import__`/`import_module`
+        // family is PyPI in Python. Any other language's homonymous load verb
+        // (notably Ruby's `require`) is not a registry install and is skipped.
+        let eco = match (file_type, target.as_str()) {
+            ("javascript" | "typescript", "require" | "import") => "npm",
+            ("python", "__import__" | "import_module" | "importlib.import_module") => "pypi",
             _ => continue,
         };
         let Some(Arg::String { value }) = args.first() else {
@@ -1669,7 +1682,7 @@ mod tests {
     fn import_calls_recovers_loads_from_symbols() {
         // The facts-only path: archive members keep Call symbols after their
         // bytes are discarded, so `require("db-dx-connector")` is still hunted.
-        let symbols = vec![
+        let js_symbols = vec![
             Symbol::Call {
                 target: Some("require".into()),
                 args: vec![Arg::String {
@@ -1684,13 +1697,6 @@ mod tests {
                 }],
                 offset: None,
             },
-            Symbol::Call {
-                target: Some("importlib.import_module".into()),
-                args: vec![Arg::String {
-                    value: "evil_telemetry".into(),
-                }],
-                offset: None,
-            },
             // Computed callee (`npm().install`) — no static target, skipped.
             Symbol::Call {
                 target: None,
@@ -1700,13 +1706,9 @@ mod tests {
                 offset: None,
             },
         ];
-        let purls = purls_of(&import_calls(&symbols));
+        let purls = purls_of(&import_calls("javascript", &js_symbols));
         assert!(
             purls.contains(&"pkg:npm/db-dx-connector".to_string()),
-            "{purls:?}"
-        );
-        assert!(
-            purls.contains(&"pkg:pypi/evil_telemetry".to_string()),
             "{purls:?}"
         );
         assert!(
@@ -1714,6 +1716,45 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("fs") || p.contains("ignored")),
             "builtins and computed callees must be skipped; got {purls:?}"
+        );
+
+        let py_symbols = vec![Symbol::Call {
+            target: Some("importlib.import_module".into()),
+            args: vec![Arg::String {
+                value: "evil_telemetry".into(),
+            }],
+            offset: None,
+        }];
+        let py = purls_of(&import_calls("python", &py_symbols));
+        assert!(py.contains(&"pkg:pypi/evil_telemetry".to_string()), "{py:?}");
+    }
+
+    #[test]
+    fn import_calls_ignores_ruby_require() {
+        // Ruby spells a library load `require "name"`, which tree-sitter surfaces
+        // as the same `Call{target:"require"}` symbol as Node. It must NOT resolve
+        // as npm: doing so fabricated `pkg:npm/date`, `pkg:npm/singleton`, and the
+        // gem's own name for a benign gem, then fetched unrelated npm squatters.
+        let symbols = vec![
+            Symbol::Call {
+                target: Some("require".into()),
+                args: vec![Arg::String {
+                    value: "faraday".into(),
+                }],
+                offset: Some(0),
+            },
+            Symbol::Call {
+                target: Some("require".into()),
+                args: vec![Arg::String {
+                    value: "date".into(), // Ruby stdlib
+                }],
+                offset: None,
+            },
+        ];
+        let purls = purls_of(&import_calls("ruby", &symbols));
+        assert!(
+            purls.is_empty(),
+            "Ruby require must not resolve as npm; got {purls:?}"
         );
     }
 
