@@ -364,7 +364,7 @@ fn import_locator(eco: &str, spec: &str) -> Option<(RefLocator, RefKind)> {
     let purl = match eco {
         "npm" => {
             let bare = spec.strip_prefix("node:").unwrap_or(spec);
-            if NODE_BUILTINS.contains(&bare) {
+            if NODE_BUILTINS.contains(&bare) || HOST_PROVIDED_MODULES.contains(&bare) {
                 return None;
             }
             npm_purl_token(&npm_import_package(spec)?)?
@@ -395,6 +395,16 @@ fn npm_import_package(spec: &str) -> Option<String> {
         (!name.is_empty()).then(|| name.to_string())
     }
 }
+
+/// Runtime/host-provided ambient modules that a bare `require(...)`/`import`
+/// resolves to at load time — never an npm registry install. `vscode` is the VS
+/// Code extension-host API object, injected by the editor into every extension;
+/// the same-named npm package is a long-deprecated (2019) test harness that no
+/// runtime code imports, so resolving `require('vscode')` to it fetches the wrong
+/// artifact (vscode-1.1.37) and mislabels every VS Code extension with that
+/// package's install-script behavior. Extend only with modules a host runtime
+/// genuinely injects, not real packages.
+const HOST_PROVIDED_MODULES: &[&str] = &["vscode"];
 
 /// Node.js builtin modules — a dynamic `import("fs")` is the runtime, not an
 /// external dependency, so it is never hunted as undeclared.
@@ -1150,6 +1160,26 @@ mod tests {
             pypi_purl_token("requests[security]==2.1"),
             Some("pkg:pypi/requests@2.1".to_string())
         );
+    }
+
+    #[test]
+    fn require_vscode_and_builtins_are_not_npm_deps() {
+        // A VS Code extension's `require('vscode')` binds the editor-injected
+        // host API, and `require('fs')` a Node builtin — neither is an npm
+        // install. Only the real package (`lodash`) resolves to a purl.
+        let call = |m: &str| Symbol::Call {
+            target: Some("require".into()),
+            args: vec![Arg::String { value: m.into() }],
+            offset: Some(0),
+        };
+        let syms = [call("vscode"), call("fs"), call("node:os"), call("lodash")];
+        let purls: Vec<String> = import_calls("javascript", &syms)
+            .iter()
+            .map(|r| match &r.locator {
+                RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
+            })
+            .collect();
+        assert_eq!(purls, vec!["pkg:npm/lodash".to_string()], "{purls:?}");
     }
 
     #[test]
