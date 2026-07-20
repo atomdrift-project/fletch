@@ -9,11 +9,12 @@
 //!
 //! The two directions are deliberately tested against each other: for the
 //! ecosystems whose download URL is a pure `name+version` function
-//! (npm, crates.io, RubyGems, Go module proxy, GitHub archives), a PURL routed
-//! through [`fetch::resolve`](crate::fetch::resolve) and back through
-//! [`url_to_purl`] must return the original. The asymmetric ecosystems — PyPI
-//! (its `files.pythonhosted.org` path carries an undrivable content hash) and
-//! platform-tagged gems — cannot round-trip and are covered forward-only.
+//! (npm, crates.io, RubyGems, Go module proxy, NuGet, Maven Central, GitHub
+//! archives), a PURL routed through [`fetch::resolve`](crate::fetch::resolve)
+//! and back through [`url_to_purl`] must return the original. The asymmetric
+//! ecosystems — PyPI (its `files.pythonhosted.org` path carries an undrivable
+//! content hash) and platform-tagged gems — cannot round-trip and are covered
+//! forward-only.
 //!
 //! This module also owns PURL **normalization**: [`normalize`] collapses every
 //! spelling this project has ever emitted onto one canonical form, and
@@ -253,6 +254,8 @@ mod tests {
             "pkg:cargo/serde@1.0.0",
             "pkg:gem/rails@7.0.0",
             "pkg:golang/github.com/BurntSushi/toml@v1.0.0",
+            "pkg:nuget/newtonsoft.json@13.0.3",
+            "pkg:maven/com.google.guava/guava@32.1.3-jre",
             "pkg:github/owner/repo@v1.0.0",
         ] {
             let url = crate::fetch::resolve(&RefLocator::Purl(purl.to_string()))

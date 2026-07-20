@@ -1000,8 +1000,8 @@ fn locator_string(locator: &RefLocator) -> String {
 
 /// Resolve a locator to a fetchable URL, or `None` if the ecosystem isn't
 /// supported yet. Ecosystems that need a registry round-trip (PyPI, Composer,
-/// the AUR, an unversioned npm PURL) resolve in [`resolved_target`] instead;
-/// official-repo alpm (a mirror lookup) is a follow-up.
+/// Firefox, the AUR, an unversioned npm PURL) resolve in [`resolved_target`]
+/// instead; official-repo alpm (a mirror lookup) is a follow-up.
 #[must_use]
 pub fn resolve(locator: &RefLocator) -> Option<String> {
     match locator {
@@ -1035,8 +1035,8 @@ fn split_path_version(rest: &str) -> (&str, Option<&str>) {
     (path, version)
 }
 
-/// Map a PURL to a deterministic download URL for the computable
-/// ecosystems (npm, crates.io, GitHub archive), or to the `oci://`
+/// Map a PURL to a deterministic download URL for the computable ecosystems
+/// (npm, crates.io, NuGet, Maven Central, GitHub archives), or to the `oci://`
 /// pseudo-URL the OCI puller consumes.
 fn resolve_purl(purl: &str) -> Option<String> {
     // Scheme and type are case-insensitive per spec; the shared splitter folds
@@ -1086,6 +1086,36 @@ fn resolve_purl(purl: &str) -> Option<String> {
                 "https://rubygems.org/downloads/{path}-{version}.gem"
             ))
         }
+        "nuget" => {
+            // NuGet's flat-container coordinates and filenames are lowercase,
+            // even when the package id/version in the PURL are not.
+            let version = version?.to_lowercase();
+            let id = path.to_lowercase();
+            Some(format!(
+                "https://api.nuget.org/v3-flatcontainer/{id}/{version}/{id}.{version}.nupkg"
+            ))
+        }
+        "maven" => {
+            // The PURL namespace is the dotted group id; Maven Central lays it
+            // out as path segments. `type` and `classifier` select a non-default
+            // artifact when present; otherwise the installable main JAR wins.
+            let version = version?;
+            let (group, artifact) = path.split_once('/')?;
+            let extension = match purl_qualifier(rest, "type") {
+                Some(v) if safe_filename_part(&v) => v,
+                Some(_) => return None,
+                None => "jar".to_string(),
+            };
+            let classifier = match purl_qualifier(rest, "classifier") {
+                Some(v) if safe_filename_part(&v) => format!("-{v}"),
+                Some(_) => return None,
+                None => String::new(),
+            };
+            Some(format!(
+                "https://repo1.maven.org/maven2/{}/{artifact}/{version}/{artifact}-{version}{classifier}.{extension}",
+                group.replace('.', "/")
+            ))
+        }
         // `chrome-extension` is the ratified purl-spec spelling of the type.
         "chrome" | "chrome-extension" => {
             // The CRX download service redirects to the current packed
@@ -1115,6 +1145,25 @@ fn resolve_purl(purl: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Read one PURL qualifier from `rest`, percent-decoding its value. Qualifiers
+/// follow the coordinate/version after `?` and are an unordered `&` list.
+fn purl_qualifier(rest: &str, key: &str) -> Option<String> {
+    rest.split_once('?')?.1.split('&').find_map(|q| {
+        let (k, v) = q.split_once('=')?;
+        k.eq_ignore_ascii_case(key).then(|| percent_decode(v))
+    })
+}
+
+/// Whether a decoded PURL qualifier can safely be embedded as one artifact
+/// filename component. Reject separators and URL delimiters instead of letting
+/// a crafted classifier/type change the Maven repository path.
+fn safe_filename_part(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .bytes()
+            .any(|b| matches!(b, b'/' | b'\\' | b'?' | b'#'))
 }
 
 /// Resolve a `pkg:oci` (or legacy `pkg:docker`) purl body to the `oci://`
@@ -1227,6 +1276,16 @@ fn resolved_target(
             } else {
                 resolve_vscode(rest, net).map(|u| (p.clone(), u))
             };
+        }
+        // AMO publishes the exact XPI URL in its API. A pinned PURL uses the
+        // direct per-version endpoint; an unpinned one follows current_version
+        // and is refined to the concrete version for provenance and cache keys.
+        if ty == "firefox" {
+            let (path, requested) = split_path_version(rest);
+            let (version, url) = resolve_firefox(path, requested, net, cache)?;
+            let locator =
+                requested.map_or_else(|| format!("pkg:firefox/{path}@{version}"), |_| p.clone());
+            return Some((locator, url));
         }
         // The AUR serves one artifact per package: the current PKGBUILD-tree
         // snapshot, addressed by *pkgbase* (a split package's snapshot lives
@@ -1361,6 +1420,47 @@ fn resolve_pypi(
     pick.get("url")
         .and_then(serde_json::Value::as_str)
         .map(String::from)
+}
+
+/// Resolve a Firefox Add-ons slug to the XPI AMO serves. A requested version
+/// goes through the immutable per-version endpoint, so an old pin can never be
+/// silently replaced by the latest release. Without a version, the add-on
+/// document's `current_version` supplies both the concrete version and file.
+fn resolve_firefox(
+    path: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<(String, String)> {
+    let slug = path.rsplit('/').next().unwrap_or(path);
+    if slug.is_empty() {
+        return None;
+    }
+    let (api, ttl) = match version {
+        Some(v) => (
+            format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/versions/{v}/"),
+            META_TTL_IMMUTABLE,
+        ),
+        None => (
+            format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/"),
+            meta_ttl_unpinned(),
+        ),
+    };
+    let bytes = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let release = if version.is_some() {
+        &json
+    } else {
+        json.get("current_version")?
+    };
+    let resolved_version = release.get("version")?.as_str()?.to_string();
+    // Defensive equality check: a malformed or surprising API response must
+    // not substitute another release for an explicitly requested version.
+    if version.is_some_and(|want| want != resolved_version) {
+        return None;
+    }
+    let url = release.pointer("/file/url")?.as_str()?.to_string();
+    Some((resolved_version, url))
 }
 
 /// The one source distribution among a PyPI version's files (there is at most
@@ -1995,6 +2095,113 @@ mod tests {
             Some("https://rubygems.org/downloads/rails-7.0.4.gem".to_string())
         );
         assert_eq!(resolve(&RefLocator::Purl("pkg:gem/rails".into())), None);
+    }
+
+    #[test]
+    fn resolve_nuget_and_maven_artifacts() {
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:nuget/Newtonsoft.Json@13.0.3".into()
+            )),
+            Some(
+                "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:maven/com.google.guava/guava@32.1.3-jre".into()
+            )),
+            Some(
+                "https://repo1.maven.org/maven2/com/google/guava/guava/32.1.3-jre/guava-32.1.3-jre.jar"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:maven/org.example/tool@1.2.0?classifier=sources&type=zip".into()
+            )),
+            Some(
+                "https://repo1.maven.org/maven2/org/example/tool/1.2.0/tool-1.2.0-sources.zip"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:maven/org.example/tool@1.2.0?classifier=..%2Fsecret".into()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_firefox_uses_exact_version_and_refines_latest() {
+        let pinned_api =
+            "https://addons.mozilla.org/api/v5/addons/addon/surf-click/versions/1.0.9/";
+        let latest_api = "https://addons.mozilla.org/api/v5/addons/addon/surf-click/";
+        let xpi = "https://addons.mozilla.org/firefox/downloads/file/4909333/surf_click-1.0.9.xpi";
+        let pinned = serde_json::json!({
+            "version": "1.0.9",
+            "file": {"url": xpi}
+        })
+        .to_string();
+        let latest = serde_json::json!({
+            "current_version": {
+                "version": "1.0.9",
+                "file": {"url": xpi}
+            }
+        })
+        .to_string();
+        let net = Fixtures::default()
+            .with(pinned_api, pinned.as_bytes())
+            .with(latest_api, latest.as_bytes())
+            .with(xpi, b"XPI");
+        let cache = BlobCache::disabled();
+
+        assert_eq!(
+            resolved_target(
+                &RefLocator::Purl("pkg:firefox/surf-click@1.0.9".into()),
+                &net,
+                &cache
+            ),
+            Some(("pkg:firefox/surf-click@1.0.9".to_string(), xpi.to_string()))
+        );
+        assert_eq!(
+            resolved_target(
+                &RefLocator::Purl("pkg:firefox/surf-click".into()),
+                &net,
+                &cache
+            ),
+            Some(("pkg:firefox/surf-click@1.0.9".to_string(), xpi.to_string()))
+        );
+        let rec = fetch_ref(
+            &dep(
+                RefLocator::Purl("pkg:firefox/surf-click@1.0.9".into()),
+                None,
+            ),
+            &net,
+            &cache,
+        );
+        assert_eq!(rec.outcome, Outcome::Ok);
+        assert_eq!(rec.resolved_url, xpi);
+        assert_eq!(rec.content_sha256.as_deref(), Some(&*sha256_hex(b"XPI")));
+
+        // A mismatched per-version response is refused rather than silently
+        // substituting another release for the requested artifact.
+        let wrong = serde_json::json!({
+            "version": "1.0.8",
+            "file": {"url": "https://example.invalid/wrong.xpi"}
+        })
+        .to_string();
+        let net = Fixtures::default().with(pinned_api, wrong.as_bytes());
+        assert_eq!(
+            resolved_target(
+                &RefLocator::Purl("pkg:firefox/surf-click@1.0.9".into()),
+                &net,
+                &cache
+            ),
+            None
+        );
     }
 
     #[test]
