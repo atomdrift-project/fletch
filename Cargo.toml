@@ -2,6 +2,9 @@
 name = "fletch"
 version = "0.1.0"
 edition = "2024"
+# Build on any rustc within ~2 releases of current stable; edition 2024 implies
+# the MSRV-aware resolver, so this also caps dependency versions.
+rust-version = "1.94"
 license = "Apache-2.0"
 description = "Find and fetch external references (packages and URLs) discovered in analyzed files"
 repository = "https://codeberg.org/atomdrift/fletch"
