@@ -7,7 +7,7 @@ edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
 description = "Find and fetch external references (packages and URLs) discovered in analyzed files"
-repository = "https://codeberg.org/atomdrift/fletch"
+repository = "https://github.com/atomdrift-project/fletch"
 
 # Lint policy mirrors cleave's workspace lints (fletch is a standalone package,
 # so they live here directly rather than via `workspace = true`). Keep in sync.
@@ -64,7 +64,7 @@ missing_panics_doc = "allow"
 # facts `find` consumes. The reference types now ship in filefacts' published
 # git HEAD, so consume it from git — a path dep here forces every downstream
 # (cleave + scan) into a local override just to satisfy this one line.
-filefacts = { git = "https://codeberg.org/atomdrift/filefacts.git" }
+filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
 
 # HTTPS client. rustls-tls avoids a system OpenSSL dependency; blocking keeps
 # the fetcher off any async runtime.
