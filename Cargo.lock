@@ -794,7 +794,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.2.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#6125def468d352b56c806cf5a2fcaf3019ea4235"
+source = "git+https://github.com/atomdrift-project/filefacts.git#237559790f9c072a46098c02167cf16dd4881b66"
 dependencies = [
  "aho-corasick",
  "cfb",
@@ -2345,9 +2345,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.15.0"
+version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
+checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
 dependencies = [
  "web-time",
  "zeroize",
@@ -2700,7 +2700,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.7.1"
-source = "git+https://github.com/atomdrift-project/stng.git#ab61c09b770369ae2cde964ac2f6e254d804ffad"
+source = "git+https://github.com/atomdrift-project/stng.git#2822b4e1be1ab0ce53c59d4e8158ac1e01fed20e"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3216,7 +3216,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#6125def468d352b56c806cf5a2fcaf3019ea4235"
+source = "git+https://github.com/atomdrift-project/filefacts.git#237559790f9c072a46098c02167cf16dd4881b66"
 dependencies = [
  "cc",
  "tree-sitter",
