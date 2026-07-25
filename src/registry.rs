@@ -2705,6 +2705,29 @@ mod tests {
     use crate::fetch::{BlobCache, Fixtures};
 
     #[test]
+    fn pinned_metadata_outlives_unpinned_and_honours_the_override() {
+        // A pinned coordinate cannot come back holding different bytes on any
+        // registry we support, so its packument is held for months; a versionless
+        // lookup resolves through mutable dist-tags and keeps a tight bound.
+        assert!(crate::fetch::meta_ttl_pinned() > crate::fetch::meta_ttl_unpinned());
+        assert!(crate::fetch::meta_ttl_pinned() >= std::time::Duration::from_secs(30 * 86_400));
+
+        // An explicit operator override still wins on both tiers, so asking for
+        // tight revalidation is never silently ignored.
+        crate::fetch::set_registry_ttl(Some(std::time::Duration::from_secs(60)));
+        assert_eq!(
+            crate::fetch::meta_ttl_pinned(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            crate::fetch::meta_ttl_unpinned(),
+            std::time::Duration::from_secs(60)
+        );
+        crate::fetch::set_registry_ttl(None);
+        assert!(crate::fetch::meta_ttl_pinned() > crate::fetch::meta_ttl_unpinned());
+    }
+
+    #[test]
     fn registry_with_sources_returns_record_and_raw_documents() {
         let packument = serde_json::json!({
             "dist-tags": {"latest": "1.3.0"},

@@ -32,16 +32,36 @@ const TTL_UNPINNED: Duration = Duration::from_secs(12 * 3600);
 /// - **Immutable** — a published version's file list (URLs, hashes, upload time)
 ///   and content-addressed data never change, so cache them forever. This is the
 ///   version-specific endpoint a download-URL resolution reads.
-/// - **Pinned** — the package-level *packument* behind a versioned lookup. The
-///   version's own facts are stable, but its yank status can flip after publish
-///   (and new siblings appear), so bound staleness to a few hours.
-/// - **Unpinned** — a `latest`/versionless lookup moves with every release, so a
-///   tighter bound.
+/// - **Pinned** — the package-level *packument* behind a versioned lookup. No
+///   registry we support lets different bytes appear at an already-published
+///   coordinate: crates.io and Maven Central refuse to overwrite a release, the
+///   Go proxy is content-addressed against the checksum database, and npm and
+///   PyPI both block reuse of a version number even after an unpublish or
+///   delete. So the attack a short TTL would defend against — publish a benign
+///   `1.0.0`, let it be cached and vouched, then swap malware in at that same
+///   coordinate — cannot happen, while revalidating hundreds of lockfile
+///   coordinates per scan only re-confirms what they already said. 90 days
+///   rather than forever so a record still refreshes on a human timescale: the
+///   schema we parse can change, and a cache that never expires can never
+///   self-heal from a bad parse.
+/// - **Unpinned** — a `latest`/versionless lookup resolves through dist-tags,
+///   which are repointable at will. That is where the real mutability lives, so
+///   it keeps a tight bound.
+///
+/// Keyed on version-ness alone rather than a per-registry allowlist: the
+/// property is universal, and a table would have to be kept correct for every
+/// ecosystem added later, failing open if it were not.
+///
+/// Accepted cost: `dep_pulled` feeds `must_rescan`, so a withdrawal — often
+/// *because* something was found malicious — invalidates a known-good vouch, and
+/// a long TTL delays noticing that. If it bites, the targeted fix is a short TTL
+/// only for coordinates the known-good bloom vouches for, since those are the
+/// only ones `must_rescan` can rescue.
 ///
 /// The two mutable tiers are overridable per process via [`set_registry_ttl`];
 /// the immutable tier is never re-checked.
 pub(crate) const META_TTL_IMMUTABLE: Duration = Duration::MAX;
-const META_TTL_PINNED_DEFAULT: Duration = Duration::from_secs(4 * 3600);
+const META_TTL_PINNED_DEFAULT: Duration = Duration::from_secs(90 * 86_400);
 const META_TTL_UNPINNED_DEFAULT: Duration = Duration::from_secs(3600);
 
 /// Process-wide override for the two mutable metadata TTLs, in seconds. `0` means
