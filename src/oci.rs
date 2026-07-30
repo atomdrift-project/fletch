@@ -278,9 +278,24 @@ fn shadowed(path: &[u8], tombstones: &HashSet<Vec<u8>>, opaque: &HashSet<Vec<u8>
     false
 }
 
+/// Borrow a raw tar entry name as a `Path`.
+///
+/// Unix `OsStr` is arbitrary bytes, so this is a zero-copy view. Windows has no
+/// equivalent — its `OsStr` is WTF-8 over UTF-16 code units, not bytes — so
+/// there the name is borrowed only when it is valid UTF-8, which OCI layer
+/// entry names are in practice. A non-UTF-8 name has no Windows path
+/// representation at all; it yields an empty path rather than a lossily
+/// mangled one, so the caller's `append_*` fails loudly instead of writing an
+/// entry under a corrupted name.
+#[cfg(unix)]
 fn bytes_path(b: &[u8]) -> &std::path::Path {
     use std::os::unix::ffi::OsStrExt;
     std::path::Path::new(std::ffi::OsStr::from_bytes(b))
+}
+
+#[cfg(not(unix))]
+fn bytes_path(b: &[u8]) -> &std::path::Path {
+    std::path::Path::new(std::str::from_utf8(b).unwrap_or(""))
 }
 
 /// Forward writes until more than `limit` bytes pass, then fail — bounding the
