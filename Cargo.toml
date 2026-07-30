@@ -103,3 +103,20 @@ tempfile = "3"
 # Temporary local patch for cross-repo development of the Registry struct
 # (release-history / custody fields, NuGet `repository_commit`). Points fletch at
 # local filefacts; restore to a published filefacts rev before merging.
+
+# illumos support for tree-sitter's vendored endian.h, pulled in transitively
+# via filefacts. Its only illumos arm tests __illumos__, which illumos-gcc
+# predefines but cross-rs's x86_64-unknown-illumos-gcc does not, so the build
+# hits "#error platform not supported" at endian.h:238. The fork adds a __sun
+# arm over <sys/byteorder.h>.
+#
+# Both crates must come from the fork together: the fork's tree-sitter uses its
+# in-tree tree-sitter-language, and `links = "tree-sitter-language"` permits
+# only one copy in the graph. The fork is 0.27.0 and unpublished — crates.io
+# tops out at 0.26.11 — so this is load-bearing for resolution, not only for
+# the fix, and every root in this tree needs an identical block: cleave,
+# filefacts, fletch, hood and scan. Remove from all five once the PR lands
+# upstream and a release carries it.
+[patch.crates-io]
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
