@@ -105,18 +105,18 @@ tempfile = "3"
 # local filefacts; restore to a published filefacts rev before merging.
 
 # illumos support for tree-sitter's vendored endian.h, pulled in transitively
-# via filefacts. Its only illumos arm tests __illumos__, which illumos-gcc
-# predefines but cross-rs's x86_64-unknown-illumos-gcc does not, so the build
-# hits "#error platform not supported" at endian.h:238. The fork adds a __sun
-# arm over <sys/byteorder.h>.
+# via filefacts. In 0.26.11 the only illumos arm tests __illumos__, which
+# illumos-gcc predefines but cross-rs's x86_64-unknown-illumos-gcc does not, so
+# the build hits "#error platform not supported" at endian.h:238. Upstream
+# added a __sun arm over <sys/byteorder.h> in 77cb23fc, still unreleased.
 #
-# Both crates must come from the fork together: the fork's tree-sitter uses its
-# in-tree tree-sitter-language, and `links = "tree-sitter-language"` permits
-# only one copy in the graph. The fork is 0.27.0 and unpublished — crates.io
+# Both crates must come from the same source: tree-sitter uses its in-tree
+# tree-sitter-language, and `links = "tree-sitter-language"` permits only one
+# copy in the graph. Upstream master is 0.27.0 and unpublished — crates.io
 # tops out at 0.26.11 — so this is load-bearing for resolution, not only for
 # the fix, and every root in this tree needs an identical block: cleave,
-# filefacts, fletch, hood and scan. Remove from all five once the PR lands
-# upstream and a release carries it.
+# filefacts, fletch, hood and scan. Remove from all five once a release
+# carries it.
 [patch.crates-io]
-tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
-tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
