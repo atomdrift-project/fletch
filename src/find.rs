@@ -354,7 +354,15 @@ fn leading_string_literal(s: &str) -> Option<&str> {
 
 /// Classify a dynamic-import specifier into a fetchable reference, or `None` for
 /// a relative path or a language builtin (never an undeclared external dep).
+///
+/// The specifier arrives as the string literal's *source* text, so its escapes
+/// are decoded first: a `require` whose argument spells every character as a
+/// `\u00XX` escape still loads Node's `readline`, and only the decoded form can
+/// be recognized as the builtin it is — or, for a real package, resolved to a
+/// name a registry can serve.
 fn import_locator(eco: &str, spec: &str) -> Option<(RefLocator, RefKind)> {
+    let decoded = decode_escapes(spec);
+    let spec = decoded.as_deref().unwrap_or(spec);
     if spec.contains("://") {
         return Some((RefLocator::Url(spec.to_string()), RefKind::UrlFetch));
     }
@@ -371,7 +379,7 @@ fn import_locator(eco: &str, spec: &str) -> Option<(RefLocator, RefKind)> {
         }
         "pypi" => {
             let top = spec.split(['.', ':']).next()?;
-            if top.is_empty() || PY_STDLIB.contains(&top) {
+            if top.is_empty() || PY_STDLIB.contains(&top) || !is_package_name(top) {
                 return None;
             }
             pypi_purl_token(top)?
@@ -383,17 +391,114 @@ fn import_locator(eco: &str, spec: &str) -> Option<(RefLocator, RefKind)> {
 
 /// The installable package name from a JS import specifier: `@scope/name` from
 /// `@scope/name/sub`, or `name` from `name/sub` (a deep import's subpath is not
-/// part of the package identity).
+/// part of the package identity). `None` when a segment is empty or is not a
+/// plausible package name.
 fn npm_import_package(spec: &str) -> Option<String> {
     if let Some(rest) = spec.strip_prefix('@') {
         let mut parts = rest.splitn(2, '/');
         let scope = parts.next()?;
         let name = parts.next()?.split('/').next()?;
-        (!scope.is_empty() && !name.is_empty()).then(|| format!("@{scope}/{name}"))
+        (is_package_name(scope) && is_package_name(name)).then(|| format!("@{scope}/{name}"))
     } else {
         let name = spec.split('/').next()?;
-        (!name.is_empty()).then(|| name.to_string())
+        is_package_name(name).then(|| name.to_string())
     }
+}
+
+/// Whether a decoded specifier segment is a plausible registry package name —
+/// non-empty ASCII letters, digits, `.`, `-`, or `_`. A specifier this module
+/// could not fully decode (a leftover escape, a control byte, a concatenation
+/// artifact) names no package any registry can serve, so it is dropped here
+/// rather than emitted as a permanently unresolvable reference.
+fn is_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Decode the escape sequences in a string literal's source text — the `\u00XX`,
+/// `\u{XX}`, `\xXX`, and legacy-octal forms — so an obfuscated module specifier
+/// resolves to the module it actually loads. JS and Python spell these the same
+/// way across the ASCII range a package name or URL lives in, so one decoder
+/// serves both. `None` when there is no backslash and nothing to decode.
+///
+/// An escape that denotes no single character (a lone surrogate half, an
+/// out-of-range code point) is left verbatim: the result is then not a
+/// plausible package name, which is exactly the outcome such a specifier
+/// deserves.
+fn decode_escapes(spec: &str) -> Option<String> {
+    if !spec.contains('\\') {
+        return None;
+    }
+    let src: Vec<char> = spec.chars().collect();
+    let mut out = String::with_capacity(spec.len());
+    let mut i = 0;
+    while i < src.len() {
+        match escape_at(&src[i..]) {
+            Some((c, consumed)) => {
+                out.push(c);
+                i += consumed;
+            }
+            None => {
+                out.push(src[i]);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The character the escape sequence at the head of `src` denotes, and how many
+/// chars of `src` it spans. `None` when `src` does not begin with a decodable
+/// escape.
+fn escape_at(src: &[char]) -> Option<(char, usize)> {
+    if src.first() != Some(&'\\') {
+        return None;
+    }
+    match src.get(1)? {
+        // Braced (variable width, at most six hex digits) before fixed-width.
+        'u' if src.get(2) == Some(&'{') => {
+            let end = src.iter().take(10).position(|&c| c == '}')?;
+            Some((code_point(src.get(3..end)?)?, end + 1))
+        }
+        'u' => Some((code_point(src.get(2..6)?)?, 6)),
+        'x' => Some((code_point(src.get(2..4)?)?, 4)),
+        // Legacy octal: one to three octal digits, `\0` through `\377`.
+        '0'..='7' => {
+            let n = src[1..]
+                .iter()
+                .take(3)
+                .take_while(|c| c.is_digit(8))
+                .count();
+            let value = src[1..1 + n]
+                .iter()
+                .fold(0, |acc, c| acc * 8 + c.to_digit(8).unwrap_or(0));
+            char::from_u32(value).map(|c| (c, 1 + n))
+        }
+        // A control escape keeps its meaning; any other escaped char is itself
+        // (`\/` is `/`), which is how both languages read it.
+        'n' => Some(('\n', 2)),
+        'r' => Some(('\r', 2)),
+        't' => Some(('\t', 2)),
+        'b' => Some(('\u{8}', 2)),
+        'f' => Some(('\u{c}', 2)),
+        'v' => Some(('\u{b}', 2)),
+        c => Some((*c, 2)),
+    }
+}
+
+/// The character a run of hex digits denotes, or `None` if the run is not hex
+/// or is not a single Unicode scalar (a lone surrogate half, out of range).
+fn code_point(hex: &[char]) -> Option<char> {
+    let mut value: u32 = 0;
+    if hex.is_empty() {
+        return None;
+    }
+    for c in hex {
+        value = value.checked_mul(16)?.checked_add(c.to_digit(16)?)?;
+    }
+    char::from_u32(value)
 }
 
 /// Runtime/host-provided ambient modules that a bare `require(...)`/`import`
@@ -1180,6 +1285,45 @@ mod tests {
             })
             .collect();
         assert_eq!(purls, vec!["pkg:npm/lodash".to_string()], "{purls:?}");
+    }
+
+    #[test]
+    fn escaped_require_specifiers_decode_before_classification() {
+        // filefacts hands back the literal's *source* text, so an obfuscated
+        // specifier arrives with its escapes intact. Undecoded, a spelled-out
+        // `readline` became the permanently unresolvable purl
+        // `pkg:npm/\u0072\u0065\u0061\u0064\u006C\u0069\u006E\u0065`;
+        // decoded, it is Node's `readline` builtin and no reference at all,
+        // while a real package resolves to its true name and a spelled-out
+        // scheme to its URL.
+        let call = |m: &str| Symbol::Call {
+            target: Some("require".into()),
+            args: vec![Arg::String { value: m.into() }],
+            offset: Some(0),
+        };
+        let syms = [
+            call(r"\u0072\u0065\u0061\u0064\u006C\u0069\u006E\u0065"), // readline
+            call(r"\x6c\x6f\x64\x61\x73\x68"),                         // lodash
+            call(r"\u{40}acme/tool"),                                  // @acme/tool
+            call(r"\146\163"),                                         // fs
+            call(r"\u0068ttps://evil.test/s.js"),                      // a URL
+            call(r"\u00zz"),                                           // undecodable
+        ];
+        let found: Vec<String> = import_calls("javascript", &syms)
+            .iter()
+            .map(|r| match &r.locator {
+                RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
+            })
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                "pkg:npm/lodash".to_string(),
+                "pkg:npm/%40acme/tool".to_string(),
+                "https://evil.test/s.js".to_string(),
+            ],
+            "{found:?}"
+        );
     }
 
     #[test]
