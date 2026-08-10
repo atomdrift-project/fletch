@@ -23,7 +23,7 @@ use serde_json::Value;
 use filefacts::Registry;
 
 use crate::fetch::{BlobCache, Fetch, cached_metadata};
-use crate::registry::parse_ts;
+use crate::registry::{parse_ts, strip_email};
 
 /// Ceiling on a single index's *decompressed* size. The 64 MiB download cap
 /// already bounds the compressed input; this backstops a decompression bomb
@@ -422,7 +422,10 @@ fn tar_find(data: &[u8], member: &str) -> Option<Vec<u8>> {
             pos += 512; // zero block: end-of-archive padding between streams
             continue;
         }
-        let size = octal(&header[124..136])? as usize;
+        // The size is attacker-supplied, so narrow it by `try_from` rather than
+        // `as`: on a 32-bit target a declared size above `usize::MAX` would
+        // otherwise wrap to a small one and walk the archive off its real frame.
+        let size = usize::try_from(octal(&header[124..136])?).ok()?;
         let start = pos + 512;
         let end = start.checked_add(size)?;
         if end > data.len() {
@@ -551,11 +554,6 @@ fn unescape_xml(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
-}
-
-/// `Name <email>` → `Name`; a bare name is returned unchanged.
-fn strip_email(s: &str) -> String {
-    s.split('<').next().unwrap_or(s).trim().to_string()
 }
 
 #[cfg(test)]

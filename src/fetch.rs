@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -485,8 +485,9 @@ impl BlobCache {
         }
         let blob = self.blob_path(key);
         let blob_mtime = std::fs::metadata(&blob).ok()?.modified().ok()?;
-        let bytes = zstd::decode_all(std::fs::read(&blob).ok()?.as_slice()).ok()?;
-        let meta: CachedMeta = serde_json::from_slice(&std::fs::read(self.meta_path(key)).ok()?).ok()?;
+        let bytes = read_blob_capped(&blob, max_fetch_bytes())?;
+        let meta: CachedMeta =
+            serde_json::from_slice(&std::fs::read(self.meta_path(key)).ok()?).ok()?;
         let age = Duration::from_secs(now().saturating_sub(meta.fetched_at));
         self.mark_accessed(key, blob_mtime);
         Some((bytes, meta, age))
@@ -541,12 +542,65 @@ impl BlobCache {
             return;
         }
         if let Ok(compressed) = zstd::encode_all(bytes, 3) {
-            let _ = std::fs::write(self.blob_path(key), compressed);
+            write_replacing(&self.blob_path(key), &compressed);
         }
         if let Ok(json) = serde_json::to_vec(meta) {
-            let _ = std::fs::write(self.meta_path(key), json);
+            write_replacing(&self.meta_path(key), &json);
         }
     }
+}
+
+/// Decompress a cache blob, refusing one that expands past `limit`.
+///
+/// Bounded even though we wrote the file ourselves: the cache lives in an OS
+/// cache directory, so anything that can write there can swap an entry for a
+/// zstd bomb. Every other decompressor in this crate is capped, and leaving
+/// this one open is only safe for as long as that assumption holds. Reads one
+/// byte past the ceiling so an oversized entry is rejected outright — serving a
+/// truncated prefix would hash to something that was never fetched.
+///
+/// `None` on any failure, which the caller already treats as a cache miss.
+fn read_blob_capped(path: &std::path::Path, limit: u64) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    zstd::stream::read::Decoder::new(std::fs::File::open(path).ok()?)
+        .ok()?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
+}
+
+/// Write `bytes` to `path` through a fresh temporary file and rename it into
+/// place. Best-effort, like the rest of the cache.
+///
+/// Two properties a plain `fs::write` does not have. The rename is atomic, so
+/// a concurrent reader sees either the whole old entry or the whole new one,
+/// never a torn prefix that would decompress to the wrong bytes. And both
+/// steps replace a *name* rather than writing through one: `create_new` fails
+/// on an existing path instead of following it, and `rename` unlinks whatever
+/// the destination was. So an entry someone pre-created as a symlink — a live
+/// risk wherever `XDG_CACHE_HOME` is shared, as on a CI runner — is destroyed
+/// rather than followed into an arbitrary file.
+fn write_replacing(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write as _;
+
+    // Unique per process and per call, so two writers never collide on the
+    // temporary and neither is left waiting on a stale one.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = std::fs::File::options()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes));
+    if written.is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_file(&tmp);
 }
 
 /// The `Content-Type` header value (case-insensitive), if any.
@@ -589,29 +643,7 @@ pub(crate) fn cached_metadata_with(
             .join(";");
         sha256_hex(format!("meta:{url}:{joined}").as_bytes())
     };
-    if let Some((bytes, meta)) = cache.fresh(&key, cache.meta_ttl) {
-        cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
-        return Some(bytes);
-    }
-    match net.get_with(url, headers) {
-        Ok(f) => {
-            let meta = CachedMeta {
-                fetched_at: now(),
-                status: f.status,
-                final_url: f.final_url,
-                redirects: f.redirects,
-                headers: f.headers,
-            };
-            cache.put(&key, &f.bytes, &meta);
-            cache.record(url, meta.status, content_type_of(&meta.headers), &f.bytes);
-            Some(f.bytes)
-        }
-        // Source unreachable: a stale metadata answer still beats none.
-        Err(_) => cache.any(&key).map(|(bytes, meta)| {
-            cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
-            bytes
-        }),
-    }
+    cached_document(&key, url, cache, || net.get_with(url, headers))
 }
 
 /// Like [`cached_metadata`] but for a JSON-RPC `POST` query — the VS Code
@@ -625,28 +657,39 @@ pub(crate) fn cached_post(
     cache: &BlobCache,
 ) -> Option<Vec<u8>> {
     let key = sha256_hex(format!("post:{url}:{}", sha256_hex(body)).as_bytes());
-    if let Some((bytes, meta)) = cache.fresh(&key, cache.meta_ttl) {
+    cached_document(&key, url, cache, || net.post(url, body, headers))
+}
+
+/// The metadata cache flow every registry read shares: serve a fresh entry,
+/// else `send` the request and store what comes back, else fall back to any
+/// cached copy however old — an unreachable source still beats no answer.
+/// Whatever is served is handed to the cache's recorder, so a caller archiving
+/// provenance sees the document exactly once per read.
+fn cached_document(
+    key: &str,
+    url: &str,
+    cache: &BlobCache,
+    send: impl FnOnce() -> Result<Fetched, FetchError>,
+) -> Option<Vec<u8>> {
+    if let Some((bytes, meta)) = cache.fresh(key, cache.meta_ttl) {
         cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
         return Some(bytes);
     }
-    match net.post(url, body, headers) {
-        Ok(f) => {
-            let meta = CachedMeta {
-                fetched_at: now(),
-                status: f.status,
-                final_url: f.final_url,
-                redirects: f.redirects,
-                headers: f.headers,
-            };
-            cache.put(&key, &f.bytes, &meta);
-            cache.record(url, meta.status, content_type_of(&meta.headers), &f.bytes);
-            Some(f.bytes)
-        }
-        Err(_) => cache.any(&key).map(|(bytes, meta)| {
-            cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
-            bytes
-        }),
-    }
+    let Ok(f) = send() else {
+        let (bytes, meta) = cache.any(key)?;
+        cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
+        return Some(bytes);
+    };
+    let meta = CachedMeta {
+        fetched_at: now(),
+        status: f.status,
+        final_url: f.final_url,
+        redirects: f.redirects,
+        headers: f.headers,
+    };
+    cache.put(key, &f.bytes, &meta);
+    cache.record(url, meta.status, content_type_of(&meta.headers), &f.bytes);
+    Some(f.bytes)
 }
 
 /// Resolve, fetch (or serve from cache), verify, and record provenance for
@@ -705,7 +748,7 @@ fn fetch_ref_inner(
     };
 
     if let Some((bytes, meta)) = cache.fresh(&key, max_age) {
-        return record(r, locator, url, &bytes, true, false, &meta);
+        return record(r, locator, url, &bytes, Served::Cache, &meta);
     }
 
     if !claim_fetch() {
@@ -756,7 +799,7 @@ fn fetch_ref_inner(
                 headers: f.headers,
             };
             cache.put(&key, &f.bytes, &meta);
-            record(r, locator, url, &f.bytes, false, false, &meta)
+            record(r, locator, url, &f.bytes, Served::Network, &meta)
         }
         // The source is unreachable. Fall back to any cached copy, however
         // old — a stale answer beats none — and mark it stale. Only a genuine
@@ -764,7 +807,7 @@ fn fetch_ref_inner(
         Err(e) => match cache.any(&key) {
             Some((bytes, meta)) => {
                 tracing::warn!(locator = %locator, error = %e, "fetch failed; serving stale cache");
-                record(r, locator, url, &bytes, true, true, &meta)
+                record(r, locator, url, &bytes, Served::StaleCache, &meta)
             }
             None => {
                 let mut rec = FetchRecord::terminal(locator, Outcome::Failed(e.to_string()));
@@ -973,15 +1016,26 @@ fn selected(r: &Reference, fetch_urls: bool) -> bool {
         }
 }
 
-/// Build a record for bytes in hand (network or cache), verifying the pin
-/// and choosing the outcome.
+/// Where bytes in hand came from. One choice rather than two `bool`s, because
+/// only three of the four flag combinations are real: a stale serve is by
+/// definition a cache serve, so `!cached && stale` must be unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Served {
+    /// Fetched over the network just now.
+    Network,
+    /// A cache entry still inside its TTL.
+    Cache,
+    /// A cache entry past its TTL, served because the source was unreachable.
+    StaleCache,
+}
+
+/// Build a record for bytes in hand, verifying the pin and choosing the outcome.
 fn record(
     r: &Reference,
     locator: String,
     resolved_url: String,
     bytes: &[u8],
-    cached: bool,
-    stale: bool,
+    served: Served,
     meta: &CachedMeta,
 ) -> FetchRecord {
     let content_sha256 = sha256_hex(bytes);
@@ -1004,8 +1058,8 @@ fn record(
         fetched_at: meta.fetched_at,
         content_sha256: Some(content_sha256),
         size: Some(bytes.len() as u64),
-        cached,
-        stale,
+        cached: matches!(served, Served::Cache | Served::StaleCache),
+        stale: served == Served::StaleCache,
         pin_verified,
         outcome,
     }
@@ -1025,12 +1079,30 @@ fn locator_string(locator: &RefLocator) -> String {
 #[must_use]
 pub fn resolve(locator: &RefLocator) -> Option<String> {
     match locator {
-        RefLocator::Url(u) => Some(u.clone()),
+        // A URL locator is verbatim text out of a scanned file, so it may name
+        // a *destination* but never pick a *transport*. [`fetch_ref`] routes an
+        // `oci://` target to the container puller, which runs on its own HTTP
+        // stack outside this module's SSRF guard — so without this gate a file
+        // that merely mentions `oci://…` selects that path for itself. An
+        // `oci://` URL is legitimate only as something [`resolve_purl`] derives
+        // from a `pkg:oci` coordinate. Plain `http` still resolves and is
+        // refused at connect, which records the more informative outcome.
+        RefLocator::Url(u) => is_web_scheme(u).then(|| u.clone()),
         RefLocator::Purl(p) => resolve_purl(p),
         // An intra-artifact file reference is resolved against the bundle's
         // other files by a consumer, never fetched.
         RefLocator::Path(_) => None,
     }
+}
+
+/// Whether a URL names a web scheme this module's own client can carry.
+/// Compared ASCII-case-insensitively, since schemes are.
+fn is_web_scheme(url: &str) -> bool {
+    let b = url.as_bytes();
+    b.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"http://"))
+        || b.get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"https://"))
 }
 
 /// Split a PURL body (everything after `pkg:<type>/`) into its coordinate path
@@ -1069,6 +1141,11 @@ fn resolve_purl(purl: &str) -> Option<String> {
         return resolve_oci_ref(rest);
     }
     let (path, version) = split_path_version(rest);
+    // Vetted once here rather than at each of the arms below, every one of
+    // which interpolates these into a URL.
+    if !safe_coordinate(path) || version.is_some_and(|v| !safe_coordinate(v)) {
+        return None;
+    }
     match ty.as_str() {
         "npm" => {
             let name = path.replace("%40", "@");
@@ -1149,9 +1226,7 @@ fn resolve_purl(purl: &str) -> Option<String> {
             // ClawHub's download API takes the slug, plus the owner handle
             // when the purl carries one (slugs are not unique across
             // publishers; a bare shared slug 409s at the registry).
-            let (owner, slug) = path
-                .split_once('/')
-                .map_or(("", path), |(o, s)| (o, s));
+            let (owner, slug) = path.split_once('/').map_or(("", path), |(o, s)| (o, s));
             let mut url = format!("https://clawhub.ai/api/v1/download?slug={slug}");
             if !owner.is_empty() {
                 url.push_str("&ownerHandle=");
@@ -1184,6 +1259,30 @@ fn safe_filename_part(value: &str) -> bool {
         && !value
             .bytes()
             .any(|b| matches!(b, b'/' | b'\\' | b'?' | b'#'))
+}
+
+/// Whether a PURL's coordinate path or version may be interpolated into a
+/// registry URL.
+///
+/// Every ecosystem builds its endpoint by `format!`-ing these straight into a
+/// path or query, and they come from a scanned manifest — attacker-controlled.
+/// The literal `https://host/` prefix means no value can move the *host*, but
+/// it can still restructure the rest of the URL: `..` climbs out of the
+/// intended path, `?`/`#` truncate it into a query or fragment, and `\` is a
+/// path separator under the WHATWG rules the URL parser applies. The result is
+/// a record whose bytes came from somewhere other than the coordinate it is
+/// filed under — provenance the whole tool rests on.
+///
+/// Rejecting is safe: no registry issues a name or version containing these,
+/// so a coordinate that does is not a package. It resolves to
+/// [`Outcome::Unresolved`] and is recorded, never silently dropped.
+pub(crate) fn safe_coordinate(value: &str) -> bool {
+    !value
+        .split('/')
+        .any(|segment| segment == ".." || segment == ".")
+        && !value
+            .bytes()
+            .any(|b| b.is_ascii_control() || matches!(b, b' ' | b'\\' | b'?' | b'#' | b'"'))
 }
 
 /// Resolve a `pkg:oci` (or legacy `pkg:docker`) purl body to the `oci://`
@@ -1500,21 +1599,25 @@ fn pick_wheel(urls: &[serde_json::Value]) -> Option<&serde_json::Value> {
     let is_wheel = |u: &&serde_json::Value| {
         u.get("packagetype").and_then(serde_json::Value::as_str) == Some("bdist_wheel")
     };
-    let filename = |u: &serde_json::Value| -> String {
+    // A `fn`, not a closure: the returned `&str` borrows from the argument, and
+    // closure lifetime elision can't express that.
+    fn filename(u: &serde_json::Value) -> &str {
         u.get("filename")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
-            .to_string()
-    };
-    urls.iter()
-        .filter(is_wheel)
-        .find(|u| filename(u).ends_with("-py3-none-any.whl"))
-        .or_else(|| {
-            urls.iter()
-                .filter(is_wheel)
-                .find(|u| filename(u).contains("-none-any."))
-        })
-        .or_else(|| urls.iter().find(is_wheel))
+    }
+    // Rank in one pass: 0 beats 1 beats 2, and `min_by_key` keeps the earliest
+    // of equal ranks, so the choice stays the file list's own order.
+    urls.iter().filter(is_wheel).min_by_key(|u| {
+        let name = filename(u);
+        if name.ends_with("-py3-none-any.whl") {
+            0
+        } else if name.contains("-none-any.") {
+            1
+        } else {
+            2
+        }
+    })
 }
 
 /// Open VSX publishes the `.vsix` download URL in its JSON API. `rest` is
@@ -1545,9 +1648,16 @@ fn resolve_vscode(rest: &str, net: &dyn Fetch) -> Option<String> {
     let version = match version {
         Some(v) => v,
         None => {
-            let body = format!(
-                r#"{{"filters":[{{"criteria":[{{"filterType":7,"value":"{publisher}.{name}"}}]}}],"flags":914}}"#
-            );
+            // Built with the JSON writer, never `format!`: `publisher` and
+            // `name` come from the PURL, so a `"` in either would otherwise
+            // close the string literal and let the caller restructure the
+            // query — returning some *other* extension's record under this
+            // coordinate, which is exactly the judgement this feeds.
+            let body = serde_json::to_vec(&serde_json::json!({
+                "filters": [{"criteria": [{"filterType": 7, "value": format!("{publisher}.{name}")}]}],
+                "flags": 914,
+            }))
+            .ok()?;
             let headers = [
                 ("Content-Type", "application/json"),
                 ("Accept", "application/json;api-version=3.0-preview.1"),
@@ -1555,7 +1665,7 @@ fn resolve_vscode(rest: &str, net: &dyn Fetch) -> Option<String> {
             let resp = net
                 .post(
                     "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery",
-                    body.as_bytes(),
+                    &body,
                     &headers,
                 )
                 .ok()?;
@@ -1643,19 +1753,15 @@ fn now() -> u64 {
 
 /// Whether an address must not be fetched — private, loopback, link-local
 /// (incl. the 169.254.169.254 metadata endpoint), CGNAT, ULA, or reserved.
-/// IPv4-mapped IPv6 is unwrapped so it can't smuggle a private v4 address.
+///
+/// This is an allowlist-shaped problem solved with a denylist, because
+/// `is_global` is still unstable. So it is written to fail closed on the
+/// *spellings* of an internal address rather than on one canonical form: every
+/// way v6 can carry a v4 destination is unwrapped and re-checked.
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_blocked_v4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_blocked_v4(mapped);
-            }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
-        }
+        IpAddr::V6(v6) => is_blocked_v6(v6),
     }
 }
 
@@ -1667,9 +1773,46 @@ fn is_blocked_v4(v4: Ipv4Addr) -> bool {
         || v4.is_broadcast()
         || v4.is_documentation()
         || v4.is_unspecified()
+        || v4.is_multicast() // 224.0.0.0/4
         || o[0] == 0 // 0.0.0.0/8
         || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT 100.64.0.0/10
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol assignments
+        || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking 198.18.0.0/15
         || o[0] >= 240 // reserved 240.0.0.0/4
+}
+
+/// Whether an IPv6 address must not be fetched.
+///
+/// The transition mechanisms are the interesting part. Each one embeds an IPv4
+/// destination that a translator or relay on the host's path will carry for
+/// you, so each is a way to spell an internal v4 target in v6 — and a guard
+/// that only understands `::ffff:a.b.c.d` waves the rest through. Rather than
+/// ban the prefixes outright (which would break fletch on a NAT64-only
+/// network, where reaching any public v4 host legitimately goes through
+/// `64:ff9b::`), unwrap the embedded address and apply the v4 rules to it.
+fn is_blocked_v6(v6: Ipv6Addr) -> bool {
+    // Both v4-in-v6 forms: `::ffff:a.b.c.d` (mapped) and the deprecated
+    // `::a.b.c.d` (compatible) that `to_ipv4_mapped` alone does not see. This
+    // also subsumes `::1` and `::`, which unwrap into the blocked 0.0.0.0/8.
+    if let Some(v4) = v6.to_ipv4() {
+        return is_blocked_v4(v4);
+    }
+    let s = v6.segments();
+    let embedded = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
+    if s[0] == 0x2002 && is_blocked_v4(embedded(s[1], s[2])) {
+        return true; // 6to4: 2002:<v4>::/48
+    }
+    if s[0] == 0x0064 && s[1] == 0xff9b && is_blocked_v4(embedded(s[6], s[7])) {
+        return true; // NAT64 well-known prefix: 64:ff9b::<v4>/96
+    }
+    v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast() // ff00::/8
+        || (s[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+        || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001) // NAT64 local-use /48
+        || (s[0] == 0x2001 && s[1] == 0x0000) // Teredo 2001::/32
+        || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
 }
 
 /// reqwest DNS resolver that resolves a host and returns only its globally
@@ -1753,28 +1896,8 @@ impl HttpFetch {
         let mut redirects = Vec::new();
 
         for _ in 0..=MAX_REDIRECTS {
-            if current.scheme() != "https" {
-                return Err(FetchError::Refused(format!(
-                    "non-https scheme: {}",
-                    current.scheme()
-                )));
-            }
-            // A literal-IP host never hits the DNS resolver, so the SSRF
-            // floor must be enforced here too (incl. bracketed IPv6).
-            match current.host_str() {
-                Some(host) => {
-                    let bare = host
-                        .strip_prefix('[')
-                        .and_then(|s| s.strip_suffix(']'))
-                        .unwrap_or(host);
-                    if let Ok(ip) = bare.parse::<IpAddr>()
-                        && is_blocked_ip(ip)
-                    {
-                        return Err(FetchError::Refused(format!("non-public host: {host}")));
-                    }
-                }
-                None => return Err(FetchError::Refused("missing host".into())),
-            }
+            // Re-checked on every hop, so a redirect can't escape the floor.
+            guard_host(&current)?;
             let mut req = self.client.get(current.clone());
             for (name, value) in headers {
                 req = req.header(*name, *value);
@@ -1807,15 +1930,7 @@ impl HttpFetch {
                 return Err(FetchError::Status(status.as_u16()));
             }
 
-            let headers = resp
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| {
-                    v.to_str()
-                        .ok()
-                        .map(|val| (k.as_str().to_string(), val.into()))
-                })
-                .collect();
+            let headers = response_headers(&resp);
             let bytes = read_body_capped(resp)?;
             return Ok(Fetched {
                 bytes,
@@ -1857,21 +1972,13 @@ impl Fetch for HttpFetch {
         if !status.is_success() {
             return Err(FetchError::Status(status.as_u16()));
         }
-        let resp_headers = resp
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| {
-                v.to_str()
-                    .ok()
-                    .map(|val| (k.as_str().to_string(), val.into()))
-            })
-            .collect();
+        let headers = response_headers(&resp);
         let bytes = read_body_capped(resp)?;
         Ok(Fetched {
             bytes,
             final_url: target.to_string(),
             status: status.as_u16(),
-            headers: resp_headers,
+            headers,
             redirects: Vec::new(),
         })
     }
@@ -1884,9 +1991,21 @@ impl Fetch for HttpFetch {
     }
 }
 
-/// The pre-connect floor shared by GET and POST: https only, and refuse a
-/// literal-IP host the DNS resolver never sees (the SSRF resolver guards
-/// hostname targets; a bare IP must be checked directly).
+/// Response headers as owned pairs, dropping any whose value isn't text.
+fn response_headers(resp: &reqwest::blocking::Response) -> Vec<(String, String)> {
+    resp.headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|val| (k.as_str().to_string(), val.to_string()))
+        })
+        .collect()
+}
+
+/// The pre-connect floor every request passes — each GET hop and the one POST:
+/// https only, and refuse a literal-IP host the DNS resolver never sees (the
+/// SSRF resolver guards hostname targets; a bare IP must be checked directly).
 fn guard_host(url: &reqwest::Url) -> Result<(), FetchError> {
     if url.scheme() != "https" {
         return Err(FetchError::Refused(format!(
@@ -2069,6 +2188,22 @@ mod tests {
             Some("https://x/universal.whl".to_string())
         );
 
+        // The middle rank: no `py3-none-any`, but a non-py3 universal wheel
+        // (`py2.py3-none-any`) is still platform-agnostic and must beat the
+        // platform wheels — and must lose to `py3-none-any` when both exist.
+        // Listed after the platform wheel so passing cannot be an artifact of
+        // input order.
+        let mid = "https://pypi.org/pypi/midwidget/1.0.0/json";
+        let mbody = br#"{"urls":[
+            {"packagetype":"bdist_wheel","filename":"midwidget-1.0.0-cp311-cp311-manylinux_x86_64.whl","url":"https://x/plat.whl"},
+            {"packagetype":"bdist_wheel","filename":"midwidget-1.0.0-py2.py3-none-any.whl","url":"https://x/universal2.whl"}
+        ]}"#;
+        let net = Fixtures::default().with(mid, mbody);
+        assert_eq!(
+            resolve_pypi("midwidget", "1.0.0", None, &net, &cache),
+            Some("https://x/universal2.whl".to_string())
+        );
+
         // sdist-only version: wheel-first default falls back to the sdist.
         let sonly = "https://pypi.org/pypi/srconly/1.0.0/json";
         let sbody = br#"{"urls":[{"packagetype":"sdist","filename":"srconly-1.0.0.tar.gz","url":"https://x/src.tar.gz"}]}"#;
@@ -2247,7 +2382,9 @@ mod tests {
         // resolves (the probe's download_url), but the fetch is refused
         // rather than routed around the backend to the live registry.
         let r = Reference {
-            locator: RefLocator::Purl("pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx".into()),
+            locator: RefLocator::Purl(
+                "pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx".into(),
+            ),
             kind: RefKind::Dependency,
             source: "test".into(),
             evidence: String::new(),
@@ -2288,7 +2425,9 @@ mod tests {
         );
         // Legacy pkg:docker with namespace and a tag in the version slot.
         assert_eq!(
-            resolve(&RefLocator::Purl("pkg:docker/smartentry/debian@dc437cc87d10".into())),
+            resolve(&RefLocator::Purl(
+                "pkg:docker/smartentry/debian@dc437cc87d10".into()
+            )),
             Some("oci://docker.io/smartentry/debian:dc437cc87d10".to_string())
         );
     }
@@ -2843,7 +2982,10 @@ mod tests {
     #[test]
     fn split_path_version_tolerates_misplaced_version() {
         // Spec order: version before qualifiers, qualifiers dropped.
-        assert_eq!(split_path_version("arch/yay@1.0-1"), ("arch/yay", Some("1.0-1")));
+        assert_eq!(
+            split_path_version("arch/yay@1.0-1"),
+            ("arch/yay", Some("1.0-1"))
+        );
         assert_eq!(
             split_path_version("arch/yay@1.0-1?repository_url=https://aur.archlinux.org"),
             ("arch/yay", Some("1.0-1"))
@@ -2895,9 +3037,150 @@ mod tests {
         let net = Fixtures::default().with(derived, b"SNAPSHOT");
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = BlobCache::with_dir(dir.path().to_path_buf());
-        let rec = fetch_ref(&dep(RefLocator::Purl("pkg:aur/yay".into()), None), &net, &cache);
+        let rec = fetch_ref(
+            &dep(RefLocator::Purl("pkg:aur/yay".into()), None),
+            &net,
+            &cache,
+        );
         assert_eq!(rec.outcome, Outcome::Ok);
         assert_eq!(rec.resolved_url, derived);
+    }
+
+    #[test]
+    fn a_url_locator_cannot_select_the_container_puller() {
+        // `oci://` reaches the OCI puller, which runs outside this module's
+        // SSRF-guarded client. It must only ever come from a `pkg:oci`
+        // coordinate, never from a URL a scanned file supplied.
+        for url in [
+            "oci://docker.io/library/nginx:latest",
+            "OCI://docker.io/library/nginx:latest",
+            "file:///etc/passwd",
+            "ftp://example.com/x.tgz",
+        ] {
+            assert_eq!(
+                resolve(&RefLocator::Url(url.to_string())),
+                None,
+                "{url} must not resolve from a URL locator"
+            );
+        }
+        // A `pkg:oci` coordinate still produces the pseudo-URL, and the web
+        // schemes still resolve — `http` so it can be refused at connect with
+        // the more specific reason.
+        assert_eq!(
+            resolve(&RefLocator::Purl("pkg:oci/nginx".to_string())),
+            Some("oci://docker.io/library/nginx:latest".to_string())
+        );
+        for url in ["https://example.com/x.tgz", "HTTPS://example.com/x.tgz"] {
+            assert_eq!(
+                resolve(&RefLocator::Url(url.to_string())),
+                Some(url.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn crafted_coordinates_never_reach_a_url() {
+        // Each of these restructures the endpoint it is interpolated into:
+        // climbing out of the intended path, or truncating it into a query or
+        // fragment. The URL's host is a literal so none can move it — but the
+        // bytes would be filed under a coordinate they did not come from.
+        for purl in [
+            "pkg:npm/../../../evil@1.0.0",
+            "pkg:cargo/serde@../../../evil",
+            "pkg:golang/github.com/a/../../../../evil@v1.0.0",
+            "pkg:maven/com.example/lib@1.0/../../../../evil",
+            // A `#` before any `?` is not stripped as a qualifier, so it does
+            // reach the interpolation and would truncate the path.
+            "pkg:gem/rails#frag@1.0",
+            "pkg:nuget/pkg@1.0\\..\\..\\evil",
+            "pkg:github/owner/repo@a b",
+        ] {
+            assert_eq!(
+                resolve(&RefLocator::Purl(purl.to_string())),
+                None,
+                "{purl} must not resolve to a URL"
+            );
+        }
+        // The guard must not reject the punctuation real coordinates carry:
+        // dots in a group id, slashes in a module path, a Debian epoch `:`,
+        // a `+` build tag, and npm's percent-encoded scope marker.
+        for purl in [
+            "pkg:npm/%40babel/core@7.24.0",
+            "pkg:golang/github.com/BurntSushi/toml@v1.4.0",
+            "pkg:maven/com.google.guava/guava@32.1.3-jre",
+            "pkg:cargo/serde@1.0.0",
+            "pkg:github/owner/repo@v1.0.0+build.1",
+        ] {
+            assert!(
+                resolve(&RefLocator::Purl(purl.to_string())).is_some(),
+                "{purl} is a real coordinate and must still resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_entry_that_expands_past_the_cap_is_a_miss() {
+        // A zstd bomb planted in the cache directory: a few hundred bytes on
+        // disk that expand without bound. It must read as a miss, not be
+        // decompressed into memory. The cap is a parameter so this costs
+        // kilobytes instead of the 256 MiB production ceiling.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blob = dir.path().join("bomb.zst");
+        let bomb = zstd::encode_all(&vec![0u8; 1 << 20][..], 3).expect("compress");
+        assert!(bomb.len() < 4096, "1 MiB of zeros should compress tiny");
+        std::fs::write(&blob, &bomb).expect("plant");
+
+        assert_eq!(
+            read_blob_capped(&blob, 1024),
+            None,
+            "an entry expanding past the cap must not be served"
+        );
+        // The same entry is served whole when it fits.
+        assert_eq!(
+            read_blob_capped(&blob, 1 << 20).map(|b| b.len()),
+            Some(1 << 20)
+        );
+        // A blob exactly at the ceiling is still valid — the `+1` read must not
+        // reject the boundary case.
+        let exact = dir.path().join("exact.zst");
+        std::fs::write(&exact, zstd::encode_all(&b"12345"[..], 3).expect("c")).expect("w");
+        assert_eq!(read_blob_capped(&exact, 5).map(|b| b.len()), Some(5));
+        assert_eq!(read_blob_capped(&exact, 4), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_cache_entry_is_replaced_not_followed() {
+        // Pre-create the entry a fetch is about to write as a symlink pointing
+        // at a file outside the cache. The store must unlink the symlink, not
+        // write through it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("precious");
+        std::fs::write(&outside, b"do not clobber").expect("seed");
+
+        let cache = BlobCache::with_dir(dir.path().join("refs"));
+        std::fs::create_dir_all(dir.path().join("refs")).expect("mkdir");
+        let key = sha256_hex(b"some-locator");
+        let blob = dir.path().join("refs").join(format!("{key}.zst"));
+        std::os::unix::fs::symlink(&outside, &blob).expect("plant symlink");
+
+        cache.put(&key, b"fetched bytes", &CachedMeta::default());
+
+        assert_eq!(
+            std::fs::read(&outside).expect("target still readable"),
+            b"do not clobber",
+            "the symlink target must be untouched"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&blob)
+                .expect("entry exists")
+                .is_symlink(),
+            "the planted symlink must have been replaced by a real file"
+        );
+        assert_eq!(
+            cache.load("some-locator").as_deref(),
+            Some(&b"fetched bytes"[..])
+        );
     }
 
     #[test]
@@ -2916,6 +3199,22 @@ mod tests {
             "fe80::1",
             "::ffff:127.0.0.1", // IPv4-mapped loopback
             "::ffff:10.0.0.1",  // IPv4-mapped private
+            // Alternate spellings of an internal v4 target. Each of these
+            // reaches the same place as an entry above, via a translator or
+            // relay, and each passed a guard that only unwrapped `::ffff:`.
+            "::127.0.0.1",        // deprecated IPv4-compatible loopback
+            "::169.254.169.254",  // IPv4-compatible cloud metadata
+            "2002:7f00:1::",      // 6to4 wrapping 127.0.0.1
+            "2002:a9fe:a9fe::",   // 6to4 wrapping 169.254.169.254
+            "64:ff9b::7f00:1",    // NAT64 wrapping 127.0.0.1
+            "64:ff9b::a9fe:a9fe", // NAT64 wrapping 169.254.169.254
+            "64:ff9b:1::1",       // NAT64 local-use prefix
+            "2001:0:1234::1",     // Teredo
+            "2001:db8::1",        // documentation
+            "ff02::1",            // multicast
+            "224.0.0.1",          // v4 multicast
+            "198.18.0.1",         // benchmarking range
+            "192.0.0.1",          // IETF protocol assignments
         ];
         for ip in blocked {
             assert!(
@@ -2928,6 +3227,10 @@ mod tests {
             "8.8.8.8",
             "93.184.216.34",
             "2606:4700:4700::1111",
+            // A NAT64/6to4 wrapper around a *public* v4 stays reachable: on an
+            // IPv6-only network that is the only route to it.
+            "64:ff9b::8080:808", // NAT64 wrapping 8.8.8.8
+            "2002:101:101::",    // 6to4 wrapping 1.1.1.1
         ];
         for ip in allowed {
             assert!(

@@ -351,7 +351,11 @@ mod tests {
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("a.zst"), b"1234567890").unwrap(); // 10 bytes
         std::os::unix::fs::symlink(&dir, sub.join("loop")).unwrap();
-        assert_eq!(dir_size(&dir), 10, "the symlink is neither followed nor counted");
+        assert_eq!(
+            dir_size(&dir),
+            10,
+            "the symlink is neither followed nor counted"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

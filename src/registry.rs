@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::distro;
 use crate::fetch::{
     BlobCache, Fetch, RecordedSource, cached_metadata, cached_metadata_with, cached_post,
-    goproxy_escape,
+    goproxy_escape, safe_coordinate,
 };
 use filefacts::{RefLocator, Registry};
 
@@ -39,6 +39,13 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         return None;
     };
     let (ty, path, version) = parse_purl(purl)?;
+    // Every arm below `format!`s these into a registry endpoint, so vet them
+    // once here — see [`crate::fetch::safe_coordinate`].
+    if !crate::fetch::safe_coordinate(&path)
+        || version.as_deref().is_some_and(|v| !safe_coordinate(v))
+    {
+        return None;
+    }
     // This reads the package-level *packument*, which is mutable even for a
     // versioned PURL: a release can be yanked after publish and new siblings
     // appear. So bound staleness — a few hours for a pinned version (its facts
@@ -237,12 +244,7 @@ pub fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
 /// document; download counts need a second (cached) endpoint.
 fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     let name = path.replace("%40", "@");
-    let doc: Value = serde_json::from_slice(&cached_metadata(
-        &format!("https://registry.npmjs.org/{name}"),
-        net,
-        cache,
-    )?)
-    .ok()?;
+    let doc = json_meta(&format!("https://registry.npmjs.org/{name}"), net, cache)?;
 
     let latest = doc.pointer("/dist-tags/latest").and_then(Value::as_str);
     let version = version.or(latest).unwrap_or_default();
@@ -370,12 +372,11 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
     });
 
     // Best-effort popularity: last-month downloads from the stats endpoint.
-    if let Some(d) = cached_metadata(
+    if let Some(d) = json_meta(
         &format!("https://api.npmjs.org/downloads/point/last-month/{name}"),
         net,
         cache,
     )
-    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
     .and_then(|j| j.get("downloads").and_then(Value::as_u64))
     {
         p.downloads_recent = Some(d);
@@ -407,12 +408,11 @@ fn crates(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://crates.io/api/v1/crates/{path}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let krate = doc.get("crate")?;
 
     let latest = krate
@@ -473,12 +473,7 @@ fn crates(
 /// own publish time and yank status come from its `releases` entry; identity
 /// text falls back to the latest release's `info`.
 fn pypi(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
-        &format!("https://pypi.org/pypi/{path}/json"),
-        net,
-        cache,
-    )?)
-    .ok()?;
+    let doc = json_meta(&format!("https://pypi.org/pypi/{path}/json"), net, cache)?;
     let info = doc.get("info")?;
     let releases = doc.get("releases").and_then(Value::as_object);
 
@@ -600,12 +595,11 @@ fn composer(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://packagist.org/packages/{path}.json"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let pkg = doc.get("package")?;
 
     let versions = pkg.get("versions").and_then(Value::as_object);
@@ -661,12 +655,11 @@ fn composer(
 /// RubyGems: a clean JSON API. The package endpoint carries downloads, author,
 /// and links; the per-version publish date comes from the versions endpoint.
 fn gem(name: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://rubygems.org/api/v1/gems/{name}.json"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let resolved = version
         .map(str::to_string)
         .or_else(|| {
@@ -678,12 +671,11 @@ fn gem(name: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
 
     // The gem endpoint omits dates; the versions list carries `created_at` per
     // release. Match the resolved version, else fall back to the newest entry.
-    let published_at = cached_metadata(
+    let published_at = json_meta(
         &format!("https://rubygems.org/api/v1/versions/{name}.json"),
         net,
         cache,
     )
-    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
     .and_then(|vs| {
         let arr = vs.as_array()?;
         arr.iter()
@@ -742,7 +734,7 @@ fn golang(
         ),
         None => format!("https://proxy.golang.org/{escaped}/@latest"),
     };
-    let doc: Value = serde_json::from_slice(&cached_metadata(&url, net, cache)?).ok()?;
+    let doc = json_meta(&url, net, cache)?;
 
     Some(Registry {
         ecosystem: "golang".into(),
@@ -771,12 +763,7 @@ fn golang(
 /// Unauthenticated, so subject to GitHub's 60-req/hour anonymous limit; a
 /// throttled lookup simply degrades to "unknown".
 fn github(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
-        &format!("https://api.github.com/repos/{path}"),
-        net,
-        cache,
-    )?)
-    .ok()?;
+    let doc = json_meta(&format!("https://api.github.com/repos/{path}"), net, cache)?;
 
     Some(Registry {
         ecosystem: "github".into(),
@@ -829,7 +816,7 @@ fn github(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
 /// repo packages aren't in the AUR, so they return an empty result → `None`.
 fn aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     let url = format!("https://aur.archlinux.org/rpc/v5/info?arg%5B%5D={name}");
-    let doc: Value = serde_json::from_slice(&cached_metadata(&url, net, cache)?).ok()?;
+    let doc = json_meta(&url, net, cache)?;
     let r = doc.pointer("/results/0")?;
 
     Some(Registry {
@@ -905,18 +892,14 @@ fn chrome(id: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
         // "Updated <Month D, YYYY>" is the listing's last-change date.
         published_at: text_after(html, "Updated").and_then(|s| parse_month_day_year(&s)),
         author: text_after(html, "Offered by"),
-        title: title.clone(),
+        title,
         description: meta_content(html, "og:description"),
         homepage: Some(url),
         // "N,NNN users" — the store's reach figure, a downloads analogue.
-        downloads_total: before(html, " users")
-            .as_deref()
-            .and_then(parse_grouped_u64),
+        downloads_total: before(html, " users").and_then(parse_grouped_u64),
         // "X out of 5 stars" / "N ratings".
         rating: before(html, " out of 5 stars").and_then(|s| s.parse::<f32>().ok()),
-        rating_count: before(html, " ratings")
-            .as_deref()
-            .and_then(parse_grouped_u64),
+        rating_count: before(html, " ratings").and_then(parse_grouped_u64),
         ..Default::default()
     })
 }
@@ -935,7 +918,7 @@ fn openvsx(
         Some(v) => format!("https://open-vsx.org/api/{ns}/{name}/{v}"),
         None => format!("https://open-vsx.org/api/{ns}/{name}"),
     };
-    let doc: Value = serde_json::from_slice(&cached_metadata(&url, net, cache)?).ok()?;
+    let doc = json_meta(&url, net, cache)?;
 
     Some(Registry {
         ecosystem: "openvsx".into(),
@@ -1015,16 +998,22 @@ fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     // | IncludeAssetUri(128) | IncludeStatistics(256). Dropping IncludeLatestVersionOnly
     // (512, what 914 set) returns the *full* version array in the same request, so the
     // release timeline costs no extra round-trip; `versions[0]` is still the latest.
-    let body = format!(
-        r#"{{"filters":[{{"criteria":[{{"filterType":7,"value":"{ext_id}"}}]}}],"flags":403}}"#
-    );
+    // Built with the JSON writer, never `format!`: `ext_id` comes from the
+    // PURL, so a `"` in it would otherwise close the string literal and let a
+    // crafted coordinate restructure the query — returning some *other*
+    // extension's reputation record under this one's name.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "filters": [{"criteria": [{"filterType": 7, "value": ext_id}]}],
+        "flags": 403,
+    }))
+    .ok()?;
     let headers = [
         ("Content-Type", "application/json"),
         ("Accept", "application/json;api-version=3.0-preview.1"),
     ];
     let doc: Value = serde_json::from_slice(&cached_post(
         "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery",
-        body.as_bytes(),
+        &body,
         &headers,
         net,
         cache,
@@ -1134,14 +1123,13 @@ fn nuget(
     cache: &BlobCache,
 ) -> Option<Registry> {
     let id = path.to_lowercase();
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!(
             "https://azuresearch-usnc.nuget.org/query?q=packageid:{id}&prerelease=true&semVerLevel=2.0.0"
         ),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let d = doc.pointer("/data/0")?;
     let latest = d.get("version").and_then(Value::as_str);
     // Honor a requested version only if the registry lists it; the search-API
@@ -1267,9 +1255,14 @@ fn nuget_gz_json(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Value>
 /// Best-effort: a decode or parse failure leaves these fields unknown. (An
 /// unlisted version has its `published` zeroed to 1900, which the RFC-3339 parse
 /// rejects as pre-epoch, so it neither dates the version nor skews the timeline.)
-fn nuget_registration(id: &str, want: &str, reg: &mut Registry, net: &dyn Fetch, cache: &BlobCache) {
-    let Some(index) =
-        nuget_gz_json(&format!("{NUGET_REGISTRATION}/{id}/index.json"), net, cache)
+fn nuget_registration(
+    id: &str,
+    want: &str,
+    reg: &mut Registry,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) {
+    let Some(index) = nuget_gz_json(&format!("{NUGET_REGISTRATION}/{id}/index.json"), net, cache)
     else {
         return;
     };
@@ -1380,12 +1373,11 @@ fn maven(
     if let Some(v) = version {
         q.push_str(&format!("+AND+v:%22{v}%22"));
     }
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://search.maven.org/solrsearch/select?q={q}&core=gav&rows=20&wt=json"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let d = doc.pointer("/response/docs/0")?;
 
     Some(Registry {
@@ -1419,12 +1411,7 @@ fn hex_pm(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
-        &format!("https://hex.pm/api/packages/{name}"),
-        net,
-        cache,
-    )?)
-    .ok()?;
+    let doc = json_meta(&format!("https://hex.pm/api/packages/{name}"), net, cache)?;
     let latest = doc
         .get("latest_stable_version")
         .or_else(|| doc.get("latest_version"))
@@ -1472,12 +1459,7 @@ fn hex_pm(
 /// CRAN: the crandb mirror serves one JSON document per package with the
 /// description, license, maintainer, and the `Date/Publication` of the release.
 fn cran(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
-        &format!("https://crandb.r-pkg.org/{name}"),
-        net,
-        cache,
-    )?)
-    .ok()?;
+    let doc = json_meta(&format!("https://crandb.r-pkg.org/{name}"), net, cache)?;
 
     Some(Registry {
         ecosystem: "cran".into(),
@@ -1512,12 +1494,11 @@ fn cran(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
 /// CPAN: MetaCPAN's release endpoint returns the latest release of a
 /// distribution with its date, author (PAUSE id), abstract, and resources.
 fn cpan(dist: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://fastapi.metacpan.org/v1/release/{dist}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
 
     Some(Registry {
         ecosystem: "cpan".into(),
@@ -1567,12 +1548,7 @@ fn pub_dev(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
-        &format!("https://pub.dev/api/packages/{name}"),
-        net,
-        cache,
-    )?)
-    .ok()?;
+    let doc = json_meta(&format!("https://pub.dev/api/packages/{name}"), net, cache)?;
     let latest = doc.pointer("/latest/version").and_then(Value::as_str);
     let rel = match version.or(latest) {
         Some(w) => doc
@@ -1625,12 +1601,11 @@ fn conda(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://api.anaconda.org/package/conda-forge/{name}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let latest = doc.get("latest_version").and_then(Value::as_str);
     let version = version.or(latest).unwrap_or_default();
     let published_at = doc
@@ -1680,12 +1655,11 @@ fn conda(
 /// Clojars: the artifacts API returns lifetime downloads, the SCM link, and the
 /// license, but no publish date — so `published_at` stays unknown.
 fn clojars(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://clojars.org/api/artifacts/{path}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let group = doc.get("group_name").and_then(Value::as_str);
     let jar = doc.get("jar_name").and_then(Value::as_str);
     let name = match (group, jar) {
@@ -1734,22 +1708,20 @@ fn clojars(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
 fn jsr(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     let decoded = path.replace("%40", "@");
     let (scope, pkg) = decoded.trim_start_matches('@').split_once('/')?;
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let latest = doc.get("latestVersion").and_then(Value::as_str);
     let want = version.or(latest).unwrap_or_default();
 
     // Per-version publish time comes from the versions list.
-    let published_at = cached_metadata(
+    let published_at = json_meta(
         &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}/versions"),
         net,
         cache,
     )
-    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
     .and_then(|vs| {
         let arr = vs.as_array()?;
         arr.iter()
@@ -1786,12 +1758,11 @@ fn jsr(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
 /// Recency comes from `last_update`; an out-of-date flag is the deprecation
 /// analogue. AUR-only packages aren't here, so they return `None`.
 fn arch(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://archlinux.org/packages/search/json/?name={name}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let r = doc.pointer("/results/0")?;
     let version = match (
         r.get("pkgver").and_then(Value::as_str),
@@ -1840,12 +1811,11 @@ fn arch(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
 /// Fedora (Rawhide via mdapi): the per-package record carries the version,
 /// summary, and homepage. mdapi reports no build time, so age stays unknown.
 fn fedora(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://mdapi.fedoraproject.org/rawhide/pkg/{name}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let version = match (
         doc.get("version").and_then(Value::as_str),
         doc.get("release").and_then(Value::as_str),
@@ -1886,12 +1856,11 @@ fn fedora(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
 /// metadata endpoint is slug-keyed, so a shared slug resolves to the
 /// registry's primary holder of that slug.
 fn clawhub(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://clawhub.ai/api/v1/skills/{slug}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     let skill = doc.get("skill")?;
     // Epoch-millisecond timestamps, occasionally fractional; fold to seconds.
     let ms_to_secs = |v: &Value| {
@@ -1939,8 +1908,7 @@ fn oci_meta(purl: &str, path: &str, net: &dyn Fetch, cache: &BlobCache) -> Optio
         .and_then(|(_, quals)| {
             quals.split('&').find_map(|q| {
                 let (k, v) = q.split_once('=')?;
-                (k == "repository_url" && !v.is_empty())
-                    .then(|| crate::fetch::percent_decode(v))
+                (k == "repository_url" && !v.is_empty()).then(|| crate::fetch::percent_decode(v))
             })
         })
         .unwrap_or_else(|| format!("docker.io/library/{}", last_seg(path)));
@@ -1955,12 +1923,11 @@ fn oci_meta(purl: &str, path: &str, net: &dyn Fetch, cache: &BlobCache) -> Optio
 /// Docker Hub repository metadata: anonymous JSON with pulls, stars, the
 /// publishing namespace, and registration/update times.
 fn docker_hub(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://hub.docker.com/v2/repositories/{image}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     Some(Registry {
         ecosystem: "oci".into(),
         name: doc
@@ -1995,12 +1962,11 @@ fn docker_hub(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registr
 /// Quay repository metadata: anonymous JSON with the description, the owning
 /// namespace, and a Unix-seconds last-modified time.
 fn quay(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://quay.io/api/v1/repository/{image}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     Some(Registry {
         ecosystem: "oci".into(),
         name: doc
@@ -2024,12 +1990,11 @@ fn quay(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
 }
 
 fn homebrew(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://formulae.brew.sh/api/formula/{name}.json"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
 
     Some(Registry {
         ecosystem: "homebrew".into(),
@@ -2132,12 +2097,11 @@ fn snap(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
 /// WordPress plugin directory: the info API carries installs, rating (0–100),
 /// the author (as an HTML anchor), and the last-updated date.
 fn wordpress(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://api.wordpress.org/plugins/info/1.0/{slug}.json"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
 
     Some(Registry {
         ecosystem: "wordpress".into(),
@@ -2184,12 +2148,11 @@ fn huggingface(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://huggingface.co/api/models/{path}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
 
     let id = doc.get("id").and_then(Value::as_str).unwrap_or(path);
     Some(Registry {
@@ -2246,12 +2209,11 @@ fn hf_license(doc: &Value) -> Option<String> {
 /// Chrome and VS Code stores — localized name/summary, rating, weekly installs,
 /// and the current version with its review date.
 fn firefox(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
 
     let mut p = Registry {
         ecosystem: "firefox".into(),
@@ -2307,12 +2269,11 @@ fn firefox(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     // One extra GET to the versions endpoint yields the release timeline (each
     // version's `reviewed` approval time) for the cadence metrics. Best-effort:
     // a failure leaves the package-age signal (from `created`) intact.
-    if let Some(versions) = cached_metadata(
+    if let Some(versions) = json_meta(
         &format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/versions/?page_size=50"),
         net,
         cache,
     )
-    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
     .and_then(|d| d.get("results").and_then(Value::as_array).cloned())
     {
         let mut times: Vec<u64> = versions
@@ -2345,12 +2306,11 @@ fn jetbrains(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry>
     let id = if !path.is_empty() && path.bytes().all(|b| b.is_ascii_digit()) {
         path.to_string()
     } else {
-        let search: Value = serde_json::from_slice(&cached_metadata(
+        let search = json_meta(
             &format!("https://plugins.jetbrains.com/api/searchPlugins?search={path}&max=20"),
             net,
             cache,
-        )?)
-        .ok()?;
+        )?;
         search
             .get("plugins")
             .and_then(Value::as_array)?
@@ -2360,19 +2320,17 @@ fn jetbrains(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry>
             .and_then(Value::as_u64)?
             .to_string()
     };
-    let doc: Value = serde_json::from_slice(&cached_metadata(
+    let doc = json_meta(
         &format!("https://plugins.jetbrains.com/api/plugins/{id}"),
         net,
         cache,
-    )?)
-    .ok()?;
+    )?;
     // The latest update carries the released version and its publish time.
-    let updates = cached_metadata(
+    let updates = json_meta(
         &format!("https://plugins.jetbrains.com/api/plugins/{id}/updates?size=1"),
         net,
         cache,
-    )
-    .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    );
     let update = updates
         .as_ref()
         .and_then(|u| u.as_array())
@@ -2455,18 +2413,16 @@ fn text_after(html: &str, marker: &str) -> Option<String> {
 
 /// The token immediately *before* `marker` — for `N users`, `4.9 out of 5
 /// stars`, `122 ratings`: walk back over the value characters.
-fn before(html: &str, marker: &str) -> Option<String> {
-    let idx = html.find(marker)?;
-    let head = &html[..idx];
-    let token: String = head
+fn before<'a>(html: &'a str, marker: &str) -> Option<&'a str> {
+    let head = &html[..html.find(marker)?];
+    // Every character in the run is ASCII, so the count is also its byte
+    // width — which makes the split point a valid `str` boundary.
+    let width = head
         .chars()
         .rev()
         .take_while(|&c| c.is_ascii_digit() || matches!(c, '.' | ','))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    Some(token).filter(|s| !s.is_empty())
+        .count();
+    Some(&head[head.len() - width..]).filter(|s| !s.is_empty())
 }
 
 /// Parse a thousands-grouped count like `40,000` to `u64`.
@@ -2503,6 +2459,13 @@ fn parse_month_day_year(s: &str) -> Option<u64> {
 }
 
 // --- JSON shaping helpers ---------------------------------------------------
+
+/// The JSON document at `url`, read through the metadata cache. `None` when the
+/// registry is unreachable with nothing cached, or answers with something that
+/// isn't JSON — both mean "unknown" to every caller, so neither is an error.
+fn json_meta(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Value> {
+    serde_json::from_slice(&cached_metadata(url, net, cache)?).ok()
+}
 
 /// A field preferred from the version object, falling back to the package root
 /// (npm packuments carry both; the version's copy is authoritative).
@@ -2585,8 +2548,9 @@ fn links_repo(links: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// `Name <email>` → `Name`; a bare name is returned unchanged.
-fn strip_email(s: &str) -> String {
+/// `Name <email>` → `Name`; a bare name is returned unchanged. Shared with
+/// [`crate::distro`], whose index formats spell a maintainer the same way.
+pub(crate) fn strip_email(s: &str) -> String {
     s.split('<').next().unwrap_or(s).trim().to_string()
 }
 
@@ -3180,9 +3144,7 @@ mod tests {
             Some("社媒助手 - Chrome Web Store")
         );
         assert_eq!(
-            before(html, " users")
-                .as_deref()
-                .and_then(parse_grouped_u64),
+            before(html, " users").and_then(parse_grouped_u64),
             Some(40_000)
         );
         assert_eq!(
@@ -3222,6 +3184,50 @@ mod tests {
         // Hermetic: an inert cache so every lookup goes straight to the fixture,
         // with no shared on-disk state across tests or runs.
         BlobCache::disabled()
+    }
+
+    #[test]
+    fn vscode_query_body_cannot_be_restructured_by_a_crafted_id() {
+        use crate::fetch::{FetchError, Fetched};
+
+        /// Captures the POST body so the emitted request can be inspected.
+        #[derive(Default, Debug)]
+        struct CaptureBody(std::sync::Mutex<Vec<u8>>);
+        impl Fetch for CaptureBody {
+            fn get(&self, _url: &str) -> Result<Fetched, FetchError> {
+                Err(FetchError::Refused("get not used".into()))
+            }
+            fn post(
+                &self,
+                _url: &str,
+                body: &[u8],
+                _headers: &[(&str, &str)],
+            ) -> Result<Fetched, FetchError> {
+                if let Ok(mut seen) = self.0.lock() {
+                    *seen = body.to_vec();
+                }
+                Err(FetchError::Refused("captured".into()))
+            }
+        }
+
+        // A coordinate crafted to close the JSON string literal and graft on
+        // sibling keys — the classic injection the old `format!` body allowed.
+        let crafted = r#"evil","flags":9999,"junk":"x/pkg"#;
+        let net = CaptureBody::default();
+        let _ = vscode(crafted, &net, &test_cache("vscode-inject"));
+
+        let body = net.0.lock().expect("lock").clone();
+        let doc: Value = serde_json::from_slice(&body).expect("body must still be valid JSON");
+        // The crafted text stays one opaque string value...
+        assert_eq!(
+            doc.pointer("/filters/0/criteria/0/value")
+                .and_then(Value::as_str),
+            Some(crafted.replace('/', ".").as_str()),
+            "the whole coordinate must remain a single JSON string: {body:?}"
+        );
+        // ...and cannot reach the query's own structure.
+        assert_eq!(doc.get("flags"), Some(&Value::from(403)));
+        assert_eq!(doc.get("junk"), None);
     }
 
     #[test]
@@ -3420,9 +3426,13 @@ mod tests {
                 &gzip(&index),
             )
             .with(page2_url, &gzip(&page2));
-        let r = nuget("Sample.Pkg", Some("2.0.0"), &net, &test_cache("nuget_reg")).expect("registry");
+        let r =
+            nuget("Sample.Pkg", Some("2.0.0"), &net, &test_cache("nuget_reg")).expect("registry");
         assert_eq!(r.version, "2.0.0");
-        assert_eq!(r.published_at, parse_rfc3339_secs("2021-06-15T12:30:00+00:00"));
+        assert_eq!(
+            r.published_at,
+            parse_rfc3339_secs("2021-06-15T12:30:00+00:00")
+        );
         assert_eq!(
             r.first_published_at,
             parse_rfc3339_secs("2020-01-01T00:00:00+00:00")
@@ -3463,7 +3473,13 @@ mod tests {
                 "https://api.nuget.org/v3/registration5-gz-semver2/hidden.pkg/index.json",
                 &gzip(&index),
             );
-        let r = nuget("Hidden.Pkg", Some("1.0.0"), &net, &test_cache("nuget_unlisted")).expect("registry");
+        let r = nuget(
+            "Hidden.Pkg",
+            Some("1.0.0"),
+            &net,
+            &test_cache("nuget_unlisted"),
+        )
+        .expect("registry");
         assert_eq!(r.published_at, None);
         assert_eq!(r.version_removed, Some(true)); // unlisted → the yank analogue
         assert_eq!(r.release_count, None); // no real publish times to count

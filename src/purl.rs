@@ -213,163 +213,6 @@ fn strip_any_suffix<'a>(s: &'a str, suffixes: &[&str]) -> Option<&'a str> {
     suffixes.iter().find_map(|suf| s.strip_suffix(suf))
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-    use crate::RefLocator;
-
-    /// Every PURL recovered from a download URL is already canonical: a
-    /// provenance-side spelling and a generated spelling of the same package
-    /// must never differ, so `url_to_purl → normalize` is the identity.
-    #[test]
-    fn url_to_purl_outputs_are_canonical() {
-        for url in [
-            "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
-            "https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz",
-            "https://static.crates.io/crates/serde/serde-1.0.0.crate",
-            "https://files.pythonhosted.org/packages/ab/cd/Ruamel.Yaml-0.18.6.tar.gz",
-            "https://rubygems.org/downloads/rails-7.0.0.gem",
-            "https://proxy.golang.org/github.com/!burnt!sushi/toml/@v/v1.4.0.zip",
-            "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
-            "https://repo1.maven.org/maven2/org/apache/logging/log4j/2.0/log4j-2.0.jar",
-            "https://codeload.github.com/owner/repo/tar.gz/v1.0.0",
-        ] {
-            let purl = url_to_purl(url).unwrap_or_else(|| panic!("{url} must map"));
-            assert_eq!(
-                normalize(&purl).as_deref(),
-                Some(purl.as_str()),
-                "url_to_purl({url}) = {purl} is not canonical"
-            );
-        }
-    }
-
-    /// Bi-directional check: for ecosystems whose download URL is a pure
-    /// name+version function, `purl → URL → purl` is the identity.
-    #[test]
-    fn purl_url_roundtrips_for_deterministic_ecosystems() {
-        for purl in [
-            "pkg:npm/lodash@4.17.21",
-            "pkg:npm/%40babel/core@7.24.0",
-            "pkg:cargo/serde@1.0.0",
-            "pkg:gem/rails@7.0.0",
-            "pkg:golang/github.com/BurntSushi/toml@v1.0.0",
-            "pkg:nuget/newtonsoft.json@13.0.3",
-            "pkg:maven/com.google.guava/guava@32.1.3-jre",
-            "pkg:github/owner/repo@v1.0.0",
-        ] {
-            let url = crate::fetch::resolve(&RefLocator::Purl(purl.to_string()))
-                .unwrap_or_else(|| panic!("resolve produced no URL for {purl}"));
-            assert_eq!(
-                url_to_purl(&url).as_deref(),
-                Some(purl),
-                "roundtrip failed via {url}",
-            );
-        }
-    }
-
-    #[test]
-    fn npm_scoped_and_dashed_names() {
-        assert_eq!(
-            url_to_purl("https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz").as_deref(),
-            Some("pkg:npm/left-pad@1.3.0"),
-        );
-        assert_eq!(
-            url_to_purl("https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz").as_deref(),
-            Some("pkg:npm/%40babel/core@7.24.0"),
-        );
-    }
-
-    #[test]
-    fn cargo_cdn_and_api_forms() {
-        assert_eq!(
-            url_to_purl("https://static.crates.io/crates/serde/serde-1.0.203.crate").as_deref(),
-            Some("pkg:cargo/serde@1.0.203"),
-        );
-        assert_eq!(
-            url_to_purl("https://crates.io/api/v1/crates/serde/1.0.203/download").as_deref(),
-            Some("pkg:cargo/serde@1.0.203"),
-        );
-    }
-
-    // PyPI can't round-trip (the pythonhosted path carries an undrivable content
-    // hash), so it's covered forward-only, exercising both artifact kinds and
-    // PEP 503 name normalization.
-    #[test]
-    fn pypi_wheel_and_sdist_with_normalization() {
-        assert_eq!(
-            url_to_purl(
-                "https://files.pythonhosted.org/packages/ab/cd/ef/requests-2.31.0-py3-none-any.whl"
-            )
-            .as_deref(),
-            Some("pkg:pypi/requests@2.31.0"),
-        );
-        assert_eq!(
-            url_to_purl(
-                "https://files.pythonhosted.org/packages/aa/bb/cc/typing_extensions-4.9.0-py3-none-any.whl"
-            )
-            .as_deref(),
-            Some("pkg:pypi/typing-extensions@4.9.0"),
-        );
-        assert_eq!(
-            url_to_purl("https://files.pythonhosted.org/packages/aa/bb/cc/Django-4.2.1.tar.gz")
-                .as_deref(),
-            Some("pkg:pypi/django@4.2.1"),
-        );
-    }
-
-    #[test]
-    fn nuget_and_maven_forward() {
-        assert_eq!(
-            url_to_purl(
-                "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
-            )
-            .as_deref(),
-            Some("pkg:nuget/newtonsoft.json@13.0.3"),
-        );
-        assert_eq!(
-            url_to_purl(
-                "https://repo1.maven.org/maven2/com/google/guava/guava/32.1.3-jre/guava-32.1.3-jre.jar"
-            )
-            .as_deref(),
-            Some("pkg:maven/com.google.guava/guava@32.1.3-jre"),
-        );
-    }
-
-    #[test]
-    fn go_proxy_uppercase_escape_reversed() {
-        assert_eq!(
-            url_to_purl("https://proxy.golang.org/github.com/!burnt!sushi/toml/@v/v1.0.0.zip")
-                .as_deref(),
-            Some("pkg:golang/github.com/BurntSushi/toml@v1.0.0"),
-        );
-        // Metadata fetches (.mod/.info) are not package artifacts.
-        assert_eq!(
-            url_to_purl("https://proxy.golang.org/rsc.io/quote/@v/v1.5.2.mod"),
-            None,
-        );
-    }
-
-    #[test]
-    fn platform_gem_and_unknowns_decline() {
-        // A platform-tagged gem's version field isn't the last segment, so we
-        // decline rather than emit a wrong PURL.
-        assert_eq!(
-            url_to_purl("https://rubygems.org/downloads/nokogiri-1.16.0-x86_64-linux.gem"),
-            None,
-        );
-        assert_eq!(url_to_purl("https://example.com/whatever.tgz"), None);
-        assert_eq!(
-            url_to_purl("ftp://registry.npmjs.org/x/-/x-1.0.0.tgz"),
-            None
-        );
-        assert_eq!(
-            url_to_purl("https://registry.npmjs.org/no-artifact-here"),
-            None
-        );
-    }
-}
-
 /// Normalize a PURL to its canonical string, or `None` when the input cannot
 /// denote a package.
 ///
@@ -712,7 +555,10 @@ mod normalize_tests {
             // PyPI folds per PEP 503 (the registry's own equivalence:
             // lowercase, separator runs collapse); composer lowercases.
             ("pkg:pypi/Ruamel.Yaml@0.18.6", "pkg:pypi/ruamel-yaml@0.18.6"),
-            ("pkg:pypi/backports__zoneinfo", "pkg:pypi/backports-zoneinfo"),
+            (
+                "pkg:pypi/backports__zoneinfo",
+                "pkg:pypi/backports-zoneinfo",
+            ),
             (
                 "pkg:composer/Symfony/Console@6.4.0",
                 "pkg:composer/symfony/console@6.4.0",
@@ -807,7 +653,8 @@ mod normalize_tests {
         // Identity then flattens the artifact-selection qualifiers, so the
         // spec example keys onto the pool's bare release coordinate.
         assert_eq!(
-            identity("pkg:rpm/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25").as_deref(),
+            identity("pkg:rpm/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25")
+                .as_deref(),
             Some("pkg:rpm/fedora/centerim@4.22.10-1.el6")
         );
     }
@@ -820,12 +667,12 @@ mod normalize_tests {
             "",
             "   ",
             "pkg:",
-            "pkg:npm",           // no name at all
-            "pkg:npm/",          // empty name
-            "pkg:npm/@1.0.0",    // version but no name
-            "pkg:/lodash",       // empty type
-            "pkg:alpm/aur/",     // empty name behind a namespace
-            "npm/lodash@1.0.0",  // no pkg: scheme
+            "pkg:npm",          // no name at all
+            "pkg:npm/",         // empty name
+            "pkg:npm/@1.0.0",   // version but no name
+            "pkg:/lodash",      // empty type
+            "pkg:alpm/aur/",    // empty name behind a namespace
+            "npm/lodash@1.0.0", // no pkg: scheme
             "not-a-purl",
             "https://example.com/x.tgz",
         ] {
@@ -857,7 +704,10 @@ mod normalize_tests {
                 "pkg:apk/alpine/musl@1.2.4-r0?arch=aarch64",
                 "pkg:apk/alpine/musl@1.2.4-r0",
             ),
-            ("pkg:pypi/requests@2.31.0?kind=sdist", "pkg:pypi/requests@2.31.0"),
+            (
+                "pkg:pypi/requests@2.31.0?kind=sdist",
+                "pkg:pypi/requests@2.31.0",
+            ),
             (
                 "pkg:openvsx/pub/name@1.0.3",
                 "pkg:vscode-extension/pub/name@1.0.3?repository_url=https://open-vsx.org",
@@ -953,5 +803,162 @@ mod normalize_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod url_to_purl_tests {
+    use super::*;
+    use crate::RefLocator;
+
+    /// Every PURL recovered from a download URL is already canonical: a
+    /// provenance-side spelling and a generated spelling of the same package
+    /// must never differ, so `url_to_purl → normalize` is the identity.
+    #[test]
+    fn url_to_purl_outputs_are_canonical() {
+        for url in [
+            "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+            "https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz",
+            "https://static.crates.io/crates/serde/serde-1.0.0.crate",
+            "https://files.pythonhosted.org/packages/ab/cd/Ruamel.Yaml-0.18.6.tar.gz",
+            "https://rubygems.org/downloads/rails-7.0.0.gem",
+            "https://proxy.golang.org/github.com/!burnt!sushi/toml/@v/v1.4.0.zip",
+            "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
+            "https://repo1.maven.org/maven2/org/apache/logging/log4j/2.0/log4j-2.0.jar",
+            "https://codeload.github.com/owner/repo/tar.gz/v1.0.0",
+        ] {
+            let purl = url_to_purl(url).unwrap_or_else(|| panic!("{url} must map"));
+            assert_eq!(
+                normalize(&purl).as_deref(),
+                Some(purl.as_str()),
+                "url_to_purl({url}) = {purl} is not canonical"
+            );
+        }
+    }
+
+    /// Bi-directional check: for ecosystems whose download URL is a pure
+    /// name+version function, `purl → URL → purl` is the identity.
+    #[test]
+    fn purl_url_roundtrips_for_deterministic_ecosystems() {
+        for purl in [
+            "pkg:npm/lodash@4.17.21",
+            "pkg:npm/%40babel/core@7.24.0",
+            "pkg:cargo/serde@1.0.0",
+            "pkg:gem/rails@7.0.0",
+            "pkg:golang/github.com/BurntSushi/toml@v1.0.0",
+            "pkg:nuget/newtonsoft.json@13.0.3",
+            "pkg:maven/com.google.guava/guava@32.1.3-jre",
+            "pkg:github/owner/repo@v1.0.0",
+        ] {
+            let url = crate::fetch::resolve(&RefLocator::Purl(purl.to_string()))
+                .unwrap_or_else(|| panic!("resolve produced no URL for {purl}"));
+            assert_eq!(
+                url_to_purl(&url).as_deref(),
+                Some(purl),
+                "roundtrip failed via {url}",
+            );
+        }
+    }
+
+    #[test]
+    fn npm_scoped_and_dashed_names() {
+        assert_eq!(
+            url_to_purl("https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz").as_deref(),
+            Some("pkg:npm/left-pad@1.3.0"),
+        );
+        assert_eq!(
+            url_to_purl("https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz").as_deref(),
+            Some("pkg:npm/%40babel/core@7.24.0"),
+        );
+    }
+
+    #[test]
+    fn cargo_cdn_and_api_forms() {
+        assert_eq!(
+            url_to_purl("https://static.crates.io/crates/serde/serde-1.0.203.crate").as_deref(),
+            Some("pkg:cargo/serde@1.0.203"),
+        );
+        assert_eq!(
+            url_to_purl("https://crates.io/api/v1/crates/serde/1.0.203/download").as_deref(),
+            Some("pkg:cargo/serde@1.0.203"),
+        );
+    }
+
+    // PyPI can't round-trip (the pythonhosted path carries an undrivable content
+    // hash), so it's covered forward-only, exercising both artifact kinds and
+    // PEP 503 name normalization.
+    #[test]
+    fn pypi_wheel_and_sdist_with_normalization() {
+        assert_eq!(
+            url_to_purl(
+                "https://files.pythonhosted.org/packages/ab/cd/ef/requests-2.31.0-py3-none-any.whl"
+            )
+            .as_deref(),
+            Some("pkg:pypi/requests@2.31.0"),
+        );
+        assert_eq!(
+            url_to_purl(
+                "https://files.pythonhosted.org/packages/aa/bb/cc/typing_extensions-4.9.0-py3-none-any.whl"
+            )
+            .as_deref(),
+            Some("pkg:pypi/typing-extensions@4.9.0"),
+        );
+        assert_eq!(
+            url_to_purl("https://files.pythonhosted.org/packages/aa/bb/cc/Django-4.2.1.tar.gz")
+                .as_deref(),
+            Some("pkg:pypi/django@4.2.1"),
+        );
+    }
+
+    #[test]
+    fn nuget_and_maven_forward() {
+        assert_eq!(
+            url_to_purl(
+                "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+            )
+            .as_deref(),
+            Some("pkg:nuget/newtonsoft.json@13.0.3"),
+        );
+        assert_eq!(
+            url_to_purl(
+                "https://repo1.maven.org/maven2/com/google/guava/guava/32.1.3-jre/guava-32.1.3-jre.jar"
+            )
+            .as_deref(),
+            Some("pkg:maven/com.google.guava/guava@32.1.3-jre"),
+        );
+    }
+
+    #[test]
+    fn go_proxy_uppercase_escape_reversed() {
+        assert_eq!(
+            url_to_purl("https://proxy.golang.org/github.com/!burnt!sushi/toml/@v/v1.0.0.zip")
+                .as_deref(),
+            Some("pkg:golang/github.com/BurntSushi/toml@v1.0.0"),
+        );
+        // Metadata fetches (.mod/.info) are not package artifacts.
+        assert_eq!(
+            url_to_purl("https://proxy.golang.org/rsc.io/quote/@v/v1.5.2.mod"),
+            None,
+        );
+    }
+
+    #[test]
+    fn platform_gem_and_unknowns_decline() {
+        // A platform-tagged gem's version field isn't the last segment, so we
+        // decline rather than emit a wrong PURL.
+        assert_eq!(
+            url_to_purl("https://rubygems.org/downloads/nokogiri-1.16.0-x86_64-linux.gem"),
+            None,
+        );
+        assert_eq!(url_to_purl("https://example.com/whatever.tgz"), None);
+        assert_eq!(
+            url_to_purl("ftp://registry.npmjs.org/x/-/x-1.0.0.tgz"),
+            None
+        );
+        assert_eq!(
+            url_to_purl("https://registry.npmjs.org/no-artifact-here"),
+            None
+        );
     }
 }
