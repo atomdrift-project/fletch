@@ -256,8 +256,26 @@ pub fn normalize(raw: &str) -> Option<String> {
     let typ = typ.as_str();
     // Split the remainder into the coordinate path and the @version/?qualifier
     // tail so the type can be re-keyed without disturbing either.
-    let (path, tail) = match rest.find(['@', '?']) {
-        Some(i) => rest.split_at(i),
+    //
+    // A *leading* `@` opens an npm scope (`pkg:npm/@scope/name@1.0.0`), never a
+    // version: a coordinate path cannot begin with its own version separator.
+    // Searching from 0 would split `@scope/name@1.0.0` into an empty path and a
+    // tail of everything, and the empty-name guard below would then refuse a
+    // perfectly good PURL — every scoped npm package, which is a large part of
+    // the registry.
+    //
+    // It is a scope only when a `/` closes it, because a scope is always
+    // `@scope/name`. Where the next delimiter is a version or a qualifier
+    // instead, the `@` really does open a version over an empty name
+    // (`pkg:npm/@1.0.0`), which the guard below must still refuse.
+    let scope_sigil = usize::from(
+        rest.starts_with('@')
+            && rest[1..]
+                .find(['/', '@', '?'])
+                .is_some_and(|i| rest[1 + i..].starts_with('/')),
+    );
+    let (path, tail) = match rest[scope_sigil..].find(['@', '?']) {
+        Some(i) => rest.split_at(scope_sigil + i),
         None => (rest, ""),
     };
     // An empty type or an empty name can only produce a degenerate key
@@ -284,6 +302,20 @@ pub fn normalize(raw: &str) -> Option<String> {
     // only when the vendor prefix names a distro this project models
     // (`fedora-25` → fedora; a bare deb codename like `jessie` never
     // matches). The qualifier itself stays; [`identity`] strips it later.
+    // Fold a literal npm scope onto its percent-encoded spelling. The spec
+    // percent-encodes `@` inside a namespace, and that is what this module's
+    // own `url_to_purl` emits, so without the fold `@scope/name` and
+    // `%40scope/name` are one package under two keys and every bloom or index
+    // lookup made with one spelling misses the other.
+    //
+    // Applied to every type, before the distro rewrite, not only to the types
+    // where a scope is idiomatic: the split above already reads a leading `@`
+    // as part of the path whatever the type is, so `pkg:rpm/@scope/pkg` has to
+    // canonicalize the same way here as it does in hopper's twin — a rule that
+    // is type-specific on one side and universal on the other is a divergence
+    // waiting to be found by a fuzzer instead of by a test.
+    let scoped = path.strip_prefix('@').map(|scope| format!("%40{scope}"));
+    let path = scoped.as_deref().unwrap_or(path);
     let path = if matches!(typ, "deb" | "rpm" | "apk" | "alpm") {
         distro_path(typ, path, tail)
     } else {
@@ -680,6 +712,49 @@ mod normalize_tests {
         }
         // The guards reject degenerate inputs, not unusual-but-real ones.
         assert!(normalize("pkg:npm/%40scope/name@1.0.0").is_some());
+        assert!(normalize("pkg:npm/@scope/name@1.0.0").is_some());
+    }
+
+    /// An npm scope is written `@scope/name`, and the leading `@` is part of
+    /// the name — not the version separator. Reading it as a separator left an
+    /// empty coordinate path, so every scoped package (a large share of npm)
+    /// was refused outright as "not a package URL".
+    #[test]
+    fn scoped_npm_names_are_not_read_as_versions() {
+        assert_eq!(
+            norm("pkg:npm/@scope/name@1.0.0"),
+            "pkg:npm/%40scope/name@1.0.0"
+        );
+        assert_eq!(
+            norm("pkg:npm/@babel/core@7.24.0"),
+            "pkg:npm/%40babel/core@7.24.0"
+        );
+        // No version, and with qualifiers, still split at the right `@`.
+        assert_eq!(norm("pkg:npm/@scope/name"), "pkg:npm/%40scope/name");
+        assert_eq!(
+            norm("pkg:npm/@scope/name@1.0.0?arch=x64"),
+            "pkg:npm/%40scope/name@1.0.0?arch=x64",
+        );
+        // The sigil is a scope only when a `/` closes it. These name nothing.
+        assert_eq!(normalize("pkg:npm/@1.0.0"), None);
+        assert_eq!(normalize("pkg:npm/@1.0.0?repository_url=https://x/y"), None);
+        assert_eq!(normalize("pkg:npm/@"), None);
+    }
+
+    /// Both spellings of a scope are the same package, so they must produce the
+    /// same key: the bloom filters and the verdict index are keyed on this
+    /// output, and two keys for one package means every lookup made with one
+    /// spelling misses an answer stored under the other.
+    #[test]
+    fn scope_spellings_converge_on_one_key() {
+        assert_eq!(
+            norm("pkg:npm/@babel/core@7.24.0"),
+            norm("pkg:npm/%40babel/core@7.24.0"),
+        );
+        assert_eq!(
+            identity("pkg:npm/@babel/core@7.24.0?kind=x"),
+            identity("pkg:npm/%40babel/core@7.24.0?kind=x"),
+        );
     }
 
     #[test]
@@ -737,6 +812,8 @@ mod normalize_tests {
         let corpus = [
             "pkg:npm/lodash@4.17.21",
             "pkg:npm/%40babel/core@7.24.0",
+            "pkg:npm/@babel/core@7.24.0",
+            "pkg:npm/@scope/name",
             "pkg:pypi/Ruamel.Yaml@0.18.6",
             "pkg:composer/Symfony/Console@6.4.0",
             "pkg:golang/github.com/BurntSushi/toml@v1.4.0",
