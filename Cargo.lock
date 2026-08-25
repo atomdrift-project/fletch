@@ -794,7 +794,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.3.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#5a1c09db68895dc2d2949d26cee92a097204c28a"
+source = "git+https://github.com/atomdrift-project/filefacts.git#2c4925877dafc44a59822cf621cde21bae8a6dd3"
 dependencies = [
  "aho-corasick",
  "cfb",
@@ -1678,7 +1678,7 @@ dependencies = [
  "num-integer",
  "num-iter",
  "num-traits",
- "rand 0.8.7",
+ "rand 0.8.8",
  "smallvec",
  "zeroize",
 ]
@@ -2057,9 +2057,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.7"
+version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
+checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "rand_chacha",
  "rand_core 0.6.4",
@@ -3222,7 +3222,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#5a1c09db68895dc2d2949d26cee92a097204c28a"
+source = "git+https://github.com/atomdrift-project/filefacts.git#2c4925877dafc44a59822cf621cde21bae8a6dd3"
 dependencies = [
  "cc",
  "tree-sitter",
