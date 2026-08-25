@@ -7,7 +7,7 @@
 //! [`Fixtures`] is the offline backend for tests. No recognition logic lives
 //! here — references come in, bytes and [`FetchRecord`]s go out.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -18,6 +18,55 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use filefacts::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
+
+/// One concrete archive published for a package coordinate.
+///
+/// `qualifiers` contains the PURL selectors that identify this exact artifact
+/// (for example PyPI's `file_name` or RubyGems' `platform`). `attributes`
+/// contains ecosystem metadata that describes compatibility but is not itself
+/// a registered PURL qualifier (`python`, `abi`, npm `cpu`, and similar).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactCandidate {
+    /// Direct URL for this archive.
+    pub url: String,
+    /// Archive basename as published by the registry.
+    pub file_name: String,
+    /// Exact PURL qualifier values that select this candidate.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub qualifiers: BTreeMap<String, String>,
+    /// Ecosystem-specific file type and compatibility tags.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attributes: BTreeMap<String, String>,
+    /// Registry-provided content digests, keyed by lowercase algorithm.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub checksums: BTreeMap<String, String>,
+    /// Whether the legacy single-URL API would choose this candidate.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub preferred: bool,
+}
+
+/// All concrete archives a registry publishes for one PURL release.
+///
+/// This additive API preserves [`resolve`]'s single-URL contract while letting
+/// scanners enumerate platform, ABI, and file-format variants. Exactly one
+/// candidate is normally marked [`ArtifactCandidate::preferred`]; no candidate
+/// is preferred when an explicit selector names an artifact the registry did
+/// not return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactMatrix {
+    /// The requested locator, retained for correlation with the caller's input.
+    pub locator: String,
+    /// Concrete artifact variants in deterministic preference order.
+    pub candidates: Vec<ArtifactCandidate>,
+}
+
+impl ArtifactMatrix {
+    /// The candidate selected by the backward-compatible single-URL policy.
+    #[must_use]
+    pub fn preferred(&self) -> Option<&ArtifactCandidate> {
+        self.candidates.iter().find(|candidate| candidate.preferred)
+    }
+}
 
 /// Cache lifetime for a pinned reference — immutable, so a stale hit is
 /// still correct (and re-verified).
@@ -1095,6 +1144,507 @@ pub fn resolve(locator: &RefLocator) -> Option<String> {
     }
 }
 
+/// Resolve every concrete artifact variant published for `locator`.
+///
+/// Unlike [`resolve`], this API may consult registry metadata. It currently
+/// expands the ecosystems where artifact variants or compatibility metadata
+/// matter most: npm, PyPI, RubyGems, Go modules, and Cargo crates. The returned
+/// matrix always retains all discovered variants; the legacy single-URL choice
+/// is identified by [`ArtifactCandidate::preferred`].
+///
+/// PyPI's `file_name`, RubyGems' `platform`, and Go's `subpath` are the
+/// registered type-specific selectors for these ecosystems; npm and Cargo have
+/// none. The common `download_url` and `file_name` selectors are also honored.
+/// Compatibility information that is not a PURL selector is exposed as an
+/// attribute: Python wheel/build/ABI/platform tags and npm os/cpu/libc/Node
+/// constraints.
+#[must_use]
+pub fn resolve_artifacts(
+    locator: &RefLocator,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<ArtifactMatrix> {
+    let locator_text = locator_string(locator);
+    let candidates = match locator {
+        RefLocator::Url(url) if is_web_scheme(url) => {
+            vec![artifact_candidate(url.clone(), "download")]
+        }
+        RefLocator::Url(_) | RefLocator::Path(_) => return None,
+        RefLocator::Purl(purl) => {
+            let (ty, rest) = crate::purl::scheme_type_rest(purl)?;
+            if let Some(url) = purl_qualifier(rest, "download_url") {
+                if !is_web_scheme(&url) {
+                    return None;
+                }
+                let mut candidate = artifact_candidate(url, "download");
+                candidate.preferred = file_name_matches(rest, &candidate.file_name);
+                vec![candidate]
+            } else {
+                let (path, version) = split_path_version(rest);
+                if !safe_coordinate(path) || version.is_some_and(|value| !safe_coordinate(value)) {
+                    return None;
+                }
+                match ty.as_str() {
+                    "npm" => npm_artifacts(path, version, rest, net, cache),
+                    "pypi" => pypi_artifacts(path, version, rest, net, cache),
+                    "gem" => gem_artifacts(path, version, rest, net, cache),
+                    "golang" => deterministic_artifacts(purl, rest, "zip"),
+                    "cargo" => deterministic_artifacts(purl, rest, "crate"),
+                    _ => return None,
+                }
+            }
+        }
+    };
+    Some(ArtifactMatrix {
+        locator: locator_text,
+        candidates,
+    })
+}
+
+fn artifact_candidate(url: String, kind: &str) -> ArtifactCandidate {
+    let file_name = file_name_from_url(&url);
+    let mut attributes = BTreeMap::new();
+    attributes.insert("kind".to_string(), kind.to_string());
+    ArtifactCandidate {
+        url,
+        file_name,
+        qualifiers: BTreeMap::new(),
+        attributes,
+        checksums: BTreeMap::new(),
+        preferred: true,
+    }
+}
+
+fn file_name_from_url(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    percent_decode(path.rsplit('/').next().unwrap_or_default())
+}
+
+fn deterministic_artifacts(purl: &str, rest: &str, kind: &str) -> Vec<ArtifactCandidate> {
+    // The matrix reports the possible artifact even when an exact file_name
+    // selector does not match it. In that case no candidate is preferred and
+    // the legacy one-URL resolver still returns None.
+    let Some(url) = resolve_purl_with_file_selection(purl, false) else {
+        return Vec::new();
+    };
+    let mut candidate = artifact_candidate(url, kind);
+    if let Some(subpath) = rest.split_once('#').map(|(_, value)| percent_decode(value))
+        && !subpath.is_empty()
+    {
+        candidate.attributes.insert("subpath".into(), subpath);
+    }
+    candidate.preferred = file_name_matches(rest, &candidate.file_name);
+    vec![candidate]
+}
+
+fn npm_artifacts(
+    path: &str,
+    requested_version: Option<&str>,
+    rest: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Vec<ArtifactCandidate> {
+    let name = npm_registry_name(path);
+    let ttl = if requested_version.is_some() {
+        meta_ttl_pinned()
+    } else {
+        meta_ttl_unpinned()
+    };
+    let api = format!("https://registry.npmjs.org/{name}");
+    let doc = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let requested = requested_version.map(percent_decode);
+    let resolved = requested.or_else(|| {
+        doc.as_ref()?
+            .pointer("/dist-tags/latest")?
+            .as_str()
+            .map(str::to_string)
+    });
+    let Some(version) = resolved else {
+        return Vec::new();
+    };
+    let version_doc = doc
+        .as_ref()
+        .and_then(|value| value.get("versions"))
+        .and_then(|versions| versions.get(&version));
+    let fallback_purl = format!("pkg:npm/{path}@{version}");
+    let url = version_doc
+        .and_then(|value| value.pointer("/dist/tarball"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| resolve_purl(&fallback_purl));
+    let Some(url) = url else {
+        return Vec::new();
+    };
+    let mut candidate = artifact_candidate(url, "tgz");
+    candidate.attributes.insert("version".into(), version);
+    for key in ["os", "cpu", "libc"] {
+        if let Some(value) = version_doc
+            .and_then(|doc| doc.get(key))
+            .and_then(json_string_list)
+        {
+            candidate.attributes.insert(key.to_string(), value);
+        }
+    }
+    if let Some(node) = version_doc
+        .and_then(|doc| doc.pointer("/engines/node"))
+        .and_then(serde_json::Value::as_str)
+    {
+        candidate.attributes.insert("node".into(), node.to_string());
+    }
+    if let Some(integrity) = version_doc
+        .and_then(|doc| doc.pointer("/dist/integrity"))
+        .and_then(serde_json::Value::as_str)
+    {
+        candidate
+            .attributes
+            .insert("integrity".into(), integrity.to_string());
+    }
+    if let Some(sha1) = version_doc
+        .and_then(|doc| doc.pointer("/dist/shasum"))
+        .and_then(serde_json::Value::as_str)
+    {
+        candidate.checksums.insert("sha1".into(), sha1.to_string());
+    }
+    candidate.preferred = file_name_matches(rest, &candidate.file_name);
+    vec![candidate]
+}
+
+fn npm_registry_name(path: &str) -> String {
+    if path
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("%40"))
+    {
+        format!("@{}", &path[3..])
+    } else {
+        path.to_string()
+    }
+}
+
+fn json_string_list(value: &serde_json::Value) -> Option<String> {
+    if let Some(value) = value.as_str() {
+        return Some(value.to_string());
+    }
+    let values = value
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then(|| values.join(","))
+}
+
+fn pypi_artifacts(
+    name: &str,
+    version: Option<&str>,
+    rest: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Vec<ArtifactCandidate> {
+    let api = version.map_or_else(
+        || format!("https://pypi.org/pypi/{name}/json"),
+        |value| format!("https://pypi.org/pypi/{name}/{value}/json"),
+    );
+    let ttl = if version.is_some() {
+        META_TTL_IMMUTABLE
+    } else {
+        meta_ttl_unpinned()
+    };
+    let Some(doc) = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return Vec::new();
+    };
+    let resolved_version = version
+        .map(percent_decode)
+        .or_else(|| doc.pointer("/info/version")?.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let Some(urls) = doc.get("urls").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<_> = urls
+        .iter()
+        .filter_map(|file| pypi_candidate(file, name, &resolved_version))
+        .collect();
+    let exact = purl_qualifier(rest, "file_name");
+    let kind = purl_qualifier(rest, "kind");
+    candidates.sort_by_key(|candidate| {
+        (
+            pypi_rank(candidate, exact.as_deref(), kind.as_deref()),
+            candidate.file_name.clone(),
+        )
+    });
+    let preferred = if let Some(file_name) = exact.as_deref() {
+        candidates
+            .iter()
+            .position(|candidate| candidate.file_name == file_name)
+    } else {
+        (!candidates.is_empty()).then_some(0)
+    }
+    .or_else(|| (exact.is_none() && !candidates.is_empty()).then_some(0));
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        candidate.preferred = Some(index) == preferred;
+    }
+    candidates
+}
+
+fn pypi_candidate(
+    file: &serde_json::Value,
+    name: &str,
+    version: &str,
+) -> Option<ArtifactCandidate> {
+    let url = file.get("url")?.as_str()?.to_string();
+    let file_name = file
+        .get("filename")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| file_name_from_url(&url), str::to_string);
+    let package_type = file
+        .get("packagetype")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("distribution");
+    let kind = match package_type {
+        "bdist_wheel" => "wheel",
+        "sdist" => "sdist",
+        other => other,
+    };
+    let mut qualifiers = BTreeMap::new();
+    qualifiers.insert("file_name".into(), file_name.clone());
+    let mut attributes = BTreeMap::new();
+    attributes.insert("kind".into(), kind.to_string());
+    if kind == "wheel" {
+        attributes.extend(wheel_attributes(&file_name, name, version));
+    }
+    for key in ["python_version", "requires_python"] {
+        if let Some(value) = file.get(key).and_then(serde_json::Value::as_str) {
+            attributes.insert(key.to_string(), value.to_string());
+        }
+    }
+    if file
+        .get("yanked")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        attributes.insert("yanked".into(), "true".into());
+    }
+    let checksums = file
+        .get("digests")
+        .and_then(serde_json::Value::as_object)
+        .map(|digests| {
+            digests
+                .iter()
+                .filter_map(|(algorithm, value)| {
+                    value
+                        .as_str()
+                        .map(|digest| (algorithm.clone(), digest.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(ArtifactCandidate {
+        url,
+        file_name,
+        qualifiers,
+        attributes,
+        checksums,
+        preferred: false,
+    })
+}
+
+fn wheel_attributes(file_name: &str, name: &str, version: &str) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    let Some(stem) = file_name.strip_suffix(".whl") else {
+        return attributes;
+    };
+
+    // Wheel filenames are `{distribution}-{version}(-{build})?-{python}-{abi}-{platform}`.
+    // Distribution punctuation is normalized to underscores, so remove the
+    // known coordinate prefix before deciding whether the optional build tag
+    // exists. Counting every `-` in the full filename misclassifies legacy
+    // distributions containing a hyphen as a build tag.
+    let distribution = name
+        .chars()
+        .map(|ch| match ch {
+            '-' | '.' => '_',
+            other => other.to_ascii_lowercase(),
+        })
+        .collect::<String>();
+    let version = version.replace('-', "_");
+    let prefix = format!("{distribution}-{version}-");
+    let suffix = stem
+        .get(..prefix.len())
+        .filter(|actual| actual.eq_ignore_ascii_case(&prefix))
+        .and_then(|_| stem.get(prefix.len()..))
+        .unwrap_or(stem);
+    let parts: Vec<&str> = suffix.split('-').collect();
+    if parts.len() < 3 {
+        return attributes;
+    }
+    let tag = parts.len() - 3;
+    attributes.insert("python".into(), parts[tag].to_string());
+    attributes.insert("abi".into(), parts[tag + 1].to_string());
+    attributes.insert("platform".into(), parts[tag + 2].to_string());
+    if parts.len() == 4 {
+        attributes.insert("build".into(), parts[0].to_string());
+    }
+    attributes
+}
+
+fn pypi_rank(
+    candidate: &ArtifactCandidate,
+    exact: Option<&str>,
+    requested_kind: Option<&str>,
+) -> u8 {
+    if let Some(file_name) = exact {
+        return u8::from(candidate.file_name != file_name);
+    }
+    let kind = candidate.attributes.get("kind").map(String::as_str);
+    let natural = if kind == Some("wheel") {
+        let python = candidate.attributes.get("python").map(String::as_str);
+        let abi = candidate.attributes.get("abi").map(String::as_str);
+        let platform = candidate.attributes.get("platform").map(String::as_str);
+        if python == Some("py3") && abi == Some("none") && platform == Some("any") {
+            0
+        } else if abi == Some("none") && platform == Some("any") {
+            1
+        } else {
+            2
+        }
+    } else if kind == Some("sdist") {
+        3
+    } else {
+        4
+    };
+    if requested_kind.is_some_and(|requested| kind != Some(requested)) {
+        10 + natural
+    } else {
+        natural
+    }
+}
+
+fn gem_artifacts(
+    name: &str,
+    requested_version: Option<&str>,
+    rest: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Vec<ArtifactCandidate> {
+    let api = format!("https://rubygems.org/api/v1/versions/{name}.json");
+    let ttl = if requested_version.is_some() {
+        meta_ttl_pinned()
+    } else {
+        meta_ttl_unpinned()
+    };
+    let entries = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let requested = requested_version.map(percent_decode);
+    let resolved =
+        requested.or_else(|| entries.first()?.get("number")?.as_str().map(str::to_string));
+    let Some(version) = resolved else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            entry.get("number").and_then(serde_json::Value::as_str) == Some(version.as_str())
+        })
+        .filter(|entry| {
+            entry
+                .get("platform")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(safe_filename_part)
+        })
+        .map(|entry| gem_candidate(name, &version, entry))
+        .collect();
+    if candidates.is_empty() {
+        let platform = purl_qualifier(rest, "platform").unwrap_or_else(|| "ruby".into());
+        if !safe_filename_part(&platform) {
+            return Vec::new();
+        }
+        candidates.push(gem_candidate_for_platform(name, &version, &platform));
+    }
+    candidates.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+    let explicit_platform = purl_qualifier(rest, "platform");
+    let wanted = explicit_platform.as_deref().unwrap_or("ruby");
+    let mut preferred = candidates.iter().position(|candidate| {
+        candidate
+            .qualifiers
+            .get("platform")
+            .is_some_and(|platform| platform == wanted)
+    });
+    if preferred.is_none() && explicit_platform.is_none() && !candidates.is_empty() {
+        preferred = Some(0);
+    }
+    if let Some(file_name) = purl_qualifier(rest, "file_name") {
+        preferred = candidates
+            .iter()
+            .position(|candidate| candidate.file_name == file_name);
+    }
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        candidate.preferred = Some(index) == preferred;
+    }
+    candidates.sort_by_key(|candidate| !candidate.preferred);
+    candidates
+}
+
+fn gem_candidate(name: &str, version: &str, entry: &serde_json::Value) -> ArtifactCandidate {
+    let platform = entry
+        .get("platform")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("ruby");
+    let mut candidate = gem_candidate_for_platform(name, version, platform);
+    if let Some(sha256) = entry.get("sha").and_then(serde_json::Value::as_str)
+        && !sha256.is_empty()
+    {
+        candidate
+            .checksums
+            .insert("sha256".into(), sha256.to_string());
+    }
+    for key in ["ruby_version", "rubygems_version"] {
+        if let Some(value) = entry.get(key).and_then(serde_json::Value::as_str) {
+            candidate.attributes.insert(key.into(), value.to_string());
+        }
+    }
+    candidate
+}
+
+fn gem_candidate_for_platform(name: &str, version: &str, platform: &str) -> ArtifactCandidate {
+    let suffix = if platform == "ruby" {
+        String::new()
+    } else {
+        format!("-{platform}")
+    };
+    let file_name = format!("{name}-{version}{suffix}.gem");
+    let mut qualifiers = BTreeMap::new();
+    qualifiers.insert("platform".into(), platform.to_string());
+    let mut attributes = BTreeMap::new();
+    attributes.insert("kind".into(), "gem".into());
+    ArtifactCandidate {
+        url: format!("https://rubygems.org/downloads/{file_name}"),
+        file_name,
+        qualifiers,
+        attributes,
+        checksums: BTreeMap::new(),
+        preferred: false,
+    }
+}
+
+fn file_name_matches(rest: &str, actual: &str) -> bool {
+    purl_qualifier(rest, "file_name").is_none_or(|wanted| wanted == actual)
+}
+
+fn selected_artifact_url(rest: &str, url: String) -> Option<String> {
+    file_name_matches(rest, &file_name_from_url(&url)).then_some(url)
+}
+
+fn maybe_selected_artifact_url(rest: &str, url: String, honor_file_name: bool) -> Option<String> {
+    if honor_file_name {
+        selected_artifact_url(rest, url)
+    } else {
+        Some(url)
+    }
+}
+
 /// Whether a URL names a web scheme this module's own client can carry.
 /// Compared ASCII-case-insensitively, since schemes are.
 fn is_web_scheme(url: &str) -> bool {
@@ -1113,6 +1663,11 @@ fn is_web_scheme(url: &str) -> bool {
 /// read as the misplaced version when `<v>` is free of `=`/`&`/`/`, any of
 /// which would mark it as part of a qualifier value instead.
 fn split_path_version(rest: &str) -> (&str, Option<&str>) {
+    // A subpath selects content *inside* the package, not a different archive.
+    // Strip it before interpreting the package coordinate or qualifiers.
+    let rest = rest
+        .split_once('#')
+        .map_or(rest, |(coordinate, _)| coordinate);
     let (bare, quals) = match rest.split_once('?') {
         Some((b, q)) => (b, Some(q)),
         None => (rest, None),
@@ -1131,6 +1686,10 @@ fn split_path_version(rest: &str) -> (&str, Option<&str>) {
 /// (npm, crates.io, NuGet, Maven Central, GitHub archives), or to the `oci://`
 /// pseudo-URL the OCI puller consumes.
 fn resolve_purl(purl: &str) -> Option<String> {
+    resolve_purl_with_file_selection(purl, true)
+}
+
+fn resolve_purl_with_file_selection(purl: &str, honor_file_name: bool) -> Option<String> {
     // Scheme and type are case-insensitive per spec; the shared splitter folds
     // their case and trims, so any spelling `purl::normalize` accepts resolves.
     let (ty, rest) = crate::purl::scheme_type_rest(purl)?;
@@ -1139,6 +1698,12 @@ fn resolve_purl(purl: &str) -> Option<String> {
     // `rest` itself rather than using the generic path@version split.
     if ty == "oci" || ty == "docker" {
         return resolve_oci_ref(rest);
+    }
+    // The standard common qualifier is an exact artifact selector and wins
+    // over an ecosystem-derived URL. The normal HTTP fetch path still applies
+    // its DNS/redirect SSRF guard to the selected destination.
+    if let Some(url) = purl_qualifier(rest, "download_url") {
+        return is_web_scheme(&url).then_some(url);
     }
     let (path, version) = split_path_version(rest);
     // Vetted once here rather than at each of the arms below, every one of
@@ -1151,15 +1716,19 @@ fn resolve_purl(purl: &str) -> Option<String> {
             let name = path.replace("%40", "@");
             let base = name.rsplit('/').next().unwrap_or(name.as_str());
             let version = version?;
-            Some(format!(
-                "https://registry.npmjs.org/{name}/-/{base}-{version}.tgz"
-            ))
+            maybe_selected_artifact_url(
+                rest,
+                format!("https://registry.npmjs.org/{name}/-/{base}-{version}.tgz"),
+                honor_file_name,
+            )
         }
         "cargo" => {
             let version = version?;
-            Some(format!(
-                "https://static.crates.io/crates/{path}/{path}-{version}.crate"
-            ))
+            maybe_selected_artifact_url(
+                rest,
+                format!("https://static.crates.io/crates/{path}/{path}-{version}.crate"),
+                honor_file_name,
+            )
         }
         "github" => {
             let reference = version.unwrap_or("HEAD");
@@ -1171,17 +1740,29 @@ fn resolve_purl(purl: &str) -> Option<String> {
             let version = version?;
             // The default Go module proxy. Module path and version are
             // case-encoded per the GOPROXY protocol.
-            Some(format!(
-                "https://proxy.golang.org/{}/@v/{}.zip",
-                goproxy_escape(path),
-                goproxy_escape(version)
-            ))
+            maybe_selected_artifact_url(
+                rest,
+                format!(
+                    "https://proxy.golang.org/{}/@v/{}.zip",
+                    goproxy_escape(path),
+                    goproxy_escape(version)
+                ),
+                honor_file_name,
+            )
         }
         "gem" => {
             let version = version?;
-            Some(format!(
-                "https://rubygems.org/downloads/{path}-{version}.gem"
-            ))
+            let platform = purl_qualifier(rest, "platform");
+            let suffix = match platform.as_deref() {
+                None | Some("ruby") => String::new(),
+                Some(value) if safe_filename_part(value) => format!("-{value}"),
+                Some(_) => return None,
+            };
+            maybe_selected_artifact_url(
+                rest,
+                format!("https://rubygems.org/downloads/{path}-{version}{suffix}.gem"),
+                honor_file_name,
+            )
         }
         "nuget" => {
             // NuGet's flat-container coordinates and filenames are lowercase,
@@ -1245,7 +1826,11 @@ fn resolve_purl(purl: &str) -> Option<String> {
 /// Read one PURL qualifier from `rest`, percent-decoding its value. Qualifiers
 /// follow the coordinate/version after `?` and are an unordered `&` list.
 fn purl_qualifier(rest: &str, key: &str) -> Option<String> {
-    rest.split_once('?')?.1.split('&').find_map(|q| {
+    let qualifiers = rest.split_once('?')?.1;
+    let qualifiers = qualifiers
+        .split_once('#')
+        .map_or(qualifiers, |(values, _)| values);
+    qualifiers.split('&').find_map(|q| {
         let (k, v) = q.split_once('=')?;
         k.eq_ignore_ascii_case(key).then(|| percent_decode(v))
     })
@@ -1371,10 +1956,19 @@ fn resolved_target(
         && let Some((ty, rest)) = crate::purl::scheme_type_rest(p)
     {
         let ty = ty.as_str();
-        // A scope is `%40`, so a literal `@` only ever separates the version;
-        // its absence means the npm dependency named no version.
-        if ty == "npm" && !rest.contains('@') {
-            return resolve_npm_unversioned(rest, net);
+        // An exact download override takes precedence even for ecosystems that
+        // normally need metadata (notably versionless npm and PyPI). Apply the
+        // common exact-filename selector to it just as the pure resolver does.
+        if let Some(url) = purl_qualifier(rest, "download_url") {
+            return (is_web_scheme(&url) && file_name_matches(rest, &file_name_from_url(&url)))
+                .then(|| (p.clone(), url));
+        }
+        // A scope is `%40`, so `split_path_version` can distinguish it from a
+        // real version separator even when qualifier values themselves contain
+        // `@`. A versionless npm dependency is refined through dist-tags.
+        let (coordinate_path, coordinate_version) = split_path_version(rest);
+        if ty == "npm" && coordinate_version.is_none() {
+            return resolve_npm_unversioned(coordinate_path, rest, net);
         }
         // Open VSX publishes the exact `.vsix` URL in its API for both a pinned
         // and the latest version, so resolve through it rather than guessing.
@@ -1395,6 +1989,18 @@ fn resolved_target(
             } else {
                 resolve_vscode(rest, net).map(|u| (p.clone(), u))
             };
+        }
+        // PyPI may publish many files for one release. Honor its registered
+        // case-sensitive `file_name` selector (and the legacy `kind` hint),
+        // then feed the preferred matrix candidate through the old one-URL
+        // fetch contract.
+        if ty == "pypi" {
+            let (path, version) = split_path_version(rest);
+            let version = version?;
+            return pypi_artifacts(path, Some(version), rest, net, cache)
+                .into_iter()
+                .find(|candidate| candidate.preferred)
+                .map(|candidate| (p.clone(), candidate.url));
         }
         // AMO publishes the exact XPI URL in its API. A pinned PURL uses the
         // direct per-version endpoint; an unpinned one follows current_version
@@ -1423,16 +2029,11 @@ fn resolved_target(
             return Some((p.clone(), resolve_aur(name, net, cache)));
         }
         if let Some((path, version)) = rest.rsplit_once('@') {
-            // Split any PURL `?qualifiers` off the version. `kind` (`wheel` /
-            // `sdist`) lets a PyPI PURL pick the artifact; the bare version is
+            // Split any PURL `?qualifiers` off the version; the bare version is
             // what every download API actually wants.
-            let (version, kind) = split_version_kind(version);
-            match ty {
-                "pypi" => {
-                    return resolve_pypi(path, version, kind, net, cache).map(|u| (p.clone(), u));
-                }
-                "composer" => return resolve_composer(path, version, net).map(|u| (p.clone(), u)),
-                _ => {}
+            let (version, _) = split_version_kind(version);
+            if ty == "composer" {
+                return resolve_composer(path, version, net).map(|u| (p.clone(), u));
             }
         }
     }
@@ -1472,19 +2073,23 @@ fn resolve_aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> String {
 /// reading the registry packument's `dist-tags.latest`. The registry's own
 /// tarball URL is preferred over the derived one. `None` if the packument can't
 /// be fetched/parsed or names no latest version.
-fn resolve_npm_unversioned(path: &str, net: &dyn Fetch) -> Option<(String, String)> {
-    let name = path.replace("%40", "@");
+fn resolve_npm_unversioned(path: &str, rest: &str, net: &dyn Fetch) -> Option<(String, String)> {
+    let name = npm_registry_name(path);
     let packument = net
         .get(&format!("https://registry.npmjs.org/{name}"))
         .ok()?;
     let doc: serde_json::Value = serde_json::from_slice(&packument.bytes).ok()?;
     let latest = doc.pointer("/dist-tags/latest")?.as_str()?;
-    let locator = format!("pkg:npm/{path}@{latest}");
+    let tail = rest.strip_prefix(path).unwrap_or_default();
+    let locator = format!("pkg:npm/{path}@{latest}{tail}");
     let url = doc
         .pointer(&format!("/versions/{latest}/dist/tarball"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .or_else(|| resolve_purl(&locator))?;
+    if !file_name_matches(rest, &file_name_from_url(&url)) {
+        return None;
+    }
     Some((locator, url))
 }
 
@@ -1510,6 +2115,7 @@ fn split_version_kind(version: &str) -> (&str, Option<&str>) {
 /// `pyproject.toml` — the install-hook attack surface), and `?kind=wheel` is the
 /// default's explicit form. Whichever is preferred, the other is the fallback so
 /// a package that ships only one kind still resolves.
+#[cfg(test)]
 fn resolve_pypi(
     name: &str,
     version: &str,
@@ -1517,28 +2123,14 @@ fn resolve_pypi(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<String> {
-    let api = format!("https://pypi.org/pypi/{name}/{version}/json");
-    // A published version's file list is immutable, so cache it forever rather
-    // than re-fetching on every scan. Resolution reads only the download URL,
-    // which never changes — unlike the package-level packument `registry()`
-    // reads, this endpoint carries no mutable yank/latest fields. Without this a
-    // warm scan of a cached artifact still pays a pypi.org round-trip just to
-    // re-derive the download URL.
-    let bytes = cached_metadata(&api, net, &cache.with_meta_ttl(META_TTL_IMMUTABLE))?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let urls = json.get("urls")?.as_array()?;
-    let pick = match kind {
-        // Explicit source-distribution request: sdist first, wheel as fallback.
-        Some("sdist") => pick_sdist(urls).or_else(|| pick_wheel(urls)),
-        // Default and explicit `kind=wheel`: wheel first, sdist as fallback.
-        _ => pick_wheel(urls).or_else(|| pick_sdist(urls)),
-    }
-    // Last resort: an unusual files list with neither a recognized wheel nor
-    // sdist — take whatever is first rather than resolving to nothing.
-    .or_else(|| urls.first())?;
-    pick.get("url")
-        .and_then(serde_json::Value::as_str)
-        .map(String::from)
+    let rest = kind.map_or_else(
+        || format!("{name}@{version}"),
+        |value| format!("{name}@{version}?kind={value}"),
+    );
+    pypi_artifacts(name, Some(version), &rest, net, cache)
+        .into_iter()
+        .find(|candidate| candidate.preferred)
+        .map(|candidate| candidate.url)
 }
 
 /// Resolve a Firefox Add-ons slug to the XPI AMO serves. A requested version
@@ -1580,44 +2172,6 @@ fn resolve_firefox(
     }
     let url = release.pointer("/file/url")?.as_str()?.to_string();
     Some((resolved_version, url))
-}
-
-/// The one source distribution among a PyPI version's files (there is at most
-/// one per version), or `None` if this version publishes only wheels.
-fn pick_sdist(urls: &[serde_json::Value]) -> Option<&serde_json::Value> {
-    urls.iter()
-        .find(|u| u.get("packagetype").and_then(serde_json::Value::as_str) == Some("sdist"))
-}
-
-/// The most representative wheel among a PyPI version's files. A version may
-/// publish anywhere from zero wheels (sdist-only) to dozens (one per
-/// platform/Python ABI), so the choice is deterministic: prefer the universal
-/// pure-Python `py3-none-any` wheel (a single platform-agnostic artifact), then
-/// any other `none-any` wheel, then the first platform wheel. `None` if this
-/// version publishes no wheel at all.
-fn pick_wheel(urls: &[serde_json::Value]) -> Option<&serde_json::Value> {
-    let is_wheel = |u: &&serde_json::Value| {
-        u.get("packagetype").and_then(serde_json::Value::as_str) == Some("bdist_wheel")
-    };
-    // A `fn`, not a closure: the returned `&str` borrows from the argument, and
-    // closure lifetime elision can't express that.
-    fn filename(u: &serde_json::Value) -> &str {
-        u.get("filename")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-    }
-    // Rank in one pass: 0 beats 1 beats 2, and `min_by_key` keeps the earliest
-    // of equal ranks, so the choice stays the file list's own order.
-    urls.iter().filter(is_wheel).min_by_key(|u| {
-        let name = filename(u);
-        if name.ends_with("-py3-none-any.whl") {
-            0
-        } else if name.contains("-none-any.") {
-            1
-        } else {
-            2
-        }
-    })
 }
 
 /// Open VSX publishes the `.vsix` download URL in its JSON API. `rest` is
@@ -2138,7 +2692,7 @@ mod tests {
         }"#;
         let net = Fixtures::default().with("https://registry.npmjs.org/easy-day-js", packument);
         assert_eq!(
-            resolve_npm_unversioned("easy-day-js", &net),
+            resolve_npm_unversioned("easy-day-js", "easy-day-js", &net),
             Some((
                 "pkg:npm/easy-day-js@1.12.0".to_string(),
                 "https://registry.npmjs.org/easy-day-js/-/easy-day-js-1.12.0.tgz".to_string()
@@ -2148,14 +2702,66 @@ mod tests {
         let scoped = br#"{"dist-tags":{"latest":"2.0.0"},"versions":{"2.0.0":{"dist":{"tarball":"https://registry.npmjs.org/@scope/util/-/util-2.0.0.tgz"}}}}"#;
         let net = Fixtures::default().with("https://registry.npmjs.org/@scope/util", scoped);
         assert_eq!(
-            resolve_npm_unversioned("%40scope/util", &net),
+            resolve_npm_unversioned("%40scope/util", "%40scope/util", &net),
             Some((
                 "pkg:npm/%40scope/util@2.0.0".to_string(),
                 "https://registry.npmjs.org/@scope/util/-/util-2.0.0.tgz".to_string()
             ))
         );
         // Registry unreachable / unknown package → unresolved.
-        assert_eq!(resolve_npm_unversioned("nope", &Fixtures::default()), None);
+        assert_eq!(
+            resolve_npm_unversioned("nope", "nope", &Fixtures::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn npm_artifact_matrix_keeps_runtime_compatibility_modifiers() {
+        let packument = br#"{
+            "versions": {"1.2.3": {
+                "os": ["linux", "darwin"], "cpu": ["x64", "arm64"],
+                "libc": "glibc", "engines": {"node": ">=20"},
+                "dist": {
+                    "tarball": "https://registry.npmjs.org/native-addon/-/native-addon-1.2.3.tgz",
+                    "shasum": "0123456789abcdef",
+                    "integrity": "sha512-Zm9v"
+                }
+            }}
+        }"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/native-addon", packument);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:npm/native-addon@1.2.3".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("matrix");
+        assert_eq!(matrix.candidates.len(), 1);
+        let candidate = matrix.preferred().expect("preferred");
+        assert_eq!(candidate.file_name, "native-addon-1.2.3.tgz");
+        assert_eq!(
+            candidate.attributes.get("kind").map(String::as_str),
+            Some("tgz")
+        );
+        assert_eq!(
+            candidate.attributes.get("os").map(String::as_str),
+            Some("linux,darwin")
+        );
+        assert_eq!(
+            candidate.attributes.get("cpu").map(String::as_str),
+            Some("x64,arm64")
+        );
+        assert_eq!(
+            candidate.attributes.get("libc").map(String::as_str),
+            Some("glibc")
+        );
+        assert_eq!(
+            candidate.attributes.get("node").map(String::as_str),
+            Some(">=20")
+        );
+        assert_eq!(
+            candidate.checksums.get("sha1").map(String::as_str),
+            Some("0123456789abcdef")
+        );
     }
 
     #[test]
@@ -2208,6 +2814,14 @@ mod tests {
             resolve_pypi("widget", "1.0.0", None, &net, &cache),
             Some("https://x/universal.whl".to_string())
         );
+        assert_eq!(
+            resolve_pypi("widget", "1.0.0", Some("wheel"), &net, &cache),
+            Some("https://x/universal.whl".to_string())
+        );
+        assert_eq!(
+            resolve_pypi("widget", "1.0.0", Some("sdist"), &net, &cache),
+            Some("https://x/widget.tar.gz".to_string())
+        );
 
         // The middle rank: no `py3-none-any`, but a non-py3 universal wheel
         // (`py2.py3-none-any`) is still platform-agnostic and must beat the
@@ -2245,6 +2859,73 @@ mod tests {
     }
 
     #[test]
+    fn pypi_artifact_matrix_exposes_file_and_wheel_tag_dimensions() {
+        let api = "https://pypi.org/pypi/widget/1.0.0/json";
+        let body = br#"{"urls":[
+            {"packagetype":"sdist","filename":"widget-1.0.0.tar.gz","url":"https://x/widget-1.0.0.tar.gz","digests":{"sha256":"srcsha"}},
+            {"packagetype":"bdist_wheel","filename":"widget-1.0.0-2-cp313-cp313-musllinux_1_2_aarch64.whl","url":"https://x/widget-musl.whl","python_version":"cp313","requires_python":">=3.10","digests":{"sha256":"muslsha"}},
+            {"packagetype":"bdist_wheel","filename":"widget-1.0.0-cp313-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl","url":"https://x/widget-linux.whl"},
+            {"packagetype":"bdist_wheel","filename":"widget-1.0.0-py3-none-any.whl","url":"https://x/widget-any.whl"}
+        ]}"#;
+        let net = Fixtures::default().with(api, body);
+        let cache = BlobCache::disabled();
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/widget@1.0.0".into()),
+            &net,
+            &cache,
+        )
+        .expect("matrix");
+        assert_eq!(matrix.candidates.len(), 4);
+        assert_eq!(
+            matrix.preferred().map(|value| value.file_name.as_str()),
+            Some("widget-1.0.0-py3-none-any.whl")
+        );
+        let musl = matrix
+            .candidates
+            .iter()
+            .find(|candidate| candidate.file_name.contains("musllinux"))
+            .expect("musl wheel");
+        assert_eq!(
+            musl.qualifiers.get("file_name").map(String::as_str),
+            Some("widget-1.0.0-2-cp313-cp313-musllinux_1_2_aarch64.whl")
+        );
+        assert_eq!(musl.attributes.get("build").map(String::as_str), Some("2"));
+        assert_eq!(
+            musl.attributes.get("python").map(String::as_str),
+            Some("cp313")
+        );
+        assert_eq!(
+            musl.attributes.get("abi").map(String::as_str),
+            Some("cp313")
+        );
+        assert_eq!(
+            musl.attributes.get("platform").map(String::as_str),
+            Some("musllinux_1_2_aarch64")
+        );
+
+        let exact = "widget-1.0.0-cp313-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl";
+        let purl = format!("pkg:pypi/widget@1.0.0?file_name={exact}");
+        let selected = resolve_artifacts(&RefLocator::Purl(purl.clone()), &net, &cache)
+            .expect("selected matrix");
+        assert_eq!(
+            selected.preferred().map(|value| value.file_name.as_str()),
+            Some(exact)
+        );
+        assert_eq!(
+            resolved_target(&RefLocator::Purl(purl), &net, &cache).map(|(_, url)| url),
+            Some("https://x/widget-linux.whl".into())
+        );
+
+        let missing = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/widget@1.0.0?file_name=missing.whl".into()),
+            &net,
+            &cache,
+        )
+        .expect("unselected matrix");
+        assert!(missing.preferred().is_none());
+    }
+
+    #[test]
     fn split_version_kind_parses_purl_qualifiers() {
         assert_eq!(split_version_kind("1.2.3"), ("1.2.3", None));
         assert_eq!(
@@ -2271,6 +2952,128 @@ mod tests {
             Some("https://rubygems.org/downloads/rails-7.0.4.gem".to_string())
         );
         assert_eq!(resolve(&RefLocator::Purl("pkg:gem/rails".into())), None);
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:gem/nokogiri@1.19.4?platform=x86_64-linux-gnu".into()
+            )),
+            Some("https://rubygems.org/downloads/nokogiri-1.19.4-x86_64-linux-gnu.gem".into())
+        );
+    }
+
+    #[test]
+    fn gem_artifact_matrix_exposes_every_published_platform() {
+        let versions = br#"[
+            {"number":"1.19.4","platform":"x86_64-linux-musl","sha":"muslsha","ruby_version":">= 3.1"},
+            {"number":"1.19.4","platform":"ruby","sha":"rubysha"},
+            {"number":"1.19.4","platform":"arm64-darwin","sha":"darwinsha"},
+            {"number":"1.19.4","platform":"../../not-a-platform","sha":"badsha"},
+            {"number":"1.19.3","platform":"ruby","sha":"oldsha"}
+        ]"#;
+        let net = Fixtures::default().with(
+            "https://rubygems.org/api/v1/versions/nokogiri.json",
+            versions,
+        );
+        let cache = BlobCache::disabled();
+        let base = resolve_artifacts(
+            &RefLocator::Purl("pkg:gem/nokogiri@1.19.4".into()),
+            &net,
+            &cache,
+        )
+        .expect("matrix");
+        assert_eq!(base.candidates.len(), 3);
+        assert_eq!(
+            base.preferred().map(|value| value.file_name.as_str()),
+            Some("nokogiri-1.19.4.gem")
+        );
+
+        let native = resolve_artifacts(
+            &RefLocator::Purl("pkg:gem/nokogiri@1.19.4?platform=x86_64-linux-musl".into()),
+            &net,
+            &cache,
+        )
+        .expect("native matrix");
+        let selected = native.preferred().expect("native preferred");
+        assert_eq!(selected.file_name, "nokogiri-1.19.4-x86_64-linux-musl.gem");
+        assert_eq!(
+            selected.qualifiers.get("platform").map(String::as_str),
+            Some("x86_64-linux-musl")
+        );
+        assert_eq!(
+            selected.checksums.get("sha256").map(String::as_str),
+            Some("muslsha")
+        );
+    }
+
+    #[test]
+    fn deterministic_ecosystems_honor_common_artifact_selectors() {
+        let go = RefLocator::Purl(
+            "pkg:golang/google.golang.org/genproto@v1.2.3#googleapis/api/annotations".into(),
+        );
+        assert_eq!(
+            resolve(&go),
+            Some("https://proxy.golang.org/google.golang.org/genproto/@v/v1.2.3.zip".into())
+        );
+        let matrix = resolve_artifacts(&go, &Fixtures::default(), &BlobCache::disabled())
+            .expect("go matrix");
+        assert_eq!(
+            matrix
+                .preferred()
+                .and_then(|value| value.attributes.get("subpath"))
+                .map(String::as_str),
+            Some("googleapis/api/annotations")
+        );
+
+        assert!(
+            resolve(&RefLocator::Purl(
+                "pkg:cargo/serde@1.0.0?file_name=another.crate".into()
+            ))
+            .is_none()
+        );
+        let unmatched = resolve_artifacts(
+            &RefLocator::Purl("pkg:cargo/serde@1.0.0?file_name=another.crate".into()),
+            &Fixtures::default(),
+            &BlobCache::disabled(),
+        )
+        .expect("unselected cargo matrix");
+        assert_eq!(unmatched.candidates.len(), 1);
+        assert_eq!(unmatched.candidates[0].file_name, "serde-1.0.0.crate");
+        assert!(unmatched.preferred().is_none());
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:cargo/serde@1.0.0?file_name=serde-1.0.0.crate".into()
+            )),
+            Some("https://static.crates.io/crates/serde/serde-1.0.0.crate".into())
+        );
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:cargo/serde@1.0.0?download_url=https:%2F%2Fmirror.test%2Fserde.crate".into()
+            )),
+            Some("https://mirror.test/serde.crate".into())
+        );
+
+        let override_purl = RefLocator::Purl(
+            "pkg:npm/native-addon?download_url=https:%2F%2Fmirror.test%2Fnative.tgz&file_name=native.tgz"
+                .into(),
+        );
+        assert_eq!(
+            resolved_target(&override_purl, &Fixtures::default(), &BlobCache::disabled()),
+            Some((
+                locator_string(&override_purl),
+                "https://mirror.test/native.tgz".into()
+            ))
+        );
+        let wrong_file = RefLocator::Purl(
+            "pkg:npm/native-addon?download_url=https:%2F%2Fmirror.test%2Fnative.tgz&file_name=other.tgz"
+                .into(),
+        );
+        assert!(
+            resolved_target(&wrong_file, &Fixtures::default(), &BlobCache::disabled()).is_none()
+        );
+        let override_matrix =
+            resolve_artifacts(&wrong_file, &Fixtures::default(), &BlobCache::disabled())
+                .expect("unselected override matrix");
+        assert_eq!(override_matrix.candidates.len(), 1);
+        assert!(override_matrix.preferred().is_none());
     }
 
     #[test]
