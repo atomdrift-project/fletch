@@ -37,7 +37,8 @@ pub struct ArtifactCandidate {
     /// Ecosystem-specific file type and compatibility tags.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attributes: BTreeMap<String, String>,
-    /// Registry-provided content digests, keyed by lowercase algorithm.
+    /// Registry-provided or PURL-declared content digests, keyed by the
+    /// standard lowercase algorithm name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checksums: BTreeMap<String, String>,
     /// Whether the legacy single-URL API would choose this candidate.
@@ -1088,7 +1089,11 @@ fn record(
     meta: &CachedMeta,
 ) -> FetchRecord {
     let content_sha256 = sha256_hex(bytes);
-    let pin_verified = verify_pin(r.pinned_hash.as_ref(), bytes, &content_sha256);
+    let pin_verified = if r.pinned_hash.is_some() {
+        verify_pin(r.pinned_hash.as_ref(), bytes, &content_sha256)
+    } else {
+        verify_purl_checksum(&r.locator, bytes, &content_sha256)
+    };
     let outcome = if pin_verified == Some(false) {
         Outcome::PinMismatch
     } else {
@@ -1154,7 +1159,9 @@ pub fn resolve(locator: &RefLocator) -> Option<String> {
 ///
 /// PyPI's `file_name`, RubyGems' `platform`, and Go's `subpath` are the
 /// registered type-specific selectors for these ecosystems; npm and Cargo have
-/// none. The common `download_url` and `file_name` selectors are also honored.
+/// none. Common `download_url`, `file_name`, `repository_url`, `checksum`, and
+/// `vers` semantics are also honored (`vers` intentionally yields no concrete
+/// candidate until its caller selects a release).
 /// Compatibility information that is not a PURL selector is exposed as an
 /// attribute: Python wheel/build/ABI/platform tags and npm os/cpu/libc/Node
 /// constraints.
@@ -1172,13 +1179,17 @@ pub fn resolve_artifacts(
         RefLocator::Url(_) | RefLocator::Path(_) => return None,
         RefLocator::Purl(purl) => {
             let (ty, rest) = crate::purl::scheme_type_rest(purl)?;
-            if let Some(url) = purl_qualifier(rest, "download_url") {
+            let mut candidates = if let Some(url) = purl_qualifier(rest, "download_url") {
                 if !is_web_scheme(&url) {
                     return None;
                 }
                 let mut candidate = artifact_candidate(url, "download");
                 candidate.preferred = file_name_matches(rest, &candidate.file_name);
                 vec![candidate]
+            } else if purl_qualifier(rest, "vers").is_some() {
+                // A range describes multiple releases, not one concrete
+                // artifact coordinate. Callers must choose a version first.
+                Vec::new()
             } else {
                 let (path, version) = split_path_version(rest);
                 if !safe_coordinate(path) || version.is_some_and(|value| !safe_coordinate(value)) {
@@ -1189,10 +1200,12 @@ pub fn resolve_artifacts(
                     "pypi" => pypi_artifacts(path, version, rest, net, cache),
                     "gem" => gem_artifacts(path, version, rest, net, cache),
                     "golang" => deterministic_artifacts(purl, rest, "zip"),
-                    "cargo" => deterministic_artifacts(purl, rest, "crate"),
+                    "cargo" => cargo_artifacts(purl, path, version, rest, net, cache),
                     _ => return None,
                 }
-            }
+            };
+            apply_common_candidate_qualifiers(rest, &mut candidates);
+            candidates
         }
     };
     Some(ArtifactMatrix {
@@ -1237,6 +1250,98 @@ fn deterministic_artifacts(purl: &str, rest: &str, kind: &str) -> Vec<ArtifactCa
     vec![candidate]
 }
 
+fn cargo_artifacts(
+    purl: &str,
+    name: &str,
+    version: Option<&str>,
+    rest: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Vec<ArtifactCandidate> {
+    let Some(repository) = purl_qualifier(rest, "repository_url") else {
+        return deterministic_artifacts(purl, rest, "crate");
+    };
+    let repository = repository.trim_end_matches('/');
+    if matches!(repository, "https://crates.io" | "https://index.crates.io") {
+        return deterministic_artifacts(purl, rest, "crate");
+    }
+    let repository = repository.strip_prefix("sparse+").unwrap_or(repository);
+    if !is_web_scheme(repository) {
+        return Vec::new();
+    }
+    let Some(version) = version.map(percent_decode) else {
+        return Vec::new();
+    };
+    let config_url = format!("{repository}/config.json");
+    let Some(download) = cached_metadata(&config_url, net, &cache.with_meta_ttl(meta_ttl_pinned()))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|config| config.get("dl")?.as_str().map(str::to_string))
+    else {
+        return Vec::new();
+    };
+    let checksums = purl_checksums(rest);
+    let url = cargo_download_url(
+        &download,
+        name,
+        &version,
+        checksums.get("sha256").map(String::as_str),
+    );
+    let Some(url) = url else {
+        return Vec::new();
+    };
+    let mut candidate = artifact_candidate(url, "crate");
+    candidate
+        .qualifiers
+        .insert("repository_url".into(), repository.to_string());
+    candidate.preferred = file_name_matches(rest, &candidate.file_name);
+    vec![candidate]
+}
+
+fn cargo_download_url(
+    template: &str,
+    name: &str,
+    version: &str,
+    sha256: Option<&str>,
+) -> Option<String> {
+    if template.contains("{sha256-checksum}") && sha256.is_none() {
+        // This template cannot be expanded without either an explicit PURL
+        // checksum or the crate's index record. Never invent the digest.
+        return None;
+    }
+    let prefix = cargo_registry_prefix(name)?;
+    let lowerprefix = cargo_registry_prefix(&name.to_ascii_lowercase())?;
+    let has_markers = template.contains('{');
+    let expanded = template
+        .replace("{crate}", name)
+        .replace("{version}", version)
+        .replace("{prefix}", &prefix)
+        .replace("{lowerprefix}", &lowerprefix)
+        .replace("{sha256-checksum}", sha256.unwrap_or_default());
+    let url = if has_markers {
+        expanded
+    } else {
+        format!(
+            "{}/{name}/{version}/download",
+            expanded.trim_end_matches('/')
+        )
+    };
+    is_web_scheme(&url).then_some(url)
+}
+
+fn cargo_registry_prefix(name: &str) -> Option<String> {
+    let characters: Vec<char> = name.chars().collect();
+    Some(match characters.len() {
+        0 => return None,
+        1 => "1".to_string(),
+        2 => "2".to_string(),
+        3 => format!("3/{}", characters[0]),
+        _ => format!(
+            "{}{}/{}{}",
+            characters[0], characters[1], characters[2], characters[3]
+        ),
+    })
+}
+
 fn npm_artifacts(
     path: &str,
     requested_version: Option<&str>,
@@ -1250,16 +1355,35 @@ fn npm_artifacts(
     } else {
         meta_ttl_unpinned()
     };
-    let api = format!("https://registry.npmjs.org/{name}");
+    let Some(repository) = repository_base(rest, "https://registry.npmjs.org") else {
+        return Vec::new();
+    };
+    let api = format!("{repository}/{name}");
     let doc = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
     let requested = requested_version.map(percent_decode);
-    let resolved = requested.or_else(|| {
-        doc.as_ref()?
-            .pointer("/dist-tags/latest")?
-            .as_str()
-            .map(str::to_string)
-    });
+    let resolved = requested.as_ref().map_or_else(
+        || {
+            doc.as_ref()?
+                .pointer("/dist-tags/latest")?
+                .as_str()
+                .map(str::to_string)
+        },
+        |value| {
+            doc.as_ref()
+                .and_then(|document| document.get("versions"))
+                .and_then(|versions| versions.get(value))
+                .map(|_| value.clone())
+                .or_else(|| {
+                    doc.as_ref()?
+                        .get("dist-tags")?
+                        .get(value)?
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .or_else(|| Some(value.clone()))
+        },
+    );
     let Some(version) = resolved else {
         return Vec::new();
     };
@@ -1267,12 +1391,12 @@ fn npm_artifacts(
         .as_ref()
         .and_then(|value| value.get("versions"))
         .and_then(|versions| versions.get(&version));
-    let fallback_purl = format!("pkg:npm/{path}@{version}");
+    let base_name = name.rsplit('/').next().unwrap_or(name.as_str());
     let url = version_doc
         .and_then(|value| value.pointer("/dist/tarball"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .or_else(|| resolve_purl(&fallback_purl));
+        .or_else(|| Some(format!("{repository}/{name}/-/{base_name}-{version}.tgz")));
     let Some(url) = url else {
         return Vec::new();
     };
@@ -1340,9 +1464,12 @@ fn pypi_artifacts(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Vec<ArtifactCandidate> {
+    let Some(repository) = repository_base(rest, "https://pypi.org") else {
+        return Vec::new();
+    };
     let api = version.map_or_else(
-        || format!("https://pypi.org/pypi/{name}/json"),
-        |value| format!("https://pypi.org/pypi/{name}/{value}/json"),
+        || format!("{repository}/pypi/{name}/json"),
+        |value| format!("{repository}/pypi/{name}/{value}/json"),
     );
     let ttl = if version.is_some() {
         META_TTL_IMMUTABLE
@@ -1425,6 +1552,12 @@ fn pypi_candidate(
     {
         attributes.insert("yanked".into(), "true".into());
     }
+    if let Some(reason) = file
+        .get("yanked_reason")
+        .and_then(serde_json::Value::as_str)
+    {
+        attributes.insert("yanked_reason".into(), reason.to_string());
+    }
     let checksums = file
         .get("digests")
         .and_then(serde_json::Value::as_object)
@@ -1432,9 +1565,12 @@ fn pypi_candidate(
             digests
                 .iter()
                 .filter_map(|(algorithm, value)| {
-                    value
-                        .as_str()
-                        .map(|digest| (algorithm.clone(), digest.to_string()))
+                    value.as_str().map(|digest| {
+                        (
+                            algorithm.to_ascii_lowercase().replace('_', "-"),
+                            digest.to_string(),
+                        )
+                    })
                 })
                 .collect()
         })
@@ -1527,7 +1663,10 @@ fn gem_artifacts(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Vec<ArtifactCandidate> {
-    let api = format!("https://rubygems.org/api/v1/versions/{name}.json");
+    let Some(repository) = repository_base(rest, "https://rubygems.org") else {
+        return Vec::new();
+    };
+    let api = format!("{repository}/api/v1/versions/{name}.json");
     let ttl = if requested_version.is_some() {
         meta_ttl_pinned()
     } else {
@@ -1554,14 +1693,19 @@ fn gem_artifacts(
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(safe_filename_part)
         })
-        .map(|entry| gem_candidate(name, &version, entry))
+        .map(|entry| gem_candidate(&repository, name, &version, entry))
         .collect();
     if candidates.is_empty() {
         let platform = purl_qualifier(rest, "platform").unwrap_or_else(|| "ruby".into());
         if !safe_filename_part(&platform) {
             return Vec::new();
         }
-        candidates.push(gem_candidate_for_platform(name, &version, &platform));
+        candidates.push(gem_candidate_for_platform(
+            &repository,
+            name,
+            &version,
+            &platform,
+        ));
     }
     candidates.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     let explicit_platform = purl_qualifier(rest, "platform");
@@ -1587,12 +1731,17 @@ fn gem_artifacts(
     candidates
 }
 
-fn gem_candidate(name: &str, version: &str, entry: &serde_json::Value) -> ArtifactCandidate {
+fn gem_candidate(
+    repository: &str,
+    name: &str,
+    version: &str,
+    entry: &serde_json::Value,
+) -> ArtifactCandidate {
     let platform = entry
         .get("platform")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("ruby");
-    let mut candidate = gem_candidate_for_platform(name, version, platform);
+    let mut candidate = gem_candidate_for_platform(repository, name, version, platform);
     if let Some(sha256) = entry.get("sha").and_then(serde_json::Value::as_str)
         && !sha256.is_empty()
     {
@@ -1608,7 +1757,12 @@ fn gem_candidate(name: &str, version: &str, entry: &serde_json::Value) -> Artifa
     candidate
 }
 
-fn gem_candidate_for_platform(name: &str, version: &str, platform: &str) -> ArtifactCandidate {
+fn gem_candidate_for_platform(
+    repository: &str,
+    name: &str,
+    version: &str,
+    platform: &str,
+) -> ArtifactCandidate {
     let suffix = if platform == "ruby" {
         String::new()
     } else {
@@ -1620,7 +1774,7 @@ fn gem_candidate_for_platform(name: &str, version: &str, platform: &str) -> Arti
     let mut attributes = BTreeMap::new();
     attributes.insert("kind".into(), "gem".into());
     ArtifactCandidate {
-        url: format!("https://rubygems.org/downloads/{file_name}"),
+        url: format!("{repository}/downloads/{file_name}"),
         file_name,
         qualifiers,
         attributes,
@@ -1716,14 +1870,24 @@ fn resolve_purl_with_file_selection(purl: &str, honor_file_name: bool) -> Option
             let name = path.replace("%40", "@");
             let base = name.rsplit('/').next().unwrap_or(name.as_str());
             let version = version?;
+            let repository = repository_base(rest, "https://registry.npmjs.org")?;
             maybe_selected_artifact_url(
                 rest,
-                format!("https://registry.npmjs.org/{name}/-/{base}-{version}.tgz"),
+                format!("{repository}/{name}/-/{base}-{version}.tgz"),
                 honor_file_name,
             )
         }
         "cargo" => {
             let version = version?;
+            if let Some(repository) = purl_qualifier(rest, "repository_url") {
+                let repository = repository.trim_end_matches('/');
+                if !matches!(repository, "https://crates.io" | "https://index.crates.io") {
+                    // Alternate Cargo registries publish their download
+                    // template in index config.json; only the metadata-aware
+                    // matrix can resolve it.
+                    return None;
+                }
+            }
             maybe_selected_artifact_url(
                 rest,
                 format!("https://static.crates.io/crates/{path}/{path}-{version}.crate"),
@@ -1738,12 +1902,13 @@ fn resolve_purl_with_file_selection(purl: &str, honor_file_name: bool) -> Option
         }
         "golang" => {
             let version = version?;
+            let repository = repository_base(rest, "https://proxy.golang.org")?;
             // The default Go module proxy. Module path and version are
             // case-encoded per the GOPROXY protocol.
             maybe_selected_artifact_url(
                 rest,
                 format!(
-                    "https://proxy.golang.org/{}/@v/{}.zip",
+                    "{repository}/{}/@v/{}.zip",
                     goproxy_escape(path),
                     goproxy_escape(version)
                 ),
@@ -1752,6 +1917,7 @@ fn resolve_purl_with_file_selection(purl: &str, honor_file_name: bool) -> Option
         }
         "gem" => {
             let version = version?;
+            let repository = repository_base(rest, "https://rubygems.org")?;
             let platform = purl_qualifier(rest, "platform");
             let suffix = match platform.as_deref() {
                 None | Some("ruby") => String::new(),
@@ -1760,7 +1926,7 @@ fn resolve_purl_with_file_selection(purl: &str, honor_file_name: bool) -> Option
             };
             maybe_selected_artifact_url(
                 rest,
-                format!("https://rubygems.org/downloads/{path}-{version}{suffix}.gem"),
+                format!("{repository}/downloads/{path}-{version}{suffix}.gem"),
                 honor_file_name,
             )
         }
@@ -1834,6 +2000,60 @@ fn purl_qualifier(rest: &str, key: &str) -> Option<String> {
         let (k, v) = q.split_once('=')?;
         k.eq_ignore_ascii_case(key).then(|| percent_decode(v))
     })
+}
+
+fn repository_base(rest: &str, default: &str) -> Option<String> {
+    match purl_qualifier(rest, "repository_url") {
+        Some(repository) if is_web_scheme(&repository) => {
+            Some(repository.trim_end_matches('/').to_string())
+        }
+        Some(_) => None,
+        None => Some(default.to_string()),
+    }
+}
+
+fn purl_checksums(rest: &str) -> BTreeMap<String, String> {
+    purl_qualifier(rest, "checksum")
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|checksum| {
+                    let (algorithm, digest) = checksum.split_once(':')?;
+                    (!algorithm.is_empty() && !digest.is_empty()).then(|| {
+                        (
+                            algorithm.to_ascii_lowercase().replace('_', "-"),
+                            digest.to_ascii_lowercase(),
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn apply_common_candidate_qualifiers(rest: &str, candidates: &mut [ArtifactCandidate]) {
+    let declared = purl_checksums(rest);
+    let repository = purl_qualifier(rest, "repository_url");
+    for candidate in candidates {
+        if let Some(repository) = repository.as_ref() {
+            candidate
+                .qualifiers
+                .insert("repository_url".into(), repository.clone());
+        }
+        for (algorithm, digest) in &declared {
+            if candidate
+                .checksums
+                .get(algorithm)
+                .is_some_and(|published| !published.eq_ignore_ascii_case(digest))
+            {
+                candidate.preferred = false;
+            }
+            candidate
+                .checksums
+                .entry(algorithm.clone())
+                .or_insert_with(|| digest.clone());
+        }
+    }
 }
 
 /// Whether a decoded PURL qualifier can safely be embedded as one artifact
@@ -1963,12 +2183,26 @@ fn resolved_target(
             return (is_web_scheme(&url) && file_name_matches(rest, &file_name_from_url(&url)))
                 .then(|| (p.clone(), url));
         }
+        if purl_qualifier(rest, "vers").is_some() {
+            return None;
+        }
         // A scope is `%40`, so `split_path_version` can distinguish it from a
         // real version separator even when qualifier values themselves contain
         // `@`. A versionless npm dependency is refined through dist-tags.
         let (coordinate_path, coordinate_version) = split_path_version(rest);
-        if ty == "npm" && coordinate_version.is_none() {
-            return resolve_npm_unversioned(coordinate_path, rest, net);
+        if ty == "npm" {
+            match coordinate_version {
+                None => return resolve_npm_dist_tag(coordinate_path, rest, "latest", net),
+                Some(version) if !npm_version_is_concrete(version) => {
+                    return resolve_npm_dist_tag(
+                        coordinate_path,
+                        rest,
+                        &percent_decode(version),
+                        net,
+                    );
+                }
+                Some(_) => {}
+            }
         }
         // Open VSX publishes the exact `.vsix` URL in its API for both a pinned
         // and the latest version, so resolve through it rather than guessing.
@@ -2073,17 +2307,45 @@ fn resolve_aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> String {
 /// reading the registry packument's `dist-tags.latest`. The registry's own
 /// tarball URL is preferred over the derived one. `None` if the packument can't
 /// be fetched/parsed or names no latest version.
+#[cfg(test)]
 fn resolve_npm_unversioned(path: &str, rest: &str, net: &dyn Fetch) -> Option<(String, String)> {
+    resolve_npm_dist_tag(path, rest, "latest", net)
+}
+
+fn npm_version_is_concrete(version: &str) -> bool {
+    let version = percent_decode(version);
+    let mut bytes = version.bytes();
+    match bytes.next() {
+        Some(first) if first.is_ascii_digit() => true,
+        Some(b'v') => bytes.next().is_some_and(|next| next.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+fn resolve_npm_dist_tag(
+    path: &str,
+    rest: &str,
+    tag: &str,
+    net: &dyn Fetch,
+) -> Option<(String, String)> {
     let name = npm_registry_name(path);
-    let packument = net
-        .get(&format!("https://registry.npmjs.org/{name}"))
-        .ok()?;
+    let repository = repository_base(rest, "https://registry.npmjs.org")?;
+    let packument = net.get(&format!("{repository}/{name}")).ok()?;
     let doc: serde_json::Value = serde_json::from_slice(&packument.bytes).ok()?;
-    let latest = doc.pointer("/dist-tags/latest")?.as_str()?;
-    let tail = rest.strip_prefix(path).unwrap_or_default();
-    let locator = format!("pkg:npm/{path}@{latest}{tail}");
+    let version = doc.get("dist-tags")?.get(tag)?.as_str()?;
+    let coordinate_tail = rest.strip_prefix(path).unwrap_or_default();
+    let tail = if let Some(version_tail) = coordinate_tail.strip_prefix('@') {
+        version_tail
+            .find(['?', '#'])
+            .map_or("", |index| &version_tail[index..])
+    } else {
+        coordinate_tail
+    };
+    let locator = format!("pkg:npm/{path}@{version}{tail}");
     let url = doc
-        .pointer(&format!("/versions/{latest}/dist/tarball"))
+        .get("versions")
+        .and_then(|versions| versions.get(version))
+        .and_then(|release| release.pointer("/dist/tarball"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .or_else(|| resolve_purl(&locator))?;
@@ -2307,6 +2569,25 @@ fn verify_pin(pin: Option<&PinnedHash>, bytes: &[u8], sha256_hex: &str) -> Optio
         }
         _ => None,
     }
+}
+
+fn verify_purl_checksum(locator: &RefLocator, bytes: &[u8], sha256_hex: &str) -> Option<bool> {
+    let RefLocator::Purl(purl) = locator else {
+        return None;
+    };
+    let (_, rest) = crate::purl::scheme_type_rest(purl)?;
+    let checksums = purl_checksums(rest);
+    let mut checked = false;
+    let mut matches = true;
+    if let Some(expected) = checksums.get("sha256") {
+        checked = true;
+        matches &= expected.eq_ignore_ascii_case(sha256_hex);
+    }
+    if let Some(expected) = checksums.get("sha512") {
+        checked = true;
+        matches &= expected.eq_ignore_ascii_case(&hex::encode(Sha512::digest(bytes)));
+    }
+    checked.then_some(matches)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -2684,10 +2965,11 @@ mod tests {
         // The packument names a current release; resolution refines the
         // versionless locator to it and returns the registry's tarball URL.
         let packument = br#"{
-            "dist-tags": { "latest": "1.12.0" },
+            "dist-tags": { "latest": "1.12.0", "next": "2.0.0-beta.1" },
             "versions": {
                 "1.11.21": { "dist": { "tarball": "https://registry.npmjs.org/easy-day-js/-/easy-day-js-1.11.21.tgz" } },
-                "1.12.0":  { "dist": { "tarball": "https://registry.npmjs.org/easy-day-js/-/easy-day-js-1.12.0.tgz" } }
+                "1.12.0":  { "dist": { "tarball": "https://registry.npmjs.org/easy-day-js/-/easy-day-js-1.12.0.tgz" } },
+                "2.0.0-beta.1": { "dist": { "tarball": "https://registry.npmjs.org/easy-day-js/-/easy-day-js-2.0.0-beta.1.tgz" } }
             }
         }"#;
         let net = Fixtures::default().with("https://registry.npmjs.org/easy-day-js", packument);
@@ -2696,6 +2978,17 @@ mod tests {
             Some((
                 "pkg:npm/easy-day-js@1.12.0".to_string(),
                 "https://registry.npmjs.org/easy-day-js/-/easy-day-js-1.12.0.tgz".to_string()
+            ))
+        );
+        assert_eq!(
+            resolved_target(
+                &RefLocator::Purl("pkg:npm/easy-day-js@next".into()),
+                &net,
+                &BlobCache::disabled(),
+            ),
+            Some((
+                "pkg:npm/easy-day-js@2.0.0-beta.1".into(),
+                "https://registry.npmjs.org/easy-day-js/-/easy-day-js-2.0.0-beta.1.tgz".into(),
             ))
         );
         // Scoped name: the `%40` encoding survives into the refined locator.
@@ -2863,7 +3156,7 @@ mod tests {
         let api = "https://pypi.org/pypi/widget/1.0.0/json";
         let body = br#"{"urls":[
             {"packagetype":"sdist","filename":"widget-1.0.0.tar.gz","url":"https://x/widget-1.0.0.tar.gz","digests":{"sha256":"srcsha"}},
-            {"packagetype":"bdist_wheel","filename":"widget-1.0.0-2-cp313-cp313-musllinux_1_2_aarch64.whl","url":"https://x/widget-musl.whl","python_version":"cp313","requires_python":">=3.10","digests":{"sha256":"muslsha"}},
+            {"packagetype":"bdist_wheel","filename":"widget-1.0.0-2-cp313-cp313-musllinux_1_2_aarch64.whl","url":"https://x/widget-musl.whl","python_version":"cp313","requires_python":">=3.10","yanked":true,"yanked_reason":"bad build","digests":{"sha256":"muslsha","blake2b_256":"blake"}},
             {"packagetype":"bdist_wheel","filename":"widget-1.0.0-cp313-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl","url":"https://x/widget-linux.whl"},
             {"packagetype":"bdist_wheel","filename":"widget-1.0.0-py3-none-any.whl","url":"https://x/widget-any.whl"}
         ]}"#;
@@ -2890,6 +3183,14 @@ mod tests {
             Some("widget-1.0.0-2-cp313-cp313-musllinux_1_2_aarch64.whl")
         );
         assert_eq!(musl.attributes.get("build").map(String::as_str), Some("2"));
+        assert_eq!(
+            musl.attributes.get("yanked_reason").map(String::as_str),
+            Some("bad build")
+        );
+        assert_eq!(
+            musl.checksums.get("blake2b-256").map(String::as_str),
+            Some("blake")
+        );
         assert_eq!(
             musl.attributes.get("python").map(String::as_str),
             Some("cp313")
@@ -3074,6 +3375,72 @@ mod tests {
                 .expect("unselected override matrix");
         assert_eq!(override_matrix.candidates.len(), 1);
         assert!(override_matrix.preferred().is_none());
+    }
+
+    #[test]
+    fn alternate_repositories_and_ranges_do_not_fall_back_to_public_defaults() {
+        let npm_repo = "https://npm.example.test";
+        let npm_doc = br#"{"versions":{"1.2.3":{"dist":{"tarball":"https://cdn.example.test/pkg-1.2.3.tgz"}}}}"#;
+        let pypi_api = "https://python.example.test/pypi/widget/1.0/json";
+        let pypi_doc = br#"{"urls":[{"packagetype":"sdist","filename":"widget-1.0.tar.gz","url":"https://python.example.test/files/widget-1.0.tar.gz"}]}"#;
+        let gem_api = "https://gems.example.test/api/v1/versions/widget.json";
+        let gem_doc = br#"[{"number":"1.0","platform":"ruby"}]"#;
+        let cargo_config = "https://cargo.example.test/index/config.json";
+        let cargo_doc = br#"{"dl":"https://cargo.example.test/files/{lowerprefix}/{crate}/{version}/{crate}.crate"}"#;
+        let net = Fixtures::default()
+            .with(&format!("{npm_repo}/pkg"), npm_doc)
+            .with(pypi_api, pypi_doc)
+            .with(gem_api, gem_doc)
+            .with(cargo_config, cargo_doc);
+        let cache = BlobCache::disabled();
+
+        let cases = [
+            (
+                "pkg:npm/pkg@1.2.3?repository_url=https:%2F%2Fnpm.example.test",
+                "https://cdn.example.test/pkg-1.2.3.tgz",
+            ),
+            (
+                "pkg:pypi/widget@1.0?repository_url=https:%2F%2Fpython.example.test",
+                "https://python.example.test/files/widget-1.0.tar.gz",
+            ),
+            (
+                "pkg:gem/widget@1.0?repository_url=https:%2F%2Fgems.example.test",
+                "https://gems.example.test/downloads/widget-1.0.gem",
+            ),
+            (
+                "pkg:cargo/serde@1.0.0?repository_url=https:%2F%2Fcargo.example.test%2Findex",
+                "https://cargo.example.test/files/se/rd/serde/1.0.0/serde.crate",
+            ),
+        ];
+        for (purl, expected) in cases {
+            let matrix = resolve_artifacts(&RefLocator::Purl(purl.into()), &net, &cache)
+                .expect("supported matrix");
+            assert_eq!(
+                matrix.preferred().map(|candidate| candidate.url.as_str()),
+                Some(expected),
+                "repository for {purl}"
+            );
+        }
+
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:golang/example.com/Mod@v1.0.0?repository_url=https:%2F%2Fgo.example.test"
+                    .into()
+            )),
+            Some("https://go.example.test/example.com/!mod/@v/v1.0.0.zip".into())
+        );
+        assert!(
+            resolve(&RefLocator::Purl(
+                "pkg:cargo/serde@1.0.0?repository_url=https:%2F%2Fcargo.example.test%2Findex"
+                    .into()
+            ))
+            .is_none()
+        );
+
+        let range = RefLocator::Purl("pkg:npm/pkg?vers=vers:npm%2F%3E%3D1.0.0".into());
+        let matrix = resolve_artifacts(&range, &net, &cache).expect("range matrix");
+        assert!(matrix.candidates.is_empty());
+        assert!(resolved_target(&range, &net, &cache).is_none());
     }
 
     #[test]
@@ -3440,6 +3807,28 @@ mod tests {
         let rec = fetch_ref(&good, &net, &cache);
         assert_eq!(rec.outcome, Outcome::Ok);
         assert_eq!(rec.pin_verified, Some(true));
+
+        let declared = dep(
+            RefLocator::Purl(format!(
+                "pkg:cargo/foo@1.0.0?checksum=sha256:{}",
+                sha256_hex(b"REAL")
+            )),
+            None,
+        );
+        let rec = fetch_ref(&declared, &net, &cache);
+        assert_eq!(rec.outcome, Outcome::Ok);
+        assert_eq!(rec.pin_verified, Some(true));
+
+        let declared_bad = dep(
+            RefLocator::Purl(format!(
+                "pkg:cargo/foo@1.0.0?checksum=sha256:{}",
+                "0".repeat(64)
+            )),
+            None,
+        );
+        let rec = fetch_ref(&declared_bad, &net, &cache);
+        assert_eq!(rec.outcome, Outcome::PinMismatch);
+        assert_eq!(rec.pin_verified, Some(false));
     }
 
     #[test]

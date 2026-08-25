@@ -25,6 +25,8 @@
 //! `fletch purl` CLI probe and hopper's crosscheck tests hold the pair in
 //! lockstep.
 
+use std::collections::BTreeMap;
+
 /// Map a registry artifact URL to its PURL, or `None` when the host/path isn't a
 /// recognized package download.
 ///
@@ -213,6 +215,378 @@ fn strip_any_suffix<'a>(s: &'a str, suffixes: &[&str]) -> Option<&'a str> {
     suffixes.iter().find_map(|suf| s.strip_suffix(suf))
 }
 
+#[derive(Debug)]
+struct CanonicalPurl {
+    typ: String,
+    namespace: Vec<String>,
+    name: String,
+    version: Option<String>,
+    qualifiers: BTreeMap<String, String>,
+    subpath: Vec<String>,
+}
+
+/// Parse a PURL using ECMA-427's right-to-left component rules and rebuild its
+/// canonical ASCII spelling. This is deliberately stricter about structure
+/// than fletch's legacy type folding, but tolerant about non-canonical input:
+/// percent triplets, qualifier order/key case, literal Unicode, repeated path
+/// separators, and ignorable subpath segments all converge here.
+fn canonicalize_purl(raw: &str) -> Option<String> {
+    let mut parts = parse_purl_components(raw)?;
+    apply_type_rules(&mut parts)?;
+    Some(build_purl(&parts))
+}
+
+fn parse_purl_components(raw: &str) -> Option<CanonicalPurl> {
+    let raw = raw.trim();
+    let (scheme, body) = raw.split_once(':')?;
+    if !scheme.eq_ignore_ascii_case("pkg") {
+        return None;
+    }
+    let body = body.trim_start_matches('/');
+    let (typ, remainder) = body.split_once('/')?;
+    if !valid_type(typ) {
+        return None;
+    }
+
+    // The standard parses from right to left. A second raw delimiter left in
+    // an earlier component is not data; data occurrences must be percent
+    // encoded, so reject rather than produce an ambiguous key.
+    let (remainder, raw_subpath) = remainder
+        .rsplit_once('#')
+        .map_or((remainder, None), |(left, right)| (left, Some(right)));
+    if remainder.contains('#') {
+        return None;
+    }
+    let (mut coordinate, raw_qualifiers) = remainder
+        .rsplit_once('?')
+        .map_or((remainder, None), |(left, right)| (left, Some(right)));
+    if coordinate.contains('?') {
+        return None;
+    }
+
+    // Older atomdrift producers emitted `?qualifiers@version`. Preserve that
+    // compatibility repair before applying the standard coordinate split.
+    let mut repaired_qualifiers = raw_qualifiers;
+    let mut repaired_version = None;
+    if let Some(qualifiers) = raw_qualifiers
+        && let Some((before, version)) = qualifiers.rsplit_once('@')
+        && !version.is_empty()
+        && !version.contains(['=', '&', '/'])
+    {
+        repaired_qualifiers = Some(before);
+        repaired_version = Some(version);
+    }
+
+    coordinate = coordinate.trim_matches('/');
+    let (raw_path, raw_version) = if let Some(version) = repaired_version {
+        (coordinate, Some(version))
+    } else if typ.eq_ignore_ascii_case("npm") && coordinate.starts_with('@') {
+        let scope_end = coordinate.find('/')?;
+        coordinate[scope_end + 1..]
+            .rfind('@')
+            .map_or((coordinate, None), |relative| {
+                let separator = scope_end + 1 + relative;
+                (&coordinate[..separator], Some(&coordinate[separator + 1..]))
+            })
+    } else {
+        coordinate
+            .rsplit_once('@')
+            .map_or((coordinate, None), |(path, version)| (path, Some(version)))
+    };
+    if raw_path.ends_with('/') && namespace_requirement(&typ.to_ascii_lowercase()) == 1 {
+        return None;
+    }
+    let raw_path = raw_path.trim_matches('/');
+    if raw_path.is_empty() {
+        return None;
+    }
+    let mut path = raw_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(decode_component)
+        .collect::<Option<Vec<_>>>()?;
+    let name = path.pop()?;
+    if name.is_empty()
+        || path
+            .iter()
+            .any(|segment| segment.is_empty() || segment.contains('/'))
+    {
+        return None;
+    }
+
+    let version = match raw_version.filter(|value| !value.is_empty()) {
+        Some(value) => Some(decode_component(value)?),
+        None => None,
+    };
+    let qualifiers = parse_qualifiers(repaired_qualifiers)?;
+    if version.is_some() && qualifiers.contains_key("vers") {
+        return None;
+    }
+    let subpath = parse_subpath(raw_subpath)?;
+    Some(CanonicalPurl {
+        typ: typ.to_ascii_lowercase(),
+        namespace: path,
+        name,
+        version,
+        qualifiers,
+        subpath,
+    })
+}
+
+fn valid_type(typ: &str) -> bool {
+    typ.bytes()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && typ
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+}
+
+fn valid_qualifier_key(key: &str) -> bool {
+    key.bytes()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && key.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+}
+
+fn parse_qualifiers(raw: Option<&str>) -> Option<BTreeMap<String, String>> {
+    let mut qualifiers = BTreeMap::new();
+    for pair in raw.unwrap_or_default().split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=')?;
+        let key = key.to_ascii_lowercase();
+        if !valid_qualifier_key(&key) {
+            return None;
+        }
+        let value = decode_component(value)?;
+        if value.is_empty() {
+            continue;
+        }
+        if qualifiers.insert(key, value).is_some() {
+            return None;
+        }
+    }
+    Some(qualifiers)
+}
+
+fn parse_subpath(raw: Option<&str>) -> Option<Vec<String>> {
+    let mut subpath = Vec::new();
+    for segment in raw.unwrap_or_default().split('/') {
+        let decoded = decode_component(segment)?;
+        if decoded.is_empty() || matches!(decoded.as_str(), "." | "..") {
+            continue;
+        }
+        if decoded.contains('/') {
+            return None;
+        }
+        subpath.push(decoded);
+    }
+    Some(subpath)
+}
+
+fn decode_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let triplet = bytes.get(index + 1..index + 3)?;
+            let hex = std::str::from_utf8(triplet).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn namespace_requirement(typ: &str) -> i8 {
+    match typ {
+        "alpm" | "apk" | "bitbucket" | "composer" | "deb" | "git" | "github" | "golang"
+        | "huggingface" | "maven" | "qpkg" | "rpm" | "swift" | "vscode-extension" => 1,
+        "bazel" | "bitnami" | "cargo" | "chrome-extension" | "cocoapods" | "conda" | "cran"
+        | "gem" | "hackage" | "julia" | "mlflow" | "nuget" | "oci" | "opam" | "otp" | "pub"
+        | "pypi" | "vcpkg" => -1,
+        _ => 0,
+    }
+}
+
+fn apply_type_rules(parts: &mut CanonicalPurl) -> Option<()> {
+    let namespace_requirement = namespace_requirement(&parts.typ);
+    let recoverable_distro_namespace = parts.namespace.is_empty()
+        && (parts
+            .qualifiers
+            .get("distro")
+            .and_then(|value| distro_spec(value.split('-').next().unwrap_or(value)))
+            .is_some_and(|(spec, _)| spec == parts.typ)
+            || (parts.typ == "alpm"
+                && parts
+                    .qualifiers
+                    .get("repository_url")
+                    .is_some_and(|value| value.contains("aur.archlinux.org"))));
+    if (namespace_requirement == 1 && parts.namespace.is_empty() && !recoverable_distro_namespace)
+        || (namespace_requirement == -1 && !parts.namespace.is_empty())
+    {
+        return None;
+    }
+    if matches!(parts.typ.as_str(), "julia" | "swid") {
+        let required = if parts.typ == "julia" {
+            "uuid"
+        } else {
+            "tag_id"
+        };
+        if !parts.qualifiers.contains_key(required) {
+            return None;
+        }
+    }
+    if parts.typ == "cpan" && parts.name.contains("::") {
+        return None;
+    }
+    if matches!(
+        parts.typ.as_str(),
+        "alpm"
+            | "apk"
+            | "bitbucket"
+            | "brew"
+            | "composer"
+            | "deb"
+            | "github"
+            | "hex"
+            | "luarocks"
+            | "qpkg"
+            | "rpm"
+            | "vscode-extension"
+            | "yocto"
+    ) {
+        for segment in &mut parts.namespace {
+            *segment = segment.to_lowercase();
+        }
+    }
+    if matches!(
+        parts.typ.as_str(),
+        "alpm"
+            | "apk"
+            | "bitbucket"
+            | "bitnami"
+            | "brew"
+            | "chrome-extension"
+            | "composer"
+            | "deb"
+            | "github"
+            | "hex"
+            | "luarocks"
+            | "oci"
+            | "otp"
+            | "pub"
+            | "vscode-extension"
+    ) {
+        parts.name = parts.name.to_lowercase();
+    }
+    if matches!(
+        parts.typ.as_str(),
+        "huggingface" | "oci" | "pypi" | "vscode-extension"
+    ) {
+        parts.version = parts.version.take().map(|value| value.to_lowercase());
+    }
+
+    match parts.typ.as_str() {
+        "pypi" => {
+            parts.name = normalize_pypi(&parts.name);
+        }
+        "git" if parts.namespace.first().is_some_and(|host| host == "github") => {
+            for segment in &mut parts.namespace {
+                *segment = segment.to_lowercase();
+            }
+            parts.name = parts.name.to_lowercase();
+        }
+        "mlflow"
+            if parts
+                .qualifiers
+                .get("repository_url")
+                .is_some_and(|url| url.contains("databricks")) =>
+        {
+            parts.name = parts.name.to_lowercase();
+        }
+        "pub" => {
+            parts.name = parts
+                .name
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_lowercase() || character.is_ascii_digit() {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+        }
+        _ => {}
+    }
+    (!parts.name.is_empty()).then_some(())
+}
+
+fn encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_' | b'~' | b':') {
+            encoded.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn build_purl(parts: &CanonicalPurl) -> String {
+    let mut output = format!("pkg:{}/", parts.typ);
+    if !parts.namespace.is_empty() {
+        output.push_str(
+            &parts
+                .namespace
+                .iter()
+                .map(|segment| encode_component(segment))
+                .collect::<Vec<_>>()
+                .join("/"),
+        );
+        output.push('/');
+    }
+    output.push_str(&encode_component(&parts.name));
+    if let Some(version) = parts.version.as_deref() {
+        output.push('@');
+        output.push_str(&encode_component(version));
+    }
+    if !parts.qualifiers.is_empty() {
+        output.push('?');
+        output.push_str(
+            &parts
+                .qualifiers
+                .iter()
+                .map(|(key, value)| format!("{key}={}", encode_component(value)))
+                .collect::<Vec<_>>()
+                .join("&"),
+        );
+    }
+    if !parts.subpath.is_empty() {
+        output.push('#');
+        output.push_str(
+            &parts
+                .subpath
+                .iter()
+                .map(|segment| encode_component(segment))
+                .collect::<Vec<_>>()
+                .join("/"),
+        );
+    }
+    output
+}
+
 /// Normalize a PURL to its canonical string, or `None` when the input cannot
 /// denote a package.
 ///
@@ -223,11 +597,11 @@ fn strip_any_suffix<'a>(s: &'a str, suffixes: &[&str]) -> Option<&'a str> {
 /// downstream consumer — registry lookup, fetch, display, provenance — sees one
 /// spelling.
 ///
-/// The `pkg` scheme and package *type* are case-insensitive per the PURL spec,
-/// so they are lowercased; the remainder is left untouched, since case
-/// significance is type-specific (the extension types and the deb/apk/alpm
-/// distro names are case-insensitive and lowercased; rpm names keep their
-/// case).
+/// All ECMA-427 components are parsed and rebuilt canonically: percent escapes
+/// use uppercase triplets, qualifier keys are lowercase and sorted, empty
+/// qualifier values and ignorable subpath segments are removed, and component
+/// case follows the PURL type definitions. Type-specific rules such as PyPI
+/// name normalization and required/prohibited namespaces are enforced.
 ///
 /// Folded spellings, so an old and a new spelling of the same package compare
 /// equal: `pkg:chrome`→`chrome-extension`, `pkg:vscode`/`pkg:openvsx`→
@@ -245,15 +619,36 @@ fn strip_any_suffix<'a>(s: &'a str, suffixes: &[&str]) -> Option<&'a str> {
 /// (`pkg:rpm/curl?distro=fedora-25` → `pkg:rpm/fedora/curl?distro=fedora-25`).
 ///
 /// `None` — never an empty or degenerate key — when the input has no `pkg:`
-/// scheme, an empty type, or an empty package name. Callers treat `None` as
+/// scheme, has malformed components, or violates a type requirement. Callers
+/// treat `None` as
 /// "not a package": the producer drops the record's PURL key, the scanner
 /// answers no-decision, the CLI reports the argument as invalid.
 #[must_use]
 pub fn normalize(raw: &str) -> Option<String> {
+    // Canonicalize once so the legacy folding layer sees unambiguous
+    // components, then again because folds may add a qualifier or change a
+    // type's case/namespace rules.
+    let canonical = canonicalize_purl(raw)?;
+    let folded = normalize_legacy(&canonical)?;
+    canonicalize_purl(&folded)
+}
+
+/// Apply atomdrift's historical type aliases and distro namespace recovery to
+/// an already-canonical PURL. Generic ECMA-427 canonicalization belongs in
+/// [`canonicalize_purl`], on both sides of this compatibility layer.
+fn normalize_legacy(raw: &str) -> Option<String> {
     // The `pkg` scheme and type are case-insensitive; the shared splitter
     // folds their case and trims. No scheme → not a PURL.
     let (typ, rest) = scheme_type_rest(raw)?;
     let typ = typ.as_str();
+    let (rest, subpath) = rest
+        .split_once('#')
+        .map_or((rest, ""), |(coordinate, value)| (coordinate, value));
+    let subpath = if subpath.is_empty() {
+        String::new()
+    } else {
+        format!("#{subpath}")
+    };
     // Split the remainder into the coordinate path and the @version/?qualifier
     // tail so the type can be re-keyed without disturbing either.
     //
@@ -327,26 +722,30 @@ pub fn normalize(raw: &str) -> Option<String> {
         // Browser / editor extensions: case-insensitive bodies, ratified types.
         "chrome" | "chrome-extension" => {
             format!(
-                "pkg:chrome-extension/{}{tail}",
+                "pkg:chrome-extension/{}{tail}{subpath}",
                 last_segment(path).to_ascii_lowercase()
             )
         }
         "vscode" | "vscode-extension" => {
-            format!("pkg:vscode-extension/{}{tail}", path.to_ascii_lowercase())
+            format!(
+                "pkg:vscode-extension/{}{tail}{subpath}",
+                path.to_ascii_lowercase()
+            )
         }
         "openvsx" => format!(
-            "pkg:vscode-extension/{}{}",
+            "pkg:vscode-extension/{}{}{}",
             path.to_ascii_lowercase(),
-            add_qualifier(tail, "repository_url=https://open-vsx.org")
+            add_qualifier(tail, "repository_url=https://open-vsx.org"),
+            subpath,
         ),
         // PyPI treats `-`/`_`/`.` as one separator and names as
         // case-insensitive — PEP 503 is the registry's own equivalence — so
         // the canonical name is the PEP 503 normalization. (There is no
         // namespace; the path is the name.) npm is deliberately NOT folded:
         // legacy mixed-case names were grandfathered in and stay distinct.
-        "pypi" => format!("pkg:pypi/{}{tail}", normalize_pypi(path)),
+        "pypi" => format!("pkg:pypi/{}{tail}{subpath}", normalize_pypi(path)),
         // Composer names are case-insensitive per spec and lowercased.
-        "composer" => format!("pkg:composer/{}{tail}", path.to_ascii_lowercase()),
+        "composer" => format!("pkg:composer/{}{tail}{subpath}", path.to_ascii_lowercase()),
         "alpm" => {
             // The AUR is its own alpm namespace: `pkg:alpm/aur/<name>`. Fold
             // the vendor-plus-qualifier spelling this project generated before
@@ -358,13 +757,13 @@ pub fn normalize(raw: &str) -> Option<String> {
                 && val.contains("aur.archlinux.org")
             {
                 format!(
-                    "pkg:alpm/aur/{}{rest_tail}",
+                    "pkg:alpm/aur/{}{rest_tail}{subpath}",
                     last_segment(path).to_ascii_lowercase()
                 )
             } else if let Some(name) = path.strip_prefix("aur/") {
-                format!("pkg:alpm/aur/{}{tail}", name.to_ascii_lowercase())
+                format!("pkg:alpm/aur/{}{tail}{subpath}", name.to_ascii_lowercase())
             } else {
-                format!("pkg:alpm/{path}{tail}")
+                format!("pkg:alpm/{path}{tail}{subpath}")
             }
         }
         other => {
@@ -389,19 +788,19 @@ pub fn normalize(raw: &str) -> Option<String> {
                     }
                     _ => (ns, tail.to_string()),
                 };
-                format!("pkg:{spec}/{ns}/{name}{tail}")
+                format!("pkg:{spec}/{ns}/{name}{tail}{subpath}")
             } else {
                 // Language/registry and unrecognized types: canonical type, body
                 // case preserved (significance is type-specific).
-                format!("pkg:{typ}/{path}{tail}")
+                format!("pkg:{typ}/{path}{tail}{subpath}")
             }
         }
     })
 }
 
-/// The identity-key form of a PURL: [`normalize`], with artifact-selection
-/// qualifiers dropped. This — not the full normalized form — is what the bloom
-/// producer inserts and the scanner looks up.
+/// The identity-key form of a PURL: [`normalize`], with the subpath and
+/// artifact-selection qualifiers dropped. This — not the full normalized form
+/// — is what the bloom producer inserts and the scanner looks up.
 ///
 /// Real-world distro PURLs (SBOM tools, OS package feeds) routinely stamp
 /// `?arch=…&distro=…` onto the coordinate, and a PyPI PURL may carry
@@ -418,8 +817,12 @@ pub fn normalize(raw: &str) -> Option<String> {
 #[must_use]
 pub fn identity(raw: &str) -> Option<String> {
     let full = normalize(raw)?;
-    let Some((head, quals)) = full.split_once('?') else {
-        return Some(full);
+    // A subpath addresses content inside the package, not a different release.
+    // Drop it before qualifiers so a fragment cannot hitch a ride in the last
+    // qualifier value and survive release-key flattening.
+    let coordinate = full.split_once('#').map_or(full.as_str(), |(head, _)| head);
+    let Some((head, quals)) = coordinate.split_once('?') else {
+        return Some(coordinate.to_string());
     };
     let kept: Vec<&str> = quals
         .split('&')
@@ -439,8 +842,9 @@ pub fn identity(raw: &str) -> Option<String> {
 /// Split a raw PURL into its lowercased type and the untouched remainder after
 /// `pkg:<type>/`. The `pkg` scheme and the type are case-insensitive per spec,
 /// so this is the one place that folds their case; leading/trailing whitespace
-/// is trimmed. `None` when the string has no `pkg:` scheme or no `/`. Shared by
-/// the registry parser and the fetch resolver so both read any spelling
+/// and the permitted slashes after `pkg:` are ignored. `None` when the string
+/// has no `pkg:` scheme, has an invalid type, or has no `/`. Shared by the
+/// registry parser and the fetch resolver so both read any spelling
 /// [`normalize`] accepts.
 pub(crate) fn scheme_type_rest(purl: &str) -> Option<(String, &str)> {
     let s = purl.trim();
@@ -450,7 +854,11 @@ pub(crate) fn scheme_type_rest(purl: &str) -> Option<(String, &str)> {
         .get(..4)
         .filter(|scheme| scheme.eq_ignore_ascii_case("pkg:"))
         .map(|_| &s[4..])?;
+    let body = body.trim_start_matches('/');
     let (ty, rest) = body.split_once('/')?;
+    if !valid_type(ty) {
+        return None;
+    }
     Some((ty.to_ascii_lowercase(), rest))
 }
 
@@ -567,6 +975,128 @@ mod normalize_tests {
     }
 
     #[test]
+    fn purl_spec_vectors_for_target_ecosystems_are_canonical() {
+        // Snapshot of every non-trivial `validate` vector in the local
+        // purl-spec corpus for npm, PyPI, Gem, Go, and Cargo. Keeping these
+        // inline makes the test hermetic while tying each behavior to the
+        // specification rather than registry folklore.
+        let cases = [
+            (
+                "pkg:npm/%40angular/animation@12.3.1",
+                "pkg:npm/%40angular/animation@12.3.1",
+            ),
+            (
+                "pkg:npm/mypackage@12.4.5?vcs_url=git://host.com/path/to/repo.git%404345abcd34343",
+                "pkg:npm/mypackage@12.4.5?vcs_url=git:%2F%2Fhost.com%2Fpath%2Fto%2Frepo.git%404345abcd34343",
+            ),
+            (
+                "pkg:npm/@babel/core#/googleapis/api/annotations/",
+                "pkg:npm/%40babel/core#googleapis/api/annotations",
+            ),
+            (
+                "pkg:npm/core@2.0.1#/googleapis/api/annotations/",
+                "pkg:npm/core@2.0.1#googleapis/api/annotations",
+            ),
+            (
+                "pkg:PYPI/Django_package@1.11.1.DEV1",
+                "pkg:pypi/django-package@1.11.1.dev1",
+            ),
+            (
+                "pkg:pypi/django@1.11.1?file_name=Django-1.11.1-py2.py3-none-any.whl",
+                "pkg:pypi/django@1.11.1?file_name=Django-1.11.1-py2.py3-none-any.whl",
+            ),
+            (
+                "pkg:gem/jruby-launcher@1.1.2?Platform=java",
+                "pkg:gem/jruby-launcher@1.1.2?platform=java",
+            ),
+            (
+                "pkg:GOLANG/google.golang.org/genproto@abcdedf#/googleapis/api/annotations/",
+                "pkg:golang/google.golang.org/genproto@abcdedf#googleapis/api/annotations",
+            ),
+            ("pkg:cargo/structopt@0.3.11", "pkg:cargo/structopt@0.3.11"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(norm(input), expected, "purl-spec vector {input}");
+        }
+    }
+
+    #[test]
+    fn generic_component_rules_canonicalize_or_reject() {
+        let cases = [
+            (
+                "PKG:////generic/naïve package@1.0+local?Z=last&a=https://x/y&empty=#/src//./../lib/",
+                "pkg:generic/na%C3%AFve%20package@1.0%2Blocal?a=https:%2F%2Fx%2Fy&z=last#src/lib",
+            ),
+            (
+                "pkg:generic/bitwarderl?checksum=sha1:ad9503%2csha256:41bf",
+                "pkg:generic/bitwarderl?checksum=sha1:ad9503%2Csha256:41bf",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(norm(input), expected, "canonicalize {input}");
+            assert_eq!(norm(expected), expected, "fixed point {expected}");
+        }
+
+        for invalid in [
+            "pkg:3npm/name",
+            "pkg:n&pm/name",
+            "pkg:npm/name?in%20production=true",
+            "pkg:npm/name?a=1&A=2",
+            "pkg:npm/name@1.0?vers=vers:npm%2F%3E1",
+            "pkg:pypi/namespace/name@1",
+            "pkg:gem/namespace/name@1",
+            "pkg:cargo/namespace/name@1",
+            "pkg:golang/name@1",
+            "pkg:golang/example.com/name#safe%2Fescape",
+            "pkg:npm/name@bad%2",
+        ] {
+            assert_eq!(normalize(invalid), None, "reject {invalid}");
+        }
+    }
+
+    #[test]
+    fn cross_type_definition_edge_rules_are_covered() {
+        let cases = [
+            (
+                "pkg:bitbucket/birKenfeld/pyGments-main@244fd47e",
+                "pkg:bitbucket/birkenfeld/pygments-main@244fd47e",
+            ),
+            (
+                "pkg:git/github/Package-url/purl-Spec@244fd47e",
+                "pkg:git/github/package-url/purl-spec@244fd47e",
+            ),
+            (
+                "pkg:hackage/AC-HalfInteger@1.2.1",
+                "pkg:hackage/AC-HalfInteger@1.2.1",
+            ),
+            (
+                "pkg:mlflow/CreditFraud@3?repository_url=https://adb-1.azuredatabricks.net/api/2.0/mlflow",
+                "pkg:mlflow/creditfraud@3?repository_url=https:%2F%2Fadb-1.azuredatabricks.net%2Fapi%2F2.0%2Fmlflow",
+            ),
+            (
+                "pkg:mlflow/CreditFraud@3?repository_url=https://westus.api.azureml.ms/mlflow",
+                "pkg:mlflow/CreditFraud@3?repository_url=https:%2F%2Fwestus.api.azureml.ms%2Fmlflow",
+            ),
+            (
+                "pkg:julia/Dates@1.9.0?uuid=ade2ca70-3891-5945-98fb-dc099432e06a",
+                "pkg:julia/Dates@1.9.0?uuid=ade2ca70-3891-5945-98fb-dc099432e06a",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(norm(input), expected, "type rule {input}");
+        }
+
+        for invalid in [
+            "pkg:cpan/GDT/URI::PackageURL",
+            "pkg:julia/Dates@1.9.0",
+            "pkg:swid/Fedora@29",
+            "pkg:swift/github.com/Alamofire/@5.4.3",
+        ] {
+            assert_eq!(normalize(invalid), None, "type rule rejects {invalid}");
+        }
+    }
+
+    #[test]
     fn folds_legacy_spellings_onto_canonical() {
         // Legacy fletch spellings fold onto the spec/common-practice form, so a
         // stored spec PURL and a scanned legacy PURL hit the same filter key.
@@ -582,7 +1112,7 @@ mod normalize_tests {
             ),
             (
                 "pkg:openvsx/jinryx/crontally@1.0.3",
-                "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https://open-vsx.org",
+                "pkg:vscode-extension/jinryx/crontally@1.0.3?repository_url=https:%2F%2Fopen-vsx.org",
             ),
             // PyPI folds per PEP 503 (the registry's own equivalence:
             // lowercase, separator runs collapse); composer lowercases.
@@ -641,13 +1171,13 @@ mod normalize_tests {
         );
         assert_eq!(
             norm("pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org@1.0.3"),
-            "pkg:vscode-extension/pub/name@1.0.3?repository_url=https://open-vsx.org"
+            "pkg:vscode-extension/pub/name@1.0.3?repository_url=https:%2F%2Fopen-vsx.org"
         );
         // A qualifier value containing `@` (URL userinfo) is not a version, and
         // a repository_url naming something other than the AUR is kept.
         assert_eq!(
             norm("pkg:alpm/arch/yay?repository_url=https://user@example.com/repo"),
-            "pkg:alpm/arch/yay?repository_url=https://user@example.com/repo"
+            "pkg:alpm/arch/yay?repository_url=https:%2F%2Fuser%40example.com%2Frepo"
         );
     }
 
@@ -666,13 +1196,9 @@ mod normalize_tests {
             ),
             (
                 "pkg:rpm/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25",
-                "pkg:rpm/fedora/centerim@4.22.10-1.el6?arch=i686&epoch=1&distro=fedora-25",
+                "pkg:rpm/fedora/centerim@4.22.10-1.el6?arch=i686&distro=fedora-25&epoch=1",
             ),
             ("pkg:rpm/Fedora/curl@1.0", "pkg:rpm/fedora/curl@1.0"),
-            (
-                "pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie",
-                "pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie",
-            ),
             (
                 "pkg:deb/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04",
                 "pkg:deb/ubuntu/curl@7.50.3-1?arch=amd64&distro=ubuntu-22.04",
@@ -682,6 +1208,12 @@ mod normalize_tests {
             assert_eq!(norm(input), want, "normalize {input}");
             assert_eq!(norm(want), want, "idempotent {want}");
         }
+        // `deb` requires a namespace. A codename alone cannot identify the
+        // repository vendor and therefore cannot repair the missing component.
+        assert_eq!(
+            normalize("pkg:deb/curl@7.50.3-1?arch=i386&distro=jessie"),
+            None
+        );
         // Identity then flattens the artifact-selection qualifiers, so the
         // spec example keys onto the pool's bare release coordinate.
         assert_eq!(
@@ -792,7 +1324,7 @@ mod normalize_tests {
             ),
             (
                 "pkg:openvsx/pub/name@1.0.3",
-                "pkg:vscode-extension/pub/name@1.0.3?repository_url=https://open-vsx.org",
+                "pkg:vscode-extension/pub/name@1.0.3?repository_url=https:%2F%2Fopen-vsx.org",
             ),
             // Folding and identity compose: the qualifier AUR form with an
             // arch stamp lands on the bare aur-namespace coordinate.
@@ -802,6 +1334,14 @@ mod normalize_tests {
             ),
             // No qualifiers → identity is the normalized form itself.
             ("pkg:npm/lodash@4.17.21", "pkg:npm/lodash@4.17.21"),
+            (
+                "pkg:golang/google.golang.org/genproto@abcd#googleapis/api",
+                "pkg:golang/google.golang.org/genproto@abcd",
+            ),
+            (
+                "pkg:npm/%40scope/name@1.0?repository_url=https://npm.example#src/index.js",
+                "pkg:npm/%40scope/name@1.0?repository_url=https:%2F%2Fnpm.example",
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(identity(input).as_deref(), Some(want), "identity {input}");
