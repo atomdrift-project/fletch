@@ -3026,6 +3026,27 @@ mod tests {
     }
 
     #[test]
+    fn golang_proxy_info_preserves_percent_encoded_version() {
+        let info = serde_json::json!({
+            "Version": "v4.4.0+incompatible", "Time": "2021-04-23T10:00:00Z"
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://proxy.golang.org/github.com/gofrs/uuid/@v/v4.4.0%2Bincompatible.info",
+            info.as_bytes(),
+        );
+        let cache = BlobCache::disabled();
+        let r = golang(
+            "github.com/gofrs/uuid",
+            Some("v4.4.0%2Bincompatible"),
+            &net,
+            &cache,
+        )
+        .expect("registry");
+        assert_eq!(r.version, "v4.4.0+incompatible");
+    }
+
+    #[test]
     fn github_repo_normalizes() {
         let repo = serde_json::json!({
             "full_name": "gin-gonic/gin", "description": "HTTP web framework",

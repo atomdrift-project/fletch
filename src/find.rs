@@ -286,9 +286,11 @@ fn npm_scripts(values: &serde_json::Value, out: &mut Found<'_>) {
 /// invocations expressed in *code* rather than on a shell line: a programmatic
 /// install API (`npm().install("pkg", …)`), a list-form subprocess install
 /// (`subprocess.run(["pip", "install", "pkg"])`), or a command embedded in a
-/// string. Replacing source punctuation with spaces collapses all of these to
-/// the same `<pm> install <pkg>` token stream the shell recognizer consumes —
-/// so `npm().install("pkg")` and `["pip","install","pkg"]` both fall out.
+/// string. Replacing source punctuation *outside string literals* with spaces
+/// collapses all of these to the same `<pm> install <pkg>` token stream the
+/// shell recognizer consumes — so `npm().install("pkg")` and
+/// `["pip","install","pkg"]` both fall out. Punctuation inside a literal is
+/// package data and stays intact (`github.com/mod@v1.2.3`, for example).
 ///
 /// A bare `obj.install(plugin)` (a DI/plugin call) stays invisible: with no
 /// package-manager keyword as the leading token, `match_pm` never fires. This
@@ -300,14 +302,35 @@ fn scan_source(text: Option<&str>, source: &str, out: &mut Found<'_>) {
         return;
     };
     let mut normalized = String::with_capacity(text.len());
+    let mut quote = None;
+    let mut escaped = false;
     for c in text.chars() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                normalized.push(c);
+                escaped = false;
+            } else if c == '\\' {
+                normalized.push(c);
+                escaped = true;
+            } else if c == delimiter {
+                normalized.push(' ');
+                quote = None;
+            } else {
+                normalized.push(c);
+            }
+            continue;
+        }
         match c {
+            '"' | '\'' | '`' => {
+                normalized.push(' ');
+                quote = Some(c);
+            }
             // Keep braces as their own tokens: they bound an options object
             // (`{ "no-save": true }`), and `commands` stops collecting package
             // args at a `{`, so option keys/values are not read as packages.
             '{' => normalized.push_str(" { "),
             '}' => normalized.push_str(" } "),
-            '.' | '(' | ')' | '[' | ']' | ',' | '"' | '\'' | ':' => normalized.push(' '),
+            '.' | '(' | ')' | '[' | ']' | ',' | ':' => normalized.push(' '),
             other => normalized.push(other),
         }
     }

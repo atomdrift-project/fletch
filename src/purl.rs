@@ -758,6 +758,13 @@ mod normalize_tests {
     }
 
     #[test]
+    fn encoded_version_is_a_normalization_fixed_point() {
+        let purl = "pkg:golang/github.com/gofrs/uuid@v4.4.0%2Bincompatible";
+        assert_eq!(norm(purl), purl);
+        assert_eq!(identity(purl).as_deref(), Some(purl));
+    }
+
+    #[test]
     fn identity_drops_artifact_selection_qualifiers() {
         // SBOM-style distro purls stamp arch/distro onto the coordinate; the
         // pool keys are bare release coordinates, so identity must collapse

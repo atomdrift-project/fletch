@@ -1701,12 +1701,33 @@ fn resolve_composer(name: &str, version: &str, net: &dyn Fetch) -> Option<String
         .map(String::from)
 }
 
-/// GOPROXY case-encoding: every uppercase ASCII letter becomes `!` followed by
-/// its lowercase form, so module paths can't collide on case-insensitive file
-/// systems (`github.com/BurntSushi/toml` → `github.com/!burnt!sushi/toml`).
+/// GOPROXY case-encoding: every unescaped uppercase ASCII letter becomes `!`
+/// followed by its lowercase form, so module paths can't collide on
+/// case-insensitive file systems (`github.com/BurntSushi/toml` →
+/// `github.com/!burnt!sushi/toml`).
+///
+/// A PURL is already percent-encoded. Its `%HH` triplets are URL escapes, not
+/// native module text, and must pass through atomically: turning the `B` in
+/// `%2B` into `!b` changes `+` into the invalid URL text `%2!b`. This matters
+/// for every Go `+incompatible` version, and applies equally to escapes in a
+/// module path or any future version spelling.
 pub(crate) fn goproxy_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let mut rest = chars.clone();
+            if let (Some(hi), Some(lo)) = (rest.next(), rest.next())
+                && hi.is_ascii_hexdigit()
+                && lo.is_ascii_hexdigit()
+            {
+                out.push(c);
+                out.push(hi);
+                out.push(lo);
+                chars = rest;
+                continue;
+            }
+        }
         if c.is_ascii_uppercase() {
             out.push('!');
             out.push(c.to_ascii_lowercase());
@@ -2475,6 +2496,23 @@ mod tests {
                 "https://proxy.golang.org/codeberg.org/a/b/@v/v0.0.0-20260507212222-cbe932efc123.zip"
                     .to_string()
             )
+        );
+        // Canonical PURLs percent-encode `+`. The escape is already valid URL
+        // syntax and GOPROXY's case transform must not rewrite its hex digits.
+        assert_eq!(
+            resolve(&RefLocator::Purl(
+                "pkg:golang/github.com/gofrs/uuid@v4.4.0%2Bincompatible".into()
+            )),
+            Some(
+                "https://proxy.golang.org/github.com/gofrs/uuid/@v/v4.4.0%2Bincompatible.zip"
+                    .to_string()
+            )
+        );
+        // The rule is about percent triplets, not this one suffix: escapes in
+        // either component survive while ordinary uppercase text is encoded.
+        assert_eq!(
+            goproxy_escape("Example.com/A%2FB@v1%2bmeta"),
+            "!example.com/!a%2F!b@v1%2bmeta"
         );
         // Without a version there is no fetchable artifact.
         assert_eq!(
