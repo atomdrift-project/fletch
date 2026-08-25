@@ -728,6 +728,14 @@ fn commands(scan: &str, source: &str, out: &mut Found<'_>) {
             let Some((family, consumed)) = match_pm(&toks[i..]) else {
                 continue;
             };
+            // Source files are also scanned for programmatic installs, but a
+            // bare `go install` in a comment/docstring/string is not evidence
+            // that the source executes Go. Keep foreign Go installs when they
+            // occur in a recognized process-execution call; shell scripts and
+            // Dockerfiles retain their unrestricted command behavior.
+            if !source_command_allowed(source, family, seg) {
+                continue;
+            }
             let eco = distro_eco(family, distro);
             for arg in &toks[i + consumed..] {
                 if arg.starts_with('>') || arg.starts_with('<') || *arg == "{" {
@@ -739,6 +747,42 @@ fn commands(scan: &str, source: &str, out: &mut Found<'_>) {
             }
             break; // the rest of the segment is this command's arguments
         }
+    }
+}
+
+/// Foreign package-manager commands in source text need an execution context.
+/// Without this gate, prose such as a Python docstring containing
+/// `go install example.invalid/tool@v1.0.0` is flattened into the same token
+/// stream as `subprocess.run(["go", "install", ...])` and becomes a dependency.
+/// Native Python/JavaScript managers remain handled by their existing
+/// programmatic-install recognizers.
+fn source_command_allowed(source: &str, family: &str, segment: &str) -> bool {
+    if family != "golang" {
+        return true;
+    }
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    match source {
+        "python" => tokens.windows(2).any(|window| {
+            (window[0] == "subprocess"
+                && matches!(
+                    window[1],
+                    "run" | "call" | "check_call" | "check_output" | "Popen"
+                ))
+                || (window[0] == "os"
+                    && (window[1] == "system"
+                        || window[1] == "popen"
+                        || window[1].starts_with("exec")
+                        || window[1].starts_with("spawn")))
+        }),
+        "javascript" | "typescript" => tokens.windows(2).any(|window| {
+            (window[0] == "child_process"
+                && matches!(
+                    window[1],
+                    "exec" | "execSync" | "spawn" | "spawnSync" | "fork"
+                ))
+                || (window[0] == "shelljs" && window[1] == "exec")
+        }),
+        _ => true,
     }
 }
 
@@ -1379,6 +1423,7 @@ mod tests {
     fn recognizes_go_cargo_gem_composer_apt_installs() {
         let script = "#!/bin/sh\n\
             go get github.com/evil/mod@v1.2.3\n\
+            go install github.com/evil/tool/cmd@v1.2.3\n\
             cargo install badcrate\n\
             gem install evilgem\n\
             composer require evil/pkg:^2.0\n\
@@ -1398,6 +1443,10 @@ mod tests {
             .collect();
         assert!(
             purls.contains(&"pkg:golang/github.com/evil/mod@v1.2.3"),
+            "{purls:?}"
+        );
+        assert!(
+            purls.contains(&"pkg:golang/github.com/evil/tool/cmd@v1.2.3"),
             "{purls:?}"
         );
         assert!(purls.contains(&"pkg:cargo/badcrate"), "{purls:?}");
@@ -1655,6 +1704,27 @@ mod tests {
         assert!(
             purls.contains(&"pkg:pypi/evil-pkg".to_string()),
             "list-form pip install should be hunted; got {purls:?}"
+        );
+    }
+
+    #[test]
+    fn ignores_go_install_in_python_prose() {
+        let py = b"\"\"\"\nUse `go install github.com/evil/tool/cmd@v1.2.3` to install the example.\n\"\"\"\n";
+        let purls = purls_of(&references_in_bytes(py, "README_helper.py"));
+        assert!(
+            !purls.iter().any(|p| p.starts_with("pkg:golang/")),
+            "Python prose must not become a Go dependency: {purls:?}"
+        );
+    }
+
+    #[test]
+    fn recognizes_python_subprocess_go_install() {
+        let py = b"import subprocess\n\
+            subprocess.run([\"go\", \"install\", \"github.com/evil/tool/cmd@v1.2.3\"])\n";
+        let purls = purls_of(&references_in_bytes(py, "installer.py"));
+        assert!(
+            purls.contains(&"pkg:golang/github.com/evil/tool/cmd@v1.2.3".to_string()),
+            "subprocess Go install should be hunted; got {purls:?}"
         );
     }
 
