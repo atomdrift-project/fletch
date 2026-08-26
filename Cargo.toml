@@ -8,6 +8,9 @@ rust-version = "1.94"
 license = "Apache-2.0"
 description = "Find and fetch external references (packages and URLs) discovered in analyzed files"
 repository = "https://github.com/atomdrift-project/fletch"
+# filefacts' required API is currently consumed from git, so a crates.io
+# package would be uninstallable. Source releases remain fully reproducible.
+publish = false
 
 # Lint policy mirrors cleave's workspace lints (fletch is a standalone package,
 # so they live here directly rather than via `workspace = true`). Keep in sync.
@@ -72,6 +75,7 @@ reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-fea
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+url = "2"
 # ARM/x86 hardware SHA acceleration is automatic in 0.11 (no feature flag), so
 # this drops the sha2-asm dependency the old `asm-aarch64` feature pulled in.
 # That feature was enabled unconditionally and its transitive `asm` broke the
@@ -96,6 +100,8 @@ oci-client = { version = "0.17.0", default-features = false, features = ["rustls
 tokio = { version = "1.53.1", features = ["rt"] }
 tar = "0.4.46"
 xz2 = "0.1.7"
+pep440_rs = "0.7.3"
+node-semver = "2.2.0"
 
 [dev-dependencies]
 tempfile = "3"

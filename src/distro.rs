@@ -1,6 +1,6 @@
 //! OS-distro package registries whose metadata lives in a *compressed index or
 //! catalog* rather than a per-package JSON API — the half of
-//! [`registry`](crate::registry) that needs decompression and index parsing.
+//! [`registry`](mod@crate::registry) that needs decompression and index parsing.
 //!
 //! Each ecosystem publishes one large index per repository: Alpine and Wolfi an
 //! `APKINDEX.tar.gz`, Debian and Ubuntu a `Packages.gz`, openSUSE and RPM Fusion

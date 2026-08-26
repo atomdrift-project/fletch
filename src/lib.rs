@@ -12,7 +12,7 @@
 //! - [`fetch`] — resolve a reference to a URL, retrieve it through an
 //!   SSRF-guarded client, cache it, verify any pin, record provenance. Pure
 //!   mechanism; no recognition logic ever leaks in here.
-//! - [`registry`] — look up and normalize a package's *registry metadata*
+//! - [`mod@registry`] — look up and normalize a package's *registry metadata*
 //!   (publish date, author, downloads, rating) across ecosystems into a
 //!   [`filefacts::Registry`], so a consumer can judge a dependency before paying
 //!   to fetch and scan its bytes.

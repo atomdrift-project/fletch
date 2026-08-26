@@ -26,6 +26,10 @@
 //! lockstep.
 
 use std::collections::BTreeMap;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// Map a registry artifact URL to its PURL, or `None` when the host/path isn't a
 /// recognized package download.
@@ -39,31 +43,35 @@ use std::collections::BTreeMap;
 #[must_use]
 pub fn url_to_purl(url: &str) -> Option<String> {
     let (host, path) = split_host_path(url)?;
-    let host = host.to_ascii_lowercase();
-    match host.as_str() {
-        "registry.npmjs.org" | "registry.yarnpkg.com" => npm(path),
-        "static.crates.io" | "crates.io" => cargo(path),
-        "files.pythonhosted.org" => pypi(path),
-        "rubygems.org" => gem(path),
-        "proxy.golang.org" => golang(path),
-        "api.nuget.org" => nuget(path),
-        "repo1.maven.org" | "repo.maven.apache.org" => maven(path),
-        "codeload.github.com" => github(path),
+    let recovered = match host.as_str() {
+        "registry.npmjs.org" | "registry.yarnpkg.com" => npm(&path),
+        "static.crates.io" | "crates.io" => cargo(&path),
+        "files.pythonhosted.org" => pypi(&path),
+        "rubygems.org" => gem(&path),
+        "proxy.golang.org" => golang(&path),
+        "api.nuget.org" => nuget(&path),
+        "repo1.maven.org" | "repo.maven.apache.org" => maven(&path),
+        "codeload.github.com" => github(&path),
         _ => None,
-    }
+    }?;
+    normalize(&recovered)
 }
 
 /// Split `scheme://host[:port]/path?query` into `(host, path)`, dropping the
 /// scheme, any port, and any `?query`/`#fragment`. The returned path has no
 /// leading slash. `None` if the input isn't an `http(s)` URL.
-fn split_host_path(url: &str) -> Option<(&str, &str)> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let host = authority.split(':').next().unwrap_or(authority);
-    let path = path.split(['?', '#']).next().unwrap_or(path);
-    Some((host, path))
+fn split_host_path(url: &str) -> Option<(String, String)> {
+    let parsed = Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some((
+        parsed.host_str()?.to_ascii_lowercase(),
+        parsed.path().trim_start_matches('/').to_string(),
+    ))
 }
 
 /// npm: `{name}/-/{base}-{version}.tgz`, where `name` may be `@scope/pkg` and
@@ -90,7 +98,8 @@ fn cargo(path: &str) -> Option<String> {
     let mut segs = rest.split('/');
     let name = segs.next()?;
     let version = segs.next()?;
-    (segs.next() == Some("download")).then(|| format!("pkg:cargo/{name}@{version}"))
+    (segs.next() == Some("download") && segs.next().is_none())
+        .then(|| format!("pkg:cargo/{name}@{version}"))
 }
 
 /// PyPI: parse the filename. Wheels
@@ -103,23 +112,65 @@ fn pypi(path: &str) -> Option<String> {
         let mut fields = stem.splitn(3, '-');
         let dist = fields.next()?;
         let version = fields.next()?;
-        return Some(format!("pkg:pypi/{}@{version}", normalize_pypi(dist)));
+        return Some(format!(
+            "pkg:pypi/{}@{version}?file_name={}",
+            normalize_pypi(dist),
+            encode_component(file)
+        ));
     }
     let stem = strip_any_suffix(file, &[".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".tgz"])?;
     let (name, version) = stem.rsplit_once('-')?;
-    starts_with_digit(version).then(|| format!("pkg:pypi/{}@{version}", normalize_pypi(name)))
+    starts_with_digit(version).then(|| {
+        format!(
+            "pkg:pypi/{}@{version}?file_name={}",
+            normalize_pypi(name),
+            encode_component(file)
+        )
+    })
 }
 
 /// RubyGems: `downloads/{name}-{version}.gem` (or the legacy `gems/` prefix).
-/// Platform-tagged gems (`name-version-platform.gem`) don't round-trip and
-/// resolve to `None` — the caller falls back to the hash path.
+/// For a platform build, preserve the platform as an exact-artifact selector.
 fn gem(path: &str) -> Option<String> {
     let rest = path
         .strip_prefix("downloads/")
         .or_else(|| path.strip_prefix("gems/"))?;
     let stem = rest.strip_suffix(".gem")?;
-    let (name, version) = stem.rsplit_once('-')?;
-    starts_with_digit(version).then(|| format!("pkg:gem/{name}@{version}"))
+    // A gem name may itself contain a numeric-leading hyphenated field, so the
+    // final numeric-looking field is the least ambiguous version boundary.
+    let (name, release) = stem.match_indices('-').rev().find_map(|(index, _)| {
+        starts_with_digit(&stem[index + 1..]).then(|| stem.split_at(index))
+    })?;
+    let release = release.strip_prefix('-')?;
+    let (version, platform) = release
+        .split_once('-')
+        .filter(|(_, platform)| looks_like_gem_platform(platform))
+        .map_or((release, None), |(version, platform)| {
+            (version, Some(platform))
+        });
+    let base = format!("pkg:gem/{name}@{version}");
+    Some(platform.map_or(base.clone(), |value| {
+        format!("{base}?platform={}", encode_component(value))
+    }))
+}
+
+fn looks_like_gem_platform(value: &str) -> bool {
+    [
+        "ruby",
+        "java",
+        "linux",
+        "darwin",
+        "mingw",
+        "mswin",
+        "x86",
+        "x64",
+        "arm",
+        "aarch",
+        "universal",
+        "wasm",
+    ]
+    .iter()
+    .any(|marker| value.eq_ignore_ascii_case(marker) || value.contains(marker))
 }
 
 /// Go module proxy: `{module}/@v/{version}.zip`, both fields `!`-escaped for
@@ -130,8 +181,8 @@ fn golang(path: &str) -> Option<String> {
     let version = tail.strip_suffix(".zip")?;
     Some(format!(
         "pkg:golang/{}@{}",
-        goproxy_unescape(module),
-        goproxy_unescape(version)
+        goproxy_unescape(module)?,
+        goproxy_unescape(version)?
     ))
 }
 
@@ -142,7 +193,9 @@ fn nuget(path: &str) -> Option<String> {
     let mut segs = rest.split('/');
     let id = segs.next()?;
     let version = segs.next()?;
-    Some(format!("pkg:nuget/{id}@{version}"))
+    let file = segs.next()?;
+    (segs.next().is_none() && file.eq_ignore_ascii_case(&format!("{id}.{version}.nupkg")))
+        .then(|| format!("pkg:nuget/{id}@{version}"))
 }
 
 /// Maven: `maven2/{group/as/path}/{artifact}/{version}/{file}`. The group is the
@@ -150,41 +203,70 @@ fn nuget(path: &str) -> Option<String> {
 fn maven(path: &str) -> Option<String> {
     let rest = path.strip_prefix("maven2/")?;
     let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-    let [group @ .., artifact, version, _file] = segs.as_slice() else {
+    let [group @ .., artifact, version, file] = segs.as_slice() else {
         return None;
     };
     if group.is_empty() {
         return None;
     }
-    Some(format!(
-        "pkg:maven/{}/{artifact}@{version}",
-        group.join(".")
-    ))
+    let prefix = format!("{artifact}-{version}");
+    let suffix = file.strip_prefix(&prefix)?;
+    let (classifier, extension) = ["tar.gz", "tar.bz2", "tar.xz"]
+        .into_iter()
+        .find_map(|extension| {
+            suffix
+                .strip_suffix(&format!(".{extension}"))
+                .map(|classifier| (classifier, extension))
+        })
+        .or_else(|| suffix.rsplit_once('.'))?;
+    if extension.is_empty() {
+        return None;
+    }
+    let mut purl = format!("pkg:maven/{}/{artifact}@{version}", group.join("."));
+    let mut qualifiers = Vec::new();
+    if let Some(classifier) = classifier.strip_prefix('-') {
+        if classifier.is_empty() {
+            return None;
+        }
+        qualifiers.push(format!("classifier={}", encode_component(classifier)));
+    } else if !classifier.is_empty() {
+        return None;
+    }
+    if extension != "jar" {
+        qualifiers.push(format!("type={}", encode_component(extension)));
+    }
+    if !qualifiers.is_empty() {
+        purl.push('?');
+        purl.push_str(&qualifiers.join("&"));
+    }
+    Some(purl)
 }
 
 /// GitHub source archive: `{owner}/{repo}/{tar.gz|zip}/{ref}`.
 fn github(path: &str) -> Option<String> {
     let segs: Vec<&str> = path.split('/').collect();
-    let [owner, repo, kind, reference, ..] = segs.as_slice() else {
+    let [owner, repo, kind, reference] = segs.as_slice() else {
         return None;
     };
     matches!(*kind, "tar.gz" | "zip").then(|| format!("pkg:github/{owner}/{repo}@{reference}"))
 }
 
 /// Reverse [`fetch::goproxy_escape`](crate::fetch): `!x` → uppercase `X`.
-fn goproxy_unescape(s: &str) -> String {
+fn goproxy_unescape(s: &str) -> Option<String> {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '!' {
-            if let Some(next) = chars.next() {
-                out.push(next.to_ascii_uppercase());
+            let next = chars.next()?;
+            if !next.is_ascii_lowercase() {
+                return None;
             }
+            out.push(next.to_ascii_uppercase());
         } else {
             out.push(c);
         }
     }
-    out
+    Some(out)
 }
 
 /// Normalize a PyPI project name per PEP 503: lowercase, and collapse any run of
@@ -215,14 +297,196 @@ fn strip_any_suffix<'a>(s: &'a str, suffixes: &[&str]) -> Option<&'a str> {
     suffixes.iter().find_map(|suf| s.strip_suffix(suf))
 }
 
-#[derive(Debug)]
-struct CanonicalPurl {
+/// A decoded, validated package URL with one canonical spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Purl {
+    #[serde(rename = "type")]
     typ: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     namespace: Vec<String>,
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     qualifiers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     subpath: Vec<String>,
+}
+
+/// Decoded input for constructing a [`Purl`].
+///
+/// This deliberately has public data fields; [`Purl::from_components`]
+/// validates them before producing the invariant-carrying type used by fetchers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurlComponents {
+    /// Registered or custom package type.
+    #[serde(rename = "type")]
+    pub typ: String,
+    /// Decoded namespace segments.
+    #[serde(default)]
+    pub namespace: Vec<String>,
+    /// Decoded package name.
+    pub name: String,
+    /// Decoded opaque version.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Decoded qualifier values.
+    #[serde(default)]
+    pub qualifiers: BTreeMap<String, String>,
+    /// Decoded relative subpath segments.
+    #[serde(default)]
+    pub subpath: Vec<String>,
+}
+
+/// Why a PURL could not be constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PurlError {
+    /// The generic ECMA-427 structure is malformed.
+    #[error("invalid package URL syntax")]
+    Syntax,
+    /// The generic structure is valid but violates its registered type rules.
+    #[error("package URL violates its type definition")]
+    Type,
+}
+
+type CanonicalPurl = Purl;
+
+impl Purl {
+    /// Parse, normalize, and validate a PURL, including Fletch's historical
+    /// aliases. The returned value is the only representation resolvers use.
+    pub fn parse(raw: &str) -> Result<Self, PurlError> {
+        parse_compatible_purl(raw)
+    }
+
+    /// Parse according to the purl-spec `parse` contract. Unlike [`Purl::parse`],
+    /// this rejects qualifier keys that need compatibility case-folding.
+    pub fn parse_strict(raw: &str) -> Result<Self, PurlError> {
+        let mut parsed = parse_purl_components(raw, false).ok_or(PurlError::Syntax)?;
+        if raw_qualifier_keys(raw).any(|key| {
+            key.bytes().any(|byte| byte.is_ascii_uppercase())
+                && is_strict_type_qualifier(&parsed.typ, &key.to_ascii_lowercase())
+        }) {
+            return Err(PurlError::Syntax);
+        }
+        apply_type_rules(&mut parsed).ok_or(PurlError::Type)?;
+        Ok(parsed)
+    }
+
+    /// Construct and validate a PURL from decoded components.
+    pub fn from_components(components: PurlComponents) -> Result<Self, PurlError> {
+        let mut components = Self {
+            typ: components.typ,
+            namespace: components.namespace,
+            name: components.name,
+            version: components.version,
+            qualifiers: components.qualifiers,
+            subpath: components.subpath,
+        };
+        if !valid_type(&components.typ)
+            || components.name.is_empty()
+            || components
+                .namespace
+                .iter()
+                .any(|segment| segment.is_empty() || segment.contains('/'))
+            || components.subpath.iter().any(|segment| {
+                segment.is_empty()
+                    || segment.contains('/')
+                    || matches!(segment.as_str(), "." | "..")
+            })
+        {
+            return Err(PurlError::Syntax);
+        }
+        let mut qualifiers = BTreeMap::new();
+        for (key, value) in components.qualifiers {
+            let key = key.to_ascii_lowercase();
+            if !valid_qualifier_key(&key) {
+                return Err(PurlError::Syntax);
+            }
+            if !value.is_empty() && qualifiers.insert(key, value).is_some() {
+                return Err(PurlError::Syntax);
+            }
+        }
+        components.qualifiers = qualifiers;
+        if components.version.is_some() && components.qualifiers.contains_key("vers") {
+            return Err(PurlError::Type);
+        }
+        components.typ.make_ascii_lowercase();
+        apply_type_rules(&mut components).ok_or(PurlError::Type)?;
+        Ok(components)
+    }
+
+    /// Registered or custom package type.
+    #[must_use]
+    pub fn typ(&self) -> &str {
+        &self.typ
+    }
+
+    /// Decoded namespace segments.
+    #[must_use]
+    pub fn namespace(&self) -> &[String] {
+        &self.namespace
+    }
+
+    /// Decoded package name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Decoded opaque version.
+    #[must_use]
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    /// Decoded qualifiers in canonical key order.
+    #[must_use]
+    pub fn qualifiers(&self) -> &BTreeMap<String, String> {
+        &self.qualifiers
+    }
+
+    /// Decoded relative subpath segments.
+    #[must_use]
+    pub fn subpath(&self) -> &[String] {
+        &self.subpath
+    }
+
+    /// Return the canonical ECMA-427 spelling.
+    #[must_use]
+    pub fn canonical(&self) -> String {
+        build_purl(self)
+    }
+
+    /// Return the decoded namespace joined with `/`.
+    #[must_use]
+    pub fn namespace_string(&self) -> Option<String> {
+        (!self.namespace.is_empty()).then(|| self.namespace.join("/"))
+    }
+
+    /// Return the decoded subpath joined with `/`.
+    #[must_use]
+    pub fn subpath_string(&self) -> Option<String> {
+        (!self.subpath.is_empty()).then(|| self.subpath.join("/"))
+    }
+}
+
+fn raw_qualifier_keys(raw: &str) -> impl Iterator<Item = &str> {
+    let qualifiers = raw.rsplit_once('?').map_or("", |(_, tail)| {
+        tail.split_once('#').map_or(tail, |(value, _)| value)
+    });
+    qualifiers
+        .split('&')
+        .filter_map(|pair| pair.split_once('=').map(|(key, _)| key))
+}
+
+fn is_strict_type_qualifier(typ: &str, key: &str) -> bool {
+    matches!((typ, key), ("gem", "platform") | ("rpm", "arch" | "epoch"))
+}
+
+impl fmt::Display for Purl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.canonical())
+    }
 }
 
 /// Parse a PURL using ECMA-427's right-to-left component rules and rebuild its
@@ -230,13 +494,22 @@ struct CanonicalPurl {
 /// than fletch's legacy type folding, but tolerant about non-canonical input:
 /// percent triplets, qualifier order/key case, literal Unicode, repeated path
 /// separators, and ignorable subpath segments all converge here.
-fn canonicalize_purl(raw: &str) -> Option<String> {
-    let mut parts = parse_purl_components(raw)?;
-    apply_type_rules(&mut parts)?;
-    Some(build_purl(&parts))
+fn parse_compatible_purl(raw: &str) -> Result<Purl, PurlError> {
+    let mut parsed = parse_purl_components(raw, true).ok_or(PurlError::Syntax)?;
+    apply_type_rules(&mut parsed).ok_or(PurlError::Type)?;
+
+    let canonical = build_purl(&parsed);
+    let folded = normalize_legacy(&canonical).ok_or(PurlError::Type)?;
+    if folded == canonical {
+        return Ok(parsed);
+    }
+
+    let mut folded = parse_purl_components(&folded, false).ok_or(PurlError::Type)?;
+    apply_type_rules(&mut folded).ok_or(PurlError::Type)?;
+    Ok(folded)
 }
 
-fn parse_purl_components(raw: &str) -> Option<CanonicalPurl> {
+fn parse_purl_components(raw: &str, allow_legacy_version_order: bool) -> Option<CanonicalPurl> {
     let raw = raw.trim();
     let (scheme, body) = raw.split_once(':')?;
     if !scheme.eq_ignore_ascii_case("pkg") {
@@ -268,7 +541,8 @@ fn parse_purl_components(raw: &str) -> Option<CanonicalPurl> {
     // compatibility repair before applying the standard coordinate split.
     let mut repaired_qualifiers = raw_qualifiers;
     let mut repaired_version = None;
-    if let Some(qualifiers) = raw_qualifiers
+    if allow_legacy_version_order
+        && let Some(qualifiers) = raw_qualifiers
         && let Some((before, version)) = qualifiers.rsplit_once('@')
         && !version.is_empty()
         && !version.contains(['=', '&', '/'])
@@ -418,6 +692,11 @@ fn namespace_requirement(typ: &str) -> i8 {
 }
 
 fn apply_type_rules(parts: &mut CanonicalPurl) -> Option<()> {
+    if parts.typ == "git" && parts.namespace.len() > 1 {
+        let mut name_segments = parts.namespace.split_off(1);
+        name_segments.push(std::mem::take(&mut parts.name));
+        parts.name = name_segments.join("/");
+    }
     let namespace_requirement = namespace_requirement(&parts.typ);
     let recoverable_distro_namespace = parts.namespace.is_empty()
         && (parts
@@ -447,6 +726,44 @@ fn apply_type_rules(parts: &mut CanonicalPurl) -> Option<()> {
     }
     if parts.typ == "cpan" && parts.name.contains("::") {
         return None;
+    }
+    if parts.typ == "cpan" {
+        for segment in &mut parts.namespace {
+            *segment = segment.to_uppercase();
+        }
+    }
+    if parts.typ == "chrome-extension"
+        && (parts.name.len() != 32
+            || !parts.name.bytes().all(|byte| matches!(byte, b'a'..=b'p'))
+            || parts.version.as_deref().is_some_and(|version| {
+                let segments: Vec<_> = version.split('.').collect();
+                segments.is_empty()
+                    || segments.len() > 4
+                    || segments.iter().any(|segment| {
+                        segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit())
+                    })
+            }))
+    {
+        return None;
+    }
+    if parts.typ == "swid" {
+        if parts.namespace.len() > 2
+            || parts
+                .qualifiers
+                .get("tag_version")
+                .is_some_and(|value| value.parse::<u64>().is_err())
+            || parts
+                .qualifiers
+                .get("patch")
+                .is_some_and(|value| !matches!(value.as_str(), "true" | "false"))
+        {
+            return None;
+        }
+        if let Some(tag_id) = parts.qualifiers.get_mut("tag_id")
+            && is_guid(tag_id)
+        {
+            *tag_id = tag_id.to_ascii_lowercase();
+        }
     }
     if matches!(
         parts.typ.as_str(),
@@ -528,7 +845,88 @@ fn apply_type_rules(parts: &mut CanonicalPurl) -> Option<()> {
         }
         _ => {}
     }
+    validate_common_qualifiers(parts)?;
     (!parts.name.is_empty()).then_some(())
+}
+
+fn is_guid(value: &str) -> bool {
+    let groups = [8, 4, 4, 4, 12];
+    let mut parts = value.split('-');
+    groups.into_iter().all(|size| {
+        parts.next().is_some_and(|part| {
+            part.len() == size && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }) && parts.next().is_none()
+}
+
+fn validate_common_qualifiers(parts: &mut CanonicalPurl) -> Option<()> {
+    if let Some(checksum) = parts.qualifiers.get_mut("checksum") {
+        let normalized = checksum
+            .split(',')
+            .map(|item| {
+                let (algorithm, digest) = item.split_once(':')?;
+                let algorithm = algorithm.to_ascii_lowercase().replace('_', "-");
+                let digest = digest.to_ascii_lowercase();
+                (!algorithm.is_empty()
+                    && algorithm.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'.' | b'+' | b'-')
+                    })
+                    && !digest.is_empty()
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+                .then(|| format!("{algorithm}:{digest}"))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        *checksum = normalized.join(",");
+    }
+    if let Some(range) = parts.qualifiers.get("vers")
+        && !valid_version_range(range)
+    {
+        return None;
+    }
+    Some(())
+}
+
+fn valid_version_range(value: &str) -> bool {
+    let Some(body) = value.strip_prefix("vers:") else {
+        return false;
+    };
+    let Some((scheme, constraints)) = body.split_once('/') else {
+        return false;
+    };
+    if scheme.is_empty()
+        || !scheme.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+        || constraints.is_empty()
+    {
+        return false;
+    }
+    if constraints == "*" {
+        return true;
+    }
+    let mut versions = std::collections::BTreeSet::new();
+    constraints.split('|').all(|constraint| {
+        if constraint.is_empty() || constraint == "*" {
+            return false;
+        }
+        let version = [">=", "<=", "!=", ">", "<"]
+            .into_iter()
+            .find_map(|operator| constraint.strip_prefix(operator))
+            .unwrap_or(constraint);
+        !version.is_empty()
+            && !matches!(
+                version.as_bytes().first(),
+                Some(b'=' | b'>' | b'<' | b'!' | b'^' | b'~')
+            )
+            && !version
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+            && versions.insert(version)
+    })
 }
 
 fn encode_component(value: &str) -> String {
@@ -557,7 +955,18 @@ fn build_purl(parts: &CanonicalPurl) -> String {
         );
         output.push('/');
     }
-    output.push_str(&encode_component(&parts.name));
+    if parts.typ == "git" {
+        output.push_str(
+            &parts
+                .name
+                .split('/')
+                .map(encode_component)
+                .collect::<Vec<_>>()
+                .join("/"),
+        );
+    } else {
+        output.push_str(&encode_component(&parts.name));
+    }
     if let Some(version) = parts.version.as_deref() {
         output.push('@');
         output.push_str(&encode_component(version));
@@ -625,17 +1034,12 @@ fn build_purl(parts: &CanonicalPurl) -> String {
 /// answers no-decision, the CLI reports the argument as invalid.
 #[must_use]
 pub fn normalize(raw: &str) -> Option<String> {
-    // Canonicalize once so the legacy folding layer sees unambiguous
-    // components, then again because folds may add a qualifier or change a
-    // type's case/namespace rules.
-    let canonical = canonicalize_purl(raw)?;
-    let folded = normalize_legacy(&canonical)?;
-    canonicalize_purl(&folded)
+    Purl::parse(raw).ok().map(|purl| purl.canonical())
 }
 
 /// Apply atomdrift's historical type aliases and distro namespace recovery to
 /// an already-canonical PURL. Generic ECMA-427 canonicalization belongs in
-/// [`canonicalize_purl`], on both sides of this compatibility layer.
+/// [`Purl::parse`], on both sides of this compatibility layer.
 fn normalize_legacy(raw: &str) -> Option<String> {
     // The `pkg` scheme and type are case-insensitive; the shared splitter
     // folds their case and trims. No scheme → not a PURL.
@@ -808,35 +1212,79 @@ fn normalize_legacy(raw: &str) -> Option<String> {
 /// *which package* it is. Our pool is keyed by release coordinate (hopper's
 /// filename parser deliberately drops the architecture), so an arch-qualified
 /// spelling must collide with the bare one or every SBOM-derived lookup
-/// misses. Only `repository_url` survives, because it selects which registry
-/// the name lives in (Open VSX vs the Microsoft marketplace) — that *is*
-/// identity.
+/// misses. `repository_url` and `vcs_url` survive because they select the
+/// package's registry or source location — that *is* release identity.
 ///
 /// Fetching keeps the full [`normalize`]d form, where `kind=sdist` and friends
 /// legitimately steer artifact selection; only key derivation flattens.
 #[must_use]
 pub fn identity(raw: &str) -> Option<String> {
-    let full = normalize(raw)?;
-    // A subpath addresses content inside the package, not a different release.
-    // Drop it before qualifiers so a fragment cannot hitch a ride in the last
-    // qualifier value and survive release-key flattening.
-    let coordinate = full.split_once('#').map_or(full.as_str(), |(head, _)| head);
-    let Some((head, quals)) = coordinate.split_once('?') else {
-        return Some(coordinate.to_string());
-    };
-    let kept: Vec<&str> = quals
-        .split('&')
-        .filter(|q| {
-            q.split('=')
-                .next()
-                .is_some_and(|k| k.eq_ignore_ascii_case("repository_url"))
-        })
-        .collect();
-    Some(if kept.is_empty() {
-        head.to_string()
-    } else {
-        format!("{head}?{}", kept.join("&"))
-    })
+    let mut parsed = Purl::parse(raw).ok()?;
+    parsed.subpath.clear();
+    parsed
+        .qualifiers
+        .retain(|key, _| matches!(key.as_str(), "repository_url" | "vcs_url"));
+    Some(parsed.canonical())
+}
+
+/// The identity of one concrete package release, retaining qualifiers that
+/// distinguish releases while dropping only qualifiers that select bytes
+/// within that release. This is intentionally narrower than [`identity`],
+/// which remains the broad lookup key used by existing bloom filters.
+#[must_use]
+pub fn release_identity(raw: &str) -> Option<String> {
+    release_identity_at(raw, None)
+}
+
+pub(crate) fn release_identity_at(raw: &str, version: Option<&str>) -> Option<String> {
+    let mut parsed = Purl::parse(raw).ok()?;
+    parsed.subpath.clear();
+    if let Some(version) = version {
+        if version.is_empty() {
+            return None;
+        }
+        parsed.version = Some(version.to_string());
+        parsed.qualifiers.remove("vers");
+    }
+    let typ = parsed.typ.as_str();
+    parsed.qualifiers.retain(|key, _| {
+        !matches!(key.as_str(), "checksum" | "download_url" | "file_name")
+            && !matches!(
+                (typ, key.as_str()),
+                ("pypi", "kind")
+                    | ("gem", "platform")
+                    | ("maven", "classifier" | "type")
+                    | ("apk" | "deb" | "rpm", "arch")
+                    | ("conda", "build" | "subdir" | "type")
+                    | ("conan", "prev")
+                    | ("vcpkg", "triplet")
+                    | ("oci", "arch")
+                    | ("vscode" | "vscode-extension", "platform")
+                    | ("otp", "arch" | "platform")
+            )
+    });
+    apply_type_rules(&mut parsed)?;
+    Some(parsed.canonical())
+}
+
+/// Build the canonical identity for one concrete artifact of a release.
+///
+/// Release-level context is deliberately reduced to repository/VCS location; exact
+/// selectors discovered by a resolver (`file_name`, `platform`, classifier,
+/// and similar registered qualifiers) are then applied. This keeps release and
+/// byte-level identity separate without asking consumers to rebuild PURLs.
+#[must_use]
+pub fn artifact_identity(release: &str, selectors: &BTreeMap<String, String>) -> Option<String> {
+    let release = release_identity(release)?;
+    let mut parsed = Purl::parse_strict(&release).ok()?;
+    for (key, value) in selectors {
+        if !valid_qualifier_key(key) || value.is_empty() {
+            return None;
+        }
+        parsed.qualifiers.insert(key.clone(), value.clone());
+    }
+    apply_type_rules(&mut parsed)?;
+    Some(parsed.canonical())
 }
 
 /// Split a raw PURL into its lowercased type and the untouched remainder after
@@ -1101,10 +1549,13 @@ mod normalize_tests {
         // Legacy fletch spellings fold onto the spec/common-practice form, so a
         // stored spec PURL and a scanned legacy PURL hit the same filter key.
         let pairs = [
-            ("pkg:chrome/KhKimila", "pkg:chrome-extension/khkimila"),
             (
-                "pkg:chrome/KhKimila@25.7.1",
-                "pkg:chrome-extension/khkimila@25.7.1",
+                "pkg:chrome/Dlpngalgnefjeiefhmpklpfiohadpglk",
+                "pkg:chrome-extension/dlpngalgnefjeiefhmpklpfiohadpglk",
+            ),
+            (
+                "pkg:chrome/Dlpngalgnefjeiefhmpklpfiohadpglk@25.7.1",
+                "pkg:chrome-extension/dlpngalgnefjeiefhmpklpfiohadpglk@25.7.1",
             ),
             (
                 "pkg:vscode/Saoudrizwan/Claude-Dev",
@@ -1473,6 +1924,8 @@ mod url_to_purl_tests {
             "pkg:golang/github.com/BurntSushi/toml@v1.0.0",
             "pkg:nuget/newtonsoft.json@13.0.3",
             "pkg:maven/com.google.guava/guava@32.1.3-jre",
+            "pkg:maven/org.example/demo@1.0.0%20Final?classifier=sources&type=tar.gz",
+            "pkg:gem/nokogiri@1.16.0?platform=x86_64-linux",
             "pkg:github/owner/repo@v1.0.0",
         ] {
             let url = crate::fetch::resolve(&RefLocator::Purl(purl.to_string()))
@@ -1482,6 +1935,59 @@ mod url_to_purl_tests {
                 Some(purl),
                 "roundtrip failed via {url}",
             );
+        }
+    }
+
+    #[test]
+    fn generated_purl_url_purl_roundtrips_cover_coordinate_shapes() {
+        let names = ["alpha", "dash-name", "name_underscore"];
+        let versions = ["0.0.1", "1.2.3", "2026.08.25-beta.1"];
+        for name in names {
+            for version in versions {
+                for purl in [
+                    format!("pkg:npm/{name}@{version}"),
+                    format!("pkg:cargo/{name}@{version}"),
+                    format!("pkg:gem/{name}@{version}"),
+                    format!("pkg:nuget/{name}@{version}"),
+                    format!("pkg:github/acme/{name}@{version}"),
+                    format!("pkg:maven/org.example/{name}@{version}"),
+                ] {
+                    let canonical = normalize(&purl).unwrap();
+                    let url = crate::fetch::resolve(&RefLocator::Purl(canonical.clone()))
+                        .unwrap_or_else(|| panic!("resolve produced no URL for {canonical}"));
+                    assert_eq!(url_to_purl(&url), Some(canonical), "roundtrip via {url}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_artifact_urls_roundtrip_through_purls() {
+        for url in [
+            "https://registry.npmjs.org/@babel/core/-/core-7.24.0.tgz",
+            "https://static.crates.io/crates/serde/serde-1.0.203.crate",
+            "https://rubygems.org/downloads/nokogiri-1.16.0-x86_64-linux.gem",
+            "https://rubygems.org/downloads/demo-2.0.0-beta.1.gem",
+            "https://proxy.golang.org/github.com/!burnt!sushi/toml/@v/v1.4.0.zip",
+            "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg",
+            "https://repo1.maven.org/maven2/org/example/demo/1.0.0%20Final/demo-1.0.0%20Final-sources.tar.gz",
+            "https://codeload.github.com/owner/repo/tar.gz/v1.0.0",
+        ] {
+            let purl = url_to_purl(url).unwrap_or_else(|| panic!("no PURL for {url}"));
+            let recovered = crate::fetch::resolve(&RefLocator::Purl(purl.clone()))
+                .unwrap_or_else(|| panic!("no URL for {purl}"));
+            assert_eq!(recovered, url, "URL roundtrip via {purl}");
+        }
+    }
+
+    #[test]
+    fn reverse_mapping_rejects_paths_that_only_look_like_artifacts() {
+        for url in [
+            "https://crates.io/api/v1/crates/serde/1.0.0/download/extra",
+            "https://codeload.github.com/owner/repo/tar.gz/v1/extra",
+            "https://proxy.golang.org/github.com/bad!/module/@v/v1.0.0.zip",
+        ] {
+            assert_eq!(url_to_purl(url), None, "accepted malformed URL {url}");
         }
     }
 
@@ -1519,19 +2025,19 @@ mod url_to_purl_tests {
                 "https://files.pythonhosted.org/packages/ab/cd/ef/requests-2.31.0-py3-none-any.whl"
             )
             .as_deref(),
-            Some("pkg:pypi/requests@2.31.0"),
+            Some("pkg:pypi/requests@2.31.0?file_name=requests-2.31.0-py3-none-any.whl"),
         );
         assert_eq!(
             url_to_purl(
                 "https://files.pythonhosted.org/packages/aa/bb/cc/typing_extensions-4.9.0-py3-none-any.whl"
             )
             .as_deref(),
-            Some("pkg:pypi/typing-extensions@4.9.0"),
+            Some("pkg:pypi/typing-extensions@4.9.0?file_name=typing_extensions-4.9.0-py3-none-any.whl"),
         );
         assert_eq!(
             url_to_purl("https://files.pythonhosted.org/packages/aa/bb/cc/Django-4.2.1.tar.gz")
                 .as_deref(),
-            Some("pkg:pypi/django@4.2.1"),
+            Some("pkg:pypi/django@4.2.1?file_name=Django-4.2.1.tar.gz"),
         );
     }
 
@@ -1568,12 +2074,15 @@ mod url_to_purl_tests {
     }
 
     #[test]
-    fn platform_gem_and_unknowns_decline() {
-        // A platform-tagged gem's version field isn't the last segment, so we
-        // decline rather than emit a wrong PURL.
+    fn platform_gem_recovers_exact_artifact_and_unknowns_decline() {
         assert_eq!(
-            url_to_purl("https://rubygems.org/downloads/nokogiri-1.16.0-x86_64-linux.gem"),
-            None,
+            url_to_purl("https://rubygems.org/downloads/nokogiri-1.16.0-x86_64-linux.gem")
+                .as_deref(),
+            Some("pkg:gem/nokogiri@1.16.0?platform=x86_64-linux"),
+        );
+        assert_eq!(
+            url_to_purl("https://rubygems.org/downloads/foo-2fa-1.0.gem").as_deref(),
+            Some("pkg:gem/foo-2fa@1.0"),
         );
         assert_eq!(url_to_purl("https://example.com/whatever.tgz"), None);
         assert_eq!(
@@ -1583,6 +2092,186 @@ mod url_to_purl_tests {
         assert_eq!(
             url_to_purl("https://registry.npmjs.org/no-artifact-here"),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod edge_case_tests {
+    use super::*;
+
+    #[test]
+    fn typed_parser_distinguishes_syntax_from_type_errors() {
+        assert_eq!(Purl::parse("not-a-purl"), Err(PurlError::Syntax));
+        assert_eq!(Purl::parse("pkg:pypi/namespace/name"), Err(PurlError::Type));
+    }
+
+    #[test]
+    fn chrome_extension_id_must_be_32_letters_a_through_p() {
+        assert_eq!(normalize("pkg:chrome-extension/dogs"), None);
+        assert_eq!(
+            normalize("pkg:chrome-extension/44444algnefjeiefhmpklpfiohadpglk"),
+            None
+        );
+    }
+
+    #[test]
+    fn chrome_extension_version_has_one_to_four_numeric_segments() {
+        let id = "dlpngalgnefjeiefhmpklpfiohadpglk";
+        assert!(normalize(&format!("pkg:chrome-extension/{id}@1.2.3.4")).is_some());
+        assert_eq!(
+            normalize(&format!("pkg:chrome-extension/{id}@1.2.3.4.5")),
+            None
+        );
+        assert_eq!(
+            normalize(&format!("pkg:chrome-extension/{id}@1.2-beta")),
+            None
+        );
+    }
+
+    #[test]
+    fn swid_namespace_has_at_most_two_segments() {
+        assert!(normalize("pkg:swid/acme/example.com/app?tag_id=id").is_some());
+        assert_eq!(normalize("pkg:swid/a/b/c/app?tag_id=id"), None);
+    }
+
+    #[test]
+    fn swid_typed_qualifiers_are_validated_and_guids_lowercase() {
+        assert_eq!(normalize("pkg:swid/app?patch=maybe&tag_id=id"), None);
+        assert_eq!(normalize("pkg:swid/app?tag_id=id&tag_version=nope"), None);
+        assert_eq!(
+            normalize("pkg:swid/app?tag_id=75B8C285-FA7B-485B-B199-4745E3004D0D"),
+            Some("pkg:swid/app?tag_id=75b8c285-fa7b-485b-b199-4745e3004d0d".into())
+        );
+    }
+
+    #[test]
+    fn cpan_author_namespace_is_canonical_uppercase() {
+        assert_eq!(
+            normalize("pkg:cpan/drolsky/DateTime@1.55"),
+            Some("pkg:cpan/DROLSKY/DateTime@1.55".into())
+        );
+    }
+
+    #[test]
+    fn checksum_qualifier_normalizes_valid_hex_and_rejects_malformed_values() {
+        assert_eq!(
+            normalize("pkg:npm/foo@1?checksum=SHA256:ABCDEF"),
+            Some("pkg:npm/foo@1?checksum=sha256:abcdef".into())
+        );
+        assert_eq!(normalize("pkg:npm/foo@1?checksum=not-a-checksum"), None);
+        assert_eq!(normalize("pkg:npm/foo@1?checksum=sha256:xyz"), None);
+    }
+
+    #[test]
+    fn vers_qualifier_requires_version_range_syntax() {
+        assert_eq!(normalize("pkg:npm/foo?vers=garbage"), None);
+        assert!(normalize("pkg:npm/foo?vers=vers:npm%2F%3E%3D1.0.0%7C%3C2.0.0").is_some());
+        assert!(normalize("pkg:npm/foo?vers=vers:npm%2F1.2.3").is_some());
+        for invalid in [
+            "vers:npm%2F%3D1.0.0",
+            "vers:npm%2F%3D%3D1.0.0",
+            "vers:npm%2F%5E1.0.0",
+            "vers:npm%2F~1.0.0",
+            "vers:npm%2F%7C1.0.0",
+            "vers:npm%2F1.0.0%7C",
+            "vers:npm%2F1.0.0%7C1.0.0",
+            "vers:npm%2F*%7C1.0.0",
+            "vers:npm%2F%3E%3D1.0.0%20",
+        ] {
+            assert_eq!(normalize(&format!("pkg:npm/foo?vers={invalid}")), None);
+        }
+    }
+
+    #[test]
+    fn tolerant_parser_repairs_legacy_order_but_strict_parser_does_not() {
+        let raw = "pkg:vscode-extension/pub/name?repository_url=https://open-vsx.org@1.0.3";
+        assert_eq!(
+            Purl::parse(raw).expect("compatible PURL").version(),
+            Some("1.0.3")
+        );
+        assert_eq!(
+            Purl::parse_strict(raw).expect("strict PURL").version(),
+            None
+        );
+    }
+
+    #[test]
+    fn release_identity_preserves_release_qualifiers_only() {
+        assert_eq!(
+            release_identity(
+                "pkg:conda/widget@1?build=py313_0&channel=conda-forge&subdir=linux-64"
+            ),
+            Some("pkg:conda/widget@1?channel=conda-forge".into())
+        );
+        assert_eq!(
+            release_identity("pkg:conan/acme/widget@1?channel=stable&prev=p1&rrev=r1&user=bob"),
+            Some("pkg:conan/acme/widget@1?channel=stable&rrev=r1&user=bob".into())
+        );
+        assert_ne!(
+            release_identity("pkg:vcpkg/zlib@1?port_version=1&triplet=x64-windows"),
+            release_identity("pkg:vcpkg/zlib@1?port_version=2&triplet=x64-windows")
+        );
+    }
+
+    #[test]
+    fn exact_artifact_identity_does_not_collapse_release_siblings() {
+        let left = BTreeMap::from([("file_name".into(), "demo-1-py3-none-any.whl".into())]);
+        let right = BTreeMap::from([("file_name".into(), "demo-1.tar.gz".into())]);
+        assert_ne!(
+            artifact_identity("pkg:pypi/demo@1", &left),
+            artifact_identity("pkg:pypi/demo@1", &right)
+        );
+        assert_eq!(
+            identity("pkg:pypi/demo@1?file_name=demo-1.tar.gz"),
+            Some("pkg:pypi/demo@1".into())
+        );
+    }
+
+    #[test]
+    fn url_authority_userinfo_cannot_spoof_a_registry_host() {
+        assert_eq!(
+            url_to_purl("https://registry.npmjs.org:443@evil.example/lodash/-/lodash-1.0.0.tgz"),
+            None
+        );
+    }
+
+    #[test]
+    fn url_scheme_and_host_are_case_insensitive() {
+        assert_eq!(
+            url_to_purl("HTTPS://REGISTRY.NPMJS.ORG/lodash/-/lodash-1.0.0.tgz"),
+            Some("pkg:npm/lodash@1.0.0".into())
+        );
+    }
+
+    #[test]
+    fn maven_reverse_mapping_preserves_classifier_and_type() {
+        assert_eq!(
+            url_to_purl("https://repo1.maven.org/maven2/org/example/tool/1.2/tool-1.2-sources.zip"),
+            Some("pkg:maven/org.example/tool@1.2?classifier=sources&type=zip".into())
+        );
+    }
+
+    #[test]
+    fn nuget_reverse_mapping_rejects_a_mismatched_filename() {
+        assert_eq!(
+            url_to_purl("https://api.nuget.org/v3-flatcontainer/demo/1.0/not-demo.nupkg"),
+            None
+        );
+    }
+
+    #[test]
+    fn git_name_may_contain_repository_path_segments() {
+        let parsed = Purl::parse_strict(
+            "pkg:git/codeberg.org/forgejo/forgejo@a72d2c07cfca03b55371089de6aa230d8c951fa0",
+        )
+        .expect("git purl");
+        assert_eq!(parsed.namespace, ["codeberg.org"]);
+        assert_eq!(parsed.name, "forgejo/forgejo");
+        assert_eq!(
+            parsed.canonical(),
+            "pkg:git/codeberg.org/forgejo/forgejo@a72d2c07cfca03b55371089de6aa230d8c951fa0"
         );
     }
 }

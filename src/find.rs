@@ -128,7 +128,7 @@ pub fn references_in_bytes(data: &[u8], filename: &str) -> Vec<Reference> {
 /// covertly-installed companion or a dependency-confusion target — even when no
 /// install command is visible. A computed callee (`npm().install`, target
 /// `None`) or non-literal argument yields nothing; relative paths and language
-/// builtins are skipped by [`import_locator`].
+/// builtins are skipped by `import_locator`.
 #[must_use]
 pub fn import_calls(file_type: &str, symbols: &[Symbol]) -> Vec<Reference> {
     let mut refs = Vec::new();

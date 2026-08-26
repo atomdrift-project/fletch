@@ -2,7 +2,7 @@
 //! record rich provenance.
 //!
 //! [`HttpFetch`] is the real backend; its SSRF guard lives in a custom DNS
-//! resolver ([`SafeResolver`]) that refuses any host resolving to a private /
+//! resolver (`SafeResolver`) that refuses any host resolving to a private /
 //! loopback / link-local / metadata address, re-checked on every redirect hop.
 //! [`Fixtures`] is the offline backend for tests. No recognition logic lives
 //! here — references come in, bytes and [`FetchRecord`]s go out.
@@ -27,6 +27,12 @@ use sha2::{Digest, Sha256, Sha512};
 /// a registered PURL qualifier (`python`, `abi`, npm `cpu`, and similar).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactCandidate {
+    /// Canonical release-level PURL shared by sibling artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_purl: Option<String>,
+    /// Canonical PURL including selectors for this exact published artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_purl: Option<String>,
     /// Direct URL for this archive.
     pub url: String,
     /// Archive basename as published by the registry.
@@ -67,6 +73,199 @@ impl ArtifactMatrix {
     pub fn preferred(&self) -> Option<&ArtifactCandidate> {
         self.candidates.iter().find(|candidate| candidate.preferred)
     }
+
+    /// Select one compatible artifact for an explicit target and policy.
+    /// Enumeration itself remains target-neutral.
+    #[must_use]
+    pub fn select(
+        &self,
+        target: &ArtifactTarget,
+        policy: &SelectionPolicy,
+    ) -> Option<&ArtifactCandidate> {
+        let exact = crate::purl::Purl::parse(&self.locator)
+            .ok()
+            .is_some_and(|purl| {
+                purl.qualifiers().keys().any(|key| {
+                    matches!(
+                        key.as_str(),
+                        "file_name" | "platform" | "download_url" | "kind"
+                    )
+                })
+            });
+        self.candidates
+            .iter()
+            .filter(|candidate| !exact || candidate.preferred)
+            .filter_map(|candidate| {
+                candidate_score(candidate, target, policy).map(|score| (score, candidate))
+            })
+            .min_by(|(left_score, left), (right_score, right)| {
+                left_score
+                    .cmp(right_score)
+                    .then_with(|| left.file_name.cmp(&right.file_name))
+            })
+            .map(|(_, candidate)| candidate)
+    }
+}
+
+/// Compatibility information supplied by a caller selecting an artifact.
+///
+/// Python and Ruby publish ecosystem-specific compatibility tags, so callers
+/// pass the tags their runtime accepts rather than Fletch guessing from a host
+/// triple. Empty tag lists mean “portable artifacts only.”
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactTarget {
+    /// Operating system (`linux`, `darwin`, `win32`, ...).
+    pub os: Option<String>,
+    /// CPU architecture (`x64`, `arm64`, `x86_64`, ...).
+    pub arch: Option<String>,
+    /// C library where relevant (`glibc`, `musl`).
+    pub libc: Option<String>,
+    /// Accepted Python interpreter tags, best first (`cp313`, `py3`, ...).
+    #[serde(default)]
+    pub python_tags: Vec<String>,
+    /// Accepted Python ABI tags (`cp313`, `abi3`, `none`, ...).
+    #[serde(default)]
+    pub abi_tags: Vec<String>,
+    /// Accepted Python platform tags (`manylinux_2_17_x86_64`, ...).
+    #[serde(default)]
+    pub python_platform_tags: Vec<String>,
+    /// Concrete Python runtime version used for `Requires-Python` checks.
+    pub python_version: Option<String>,
+    /// Concrete Node.js runtime version used for npm `engines.node` checks.
+    pub node_version: Option<String>,
+    /// Accepted RubyGems platform strings (`x86_64-linux`, ...).
+    #[serde(default)]
+    pub gem_platforms: Vec<String>,
+}
+
+/// Policy choices kept separate from registry enumeration and host identity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionPolicy {
+    /// Permit a yanked/withdrawn artifact when no healthy candidate exists.
+    pub allow_yanked: bool,
+    /// Prefer source distributions over compatible binaries.
+    pub prefer_source: bool,
+}
+
+fn candidate_score(
+    candidate: &ArtifactCandidate,
+    target: &ArtifactTarget,
+    policy: &SelectionPolicy,
+) -> Option<u16> {
+    if candidate.attributes.contains_key("checksum_mismatch") {
+        return None;
+    }
+    if !policy.allow_yanked && candidate.attributes.contains_key("yanked") {
+        return None;
+    }
+    if let Some(constraint) = candidate.attributes.get("requires_python")
+        && let Some(version) = target.python_version.as_deref()
+    {
+        let specifiers = constraint.parse::<pep440_rs::VersionSpecifiers>().ok()?;
+        let version = version.parse::<pep440_rs::Version>().ok()?;
+        if !specifiers.contains(&version) {
+            return None;
+        }
+    }
+    if let Some(constraint) = candidate.attributes.get("node")
+        && let Some(version) = target.node_version.as_deref()
+    {
+        let range = node_semver::Range::parse(constraint).ok()?;
+        let version = node_semver::Version::parse(version).ok()?;
+        if !range.satisfies(&version) {
+            return None;
+        }
+    }
+    for (attribute, requested) in [
+        ("os", target.os.as_deref()),
+        ("cpu", target.arch.as_deref()),
+        ("libc", target.libc.as_deref()),
+    ] {
+        if let Some(constraint) = candidate.attributes.get(attribute)
+            && !runtime_constraint_matches(constraint, requested)
+        {
+            return None;
+        }
+    }
+
+    let kind = candidate.attributes.get("kind").map(String::as_str);
+    let natural = match kind {
+        Some("wheel") => {
+            let python = candidate.attributes.get("python").map(String::as_str)?;
+            let abi = candidate.attributes.get("abi").map(String::as_str)?;
+            let platform = candidate.attributes.get("platform").map(String::as_str)?;
+            if !compressed_tag_matches(python, &target.python_tags, python.starts_with("py"))
+                || !compressed_tag_matches(abi, &target.abi_tags, abi == "none")
+                || !compressed_tag_matches(
+                    platform,
+                    &target.python_platform_tags,
+                    platform == "any",
+                )
+            {
+                return None;
+            }
+            if policy.prefer_source { 4 } else { 0 }
+        }
+        Some("sdist") => {
+            if policy.prefer_source {
+                0
+            } else {
+                1
+            }
+        }
+        Some("gem") => {
+            let platform = candidate
+                .qualifiers
+                .get("platform")
+                .map_or("ruby", String::as_str);
+            if platform != "ruby" && !target.gem_platforms.iter().any(|tag| tag == platform) {
+                return None;
+            }
+            u16::from(platform != "ruby")
+        }
+        _ => 0,
+    };
+    Some(natural + 100 * u16::from(candidate.attributes.contains_key("yanked")))
+}
+
+fn compressed_tag_matches(actual: &str, accepted: &[String], targetless_compatible: bool) -> bool {
+    if accepted.is_empty() {
+        return targetless_compatible;
+    }
+    actual
+        .split('.')
+        .any(|tag| accepted.iter().any(|accepted| accepted == tag))
+}
+
+fn runtime_constraint_matches(constraint: &str, requested: Option<&str>) -> bool {
+    let Some(requested) = requested else {
+        return constraint
+            .split(',')
+            .map(str::trim)
+            .all(|value| value.starts_with('!'));
+    };
+    if constraint.split(',').map(str::trim).any(|value| {
+        value
+            .strip_prefix('!')
+            .is_some_and(|denied| runtime_value_matches(denied, requested))
+    }) {
+        return false;
+    }
+    let mut allowed = constraint
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.starts_with('!'));
+    allowed.clone().next().is_none() || allowed.any(|value| runtime_value_matches(value, requested))
+}
+
+fn runtime_value_matches(candidate: &str, requested: &str) -> bool {
+    candidate == requested
+        || matches!(
+            (candidate, requested),
+            ("x86_64" | "amd64" | "x64", "x86_64" | "amd64" | "x64")
+                | ("aarch64" | "arm64", "aarch64" | "arm64")
+                | ("windows" | "win32", "windows" | "win32")
+        )
 }
 
 /// Cache lifetime for a pinned reference — immutable, so a stale hit is
@@ -257,6 +456,9 @@ pub enum Outcome {
     Ok,
     /// Bytes whose hash did not match the declared pin — a finding.
     PinMismatch,
+    /// A pin was declared, but Fletch cannot verify that algorithm over the
+    /// downloaded bytes. Never silently treated as an unpinned success.
+    UnverifiablePin,
     /// Locator could not be resolved to a URL (unsupported ecosystem).
     Unresolved,
     /// Not a fetch target (identity / unclassified) — recorded, not fetched.
@@ -411,7 +613,7 @@ pub type RawSink = Arc<Mutex<Vec<RecordedSource>>>;
 /// Content-addressed cache of fetched responses — bytes (`<key>.zst`) plus a
 /// provenance sidecar (`<key>.json`), keyed by `sha256(locator)`. Two
 /// manifests naming the same package share one entry. TTL is the caller's
-/// policy (passed to [`BlobCache::fresh`]).
+/// policy (passed to `BlobCache::fresh`).
 #[derive(Debug, Clone)]
 pub struct BlobCache {
     dir: PathBuf,
@@ -760,7 +962,7 @@ pub fn counts_against_budget(rec: &FetchRecord) -> bool {
     !rec.cached
         && matches!(
             rec.outcome,
-            Outcome::Ok | Outcome::PinMismatch | Outcome::Failed(_)
+            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin | Outcome::Failed(_)
         )
 }
 
@@ -914,7 +1116,7 @@ fn fetch_concurrency() -> usize {
 /// raw-URL targets; without it only registry packages (PURLs) are fetched.
 /// Identity references (a repository) are never fetched.
 ///
-/// Fetches run concurrently across a bounded pool ([`fetch_concurrency`]); the
+/// Fetches run concurrently across a bounded pool (`fetch_concurrency`); the
 /// returned order is always declaration order regardless of completion order.
 /// `max_count` bounds *live* fetches only: a slot is claimed atomically the
 /// moment a cache miss is about to hit the network, so the live total never
@@ -1089,13 +1291,26 @@ fn record(
     meta: &CachedMeta,
 ) -> FetchRecord {
     let content_sha256 = sha256_hex(bytes);
-    let pin_verified = if r.pinned_hash.is_some() {
-        verify_pin(r.pinned_hash.as_ref(), bytes, &content_sha256)
+    let mut verifications = Vec::new();
+    if r.pinned_hash.is_some() {
+        verifications.push(verify_pin(r.pinned_hash.as_ref(), bytes, &content_sha256));
+    }
+    if purl_declares_checksum(&locator) {
+        verifications.push(verify_purl_checksum(&locator, bytes, &content_sha256));
+    }
+    let pin_verified = if verifications.is_empty() {
+        None
+    } else if verifications.contains(&Some(false)) {
+        Some(false)
+    } else if verifications.iter().any(Option::is_none) {
+        None
     } else {
-        verify_purl_checksum(&r.locator, bytes, &content_sha256)
+        Some(true)
     };
     let outcome = if pin_verified == Some(false) {
         Outcome::PinMismatch
+    } else if pin_verified.is_none() && reference_declares_pin(r, &locator) {
+        Outcome::UnverifiablePin
     } else {
         Outcome::Ok
     };
@@ -1119,6 +1334,16 @@ fn record(
     }
 }
 
+fn reference_declares_pin(reference: &Reference, locator: &str) -> bool {
+    reference.pinned_hash.is_some() || purl_declares_checksum(locator)
+}
+
+fn purl_declares_checksum(locator: &str) -> bool {
+    crate::purl::Purl::parse(locator)
+        .ok()
+        .is_some_and(|purl| purl.qualifiers().contains_key("checksum"))
+}
+
 /// The canonical locator string (the PURL or URL).
 fn locator_string(locator: &RefLocator) -> String {
     match locator {
@@ -1128,7 +1353,7 @@ fn locator_string(locator: &RefLocator) -> String {
 
 /// Resolve a locator to a fetchable URL, or `None` if the ecosystem isn't
 /// supported yet. Ecosystems that need a registry round-trip (PyPI, Composer,
-/// Firefox, the AUR, an unversioned npm PURL) resolve in [`resolved_target`]
+/// Firefox, the AUR, an unversioned npm PURL) resolve in `resolved_target`
 /// instead; official-repo alpm (a mirror lookup) is a follow-up.
 #[must_use]
 pub fn resolve(locator: &RefLocator) -> Option<String> {
@@ -1142,7 +1367,7 @@ pub fn resolve(locator: &RefLocator) -> Option<String> {
         // from a `pkg:oci` coordinate. Plain `http` still resolves and is
         // refused at connect, which records the more informative outcome.
         RefLocator::Url(u) => is_web_scheme(u).then(|| u.clone()),
-        RefLocator::Purl(p) => resolve_purl(p),
+        RefLocator::Purl(p) => crate::purl::normalize(p).and_then(|purl| resolve_purl(&purl)),
         // An intra-artifact file reference is resolved against the bundle's
         // other files by a consumer, never fetched.
         RefLocator::Path(_) => None,
@@ -1157,9 +1382,11 @@ pub fn resolve(locator: &RefLocator) -> Option<String> {
 /// matrix always retains all discovered variants; the legacy single-URL choice
 /// is identified by [`ArtifactCandidate::preferred`].
 ///
-/// PyPI's `file_name`, RubyGems' `platform`, and Go's `subpath` are the
-/// registered type-specific selectors for these ecosystems; npm and Cargo have
-/// none. Common `download_url`, `file_name`, `repository_url`, `checksum`, and
+/// PyPI's `file_name` and RubyGems' `platform` are the registered
+/// type-specific artifact selectors for these ecosystems; npm, Go, and Cargo
+/// have none. A Go `subpath` addresses content inside its one module ZIP, so it
+/// is retained as context but never treated as another artifact. Common
+/// `download_url`, `file_name`, `repository_url`, `checksum`, and
 /// `vers` semantics are also honored (`vers` intentionally yields no concrete
 /// candidate until its caller selects a release).
 /// Compatibility information that is not a PURL selector is exposed as an
@@ -1171,14 +1398,16 @@ pub fn resolve_artifacts(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<ArtifactMatrix> {
-    let locator_text = locator_string(locator);
+    let mut locator_text = locator_string(locator);
     let candidates = match locator {
         RefLocator::Url(url) if is_web_scheme(url) => {
             vec![artifact_candidate(url.clone(), "download")]
         }
         RefLocator::Url(_) | RefLocator::Path(_) => return None,
         RefLocator::Purl(purl) => {
-            let (ty, rest) = crate::purl::scheme_type_rest(purl)?;
+            let purl = crate::purl::normalize(purl)?;
+            locator_text.clone_from(&purl);
+            let (ty, rest) = crate::purl::scheme_type_rest(&purl)?;
             let mut candidates = if let Some(url) = purl_qualifier(rest, "download_url") {
                 if !is_web_scheme(&url) {
                     return None;
@@ -1199,12 +1428,13 @@ pub fn resolve_artifacts(
                     "npm" => npm_artifacts(path, version, rest, net, cache),
                     "pypi" => pypi_artifacts(path, version, rest, net, cache),
                     "gem" => gem_artifacts(path, version, rest, net, cache),
-                    "golang" => deterministic_artifacts(purl, rest, "zip"),
-                    "cargo" => cargo_artifacts(purl, path, version, rest, net, cache),
+                    "golang" => deterministic_artifacts(&purl, rest, "zip"),
+                    "cargo" => cargo_artifacts(&purl, path, version, rest, net, cache),
                     _ => return None,
                 }
             };
             apply_common_candidate_qualifiers(rest, &mut candidates);
+            attach_candidate_identities(&purl, &mut candidates);
             candidates
         }
     };
@@ -1219,6 +1449,8 @@ fn artifact_candidate(url: String, kind: &str) -> ArtifactCandidate {
     let mut attributes = BTreeMap::new();
     attributes.insert("kind".to_string(), kind.to_string());
     ArtifactCandidate {
+        release_purl: None,
+        artifact_purl: None,
         url,
         file_name,
         qualifiers: BTreeMap::new(),
@@ -1279,7 +1511,12 @@ fn cargo_artifacts(
     else {
         return Vec::new();
     };
-    let checksums = purl_checksums(rest);
+    let mut checksums = purl_checksums(rest);
+    if !checksums.contains_key("sha256")
+        && let Some(checksum) = cargo_index_checksum(repository, name, &version, net, cache)
+    {
+        checksums.insert("sha256".into(), checksum);
+    }
     let url = cargo_download_url(
         &download,
         name,
@@ -1290,11 +1527,34 @@ fn cargo_artifacts(
         return Vec::new();
     };
     let mut candidate = artifact_candidate(url, "crate");
+    candidate.checksums = checksums;
     candidate
         .qualifiers
         .insert("repository_url".into(), repository.to_string());
     candidate.preferred = file_name_matches(rest, &candidate.file_name);
     vec![candidate]
+}
+
+fn cargo_index_checksum(
+    repository: &str,
+    name: &str,
+    version: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let prefix = cargo_registry_prefix(&lower)?;
+    let index_url = format!("{repository}/{prefix}/{lower}");
+    let bytes = cached_metadata(&index_url, net, &cache.with_meta_ttl(meta_ttl_pinned()))?;
+    std::str::from_utf8(&bytes)
+        .ok()?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|entry| {
+            (entry.get("vers")?.as_str()? == version)
+                .then(|| entry.get("cksum")?.as_str().map(str::to_string))
+                .flatten()
+        })
 }
 
 fn cargo_download_url(
@@ -1381,7 +1641,6 @@ fn npm_artifacts(
                         .as_str()
                         .map(str::to_string)
                 })
-                .or_else(|| Some(value.clone()))
         },
     );
     let Some(version) = resolved else {
@@ -1423,6 +1682,7 @@ fn npm_artifacts(
         candidate
             .attributes
             .insert("integrity".into(), integrity.to_string());
+        add_sri_checksums(integrity, &mut candidate.checksums);
     }
     if let Some(sha1) = version_doc
         .and_then(|doc| doc.pointer("/dist/shasum"))
@@ -1432,6 +1692,24 @@ fn npm_artifacts(
     }
     candidate.preferred = file_name_matches(rest, &candidate.file_name);
     vec![candidate]
+}
+
+fn add_sri_checksums(integrity: &str, checksums: &mut BTreeMap<String, String>) {
+    use base64::Engine as _;
+    for token in integrity.split_ascii_whitespace() {
+        let Some((algorithm, encoded)) = token.split_once('-') else {
+            continue;
+        };
+        let Some(bytes) = base64::engine::general_purpose::STANDARD
+            .decode(encoded.split('?').next().unwrap_or(encoded))
+            .ok()
+        else {
+            continue;
+        };
+        checksums
+            .entry(algorithm.to_ascii_lowercase())
+            .or_insert_with(|| hex::encode(bytes));
+    }
 }
 
 fn npm_registry_name(path: &str) -> String {
@@ -1537,6 +1815,7 @@ fn pypi_candidate(
     qualifiers.insert("file_name".into(), file_name.clone());
     let mut attributes = BTreeMap::new();
     attributes.insert("kind".into(), kind.to_string());
+    attributes.insert("version".into(), version.to_string());
     if kind == "wheel" {
         attributes.extend(wheel_attributes(&file_name, name, version));
     }
@@ -1576,6 +1855,8 @@ fn pypi_candidate(
         })
         .unwrap_or_default();
     Some(ArtifactCandidate {
+        release_purl: None,
+        artifact_purl: None,
         url,
         file_name,
         qualifiers,
@@ -1642,18 +1923,24 @@ fn pypi_rank(
         } else if abi == Some("none") && platform == Some("any") {
             1
         } else {
-            2
+            3
         }
     } else if kind == Some("sdist") {
-        3
+        2
     } else {
         4
     };
-    if requested_kind.is_some_and(|requested| kind != Some(requested)) {
+    let requested = if requested_kind.is_some_and(|requested| kind != Some(requested)) {
         10 + natural
     } else {
         natural
-    }
+    };
+    requested
+        + if candidate.attributes.contains_key("yanked") {
+            20
+        } else {
+            0
+        }
 }
 
 fn gem_artifacts(
@@ -1696,16 +1983,7 @@ fn gem_artifacts(
         .map(|entry| gem_candidate(&repository, name, &version, entry))
         .collect();
     if candidates.is_empty() {
-        let platform = purl_qualifier(rest, "platform").unwrap_or_else(|| "ruby".into());
-        if !safe_filename_part(&platform) {
-            return Vec::new();
-        }
-        candidates.push(gem_candidate_for_platform(
-            &repository,
-            name,
-            &version,
-            &platform,
-        ));
+        return Vec::new();
     }
     candidates.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     let explicit_platform = purl_qualifier(rest, "platform");
@@ -1716,9 +1994,6 @@ fn gem_artifacts(
             .get("platform")
             .is_some_and(|platform| platform == wanted)
     });
-    if preferred.is_none() && explicit_platform.is_none() && !candidates.is_empty() {
-        preferred = Some(0);
-    }
     if let Some(file_name) = purl_qualifier(rest, "file_name") {
         preferred = candidates
             .iter()
@@ -1773,7 +2048,10 @@ fn gem_candidate_for_platform(
     qualifiers.insert("platform".into(), platform.to_string());
     let mut attributes = BTreeMap::new();
     attributes.insert("kind".into(), "gem".into());
+    attributes.insert("version".into(), version.to_string());
     ArtifactCandidate {
+        release_purl: None,
+        artifact_purl: None,
         url: format!("{repository}/downloads/{file_name}"),
         file_name,
         qualifiers,
@@ -1862,7 +2140,14 @@ fn resolve_purl_with_file_selection(purl: &str, honor_file_name: bool) -> Option
     let (path, version) = split_path_version(rest);
     // Vetted once here rather than at each of the arms below, every one of
     // which interpolates these into a URL.
-    if !safe_coordinate(path) || version.is_some_and(|v| !safe_coordinate(v)) {
+    let version_is_safe = version.is_none_or(|value| {
+        if ty == "maven" {
+            safe_coordinate_inner(value, true)
+        } else {
+            safe_coordinate(value)
+        }
+    });
+    if !safe_coordinate(path) || !version_is_safe {
         return None;
     }
     match ty.as_str() {
@@ -2034,11 +2319,30 @@ fn purl_checksums(rest: &str) -> BTreeMap<String, String> {
 fn apply_common_candidate_qualifiers(rest: &str, candidates: &mut [ArtifactCandidate]) {
     let declared = purl_checksums(rest);
     let repository = purl_qualifier(rest, "repository_url");
+    let vcs = purl_qualifier(rest, "vcs_url");
+    let download = purl_qualifier(rest, "download_url");
+    let file_name = purl_qualifier(rest, "file_name");
     for candidate in candidates {
         if let Some(repository) = repository.as_ref() {
             candidate
                 .qualifiers
                 .insert("repository_url".into(), repository.clone());
+        }
+        if let Some(vcs) = vcs.as_ref() {
+            candidate.qualifiers.insert("vcs_url".into(), vcs.clone());
+        }
+        if let Some(download) = download.as_ref() {
+            candidate
+                .qualifiers
+                .insert("download_url".into(), download.clone());
+        }
+        if let Some(file_name) = file_name.as_ref()
+            && candidate.file_name == *file_name
+        {
+            candidate
+                .qualifiers
+                .entry("file_name".into())
+                .or_insert_with(|| file_name.clone());
         }
         for (algorithm, digest) in &declared {
             if candidate
@@ -2047,12 +2351,38 @@ fn apply_common_candidate_qualifiers(rest: &str, candidates: &mut [ArtifactCandi
                 .is_some_and(|published| !published.eq_ignore_ascii_case(digest))
             {
                 candidate.preferred = false;
+                candidate
+                    .attributes
+                    .insert("checksum_mismatch".into(), "true".into());
             }
             candidate
                 .checksums
                 .entry(algorithm.clone())
                 .or_insert_with(|| digest.clone());
         }
+    }
+}
+
+fn attach_candidate_identities(release: &str, candidates: &mut [ArtifactCandidate]) {
+    for candidate in candidates {
+        let version = candidate.attributes.get("version").map(String::as_str);
+        let release_purl = crate::purl::release_identity_at(release, version);
+        candidate.release_purl.clone_from(&release_purl);
+        let mut selectors = candidate.qualifiers.clone();
+        if !candidate.checksums.is_empty() {
+            selectors.insert(
+                "checksum".into(),
+                candidate
+                    .checksums
+                    .iter()
+                    .map(|(algorithm, digest)| format!("{algorithm}:{digest}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        candidate.artifact_purl = release_purl
+            .as_deref()
+            .and_then(|release| crate::purl::artifact_identity(release, &selectors));
     }
 }
 
@@ -2082,12 +2412,24 @@ fn safe_filename_part(value: &str) -> bool {
 /// so a coordinate that does is not a package. It resolves to
 /// [`Outcome::Unresolved`] and is recorded, never silently dropped.
 pub(crate) fn safe_coordinate(value: &str) -> bool {
-    !value
-        .split('/')
-        .any(|segment| segment == ".." || segment == ".")
+    safe_coordinate_inner(value, false)
+}
+
+fn safe_coordinate_inner(value: &str, allow_encoded_space: bool) -> bool {
+    let decoded = percent_decode(value);
+    value.bytes().filter(|byte| *byte == b'/').count()
+        == decoded.bytes().filter(|byte| *byte == b'/').count()
+        && !decoded
+            .split('/')
+            .any(|segment| segment == ".." || segment == ".")
         && !value
             .bytes()
             .any(|b| b.is_ascii_control() || matches!(b, b' ' | b'\\' | b'?' | b'#' | b'"'))
+        && !decoded.bytes().any(|b| {
+            b.is_ascii_control()
+                || matches!(b, b'\\' | b'?' | b'#' | b'"')
+                || (b == b' ' && !allow_encoded_space)
+        })
 }
 
 /// Resolve a `pkg:oci` (or legacy `pkg:docker`) purl body to the `oci://`
@@ -2172,8 +2514,9 @@ fn resolved_target(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<(String, String)> {
-    if let RefLocator::Purl(p) = locator
-        && let Some((ty, rest)) = crate::purl::scheme_type_rest(p)
+    if let RefLocator::Purl(raw) = locator
+        && let Some(p) = crate::purl::normalize(raw)
+        && let Some((ty, rest)) = crate::purl::scheme_type_rest(&p)
     {
         let ty = ty.as_str();
         // An exact download override takes precedence even for ecosystems that
@@ -2186,10 +2529,37 @@ fn resolved_target(
         if purl_qualifier(rest, "vers").is_some() {
             return None;
         }
+        let (coordinate_path, coordinate_version) = split_path_version(rest);
+        // Registry metadata can refine a mutable/tagged request to a concrete
+        // release and exact artifact. Use that identity for cache/provenance;
+        // retain the pure resolver below as the offline compatibility path.
+        let needs_matrix = ty == "pypi"
+            || (ty == "npm"
+                && coordinate_version.is_none_or(|version| !npm_version_is_concrete(version)))
+            || (ty == "gem" && coordinate_version.is_none())
+            || (ty == "cargo"
+                && purl_qualifier(rest, "repository_url").is_some_and(|repository| {
+                    !matches!(
+                        repository.trim_end_matches('/'),
+                        "https://crates.io" | "https://index.crates.io"
+                    )
+                }));
+        if needs_matrix
+            && let Some(candidate) = resolve_artifacts(locator, net, cache)
+                .as_ref()
+                .and_then(ArtifactMatrix::preferred)
+        {
+            let exact = candidate
+                .artifact_purl
+                .as_ref()
+                .or(candidate.release_purl.as_ref())
+                .cloned()
+                .unwrap_or_else(|| p.clone());
+            return Some((exact, candidate.url.clone()));
+        }
         // A scope is `%40`, so `split_path_version` can distinguish it from a
         // real version separator even when qualifier values themselves contain
         // `@`. A versionless npm dependency is refined through dist-tags.
-        let (coordinate_path, coordinate_version) = split_path_version(rest);
         if ty == "npm" {
             match coordinate_version {
                 None => return resolve_npm_dist_tag(coordinate_path, rest, "latest", net),
@@ -2271,7 +2641,13 @@ fn resolved_target(
             }
         }
     }
-    resolve(locator).map(|u| (locator_string(locator), u))
+    match locator {
+        RefLocator::Purl(raw) => {
+            let canonical = crate::purl::normalize(raw)?;
+            resolve(&RefLocator::Purl(canonical.clone())).map(|url| (canonical, url))
+        }
+        _ => resolve(locator).map(|url| (locator_string(locator), url)),
+    }
 }
 
 /// The AUR snapshot URL for `name`: ask the (cached) RPC for the package's
@@ -2314,12 +2690,18 @@ fn resolve_npm_unversioned(path: &str, rest: &str, net: &dyn Fetch) -> Option<(S
 
 fn npm_version_is_concrete(version: &str) -> bool {
     let version = percent_decode(version);
-    let mut bytes = version.bytes();
-    match bytes.next() {
-        Some(first) if first.is_ascii_digit() => true,
-        Some(b'v') => bytes.next().is_some_and(|next| next.is_ascii_digit()),
-        _ => false,
-    }
+    let version = version.strip_prefix('v').unwrap_or(&version);
+    version
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_digit())
+        && !version.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || matches!(
+                    byte,
+                    b'*' | b'x' | b'X' | b'<' | b'>' | b'=' | b'^' | b'~' | b'|'
+                )
+        })
 }
 
 fn resolve_npm_dist_tag(
@@ -2571,23 +2953,30 @@ fn verify_pin(pin: Option<&PinnedHash>, bytes: &[u8], sha256_hex: &str) -> Optio
     }
 }
 
-fn verify_purl_checksum(locator: &RefLocator, bytes: &[u8], sha256_hex: &str) -> Option<bool> {
-    let RefLocator::Purl(purl) = locator else {
-        return None;
-    };
-    let (_, rest) = crate::purl::scheme_type_rest(purl)?;
+fn verify_purl_checksum(locator: &str, bytes: &[u8], sha256_hex: &str) -> Option<bool> {
+    let (_, rest) = crate::purl::scheme_type_rest(locator)?;
     let checksums = purl_checksums(rest);
-    let mut checked = false;
-    let mut matches = true;
-    if let Some(expected) = checksums.get("sha256") {
-        checked = true;
-        matches &= expected.eq_ignore_ascii_case(sha256_hex);
+    if checksums.is_empty() {
+        return None;
     }
-    if let Some(expected) = checksums.get("sha512") {
-        checked = true;
-        matches &= expected.eq_ignore_ascii_case(&hex::encode(Sha512::digest(bytes)));
+    let sha512 = checksums
+        .contains_key("sha512")
+        .then(|| hex::encode(Sha512::digest(bytes)));
+    let mut unsupported = false;
+    for (algorithm, expected) in checksums {
+        let actual = match algorithm.as_str() {
+            "sha256" => sha256_hex,
+            "sha512" => sha512.as_deref().unwrap_or_default(),
+            _ => {
+                unsupported = true;
+                continue;
+            }
+        };
+        if !expected.eq_ignore_ascii_case(actual) {
+            return Some(false);
+        }
     }
-    checked.then_some(matches)
+    (!unsupported).then_some(true)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -4487,5 +4876,379 @@ mod tests {
                 other => panic!("{url} should be refused, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn percent_encoded_path_structure_never_reaches_a_registry_url() {
+        for purl in [
+            "pkg:cargo/foo%2F..%2Fbar@1.0.0",
+            "pkg:npm/foo%2Fbar@1.0.0",
+            "pkg:gem/foo%2Fbar@1.0.0",
+        ] {
+            assert_eq!(resolve(&RefLocator::Purl(purl.into())), None, "{purl}");
+        }
+    }
+
+    #[test]
+    fn npm_matrix_never_invents_unknown_versions_or_ranges() {
+        let body = br#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"dist":{"tarball":"https://x/pkg-1.0.0.tgz"}}}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/pkg", body);
+        for purl in [
+            "pkg:npm/pkg@9.9.9",
+            "pkg:npm/pkg@1.x",
+            "pkg:npm/pkg@%3E%3D1",
+        ] {
+            let matrix =
+                resolve_artifacts(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled())
+                    .expect("npm matrix");
+            assert!(matrix.candidates.is_empty(), "{purl}");
+        }
+    }
+
+    #[test]
+    fn npm_integrity_is_promoted_to_a_hex_checksum() {
+        let body = br#"{"versions":{"1.0.0":{"dist":{"tarball":"https://x/pkg.tgz","integrity":"sha512-Zm9v"}}}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/pkg", body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:npm/pkg@1.0.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("npm matrix");
+        assert_eq!(
+            matrix.candidates[0]
+                .checksums
+                .get("sha512")
+                .map(String::as_str),
+            Some("666f6f")
+        );
+    }
+
+    #[test]
+    fn pypi_platform_wheels_do_not_beat_a_portable_sdist_without_a_target() {
+        let api = "https://pypi.org/pypi/native/1.0/json";
+        let body = br#"{"urls":[
+            {"packagetype":"bdist_wheel","filename":"native-1.0-cp313-cp313-macosx_14_0_arm64.whl","url":"https://x/mac.whl"},
+            {"packagetype":"bdist_wheel","filename":"native-1.0-cp313-cp313-manylinux_2_17_x86_64.whl","url":"https://x/linux.whl"},
+            {"packagetype":"sdist","filename":"native-1.0.tar.gz","url":"https://x/native.tar.gz"}
+        ]}"#;
+        let net = Fixtures::default().with(api, body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/native@1.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("pypi matrix");
+        assert_eq!(
+            matrix
+                .preferred()
+                .map(|candidate| candidate.file_name.as_str()),
+            Some("native-1.0.tar.gz")
+        );
+    }
+
+    #[test]
+    fn pypi_yanked_universal_wheel_does_not_beat_a_healthy_sdist() {
+        let api = "https://pypi.org/pypi/yanked/1.0/json";
+        let body = br#"{"urls":[
+            {"packagetype":"bdist_wheel","filename":"yanked-1.0-py3-none-any.whl","url":"https://x/yanked.whl","yanked":true},
+            {"packagetype":"sdist","filename":"yanked-1.0.tar.gz","url":"https://x/healthy.tar.gz"}
+        ]}"#;
+        let net = Fixtures::default().with(api, body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/yanked@1.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("pypi matrix");
+        assert_eq!(
+            matrix.preferred().map(|candidate| candidate.url.as_str()),
+            Some("https://x/healthy.tar.gz")
+        );
+    }
+
+    #[test]
+    fn gem_without_a_ruby_build_has_no_targetless_preference() {
+        let body = br#"[{"number":"1.0","platform":"x86_64-linux"},{"number":"1.0","platform":"arm64-darwin"}]"#;
+        let net =
+            Fixtures::default().with("https://rubygems.org/api/v1/versions/native.json", body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:gem/native@1.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("gem matrix");
+        assert!(matrix.preferred().is_none());
+    }
+
+    #[test]
+    fn selector_uses_explicit_python_target_tags() {
+        let api = "https://pypi.org/pypi/native/1.0/json";
+        let body = br#"{"urls":[
+            {"packagetype":"bdist_wheel","filename":"native-1.0-cp313-cp313-macosx_14_0_arm64.whl","url":"https://x/mac.whl"},
+            {"packagetype":"bdist_wheel","filename":"native-1.0-cp313-cp313-manylinux_2_17_x86_64.whl","url":"https://x/linux.whl"},
+            {"packagetype":"sdist","filename":"native-1.0.tar.gz","url":"https://x/native.tar.gz"}
+        ]}"#;
+        let net = Fixtures::default().with(api, body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/native@1.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("pypi matrix");
+        let target = ArtifactTarget {
+            python_tags: vec!["cp313".into()],
+            abi_tags: vec!["cp313".into()],
+            python_platform_tags: vec!["manylinux_2_17_x86_64".into()],
+            ..ArtifactTarget::default()
+        };
+        assert_eq!(
+            matrix
+                .select(&target, &SelectionPolicy::default())
+                .map(|candidate| candidate.url.as_str()),
+            Some("https://x/linux.whl")
+        );
+    }
+
+    #[test]
+    fn selector_does_not_treat_a_py2_wheel_as_runtime_agnostic() {
+        let api = "https://pypi.org/pypi/legacy/1.0/json";
+        let body = br#"{"urls":[
+            {"packagetype":"bdist_wheel","filename":"legacy-1.0-py2-none-any.whl","url":"https://x/py2.whl"},
+            {"packagetype":"sdist","filename":"legacy-1.0.tar.gz","url":"https://x/legacy.tar.gz"}
+        ]}"#;
+        let net = Fixtures::default().with(api, body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/legacy@1.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("pypi matrix");
+        let target = ArtifactTarget {
+            python_tags: vec!["cp313".into(), "py3".into()],
+            abi_tags: vec!["cp313".into(), "abi3".into(), "none".into()],
+            python_platform_tags: vec!["any".into()],
+            ..ArtifactTarget::default()
+        };
+        assert_eq!(
+            matrix
+                .select(&target, &SelectionPolicy::default())
+                .map(|candidate| candidate.url.as_str()),
+            Some("https://x/legacy.tar.gz")
+        );
+    }
+
+    #[test]
+    fn selector_enforces_npm_os_cpu_and_libc_constraints() {
+        let body = br#"{"versions":{"1.0.0":{"os":["linux","!darwin"],"cpu":["x64"],"libc":"glibc","dist":{"tarball":"https://x/native.tgz"}}}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/native", body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:npm/native@1.0.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("npm matrix");
+        let linux = ArtifactTarget {
+            os: Some("linux".into()),
+            arch: Some("x86_64".into()),
+            libc: Some("glibc".into()),
+            ..ArtifactTarget::default()
+        };
+        assert!(matrix.select(&linux, &SelectionPolicy::default()).is_some());
+        let mac = ArtifactTarget {
+            os: Some("darwin".into()),
+            ..linux
+        };
+        assert!(matrix.select(&mac, &SelectionPolicy::default()).is_none());
+    }
+
+    #[test]
+    fn selector_enforces_python_and_node_runtime_versions() {
+        let pypi = br#"{"urls":[
+            {"packagetype":"bdist_wheel","filename":"runtime-1.0-py3-none-any.whl","url":"https://x/runtime.whl","requires_python":">=3.10"},
+            {"packagetype":"sdist","filename":"runtime-1.0.tar.gz","url":"https://x/runtime.tar.gz"}
+        ]}"#;
+        let npm = br#"{"versions":{"1.0.0":{"engines":{"node":">=20"},"dist":{"tarball":"https://x/runtime.tgz"}}}}"#;
+        let net = Fixtures::default()
+            .with("https://pypi.org/pypi/runtime/1.0/json", pypi)
+            .with("https://registry.npmjs.org/runtime", npm);
+        let cache = BlobCache::disabled();
+        let python = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/runtime@1.0".into()),
+            &net,
+            &cache,
+        )
+        .expect("pypi matrix");
+        let py39 = ArtifactTarget {
+            python_version: Some("3.9".into()),
+            ..ArtifactTarget::default()
+        };
+        assert_eq!(
+            python
+                .select(&py39, &SelectionPolicy::default())
+                .map(|candidate| candidate.url.as_str()),
+            Some("https://x/runtime.tar.gz")
+        );
+
+        let node = resolve_artifacts(
+            &RefLocator::Purl("pkg:npm/runtime@1.0.0".into()),
+            &net,
+            &cache,
+        )
+        .expect("npm matrix");
+        let node18 = ArtifactTarget {
+            node_version: Some("18.20.0".into()),
+            ..ArtifactTarget::default()
+        };
+        assert!(node.select(&node18, &SelectionPolicy::default()).is_none());
+        let node20 = ArtifactTarget {
+            node_version: Some("20.0.0".into()),
+            ..ArtifactTarget::default()
+        };
+        assert!(node.select(&node20, &SelectionPolicy::default()).is_some());
+    }
+
+    #[test]
+    fn allow_yanked_is_fallback_only() {
+        let api = "https://pypi.org/pypi/fallback/1.0/json";
+        let body = br#"{"urls":[
+            {"packagetype":"bdist_wheel","filename":"fallback-1.0-py3-none-any.whl","url":"https://x/yanked.whl","yanked":true},
+            {"packagetype":"sdist","filename":"fallback-1.0.tar.gz","url":"https://x/healthy.tar.gz"}
+        ]}"#;
+        let net = Fixtures::default().with(api, body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/fallback@1.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("pypi matrix");
+        assert_eq!(
+            matrix
+                .select(
+                    &ArtifactTarget::default(),
+                    &SelectionPolicy {
+                        allow_yanked: true,
+                        prefer_source: false,
+                    },
+                )
+                .map(|candidate| candidate.url.as_str()),
+            Some("https://x/healthy.tar.gz")
+        );
+    }
+
+    #[test]
+    fn declared_checksum_conflict_makes_candidate_unselectable() {
+        let body = br#"{"urls":[{"packagetype":"sdist","filename":"demo-1.0.tar.gz","url":"https://x/demo.tar.gz","digests":{"sha256":"aaaaaaaa"}}]}"#;
+        let net = Fixtures::default().with("https://pypi.org/pypi/demo/1.0/json", body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/demo@1.0?checksum=sha256:bbbbbbbb".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("pypi matrix");
+        assert!(matrix.preferred().is_none());
+        assert!(
+            matrix
+                .select(&ArtifactTarget::default(), &SelectionPolicy::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unsupported_declared_checksum_is_not_reported_as_ok() {
+        let url = "https://static.crates.io/crates/foo/foo-1.0.0.crate";
+        let net = Fixtures::default().with(url, b"REAL");
+        let reference = dep(
+            RefLocator::Purl("pkg:cargo/foo@1.0.0?checksum=sha1:0123456789abcdef".into()),
+            None,
+        );
+        let record = fetch_ref(&reference, &net, &BlobCache::disabled());
+        assert_eq!(record.outcome, Outcome::UnverifiablePin);
+        assert_eq!(record.pin_verified, None);
+    }
+
+    #[test]
+    fn one_supported_and_one_unsupported_checksum_is_unverifiable() {
+        let url = "https://static.crates.io/crates/foo/foo-1.0.0.crate";
+        let bytes = b"REAL";
+        let net = Fixtures::default().with(url, bytes);
+        let reference = dep(
+            RefLocator::Purl(format!(
+                "pkg:cargo/foo@1.0.0?checksum=blake2b-256:abcd,sha256:{}",
+                sha256_hex(bytes)
+            )),
+            None,
+        );
+        let record = fetch_ref(&reference, &net, &BlobCache::disabled());
+        assert_eq!(record.outcome, Outcome::UnverifiablePin);
+        assert_eq!(record.pin_verified, None);
+    }
+
+    #[test]
+    fn registry_candidate_refines_locator_and_verifies_its_checksum() {
+        let artifact = "https://files.pythonhosted.org/demo-1.0.tar.gz";
+        let bytes = b"artifact bytes";
+        let digest = sha256_hex(bytes);
+        let body = format!(
+            r#"{{"urls":[{{"packagetype":"sdist","filename":"demo-1.0.tar.gz","url":"{artifact}","digests":{{"sha256":"{digest}"}}}}]}}"#
+        );
+        let net = Fixtures::default()
+            .with("https://pypi.org/pypi/demo/1.0/json", body.as_bytes())
+            .with(artifact, bytes);
+        let record = fetch_ref(
+            &dep(RefLocator::Purl("pkg:pypi/demo@1.0".into()), None),
+            &net,
+            &BlobCache::disabled(),
+        );
+        assert_eq!(record.outcome, Outcome::Ok);
+        assert_eq!(record.pin_verified, Some(true));
+        assert!(record.locator.contains("checksum=sha256:"));
+        assert!(record.locator.contains("file_name=demo-1.0.tar.gz"));
+    }
+
+    #[test]
+    fn cargo_checksum_template_uses_the_sparse_index_record() {
+        let repository = "https://cargo.example.test/index";
+        let config = br#"{"dl":"https://cargo.example.test/files/{crate}/{version}/{sha256-checksum}.crate"}"#;
+        let index = br#"{"name":"serde","vers":"1.0.0","cksum":"abc123"}"#;
+        let net = Fixtures::default()
+            .with(&format!("{repository}/config.json"), config)
+            .with(&format!("{repository}/se/rd/serde"), index);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl(
+                "pkg:cargo/serde@1.0.0?repository_url=https:%2F%2Fcargo.example.test%2Findex"
+                    .into(),
+            ),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("cargo matrix");
+        let candidate = matrix.preferred().expect("cargo artifact");
+        assert_eq!(
+            candidate.url,
+            "https://cargo.example.test/files/serde/1.0.0/abc123.crate"
+        );
+        assert_eq!(
+            candidate.checksums.get("sha256").map(String::as_str),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn every_purl_candidate_carries_release_and_artifact_identity() {
+        let body = br#"{"urls":[{"packagetype":"sdist","filename":"demo-1.0.tar.gz","url":"https://x/demo.tar.gz"}]}"#;
+        let net = Fixtures::default().with("https://pypi.org/pypi/demo/1.0/json", body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/demo@1.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("matrix");
+        let candidate = &matrix.candidates[0];
+        assert_eq!(candidate.release_purl.as_deref(), Some("pkg:pypi/demo@1.0"));
+        assert_eq!(
+            candidate.artifact_purl.as_deref(),
+            Some("pkg:pypi/demo@1.0?file_name=demo-1.0.tar.gz")
+        );
     }
 }

@@ -9,7 +9,7 @@ BINARY = fletch
 # with "No rule to make target '-j'".
 CARGO = env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS cargo
 
-.PHONY: all build release test lint fix fmt install-precommit clean help
+.PHONY: all build release test test-purl-spec lint fix fmt install-precommit clean help
 
 all: build
 
@@ -21,6 +21,7 @@ help: ## Show this help
 	@echo "  build              - Build in debug mode (default)"
 	@echo "  release            - Build in release mode"
 	@echo "  test               - Run all tests"
+	@echo "  test-purl-spec     - Run the authoritative vectors in PURL_SPEC_DIR"
 	@echo "  lint               - Run clippy with warnings denied"
 	@echo "  fix                - Auto-fix clippy lints, then format with rustfmt"
 	@echo "  fmt                - Format code with rustfmt"
@@ -35,6 +36,10 @@ release:
 
 test:
 	$(CARGO) test
+
+test-purl-spec:
+	test -n "$(PURL_SPEC_DIR)"
+	PURL_SPEC_DIR="$(PURL_SPEC_DIR)" $(CARGO) test --test purl_spec
 
 lint:
 	$(CARGO) clippy --all-targets -- -D warnings

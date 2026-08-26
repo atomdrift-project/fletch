@@ -212,6 +212,11 @@ pub fn registry_with_sources(
 /// keys on.
 #[must_use]
 pub fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
+    let canonical = crate::purl::normalize(purl)?;
+    parse_canonical_purl(&canonical)
+}
+
+fn parse_canonical_purl(purl: &str) -> Option<(String, String, Option<String>)> {
     // Scheme and type are case-insensitive per spec; the shared splitter folds
     // their case and trims, so any spelling `purl::normalize` accepts parses.
     let (ty, rest) = crate::purl::scheme_type_rest(purl)?;
@@ -228,15 +233,7 @@ pub fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
     let (path, version) = bare
         .rsplit_once('@')
         .map_or((bare, None), |(p, v)| (p, Some(v.to_string())));
-    // Tolerate the non-spec `?qualifiers@version` ordering older hopper exports
-    // emitted (a version appended to a qualifier-bearing purl_base): a trailing
-    // `@<v>` inside the qualifier tail is the misplaced version when `<v>` is
-    // free of `=`/`&`/`/`, any of which would mark it as part of a qualifier
-    // value instead.
-    let version = version.or_else(|| {
-        let (_, v) = quals?.rsplit_once('@')?;
-        (!v.is_empty() && !v.contains(['=', '&', '/'])).then(|| v.to_string())
-    });
+    let _ = quals;
     Some((ty.to_string(), path.to_string(), version))
 }
 
@@ -3981,18 +3978,37 @@ mod tests {
         // Spec order: `@version` before `?qualifiers`.
         assert_eq!(
             parse_purl("pkg:alpm/arch/yay@1.0-1?repository_url=https://aur.archlinux.org"),
-            Some(("alpm".into(), "arch/yay".into(), Some("1.0-1".into())))
+            Some(("alpm".into(), "aur/yay".into(), Some("1.0-1".into())))
         );
         // The non-spec `?qualifiers@version` ordering older hopper exports
         // emitted: the trailing version is still recovered.
         assert_eq!(
             parse_purl("pkg:alpm/arch/yay?repository_url=https://aur.archlinux.org@1.0-1"),
-            Some(("alpm".into(), "arch/yay".into(), Some("1.0-1".into())))
+            Some(("alpm".into(), "aur/yay".into(), Some("1.0-1".into())))
         );
         // A qualifier value containing `@` (URL userinfo) is not a version.
         assert_eq!(
             parse_purl("pkg:alpm/arch/yay?repository_url=https://user@example.com/repo"),
             Some(("alpm".into(), "arch/yay".into(), None))
         );
+    }
+
+    #[test]
+    fn parse_purl_canonicalizes_a_versionless_literal_npm_scope() {
+        assert_eq!(
+            parse_purl("pkg:npm/@scope/name"),
+            Some(("npm".into(), "%40scope/name".into(), None))
+        );
+    }
+
+    #[test]
+    fn registry_parser_rejects_type_prohibited_namespaces() {
+        for invalid in [
+            "pkg:pypi/namespace/name@1",
+            "pkg:gem/namespace/name@1",
+            "pkg:cargo/namespace/name@1",
+        ] {
+            assert_eq!(parse_purl(invalid), None, "{invalid}");
+        }
     }
 }

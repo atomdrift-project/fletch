@@ -83,6 +83,29 @@ Add it as a git dependency (the same pin consumers use):
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }
 ```
 
+### PURL identity and artifacts
+
+`purl::Purl` is the validated representation used at the fetch boundary.
+`Purl::parse` follows Postel's law for safe, common legacy spellings and emits
+one canonical PURL; `Purl::parse_strict` implements the purl-spec parse contract
+without compatibility repairs. Three identities are intentionally distinct:
+
+- `purl::identity` is the broad, backward-compatible package lookup key.
+- `purl::release_identity` retains qualifiers that distinguish a release.
+- `ArtifactCandidate::artifact_purl` identifies one exact file, including its
+  selectors and registry-published checksums.
+
+Use `fetch::resolve_artifacts` when a release can publish more than one file.
+Its `ArtifactMatrix` enumerates filenames, URLs, checksums, platform/ABI tags,
+and runtime constraints. `ArtifactMatrix::select` applies an explicit
+`ArtifactTarget` and `SelectionPolicy`; the older single-URL fetch API keeps a
+deterministic best-effort choice for compatibility.
+
+PURL-to-URL-to-PURL is tested bidirectionally for registries whose artifact URL
+contains enough information to recover the coordinate. PyPI content-hash paths,
+mutable tags, and other lossy URL schemes are tested through registry-backed
+exact artifact identities instead; they are not falsely presented as bijective.
+
 ## Caching
 
 Fetched blobs are cached on disk and reclaimed in the background — best-effort,
@@ -100,6 +123,7 @@ can perform the reclamation.
 ```bash
 make release        # release binary in target/release/fletch
 make test           # run the test suite
+make test-purl-spec PURL_SPEC_DIR=../purl-spec
 ```
 
 Requires Rust 1.94+.
