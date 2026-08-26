@@ -800,7 +800,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.3.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#0921a065878c83ec9870eb0a8e0083a28a61da42"
+source = "git+https://github.com/atomdrift-project/filefacts.git#173e17b508cd8bc7adc0e8dc7d37228a929fb269"
 dependencies = [
  "aho-corasick",
  "cfb",
@@ -2778,7 +2778,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.9.0"
-source = "git+https://github.com/atomdrift-project/stng.git#9eceb4b85fc270e61bb8e0e247113a79c07a49ef"
+source = "git+https://github.com/atomdrift-project/stng.git#bd4e6ef9b4645e733e3e44ef38ac2924dfd77ca5"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3314,7 +3314,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#0921a065878c83ec9870eb0a8e0083a28a61da42"
+source = "git+https://github.com/atomdrift-project/filefacts.git#173e17b508cd8bc7adc0e8dc7d37228a929fb269"
 dependencies = [
  "cc",
  "tree-sitter",
