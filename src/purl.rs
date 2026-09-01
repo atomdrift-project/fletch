@@ -539,9 +539,33 @@ fn parse_purl_components(raw: &str, allow_legacy_version_order: bool) -> Option<
 
     // Older atomdrift producers emitted `?qualifiers@version`. Preserve that
     // compatibility repair before applying the standard coordinate split.
+    //
+    // Only where the coordinate has no version of its own. Those producers
+    // appended the version because there was nowhere else for it to go, so a
+    // coordinate that already carries one was never written by them, and a
+    // trailing `@…` in the qualifier string is then part of a qualifier VALUE —
+    // a repository_url with userinfo or a tagged path. Repairing it anyway
+    // moved that fragment out of the value and swallowed the real version into
+    // the name: `pkg:npm/lodash@1.0.0?repository_url=…@1.2-1` came back as
+    // `pkg:npm/lodash%401.0.0@1.2-1?…`, a coordinate for a package that does
+    // not exist. The standard reads the version out of the coordinate only,
+    // after qualifiers are split off at the first `?`, and hopper's twin has
+    // always applied this repair solely when the tail begins with `?`.
+    let coordinate_has_version = if typ.eq_ignore_ascii_case("npm")
+        && coordinate.starts_with('@')
+    {
+        // A leading `@` opens an npm scope, not a version; the version can only
+        // follow the `/` that closes it.
+        coordinate
+            .find('/')
+            .is_some_and(|scope_end| coordinate[scope_end + 1..].contains('@'))
+    } else {
+        coordinate.contains('@')
+    };
     let mut repaired_qualifiers = raw_qualifiers;
     let mut repaired_version = None;
     if allow_legacy_version_order
+        && !coordinate_has_version
         && let Some(qualifiers) = raw_qualifiers
         && let Some((before, version)) = qualifiers.rsplit_once('@')
         && !version.is_empty()

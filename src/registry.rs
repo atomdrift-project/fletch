@@ -154,9 +154,19 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // `vscode-extension` is the ratified type; the OS types carry the distro
         // in the namespace (`pkg:deb/debian/curl`).
         // vscode-extension covers both stores; Open VSX is flagged by the
-        // `repository_url` qualifier (dropped by parse_purl, so read off the raw).
+        // `repository_url` qualifier, which parse_purl drops.
+        //
+        // Read it off the NORMALIZED form, not the raw input. The legacy
+        // `pkg:openvsx/<pub>/<ext>` spelling carries the store in its type and
+        // has no qualifier at all, and normalization is precisely what turns
+        // the one into the other — so testing the raw string missed every
+        // legacy-spelled extension and fetched it from Microsoft's marketplace
+        // instead of Open VSX. Normalization is the authority on what a
+        // coordinate means; routing should ask it rather than pattern-match the
+        // text a caller happened to type.
         "vscode-extension" => {
-            if purl.contains("open-vsx.org") {
+            let canonical = crate::purl::normalize(purl);
+            if canonical.as_deref().unwrap_or(purl).contains("open-vsx.org") {
                 openvsx(&path, version, net, cache)
             } else {
                 vscode(&path, net, cache)
