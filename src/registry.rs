@@ -166,7 +166,11 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // text a caller happened to type.
         "vscode-extension" => {
             let canonical = crate::purl::normalize(purl);
-            if canonical.as_deref().unwrap_or(purl).contains("open-vsx.org") {
+            if canonical
+                .as_deref()
+                .unwrap_or(purl)
+                .contains("open-vsx.org")
+            {
                 openvsx(&path, version, net, cache)
             } else {
                 vscode(&path, net, cache)

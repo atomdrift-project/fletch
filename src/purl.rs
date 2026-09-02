@@ -551,9 +551,7 @@ fn parse_purl_components(raw: &str, allow_legacy_version_order: bool) -> Option<
     // not exist. The standard reads the version out of the coordinate only,
     // after qualifiers are split off at the first `?`, and hopper's twin has
     // always applied this repair solely when the tail begins with `?`.
-    let coordinate_has_version = if typ.eq_ignore_ascii_case("npm")
-        && coordinate.starts_with('@')
-    {
+    let coordinate_has_version = if typ.eq_ignore_ascii_case("npm") && coordinate.starts_with('@') {
         // A leading `@` opens an npm scope, not a version; the version can only
         // follow the `/` that closes it.
         coordinate
