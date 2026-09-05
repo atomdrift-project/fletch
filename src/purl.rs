@@ -702,10 +702,24 @@ fn decode_component(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+/// The purl-spec type definitions' namespace rule, with one deliberate
+/// departure.
+///
+/// The spec marks `golang`'s namespace required, which encodes a module path
+/// as `namespace/name` and leaves no spelling for a module whose path is a
+/// single segment. Those exist and are fetched from the proxy like any other:
+/// `tailscale.com`, `gioui.org`, `goji.io`, `collectd.org`, `go.m3o.com`.
+/// Following the spec here rejected every one of them as "not a package URL"
+/// — measured 2026-09-05, twenty times a day from the precache alone — and
+/// left their proxy download URLs unrecognizable to [`url_to_purl`]. So for
+/// `golang` the namespace is optional: absent, the name is the whole module
+/// path. Hopper's `pkgparse.purlNamespaceRequirement` makes the same
+/// departure and must keep making it, or a coordinate one side keys the other
+/// refuses.
 fn namespace_requirement(typ: &str) -> i8 {
     match typ {
-        "alpm" | "apk" | "bitbucket" | "composer" | "deb" | "git" | "github" | "golang"
-        | "huggingface" | "maven" | "qpkg" | "rpm" | "swift" | "vscode-extension" => 1,
+        "alpm" | "apk" | "bitbucket" | "composer" | "deb" | "git" | "github" | "huggingface"
+        | "maven" | "qpkg" | "rpm" | "swift" | "vscode-extension" => 1,
         "bazel" | "bitnami" | "cargo" | "chrome-extension" | "cocoapods" | "conda" | "cran"
         | "gem" | "hackage" | "julia" | "mlflow" | "nuget" | "oci" | "opam" | "otp" | "pub"
         | "pypi" | "vcpkg" => -1,
@@ -1501,6 +1515,17 @@ mod normalize_tests {
                 "pkg:generic/bitwarderl?checksum=sha1:ad9503%2csha256:41bf",
                 "pkg:generic/bitwarderl?checksum=sha1:ad9503%2Csha256:41bf",
             ),
+            // A Go module whose path is one segment has no namespace to give.
+            // The spec calls the namespace required; see namespace_requirement
+            // for why this project does not.
+            (
+                "pkg:golang/tailscale.com@v1.102.3",
+                "pkg:golang/tailscale.com@v1.102.3",
+            ),
+            (
+                "pkg:GOLANG/goji.io@v2.0.0%2Bincompatible",
+                "pkg:golang/goji.io@v2.0.0%2Bincompatible",
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(norm(input), expected, "canonicalize {input}");
@@ -1516,7 +1541,6 @@ mod normalize_tests {
             "pkg:pypi/namespace/name@1",
             "pkg:gem/namespace/name@1",
             "pkg:cargo/namespace/name@1",
-            "pkg:golang/name@1",
             "pkg:golang/example.com/name#safe%2Fescape",
             "pkg:npm/name@bad%2",
         ] {
