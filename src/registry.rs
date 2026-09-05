@@ -19,8 +19,8 @@ use serde_json::Value;
 
 use crate::distro;
 use crate::fetch::{
-    BlobCache, Fetch, RecordedSource, cached_metadata, cached_metadata_with, cached_post,
-    goproxy_escape, safe_coordinate,
+    BlobCache, Fetch, RecordedSource, cached_metadata, cached_metadata_status,
+    cached_metadata_with, cached_post, goproxy_escape, percent_decode, safe_coordinate,
 };
 use filefacts::{RefLocator, Registry};
 
@@ -731,6 +731,9 @@ fn gem(name: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
 /// document with the version and its commit time — the only registry facts Go
 /// exposes. The module path is GOPROXY case-encoded. `Origin.URL` recovers the
 /// backing VCS repository.
+///
+/// A release the proxy will not serve falls back to the module's own `@latest`
+/// record; see the comment on that path for why.
 fn golang(
     path: &str,
     version: Option<&str>,
@@ -738,16 +741,83 @@ fn golang(
     cache: &BlobCache,
 ) -> Option<Registry> {
     let escaped = goproxy_escape(path);
-    let url = match version {
-        Some(v) => format!(
-            "https://proxy.golang.org/{escaped}/@v/{}.info",
-            goproxy_escape(v)
-        ),
-        None => format!("https://proxy.golang.org/{escaped}/@latest"),
-    };
-    let doc = json_meta(&url, net, cache)?;
+    let latest_url = format!("https://proxy.golang.org/{escaped}/@latest");
 
-    Some(Registry {
+    // A versionless lookup asks the proxy what the current release is, so the
+    // answer names itself in both fields.
+    let Some(version) = version else {
+        let mut record = golang_record(path, &json_meta(&latest_url, net, cache)?);
+        record.latest_version = Some(record.version.clone()).filter(|v| !v.is_empty());
+        record.version_removed = Some(false);
+        record.security_hold = Some(false);
+        return Some(record);
+    };
+
+    // Kept as a status rather than a document, because a refusal is the answer
+    // here and `.ok()` would throw away which refusal it was.
+    let info = cached_metadata_status(
+        &format!(
+            "https://proxy.golang.org/{escaped}/@v/{}.info",
+            goproxy_escape(version)
+        ),
+        &[],
+        net,
+        cache,
+    );
+    if let Ok(bytes) = &info
+        && let Ok(doc) = serde_json::from_slice::<Value>(bytes)
+    {
+        let mut record = golang_record(path, &doc);
+        record.version_removed = Some(false);
+        record.security_hold = Some(false);
+        return Some(record);
+    }
+
+    // The proxy would not serve this release's `.info`, so it will not serve
+    // its `.zip` either: both come from the same index entry, and a retracted,
+    // withdrawn, withheld, or never-published version is missing from both.
+    //
+    // Every other ecosystem already survives that. npm, PyPI, crates.io and
+    // RubyGems each answer the *package* document from an endpoint that is not
+    // the artifact, so a release whose bytes are gone still yields registry
+    // facts a caller can scan instead. Go's `.info` is the artifact's own
+    // neighbour, so without this a missing release yielded no record at all —
+    // and a caller with nothing to fall back on has to report a server fault
+    // where it should be reporting a missing artifact.
+    //
+    // `version_removed` is set from the same evidence npm's is: the registry
+    // knows the module and does not offer this release. A transient failure
+    // reaching `.info` also lands here, and costs a metadata-only answer about
+    // a release that was in fact fetchable — the safe direction to be wrong in.
+    let mut record = golang_record(path, &json_meta(&latest_url, net, cache)?);
+    record.latest_version = Some(std::mem::take(&mut record.version)).filter(|v| !v.is_empty());
+    // The release asked about, not the one the proxy offered instead. Its
+    // publish time is not knowable: it lives in the record being withheld.
+    record.version = percent_decode(version);
+    record.published_at = None;
+    record.version_removed = Some(true);
+    // The Go analogue of npm's `security holding package` tombstone.
+    //
+    // The proxy separates the two things a missing release can mean, and only
+    // the status carries the distinction: 404 for a version it does not have,
+    // 403 for one it will not serve — "the module proxy considers this module
+    // to be malicious", in its own words. Without reading it the fallback
+    // above would report a module Go has taken down as quietly unpublished,
+    // and scan treats `security_hold` as a hostile signal precisely so it does
+    // not have to.
+    record.security_hold = Some(info.err() == Some(Some(GOPROXY_WITHHELD)));
+    Some(record)
+}
+
+/// The status proxy.golang.org answers for a module it has taken down for
+/// malware, as against the 404 it gives for one it simply does not hold.
+const GOPROXY_WITHHELD: u16 = 403;
+
+/// The registry facts one proxy document carries. `version_removed` and
+/// `latest_version` are left to the caller, the only side that knows whether
+/// this document describes the release that was asked about.
+fn golang_record(path: &str, doc: &Value) -> Registry {
+    Registry {
         ecosystem: "golang".into(),
         name: path.to_string(),
         version: doc
@@ -764,7 +834,7 @@ fn golang(
             .and_then(Value::as_str)
             .map(str::to_string),
         ..Default::default()
-    })
+    }
 }
 
 /// GitHub: a `pkg:github/<owner>/<repo>` reference has no package registry — the
@@ -3055,6 +3125,112 @@ mod tests {
         )
         .expect("registry");
         assert_eq!(r.version, "v4.4.0+incompatible");
+        assert_eq!(r.version_removed, Some(false));
+    }
+
+    /// A release the proxy will not serve still yields the module's record,
+    /// marked removed — the same shape npm answers with for an unpublished
+    /// version, and what lets a caller scan metadata instead of reporting a
+    /// fault it cannot act on.
+    #[test]
+    fn golang_unservable_version_falls_back_to_the_module_record() {
+        let latest = serde_json::json!({
+            "Version": "v1.5.9", "Time": "2021-04-23T10:00:00Z",
+            "Origin": {"VCS": "git", "URL": "https://gitlab.com/NebulousLabs/Sia"}
+        })
+        .to_string();
+        // Only `@latest` answers: the retracted release's `.info` is absent,
+        // exactly as the proxy serves it.
+        let net = Fixtures::default().with(
+            "https://proxy.golang.org/gitlab.com/!nebulous!labs/!sia/@latest",
+            latest.as_bytes(),
+        );
+        let cache = BlobCache::disabled();
+        let r = golang(
+            "gitlab.com/NebulousLabs/Sia",
+            Some("v1.5.5-rc2"),
+            &net,
+            &cache,
+        )
+        .expect("registry");
+        assert_eq!(r.version, "v1.5.5-rc2", "the release asked about");
+        assert_eq!(r.latest_version.as_deref(), Some("v1.5.9"));
+        assert_eq!(r.version_removed, Some(true));
+        assert_eq!(r.published_at, None, "not knowable without the .info");
+        assert_eq!(
+            r.repository.as_deref(),
+            Some("https://gitlab.com/NebulousLabs/Sia")
+        );
+        assert_eq!(r.security_hold, Some(false), "absent, not withheld");
+    }
+
+    /// The proxy's malware refusal is a verdict, not an absence. Without this
+    /// the fallback above would report a module Go has taken down as merely
+    /// unpublished, and scan's registry signals — which read `security_hold`
+    /// as hostile — would see nothing at all.
+    #[test]
+    fn golang_proxy_security_refusal_is_a_hold() {
+        let latest = serde_json::json!({
+            "Version": "v0.74.0", "Time": "2026-08-14T10:24:58Z",
+            "Origin": {"VCS": "git", "URL": "https://github.com/aquasecurity/trivy"}
+        })
+        .to_string();
+        // proxy.golang.org answers 403 here. The body explains it to a human
+        // ("SECURITY ERROR / The module proxy considers this module to be
+        // malicious"), but an HTTP client discards the body of a refusal, so
+        // the status is the whole of what reaches us — which is what this
+        // fixture reproduces.
+        let net = Fixtures::default()
+            .refusing(
+                "https://proxy.golang.org/github.com/aquasecurity/trivy/@v/v0.69.4.info",
+                403,
+            )
+            .with(
+                "https://proxy.golang.org/github.com/aquasecurity/trivy/@latest",
+                latest.as_bytes(),
+            );
+        let cache = BlobCache::disabled();
+        let r = golang(
+            "github.com/aquasecurity/trivy",
+            Some("v0.69.4"),
+            &net,
+            &cache,
+        )
+        .expect("registry");
+        assert_eq!(r.version, "v0.69.4");
+        assert_eq!(r.security_hold, Some(true));
+        assert_eq!(r.version_removed, Some(true), "no bytes either way");
+    }
+
+    /// And the ordinary refusal is not one. 404 is what the proxy says about
+    /// the great majority of releases poppy asks for and cannot get; reading
+    /// that as a malware verdict would drown the real ones.
+    #[test]
+    fn golang_missing_version_is_not_a_hold() {
+        let latest = serde_json::json!({"Version": "v1.5.9"}).to_string();
+        let net = Fixtures::default()
+            .refusing(
+                "https://proxy.golang.org/example.com/m/@v/v9.9.9.info",
+                404,
+            )
+            .with(
+                "https://proxy.golang.org/example.com/m/@latest",
+                latest.as_bytes(),
+            );
+        let cache = BlobCache::disabled();
+        let r = golang("example.com/m", Some("v9.9.9"), &net, &cache).expect("registry");
+        assert_eq!(r.version_removed, Some(true));
+        assert_eq!(r.security_hold, Some(false));
+    }
+
+    /// A module the proxy does not know at all is still `None`: there is no
+    /// package here to report facts about, and inventing one would turn "not a
+    /// module" into "a module with nothing in it".
+    #[test]
+    fn golang_unknown_module_stays_unknown() {
+        let net = Fixtures::default();
+        let cache = BlobCache::disabled();
+        assert!(golang("example.invalid/nope", Some("v1.0.0"), &net, &cache).is_none());
     }
 
     #[test]

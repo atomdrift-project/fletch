@@ -885,6 +885,26 @@ pub(crate) fn cached_metadata_with(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<Vec<u8>> {
+    cached_metadata_status(url, headers, net, cache).ok()
+}
+
+/// [`cached_metadata_with`], keeping the status of a refusal.
+///
+/// A registry that answers a metadata request with a status instead of a
+/// document is sometimes *saying* something about the package rather than
+/// failing to answer: proxy.golang.org replies 403 to a release it has taken
+/// down for malware, which is a fact worth recording and not a lookup that
+/// went wrong. [`cached_metadata`] cannot express the difference — every
+/// unhappy path is the same `None`.
+///
+/// `Err(Some(status))` is a server that answered and refused; `Err(None)` is
+/// one that could not be reached, with nothing cached to fall back on.
+pub(crate) fn cached_metadata_status(
+    url: &str,
+    headers: &[(&str, &str)],
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Vec<u8>, Option<u16>> {
     let key = if headers.is_empty() {
         sha256_hex(format!("meta:{url}").as_bytes())
     } else {
@@ -909,7 +929,7 @@ pub(crate) fn cached_post(
     cache: &BlobCache,
 ) -> Option<Vec<u8>> {
     let key = sha256_hex(format!("post:{url}:{}", sha256_hex(body)).as_bytes());
-    cached_document(&key, url, cache, || net.post(url, body, headers))
+    cached_document(&key, url, cache, || net.post(url, body, headers)).ok()
 }
 
 /// The metadata cache flow every registry read shares: serve a fresh entry,
@@ -917,20 +937,34 @@ pub(crate) fn cached_post(
 /// cached copy however old — an unreachable source still beats no answer.
 /// Whatever is served is handed to the cache's recorder, so a caller archiving
 /// provenance sees the document exactly once per read.
+///
+/// `Err` carries the refusal's status where the server gave one, so a caller
+/// that can read meaning into it — see [`cached_metadata_status`] — is not
+/// forced to re-issue the request to find out.
 fn cached_document(
     key: &str,
     url: &str,
     cache: &BlobCache,
     send: impl FnOnce() -> Result<Fetched, FetchError>,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, Option<u16>> {
     if let Some((bytes, meta)) = cache.fresh(key, cache.meta_ttl) {
         cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
-        return Some(bytes);
+        return Ok(bytes);
     }
-    let Ok(f) = send() else {
-        let (bytes, meta) = cache.any(key)?;
-        cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
-        return Some(bytes);
+    let f = match send() {
+        Ok(f) => f,
+        Err(e) => {
+            // A stale copy still beats no answer, and outranks the refusal:
+            // the document was true once, where the status is only true now.
+            if let Some((bytes, meta)) = cache.any(key) {
+                cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
+                return Ok(bytes);
+            }
+            return Err(match e {
+                FetchError::Status(status) => Some(status),
+                _ => None,
+            });
+        }
     };
     let meta = CachedMeta {
         fetched_at: now(),
@@ -941,7 +975,7 @@ fn cached_document(
     };
     cache.put(key, &f.bytes, &meta);
     cache.record(url, meta.status, content_type_of(&meta.headers), &f.bytes);
-    Some(f.bytes)
+    Ok(f.bytes)
 }
 
 /// Resolve, fetch (or serve from cache), verify, and record provenance for
@@ -3294,6 +3328,7 @@ fn map_send_err(e: reqwest::Error) -> FetchError {
 #[derive(Debug, Default, Clone)]
 pub struct Fixtures {
     responses: HashMap<String, Fetched>,
+    refusals: HashMap<String, u16>,
 }
 
 impl Fixtures {
@@ -3301,6 +3336,15 @@ impl Fixtures {
     #[must_use]
     pub fn with(self, url: &str, bytes: &[u8]) -> Self {
         self.with_headers(url, bytes, &[])
+    }
+
+    /// Register `url` as a refusal carrying `status`, the way a real client
+    /// reports one: an error, with no body reaching the caller. A registry's
+    /// refusal is sometimes an answer, so a test has to be able to spell one.
+    #[must_use]
+    pub fn refusing(mut self, url: &str, status: u16) -> Self {
+        self.refusals.insert(url.to_string(), status);
+        self
     }
 
     /// Register a 200 response with explicit headers.
@@ -3325,6 +3369,9 @@ impl Fixtures {
 
 impl Fetch for Fixtures {
     fn get(&self, url: &str) -> Result<Fetched, FetchError> {
+        if let Some(status) = self.refusals.get(url) {
+            return Err(FetchError::Status(*status));
+        }
         self.responses
             .get(url)
             .cloned()
