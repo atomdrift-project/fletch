@@ -385,6 +385,17 @@ pub trait Fetch {
         self.get(url)
     }
 
+    /// [`get_with`](Self::get_with), but a status the server *answered* with
+    /// comes back as the [`Fetched`] it is — status and body — instead of
+    /// [`FetchError::Status`]. For the one registry whose refusal body says
+    /// something: proxy.golang.org's 404 names the module path it would have
+    /// accepted (see [`goproxy_canonical_path`]). The default keeps the plain
+    /// behaviour, so a backend that has not opted in still reports refusals
+    /// as errors and nothing downstream changes for it.
+    fn get_any_status(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
+        self.get_with(url, headers)
+    }
+
     /// POST `body` with the given `(name, value)` headers and return the
     /// response. Defaults to unsupported; a backend overrides it only when a
     /// registry needs it — e.g. the VS Code Marketplace's JSON-RPC query, which
@@ -888,6 +899,26 @@ pub(crate) fn cached_metadata_with(
     cached_metadata_status(url, headers, net, cache).ok()
 }
 
+/// The cache key [`cached_metadata`] files a header-less read of `url` under.
+pub(crate) fn metadata_cache_key(url: &str) -> String {
+    sha256_hex(format!("meta:{url}").as_bytes())
+}
+
+/// File a response under [`cached_metadata`]'s key for `url`, so a later
+/// header-less read of the same document is a cache hit. For a caller that
+/// already has the bytes in hand for another reason and would otherwise make
+/// the registry answer twice.
+pub(crate) fn store_metadata(url: &str, fetched: &Fetched, cache: &BlobCache) {
+    let meta = CachedMeta {
+        fetched_at: now(),
+        status: fetched.status,
+        final_url: fetched.final_url.clone(),
+        redirects: fetched.redirects.clone(),
+        headers: fetched.headers.clone(),
+    };
+    cache.put(&metadata_cache_key(url), &fetched.bytes, &meta);
+}
+
 /// [`cached_metadata_with`], keeping the status of a refusal.
 ///
 /// A registry that answers a metadata request with a status instead of a
@@ -906,7 +937,7 @@ pub(crate) fn cached_metadata_status(
     cache: &BlobCache,
 ) -> Result<Vec<u8>, Option<u16>> {
     let key = if headers.is_empty() {
-        sha256_hex(format!("meta:{url}").as_bytes())
+        metadata_cache_key(url)
     } else {
         let joined = headers
             .iter()
@@ -1462,7 +1493,7 @@ pub fn resolve_artifacts(
                     "npm" => npm_artifacts(path, version, rest, net, cache),
                     "pypi" => pypi_artifacts(path, version, rest, net, cache),
                     "gem" => gem_artifacts(path, version, rest, net, cache),
-                    "golang" => deterministic_artifacts(&purl, rest, "zip"),
+                    "golang" => golang_artifacts(&purl, path, version, rest, net, cache),
                     "cargo" => cargo_artifacts(&purl, path, version, rest, net, cache),
                     _ => return None,
                 }
@@ -1514,6 +1545,150 @@ fn deterministic_artifacts(purl: &str, rest: &str, kind: &str) -> Vec<ArtifactCa
     }
     candidate.preferred = file_name_matches(rest, &candidate.file_name);
     vec![candidate]
+}
+
+/// Go module zips: the proxy's URL for the module path as written, unless
+/// the proxy's refusal names the spelling it wants ([`goproxy_canonical_path`]),
+/// in which case the candidate is built for that spelling.
+fn golang_artifacts(
+    purl: &str,
+    path: &str,
+    version: Option<&str>,
+    rest: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Vec<ArtifactCandidate> {
+    let resolved = goproxy_canonical_path(path, version, net, cache);
+    // `rest` opens with the path as written; anything after it (version,
+    // qualifiers, subpath) carries over unchanged.
+    let Some(tail) = (resolved.path != path)
+        .then(|| rest.strip_prefix(path))
+        .flatten()
+    else {
+        return deterministic_artifacts(purl, rest, "zip");
+    };
+    let canonical = format!("pkg:golang/{}{tail}", resolved.path);
+    let canonical_rest = &canonical["pkg:golang/".len()..];
+    deterministic_artifacts(&canonical, canonical_rest, "zip")
+}
+
+/// What [`goproxy_canonical_path`] learned about a module path.
+pub(crate) struct GoproxyPath {
+    /// The spelling the proxy serves: the path as given, or the case variant
+    /// its refusal named.
+    pub(crate) path: String,
+    /// When `path` is the path as given and the probe was a refusal with no
+    /// alternative in it, that status — so the caller need not ask the same
+    /// question again (each proxy miss costs it a second or more upstream).
+    pub(crate) refused: Option<u16>,
+}
+
+/// The spelling of a Go module path that proxy.golang.org will serve.
+///
+/// Module paths are case-sensitive and the proxy encodes uppercase as `!x`,
+/// but a PURL can arrive lowercased — a producer that normalizes names does
+/// it to every ecosystem alike — and then every request for
+/// `gitlab.com/nebulouslabs/sia` is a 404 that costs the proxy an upstream
+/// round trip (1–5 s, measured) and costs the caller the artifact: a
+/// metadata-only verdict on a package whose bytes were one letter-case away.
+/// The proxy's refusal body says which spelling it wanted, in one of two
+/// forms — a vanity/host import redirect (`meta tag gitlab.com/NebulousLabs/Sia
+/// did not match import path gitlab.com/nebulouslabs/sia`) or the module's own
+/// `go.mod` (`module declares its path as: X but was required as: Y`). Only
+/// a spelling that differs from the given one by letter case is accepted
+/// (a rename is a different module, not this one respelled), and the answer
+/// is cached for the metadata TTL so the miss is paid once per module.
+///
+/// A successful probe is filed under the `.info` / `@latest` document's
+/// own cache key, so the registry read that follows is a hit, not a second
+/// request.
+pub(crate) fn goproxy_canonical_path(
+    path: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> GoproxyPath {
+    let key = sha256_hex(format!("meta:goproxy-canonical:{path}").as_bytes());
+    if let Some((bytes, _)) = cache.fresh(&key, cache.meta_ttl)
+        && let Ok(known) = String::from_utf8(bytes)
+        && !known.is_empty()
+    {
+        return GoproxyPath {
+            path: known,
+            refused: None,
+        };
+    }
+    let escaped = goproxy_escape(path);
+    let url = match version {
+        Some(v) => format!(
+            "https://proxy.golang.org/{escaped}/@v/{}.info",
+            goproxy_escape(v)
+        ),
+        None => format!("https://proxy.golang.org/{escaped}/@latest"),
+    };
+    let Ok(fetched) = net.get_any_status(&url, &[]) else {
+        return GoproxyPath {
+            path: path.to_string(),
+            refused: None,
+        };
+    };
+    if (200..300).contains(&fetched.status) {
+        store_metadata(&url, &fetched, cache);
+        remember_goproxy_path(&key, path, &url, cache);
+        return GoproxyPath {
+            path: path.to_string(),
+            refused: None,
+        };
+    }
+    match goproxy_declared_path(path, &String::from_utf8_lossy(&fetched.bytes)) {
+        Some(canonical) => {
+            remember_goproxy_path(&key, &canonical, &url, cache);
+            GoproxyPath {
+                path: canonical,
+                refused: None,
+            }
+        }
+        None => GoproxyPath {
+            path: path.to_string(),
+            refused: Some(fetched.status),
+        },
+    }
+}
+
+fn remember_goproxy_path(key: &str, canonical: &str, url: &str, cache: &BlobCache) {
+    let meta = CachedMeta {
+        fetched_at: now(),
+        status: 200,
+        final_url: url.to_string(),
+        redirects: Vec::new(),
+        headers: Vec::new(),
+    };
+    cache.put(key, canonical.as_bytes(), &meta);
+}
+
+/// The module path a proxy.golang.org refusal names, when it is `given`
+/// respelled: the same path letter-case-insensitively, or a prefix of it
+/// (an import redirect names the repository module; the remainder of the
+/// given path is a package inside it and carries over).
+fn goproxy_declared_path(given: &str, body: &str) -> Option<String> {
+    const MARKERS: [&str; 2] = ["meta tag ", "module declares its path as: "];
+    let named = MARKERS.iter().find_map(|marker| {
+        let start = body.find(marker)? + marker.len();
+        let rest = &body[start..];
+        let end = rest
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(rest.len());
+        let candidate = rest[..end].trim_end_matches(',');
+        (!candidate.is_empty()).then(|| candidate.to_string())
+    })?;
+    if !safe_coordinate(&named) || named == given {
+        return None;
+    }
+    if named.eq_ignore_ascii_case(given) {
+        return Some(named);
+    }
+    let (head, tail) = given.split_at_checked(named.len())?;
+    (head.eq_ignore_ascii_case(&named) && tail.starts_with('/')).then(|| format!("{named}{tail}"))
 }
 
 fn cargo_artifacts(
@@ -2568,6 +2743,10 @@ fn resolved_target(
         // release and exact artifact. Use that identity for cache/provenance;
         // retain the pure resolver below as the offline compatibility path.
         let needs_matrix = ty == "pypi"
+            // Go: the proxy is case-sensitive and a PURL may not be; the
+            // matrix asks the proxy which spelling it serves
+            // (`golang_artifacts`), the pure resolver cannot.
+            || ty == "golang"
             || (ty == "npm"
                 && coordinate_version.is_none_or(|version| !npm_version_is_concrete(version)))
             || (ty == "gem" && coordinate_version.is_none())
@@ -3170,6 +3349,18 @@ impl HttpFetch {
     /// [`Fetch::get`] and [`Fetch::get_with`] funnel through here so the security
     /// floor is defined exactly once.
     fn get_inner(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
+        self.get_inner_opts(url, headers, false)
+    }
+
+    /// `any_status`: return a non-success response as a [`Fetched`] rather
+    /// than a [`FetchError::Status`]; redirects and the host guard apply
+    /// either way.
+    fn get_inner_opts(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        any_status: bool,
+    ) -> Result<Fetched, FetchError> {
         let mut current =
             reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
         let mut redirects = Vec::new();
@@ -3205,7 +3396,7 @@ impl HttpFetch {
                 current = next;
                 continue;
             }
-            if !status.is_success() {
+            if !status.is_success() && !any_status {
                 return Err(FetchError::Status(status.as_u16()));
             }
 
@@ -3230,6 +3421,10 @@ impl Fetch for HttpFetch {
 
     fn get_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
         self.get_inner(url, headers)
+    }
+
+    fn get_any_status(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
+        self.get_inner_opts(url, headers, true)
     }
 
     fn post(
@@ -3329,6 +3524,9 @@ fn map_send_err(e: reqwest::Error) -> FetchError {
 pub struct Fixtures {
     responses: HashMap<String, Fetched>,
     refusals: HashMap<String, u16>,
+    /// Bodies for refusals, served only through
+    /// [`get_any_status`](Fetch::get_any_status).
+    refusal_bodies: HashMap<String, Vec<u8>>,
 }
 
 impl Fixtures {
@@ -3344,6 +3542,15 @@ impl Fixtures {
     #[must_use]
     pub fn refusing(mut self, url: &str, status: u16) -> Self {
         self.refusals.insert(url.to_string(), status);
+        self
+    }
+    /// [`refusing`](Self::refusing), with the body the server sent along —
+    /// reachable only through [`get_any_status`](Fetch::get_any_status), the
+    /// way a real client exposes it.
+    #[must_use]
+    pub fn refusing_with_body(mut self, url: &str, status: u16, body: &[u8]) -> Self {
+        self.refusals.insert(url.to_string(), status);
+        self.refusal_bodies.insert(url.to_string(), body.to_vec());
         self
     }
 
@@ -3378,6 +3585,18 @@ impl Fetch for Fixtures {
             .ok_or_else(|| FetchError::Transport(format!("no fixture for {url}")))
     }
 
+    fn get_any_status(&self, url: &str, _headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
+        if let Some(status) = self.refusals.get(url) {
+            return Ok(Fetched {
+                bytes: self.refusal_bodies.get(url).cloned().unwrap_or_default(),
+                final_url: url.to_string(),
+                status: *status,
+                headers: Vec::new(),
+                redirects: Vec::new(),
+            });
+        }
+        self.get(url)
+    }
     /// A query's response is deterministic for its endpoint, so fixtures key on
     /// the URL and ignore the body.
     fn post(
@@ -4643,6 +4862,104 @@ mod tests {
 
         let pypi = dep(RefLocator::Purl("pkg:pypi/requests@2.0".into()), None);
         assert_eq!(fetch_ref(&pypi, &net, &cache).outcome, Outcome::Unresolved);
+    }
+
+    /// The proxy's refusal names the spelling it wanted; only a letter-case
+    /// respelling of the path asked for is taken as this module's.
+    #[test]
+    fn goproxy_declared_path_accepts_case_variants_only() {
+        let meta = "not found: gitlab.com/nebulouslabs/sia@v1.5.5: unrecognized import path \
+            \"gitlab.com/nebulouslabs/sia\": parse https://gitlab.com/nebulouslabs/sia?go-get=1: \
+            no go-import meta tags (meta tag gitlab.com/NebulousLabs/Sia did not match import \
+            path gitlab.com/nebulouslabs/sia)";
+        assert_eq!(
+            goproxy_declared_path("gitlab.com/nebulouslabs/sia", meta).as_deref(),
+            Some("gitlab.com/NebulousLabs/Sia")
+        );
+        // An import redirect names the repository module; a package inside
+        // it keeps its tail.
+        assert_eq!(
+            goproxy_declared_path("gitlab.com/nebulouslabs/sia/modules/host", meta).as_deref(),
+            Some("gitlab.com/NebulousLabs/Sia/modules/host")
+        );
+        let gomod = "go.mod has post-v0 module path: module declares its path as: \
+            github.com/BurntSushi/toml\n\tbut was required as: github.com/burntsushi/toml";
+        assert_eq!(
+            goproxy_declared_path("github.com/burntsushi/toml", gomod).as_deref(),
+            Some("github.com/BurntSushi/toml")
+        );
+        // A rename is another module, not this one respelled.
+        let renamed = "module declares its path as: github.com/IBM/sarama\n\tbut was \
+            required as: github.com/shopify/sarama";
+        assert_eq!(goproxy_declared_path("github.com/shopify/sarama", renamed), None);
+        // No hint at all.
+        assert_eq!(
+            goproxy_declared_path("github.com/hatch1fy/errors", "not found: could not read Username"),
+            None
+        );
+        // The spelling asked for is already the one named.
+        assert_eq!(
+            goproxy_declared_path("gitlab.com/NebulousLabs/Sia", meta),
+            None
+        );
+    }
+
+    /// A lowercased module path resolves through the refusal to the
+    /// spelling the proxy serves, and the zip candidate is built for it.
+    #[test]
+    fn golang_artifacts_recover_case_from_the_proxy_refusal() {
+        let body = "not found: gitlab.com/nebulouslabs/sia@v1.5.5: no go-import meta tags \
+            (meta tag gitlab.com/NebulousLabs/Sia did not match import path \
+            gitlab.com/nebulouslabs/sia)";
+        let net = Fixtures::default().refusing_with_body(
+            "https://proxy.golang.org/gitlab.com/nebulouslabs/sia/@v/v1.5.5.info",
+            404,
+            body.as_bytes(),
+        );
+        let cache = BlobCache::disabled();
+        let resolved = goproxy_canonical_path("gitlab.com/nebulouslabs/sia", Some("v1.5.5"), &net, &cache);
+        assert_eq!(resolved.path, "gitlab.com/NebulousLabs/Sia");
+        assert_eq!(resolved.refused, None);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:golang/gitlab.com/nebulouslabs/sia@v1.5.5".into()),
+            &net,
+            &cache,
+        )
+        .expect("matrix");
+        let urls: Vec<&str> = matrix.candidates.iter().map(|c| c.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            ["https://proxy.golang.org/gitlab.com/!nebulous!labs/!sia/@v/v1.5.5.zip"]
+        );
+    }
+
+    /// A refusal that names nothing is reported once, so the registry read
+    /// that follows does not ask the proxy the same question again.
+    #[test]
+    fn goproxy_canonical_path_reports_a_bare_refusal() {
+        let net = Fixtures::default().refusing_with_body(
+            "https://proxy.golang.org/github.com/hatch1fy/errors/@v/v0.2.0.info",
+            404,
+            b"not found: could not read Username",
+        );
+        let resolved = goproxy_canonical_path(
+            "github.com/hatch1fy/errors",
+            Some("v0.2.0"),
+            &net,
+            &BlobCache::disabled(),
+        );
+        assert_eq!(resolved.path, "github.com/hatch1fy/errors");
+        assert_eq!(resolved.refused, Some(404));
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:golang/github.com/hatch1fy/errors@v0.2.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("matrix");
+        assert_eq!(
+            matrix.candidates[0].url,
+            "https://proxy.golang.org/github.com/hatch1fy/errors/@v/v0.2.0.zip"
+        );
     }
 
     #[test]

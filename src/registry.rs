@@ -740,6 +740,11 @@ fn golang(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<Registry> {
+    // The spelling the proxy serves — a lowercased PURL is a 404 at the proxy
+    // for every request until the case is put back (see
+    // `goproxy_canonical_path`).
+    let resolved = crate::fetch::goproxy_canonical_path(path, version, net, cache);
+    let path = resolved.path.as_str();
     let escaped = goproxy_escape(path);
     let latest_url = format!("https://proxy.golang.org/{escaped}/@latest");
 
@@ -755,15 +760,21 @@ fn golang(
 
     // Kept as a status rather than a document, because a refusal is the answer
     // here and `.ok()` would throw away which refusal it was.
-    let info = cached_metadata_status(
-        &format!(
-            "https://proxy.golang.org/{escaped}/@v/{}.info",
-            goproxy_escape(version)
+    // The probe above already asked for this `.info`; when it was refused
+    // outright, that is the answer, and asking again would cost the proxy
+    // another upstream round trip for the same 404.
+    let info = match resolved.refused {
+        Some(status) => Err(Some(status)),
+        None => cached_metadata_status(
+            &format!(
+                "https://proxy.golang.org/{escaped}/@v/{}.info",
+                goproxy_escape(version)
+            ),
+            &[],
+            net,
+            cache,
         ),
-        &[],
-        net,
-        cache,
-    );
+    };
     if let Ok(bytes) = &info
         && let Ok(doc) = serde_json::from_slice::<Value>(bytes)
     {
@@ -3132,6 +3143,42 @@ mod tests {
     /// marked removed — the same shape npm answers with for an unpublished
     /// version, and what lets a caller scan metadata instead of reporting a
     /// fault it cannot act on.
+    /// A lowercased PURL reaches the proxy as a spelling it refuses; the
+    /// refusal names the real one and the record is that module's.
+    #[test]
+    fn golang_lowercased_path_resolves_to_the_proxy_spelling() {
+        let info = serde_json::json!({
+            "Version": "v1.5.5", "Time": "2021-04-23T10:00:00Z",
+            "Origin": {"VCS": "git", "URL": "https://gitlab.com/NebulousLabs/Sia"}
+        })
+        .to_string();
+        let net = Fixtures::default()
+            .refusing_with_body(
+                "https://proxy.golang.org/gitlab.com/nebulouslabs/sia/@v/v1.5.5.info",
+                404,
+                b"no go-import meta tags (meta tag gitlab.com/NebulousLabs/Sia did not match \
+                  import path gitlab.com/nebulouslabs/sia)",
+            )
+            .with(
+                "https://proxy.golang.org/gitlab.com/!nebulous!labs/!sia/@v/v1.5.5.info",
+                info.as_bytes(),
+            );
+        let r = golang(
+            "gitlab.com/nebulouslabs/sia",
+            Some("v1.5.5"),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("registry");
+        assert_eq!(r.name, "gitlab.com/NebulousLabs/Sia");
+        assert_eq!(r.version, "v1.5.5");
+        assert_eq!(r.version_removed, Some(false));
+        assert_eq!(
+            r.repository.as_deref(),
+            Some("https://gitlab.com/NebulousLabs/Sia")
+        );
+    }
+
     #[test]
     fn golang_unservable_version_falls_back_to_the_module_record() {
         let latest = serde_json::json!({
