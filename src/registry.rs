@@ -3256,10 +3256,7 @@ mod tests {
     fn golang_missing_version_is_not_a_hold() {
         let latest = serde_json::json!({"Version": "v1.5.9"}).to_string();
         let net = Fixtures::default()
-            .refusing(
-                "https://proxy.golang.org/example.com/m/@v/v9.9.9.info",
-                404,
-            )
+            .refusing("https://proxy.golang.org/example.com/m/@v/v9.9.9.info", 404)
             .with(
                 "https://proxy.golang.org/example.com/m/@latest",
                 latest.as_bytes(),

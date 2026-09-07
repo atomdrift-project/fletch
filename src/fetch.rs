@@ -389,7 +389,7 @@ pub trait Fetch {
     /// comes back as the [`Fetched`] it is — status and body — instead of
     /// [`FetchError::Status`]. For the one registry whose refusal body says
     /// something: proxy.golang.org's 404 names the module path it would have
-    /// accepted (see [`goproxy_canonical_path`]). The default keeps the plain
+    /// accepted (see `goproxy_canonical_path`). The default keeps the plain
     /// behaviour, so a backend that has not opted in still reports refusals
     /// as errors and nothing downstream changes for it.
     fn get_any_status(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
@@ -1675,9 +1675,7 @@ fn goproxy_declared_path(given: &str, body: &str) -> Option<String> {
     let named = MARKERS.iter().find_map(|marker| {
         let start = body.find(marker)? + marker.len();
         let rest = &body[start..];
-        let end = rest
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(rest.len());
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let candidate = rest[..end].trim_end_matches(',');
         (!candidate.is_empty()).then(|| candidate.to_string())
     })?;
@@ -4891,10 +4889,16 @@ mod tests {
         // A rename is another module, not this one respelled.
         let renamed = "module declares its path as: github.com/IBM/sarama\n\tbut was \
             required as: github.com/shopify/sarama";
-        assert_eq!(goproxy_declared_path("github.com/shopify/sarama", renamed), None);
+        assert_eq!(
+            goproxy_declared_path("github.com/shopify/sarama", renamed),
+            None
+        );
         // No hint at all.
         assert_eq!(
-            goproxy_declared_path("github.com/hatch1fy/errors", "not found: could not read Username"),
+            goproxy_declared_path(
+                "github.com/hatch1fy/errors",
+                "not found: could not read Username"
+            ),
             None
         );
         // The spelling asked for is already the one named.
@@ -4917,7 +4921,8 @@ mod tests {
             body.as_bytes(),
         );
         let cache = BlobCache::disabled();
-        let resolved = goproxy_canonical_path("gitlab.com/nebulouslabs/sia", Some("v1.5.5"), &net, &cache);
+        let resolved =
+            goproxy_canonical_path("gitlab.com/nebulouslabs/sia", Some("v1.5.5"), &net, &cache);
         assert_eq!(resolved.path, "gitlab.com/NebulousLabs/Sia");
         assert_eq!(resolved.refused, None);
         let matrix = resolve_artifacts(

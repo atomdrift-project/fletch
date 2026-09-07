@@ -42,6 +42,7 @@ test-purl-spec:
 	PURL_SPEC_DIR="$(PURL_SPEC_DIR)" $(CARGO) test --test purl_spec
 
 lint:
+	$(CARGO) fmt --all --check
 	$(CARGO) clippy --all-targets -- -D warnings
 
 # Auto-fix what clippy and rustfmt can fix on their own. Run fmt last so it
