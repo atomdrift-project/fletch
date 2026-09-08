@@ -1357,25 +1357,32 @@ fn record(
     meta: &CachedMeta,
 ) -> FetchRecord {
     let content_sha256 = sha256_hex(bytes);
-    let mut verifications = Vec::new();
-    if r.pinned_hash.is_some() {
-        verifications.push(verify_pin(r.pinned_hash.as_ref(), bytes, &content_sha256));
-    }
-    if purl_declares_checksum(&locator) {
-        verifications.push(verify_purl_checksum(&locator, bytes, &content_sha256));
-    }
-    let pin_verified = if verifications.is_empty() {
-        None
-    } else if verifications.contains(&Some(false)) {
-        Some(false)
-    } else if verifications.iter().any(Option::is_none) {
-        None
-    } else {
-        Some(true)
+    // Two independent digests can ride on one reference: the manifest's pin and
+    // a `checksum` qualifier the resolver refined into the locator. Either one
+    // disagreeing with the bytes is the verdict; failing that, either one
+    // agreeing is; only when neither could be computed is the pin unverified.
+    let pin_verified = match (
+        verify_pin(r.pinned_hash.as_ref(), bytes, &content_sha256),
+        verify_purl_checksum(&locator, bytes, &content_sha256),
+    ) {
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (None, None) => None,
     };
+    // A Go `h1:` is not a claim about these bytes — it hashes the module's file
+    // tree, not the zip we downloaded — so it never leaves a fetch sitting on
+    // `UnverifiablePin`, which is the label for an actionable gap rather than
+    // the standing state of an ecosystem. The digest still rides the record.
+    // Confirming it for real means Go's dirhash over the zip's entries, which
+    // needs a zip reader fletch does not have.
+    let declares_content_pin = r
+        .pinned_hash
+        .as_ref()
+        .is_some_and(|pin| pin.algo != HashAlgo::GoModH1)
+        || purl_declares_checksum(&locator);
     let outcome = if pin_verified == Some(false) {
         Outcome::PinMismatch
-    } else if pin_verified.is_none() && reference_declares_pin(r, &locator) {
+    } else if pin_verified.is_none() && declares_content_pin {
         Outcome::UnverifiablePin
     } else {
         Outcome::Ok
@@ -1398,24 +1405,6 @@ fn record(
         pin_verified,
         outcome,
     }
-}
-
-/// Whether a reference declares a digest *over the bytes this fetch returns*.
-///
-/// A Go `h1:` is deliberately excluded. It hashes the module's file tree, not
-/// the zip we downloaded, so no amount of hashing these bytes can ever confirm
-/// or refute it — reporting it as an unverified content pin marked every single
-/// `go.sum` dependency `pin unverifiable`, which is the label describing an
-/// actionable gap, not the standing state of an ecosystem. The digest stays on
-/// the record with `pin_verified: None` for machine consumers. Verifying it for
-/// real means computing Go's dirhash over the zip's entries, which needs a zip
-/// reader fletch does not have.
-fn reference_declares_pin(reference: &Reference, locator: &str) -> bool {
-    let content_pin = reference
-        .pinned_hash
-        .as_ref()
-        .is_some_and(|pin| pin.algo != HashAlgo::GoModH1);
-    content_pin || purl_declares_checksum(locator)
 }
 
 fn purl_declares_checksum(locator: &str) -> bool {
@@ -5695,6 +5684,35 @@ mod tests {
         let record = fetch_ref(&reference, &net, &BlobCache::disabled());
         assert_eq!(record.outcome, Outcome::Ok);
         assert_eq!(record.pin_verified, None);
+    }
+
+    /// The same rule the digest list follows, one level up: a manifest pin in
+    /// an algorithm we cannot compute must not erase a `checksum` qualifier
+    /// that did confirm the bytes.
+    #[test]
+    fn an_uncomputable_manifest_pin_does_not_erase_a_verified_checksum() {
+        let artifact = "https://files.pythonhosted.org/demo-1.0.tar.gz";
+        let bytes = b"artifact bytes";
+        let body = format!(
+            r#"{{"urls":[{{"packagetype":"sdist","filename":"demo-1.0.tar.gz","url":"{artifact}","digests":{{"sha256":"{}"}}}}]}}"#,
+            sha256_hex(bytes)
+        );
+        let net = Fixtures::default()
+            .with("https://pypi.org/pypi/demo/1.0/json", body.as_bytes())
+            .with(artifact, bytes);
+        let record = fetch_ref(
+            &dep(
+                RefLocator::Purl("pkg:pypi/demo@1.0".into()),
+                Some(PinnedHash {
+                    algo: HashAlgo::GoModH1,
+                    value: "NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=".into(),
+                }),
+            ),
+            &net,
+            &BlobCache::disabled(),
+        );
+        assert_eq!(record.outcome, Outcome::Ok);
+        assert_eq!(record.pin_verified, Some(true));
     }
 
     #[test]

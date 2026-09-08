@@ -1267,15 +1267,6 @@ struct UrlScan<'a> {
     rest: &'a str,
 }
 
-/// Drop trailing bytes that ended the *text*, not the URL. A URL lifted out of
-/// a shell script keeps the line-continuation backslash that followed it, and
-/// one lifted out of prose keeps the sentence punctuation; both then resolve to
-/// a path the server has never heard of. An empty `#` fragment names the same
-/// resource with or without it, so it goes too.
-fn trim_url_tail(url: &str) -> &str {
-    url.trim_end_matches(['\\', '#', '.', ',', ';', ':', '!', '?'])
-}
-
 impl<'a> Iterator for UrlScan<'a> {
     type Item = &'a str;
 
@@ -1297,7 +1288,10 @@ impl<'a> Iterator for UrlScan<'a> {
                         )
                 })
                 .unwrap_or(cand.len());
-            let url = trim_url_tail(&cand[..end]);
+            // Drop the bytes that ended the *text*, not the URL: a shell
+            // line-continuation backslash, the punctuation closing a sentence,
+            // an empty fragment naming the same resource.
+            let url = cand[..end].trim_end_matches(['\\', '#', '.', ',', ';', ':', '!', '?']);
             self.rest = &cand[end..];
             if url.len() > "https://".len() {
                 return Some(url);
