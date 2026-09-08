@@ -1131,6 +1131,12 @@ fn fetch_ref_inner(
                 let mut rec = FetchRecord::terminal(locator, Outcome::Failed(e.to_string()));
                 rec.resolved_url = url;
                 rec.fetched_at = now();
+                // A refused status *did* reach the network, and the code is the
+                // whole of what the server said: keep it in the field consumers
+                // read rather than only in the error text.
+                if let FetchError::Status(status) = e {
+                    rec.status = Some(status);
+                }
                 rec
             }
         },
@@ -4796,6 +4802,18 @@ mod tests {
             assert_eq!(rec.locator, format!("pkg:npm/p{i}@1.0.0"));
             assert_eq!(rec.outcome, Outcome::Ok);
         }
+    }
+
+    /// A refusal reached the network, so the record keeps the code the server
+    /// answered with — consumers read `status`, not the error prose.
+    #[test]
+    fn a_refused_status_is_recorded_on_the_failure() {
+        let url = "https://registry.npmjs.org/gone/-/gone-1.0.0.tgz";
+        let r = dep(RefLocator::Purl("pkg:npm/gone@1.0.0".into()), None);
+        let net = Fixtures::default().refusing(url, 404);
+        let rec = fetch_ref(&r, &net, &BlobCache::disabled());
+        assert!(matches!(rec.outcome, Outcome::Failed(_)), "{rec:?}");
+        assert_eq!(rec.status, Some(404));
     }
 
     #[test]
