@@ -82,6 +82,8 @@ url = "2"
 # x86_64 MSVC build outright: sha2-asm ships GAS-syntax .S files that MSVC's
 # assembler cannot build. Matches cleave, which is already on 0.11.
 sha2 = "0.11"
+# Legacy npm `integrity` pins (`sha1-…`) — every entry in a yarn v1 lockfile.
+sha1 = "0.11"
 base64 = "0.22"
 hex = "0.4"
 zstd = "0.13"

@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use filefacts::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 
 /// One concrete archive published for a package coordinate.
@@ -1399,8 +1400,22 @@ fn record(
     }
 }
 
+/// Whether a reference declares a digest *over the bytes this fetch returns*.
+///
+/// A Go `h1:` is deliberately excluded. It hashes the module's file tree, not
+/// the zip we downloaded, so no amount of hashing these bytes can ever confirm
+/// or refute it — reporting it as an unverified content pin marked every single
+/// `go.sum` dependency `pin unverifiable`, which is the label describing an
+/// actionable gap, not the standing state of an ecosystem. The digest stays on
+/// the record with `pin_verified: None` for machine consumers. Verifying it for
+/// real means computing Go's dirhash over the zip's entries, which needs a zip
+/// reader fletch does not have.
 fn reference_declares_pin(reference: &Reference, locator: &str) -> bool {
-    reference.pinned_hash.is_some() || purl_declares_checksum(locator)
+    let content_pin = reference
+        .pinned_hash
+        .as_ref()
+        .is_some_and(|pin| pin.algo != HashAlgo::GoModH1);
+    content_pin || purl_declares_checksum(locator)
 }
 
 fn purl_declares_checksum(locator: &str) -> bool {
@@ -3160,6 +3175,19 @@ fn verify_pin(pin: Option<&PinnedHash>, bytes: &[u8], sha256_hex: &str) -> Optio
             let b64 = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes));
             Some(b64 == pin.value)
         }
+        // Legacy npm `integrity` — everything a yarn v1 lockfile pins, so
+        // treating it as unverifiable made a whole ecosystem's lockfiles
+        // report an unchecked pin over bytes we had already hashed. SHA-1 is
+        // collision-weak, but a declared digest that matches the delivered
+        // bytes is still evidence they are the bytes the lockfile named.
+        // `integrity` carries base64; a `resolved` fragment carries hex.
+        HashAlgo::Sha1 => {
+            use base64::Engine as _;
+            let digest = Sha1::digest(bytes);
+            let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+            Some(b64 == pin.value || hex::encode(digest).eq_ignore_ascii_case(&pin.value))
+        }
+        // A Go module `h1:` digest covers a file *tree*, not these bytes.
         _ => None,
     }
 }
@@ -3173,21 +3201,28 @@ fn verify_purl_checksum(locator: &str, bytes: &[u8], sha256_hex: &str) -> Option
     let sha512 = checksums
         .contains_key("sha512")
         .then(|| hex::encode(Sha512::digest(bytes)));
-    let mut unsupported = false;
+    let sha1 = checksums
+        .contains_key("sha1")
+        .then(|| hex::encode(Sha1::digest(bytes)));
+    // A digest we cannot compute is no evidence either way, so it neither
+    // verifies the bytes nor casts doubt on a supported digest that matched.
+    // Letting it veto meant every PyPI artifact read as an unverified pin:
+    // the provider publishes `blake2b_256` and `md5` beside the `sha256` we
+    // check, and the two we skip were erasing the one we confirmed.
+    let mut verified = false;
     for (algorithm, expected) in checksums {
         let actual = match algorithm.as_str() {
             "sha256" => sha256_hex,
             "sha512" => sha512.as_deref().unwrap_or_default(),
-            _ => {
-                unsupported = true;
-                continue;
-            }
+            "sha1" => sha1.as_deref().unwrap_or_default(),
+            _ => continue,
         };
         if !expected.eq_ignore_ascii_case(actual) {
             return Some(false);
         }
+        verified = true;
     }
-    (!unsupported).then_some(true)
+    verified.then_some(true)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -5528,7 +5563,7 @@ mod tests {
         let url = "https://static.crates.io/crates/foo/foo-1.0.0.crate";
         let net = Fixtures::default().with(url, b"REAL");
         let reference = dep(
-            RefLocator::Purl("pkg:cargo/foo@1.0.0?checksum=sha1:0123456789abcdef".into()),
+            RefLocator::Purl("pkg:cargo/foo@1.0.0?checksum=md5:0123456789abcdef".into()),
             None,
         );
         let record = fetch_ref(&reference, &net, &BlobCache::disabled());
@@ -5536,8 +5571,10 @@ mod tests {
         assert_eq!(record.pin_verified, None);
     }
 
+    /// PyPI publishes `blake2b_256` and `md5` alongside the `sha256` we can
+    /// check, so a digest we cannot compute must not erase one we confirmed.
     #[test]
-    fn one_supported_and_one_unsupported_checksum_is_unverifiable() {
+    fn a_supported_checksum_verifies_beside_an_unsupported_one() {
         let url = "https://static.crates.io/crates/foo/foo-1.0.0.crate";
         let bytes = b"REAL";
         let net = Fixtures::default().with(url, bytes);
@@ -5549,7 +5586,114 @@ mod tests {
             None,
         );
         let record = fetch_ref(&reference, &net, &BlobCache::disabled());
-        assert_eq!(record.outcome, Outcome::UnverifiablePin);
+        assert_eq!(record.outcome, Outcome::Ok);
+        assert_eq!(record.pin_verified, Some(true));
+    }
+
+    /// A yarn v1 lockfile pins every entry with a legacy `sha1-` integrity.
+    #[test]
+    fn a_legacy_sha1_integrity_pin_verifies() {
+        use base64::Engine as _;
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let bytes = b"tarball bytes";
+        let net = Fixtures::default().with(url, bytes);
+        let reference = dep(
+            RefLocator::Url(url.into()),
+            Some(PinnedHash {
+                algo: HashAlgo::Sha1,
+                value: base64::engine::general_purpose::STANDARD.encode(Sha1::digest(bytes)),
+            }),
+        );
+        let record = fetch_ref(&reference, &net, &BlobCache::disabled());
+        assert_eq!(record.outcome, Outcome::Ok);
+        assert_eq!(record.pin_verified, Some(true));
+    }
+
+    /// A yarn `resolved` fragment spells the same digest in hex.
+    #[test]
+    fn a_hex_spelled_sha1_pin_verifies() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let bytes = b"tarball bytes";
+        let net = Fixtures::default().with(url, bytes);
+        let reference = dep(
+            RefLocator::Url(url.into()),
+            Some(PinnedHash {
+                algo: HashAlgo::Sha1,
+                value: hex::encode(Sha1::digest(bytes)).to_ascii_uppercase(),
+            }),
+        );
+        let record = fetch_ref(&reference, &net, &BlobCache::disabled());
+        assert_eq!(record.outcome, Outcome::Ok);
+        assert_eq!(record.pin_verified, Some(true));
+    }
+
+    #[test]
+    fn a_mismatched_sha1_integrity_pin_is_a_finding() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let net = Fixtures::default().with(url, b"tarball bytes");
+        let reference = dep(
+            RefLocator::Url(url.into()),
+            Some(PinnedHash {
+                algo: HashAlgo::Sha1,
+                value: hex::encode(Sha1::digest(b"other bytes")),
+            }),
+        );
+        let record = fetch_ref(&reference, &net, &BlobCache::disabled());
+        assert_eq!(record.outcome, Outcome::PinMismatch);
+        assert_eq!(record.pin_verified, Some(false));
+    }
+
+    /// The direction that matters: an algorithm we cannot compute must not
+    /// rescue a supported digest that *disagrees* with the bytes.
+    #[test]
+    fn a_mismatched_supported_checksum_beats_an_unsupported_one() {
+        let url = "https://static.crates.io/crates/foo/foo-1.0.0.crate";
+        let net = Fixtures::default().with(url, b"REAL");
+        let reference = dep(
+            RefLocator::Purl(format!(
+                "pkg:cargo/foo@1.0.0?checksum=blake2b-256:abcd,sha256:{}",
+                sha256_hex(b"SUBSTITUTED")
+            )),
+            None,
+        );
+        let record = fetch_ref(&reference, &net, &BlobCache::disabled());
+        assert_eq!(record.outcome, Outcome::PinMismatch);
+        assert_eq!(record.pin_verified, Some(false));
+    }
+
+    #[test]
+    fn a_purl_declared_sha1_checksum_is_verified() {
+        let url = "https://static.crates.io/crates/foo/foo-1.0.0.crate";
+        let bytes = b"REAL";
+        let net = Fixtures::default().with(url, bytes);
+        let reference = dep(
+            RefLocator::Purl(format!(
+                "pkg:cargo/foo@1.0.0?checksum=sha1:{}",
+                hex::encode(Sha1::digest(bytes))
+            )),
+            None,
+        );
+        let record = fetch_ref(&reference, &net, &BlobCache::disabled());
+        assert_eq!(record.outcome, Outcome::Ok);
+        assert_eq!(record.pin_verified, Some(true));
+    }
+
+    /// A `go.sum` `h1:` hashes the module's file tree, not the zip's bytes, so
+    /// it is not a content pin and must not park every Go dependency on
+    /// `UnverifiablePin`.
+    #[test]
+    fn a_go_module_tree_hash_is_not_reported_as_an_unverified_content_pin() {
+        let url = "https://proxy.golang.org/example.test/m/@v/v1.0.0.zip";
+        let net = Fixtures::default().with(url, b"module zip");
+        let reference = dep(
+            RefLocator::Url(url.into()),
+            Some(PinnedHash {
+                algo: HashAlgo::GoModH1,
+                value: "NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=".into(),
+            }),
+        );
+        let record = fetch_ref(&reference, &net, &BlobCache::disabled());
+        assert_eq!(record.outcome, Outcome::Ok);
         assert_eq!(record.pin_verified, None);
     }
 

