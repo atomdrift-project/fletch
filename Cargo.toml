@@ -1,6 +1,6 @@
 [package]
 name = "fletch"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable; edition 2024 implies
 # the MSRV-aware resolver, so this also caps dependency versions.
