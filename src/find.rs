@@ -88,10 +88,32 @@ fn extracted_refs(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
 fn dedup(refs: &mut Vec<Reference>) {
     let mut seen = std::collections::HashSet::new();
     refs.retain(|r| {
+        // Unclassified facts can describe distinct constraints on the same
+        // locator (module-tree vs manifest hashes, conflicting pins, or
+        // replacement directives). They are not fetch targets to coalesce.
+        if r.kind == RefKind::Undefined {
+            return true;
+        }
         seen.insert(match &r.locator {
             RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
         })
     });
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    #[test]
+    fn checksum_metadata_and_conflicts_survive_discovery() {
+        let bytes = b"example.test/m v1.0.0/go.mod h1:METADATA\nexample.test/m v1.0.0 h1:ONE\nexample.test/m v1.0.0 h1:TWO\n";
+        let parsed = filefacts::open_with_path(std::path::Path::new("go.sum"), bytes).unwrap();
+        for refs in [
+            super::references(&parsed),
+            super::references_from_facts(parsed.values().as_json(), parsed.references()),
+        ] {
+            assert_eq!(refs.len(), 3);
+            assert!(refs.iter().all(|r| r.kind == filefacts::RefKind::Undefined));
+        }
+    }
 }
 
 /// Discover references in raw bytes: open them with filefacts and run

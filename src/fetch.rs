@@ -19,6 +19,7 @@ use filefacts::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
+mod go_hash;
 
 /// One concrete archive published for a package coordinate.
 ///
@@ -543,8 +544,8 @@ pub struct FetchRecord {
     #[serde(default, skip_serializing_if = "is_false")]
     pub stale: bool,
     /// Pin verification: `Some(true/false)` when the reference declared a
-    /// verifiable pin (sha256/sha512); `None` when unpinned or the pin
-    /// algorithm can't be checked against raw bytes (Go `h1:`).
+    /// verifiable content or Go module-tree pin; `None` when unpinned,
+    /// unsupported, malformed, or over the verification budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_verified: Option<bool>,
     /// The terminal outcome.
@@ -1375,17 +1376,9 @@ fn record(
         (Some(true), _) | (_, Some(true)) => Some(true),
         (None, None) => None,
     };
-    // A Go `h1:` is not a claim about these bytes — it hashes the module's file
-    // tree, not the zip we downloaded — so it never leaves a fetch sitting on
-    // `UnverifiablePin`, which is the label for an actionable gap rather than
-    // the standing state of an ecosystem. The digest still rides the record.
-    // Confirming it for real means Go's dirhash over the zip's entries, which
-    // needs a zip reader fletch does not have.
-    let declares_content_pin = r
-        .pinned_hash
-        .as_ref()
-        .is_some_and(|pin| pin.algo != HashAlgo::GoModH1)
-        || purl_declares_checksum(&locator);
+    // A declared tree hash is an integrity requirement too. Malformed or
+    // over-budget archives must remain explicitly unverified.
+    let declares_content_pin = r.pinned_hash.is_some() || purl_declares_checksum(&locator);
     let outcome = if pin_verified == Some(false) {
         Outcome::PinMismatch
     } else if pin_verified.is_none() && declares_content_pin {
@@ -1473,6 +1466,11 @@ pub fn resolve_artifacts(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<ArtifactMatrix> {
+    if let Some(exact) = resolve_requirement(locator, net, cache)? {
+        let mut matrix = resolve_artifacts(&exact, net, cache)?;
+        matrix.locator = locator_string(locator);
+        return Some(matrix);
+    }
     let mut locator_text = locator_string(locator);
     let candidates = match locator {
         RefLocator::Url(url) if is_web_scheme(url) => {
@@ -1517,6 +1515,192 @@ pub fn resolve_artifacts(
         locator: locator_text,
         candidates,
     })
+}
+
+/// Resolve declared ranges without silently substituting latest. Outer None
+/// means unresolved/unsupported; Some(None) means no range was requested.
+/// The original reference retains requirements, role, and environment markers.
+fn resolve_requirement(
+    locator: &RefLocator,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Option<RefLocator>> {
+    let RefLocator::Purl(raw) = locator else {
+        return Some(None);
+    };
+    let purl = crate::purl::normalize(raw)?;
+    let (ty, rest) = crate::purl::scheme_type_rest(&purl)?;
+    let Some(requirement) = purl_qualifier(rest, "version_requirement") else {
+        return Some(None);
+    };
+    let (name, version) = split_path_version(rest);
+    if version.is_some() || !safe_coordinate(name) || purl_qualifier(rest, "registry").is_some() {
+        return None;
+    }
+    let (resolved, checksum) = match ty.as_str() {
+        "cargo" => {
+            // A named/private registry is never redirected to crates.io.
+            if purl_qualifier(rest, "repository_url").is_some_and(|r| {
+                !matches!(
+                    r.trim_end_matches('/'),
+                    "https://crates.io" | "https://index.crates.io"
+                )
+            }) {
+                return None;
+            }
+            let range = requirement.parse::<semver::VersionReq>().ok()?;
+            let url = format!("https://crates.io/api/v1/crates/{name}");
+            let bytes = cached_metadata(&url, net, &cache.with_meta_ttl(meta_ttl_unpinned()))?;
+            let doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let candidates = doc.get("versions")?.as_array()?;
+            let (version, row) = candidates
+                .iter()
+                .filter(|v| v.get("yanked").and_then(serde_json::Value::as_bool) != Some(true))
+                .filter_map(|row| {
+                    let version = row.get("num")?.as_str()?.parse::<semver::Version>().ok()?;
+                    range.matches(&version).then_some((version, row))
+                })
+                .max_by(|a, b| a.0.cmp(&b.0))?;
+            (
+                version.to_string(),
+                row.get("checksum")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+        }
+        "pypi" => {
+            let range = requirement.parse::<pep440_rs::VersionSpecifiers>().ok()?;
+            let repository = repository_base(rest, "https://pypi.org")?;
+            let url = format!("{repository}/pypi/{name}/json");
+            let bytes = cached_metadata(&url, net, &cache.with_meta_ttl(meta_ttl_unpinned()))?;
+            let doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let versions = doc.get("releases")?.as_object()?;
+            let (_, spelling) = versions
+                .iter()
+                .filter(|(_, files)| {
+                    files.as_array().is_some_and(|files| {
+                        files.iter().any(|f| {
+                            f.get("yanked").and_then(serde_json::Value::as_bool) != Some(true)
+                        })
+                    })
+                })
+                .filter_map(|(spelling, _)| {
+                    let version = spelling.parse::<pep440_rs::Version>().ok()?;
+                    (range.contains(&version) && !version.any_prerelease())
+                        .then_some((version, spelling))
+                })
+                .max_by(|a, b| a.0.cmp(&b.0))?;
+            (spelling.clone(), None)
+        }
+        _ => return None,
+    };
+    let mut exact = format!("pkg:{ty}/{name}@{resolved}");
+    let mut qualifiers: Vec<String> = rest
+        .split_once('?')
+        .map(|(_, q)| {
+            q.split('#')
+                .next()
+                .unwrap_or(q)
+                .split('&')
+                .filter(|part| !part.starts_with("version_requirement="))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(checksum) =
+        checksum.filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        && !qualifiers.iter().any(|q| q.starts_with("checksum="))
+    {
+        qualifiers.push(format!("checksum=sha256:{checksum}"));
+    }
+    if !qualifiers.is_empty() {
+        exact.push('?');
+        exact.push_str(&qualifiers.join("&"));
+    }
+    Some(Some(RefLocator::Purl(exact)))
+}
+
+/// Refine a manifest requirement before registry-age or reputation gating.
+/// Returns `None` on unresolved requirements, never a guessed latest release.
+/// The declaration's source/role/evidence remain attached to the exact target.
+#[must_use]
+pub fn resolve_declared_reference(
+    reference: &Reference,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Reference> {
+    let mut exact = reference.clone();
+    if let Some(locator) = resolve_requirement(&reference.locator, net, cache)? {
+        exact.locator = locator;
+    }
+    Some(exact)
+}
+
+/// Prefer a unique compatible lock pin for a manifest dependency. The caller
+/// must supply only the applicable package/workspace lock, not an archive-wide
+/// union. Multiple compatible versions stay unresolved rather than guessing.
+#[must_use]
+pub fn prefer_lock_pin(reference: &Reference, lock: &[Reference]) -> Reference {
+    let RefLocator::Purl(raw) = &reference.locator else {
+        return reference.clone();
+    };
+    let Some((ty, rest)) = crate::purl::scheme_type_rest(raw) else {
+        return reference.clone();
+    };
+    let Some(requirement) = purl_qualifier(rest, "version_requirement") else {
+        return reference.clone();
+    };
+    let (name, version) = split_path_version(rest);
+    if version.is_some() || purl_qualifier(rest, "registry").is_some() {
+        return reference.clone();
+    }
+    let matches: Vec<_> = lock
+        .iter()
+        .filter(|pin| {
+            let RefLocator::Purl(p) = &pin.locator else {
+                return false;
+            };
+            let Some((pin_ty, pin_rest)) = crate::purl::scheme_type_rest(p) else {
+                return false;
+            };
+            let (pin_name, pin_version) = split_path_version(pin_rest);
+            let Some(pin_version) = pin_version else {
+                return false;
+            };
+            if pin_ty != ty
+                || pin_name != name
+                || purl_qualifier(rest, "repository_url")
+                    != purl_qualifier(pin_rest, "repository_url")
+            {
+                return false;
+            }
+            match ty.as_str() {
+                "cargo" => requirement
+                    .parse::<semver::VersionReq>()
+                    .ok()
+                    .zip(percent_decode(pin_version).parse::<semver::Version>().ok())
+                    .is_some_and(|(r, v)| r.matches(&v)),
+                "pypi" => requirement
+                    .parse::<pep440_rs::VersionSpecifiers>()
+                    .ok()
+                    .zip(
+                        percent_decode(pin_version)
+                            .parse::<pep440_rs::Version>()
+                            .ok(),
+                    )
+                    .is_some_and(|(r, v)| r.contains(&v)),
+                _ => false,
+            }
+        })
+        .collect();
+    if matches.len() != 1 {
+        return reference.clone();
+    }
+    let mut resolved = reference.clone();
+    resolved.locator = matches[0].locator.clone();
+    resolved.pinned_hash = matches[0].pinned_hash.clone();
+    resolved.content_sha256 = matches[0].content_sha256.clone();
+    resolved
 }
 
 fn artifact_candidate(url: String, kind: &str) -> ArtifactCandidate {
@@ -2731,6 +2915,9 @@ fn resolved_target(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<(String, String)> {
+    if let Some(exact) = resolve_requirement(locator, net, cache)? {
+        return resolved_target(&exact, net, cache);
+    }
     if let RefLocator::Purl(raw) = locator
         && let Some(p) = crate::purl::normalize(raw)
         && let Some((ty, rest)) = crate::purl::scheme_type_rest(&p)
@@ -3158,8 +3345,7 @@ pub(crate) fn goproxy_escape(s: &str) -> String {
 }
 
 /// Verify fetched bytes against a declared pin. `None` when there is no pin
-/// or the algorithm can't be checked against raw content (Go `h1:` is a
-/// tree hash; SHA-1 isn't computed here; future algorithms via the `_`).
+/// or verification is unsupported, malformed, or exceeds its budget.
 fn verify_pin(pin: Option<&PinnedHash>, bytes: &[u8], sha256_hex: &str) -> Option<bool> {
     let pin = pin?;
     match pin.algo {
@@ -3182,7 +3368,9 @@ fn verify_pin(pin: Option<&PinnedHash>, bytes: &[u8], sha256_hex: &str) -> Optio
             let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
             Some(b64 == pin.value || hex::encode(digest).eq_ignore_ascii_case(&pin.value))
         }
-        // A Go module `h1:` digest covers a file *tree*, not these bytes.
+        HashAlgo::GoModH1 => {
+            go_hash::zip_h1(bytes).map(|actual| actual == pin.value.trim_start_matches("h1:"))
+        }
         _ => None,
     }
 }
@@ -3642,6 +3830,51 @@ impl Fetch for Fixtures {
 mod tests {
     use super::*;
     use filefacts::RefKind;
+
+    #[test]
+    fn cargo_requirement_selects_compatible_non_yanked_release() {
+        let net=Fixtures::default().with("https://crates.io/api/v1/crates/codec",br#"{"versions":[{"num":"2.0.0","yanked":false},{"num":"1.9.0","yanked":true},{"num":"1.4.2","yanked":false}]}"#);
+        let locator = RefLocator::Purl("pkg:cargo/codec?version_requirement=%5E1.2".into());
+        let (exact, url) = resolved_target(&locator, &net, &BlobCache::disabled()).unwrap();
+        assert_eq!(exact, "pkg:cargo/codec@1.4.2");
+        assert!(url.ends_with("codec-1.4.2.crate"));
+        assert!(
+            resolved_target(
+                &RefLocator::Purl("pkg:cargo/codec?version_requirement=%3E%3D9".into()),
+                &net,
+                &BlobCache::disabled()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn python_requirement_does_not_pick_incompatible_latest() {
+        let net=Fixtures::default().with("https://pypi.org/pypi/codec/json",br#"{"info":{"version":"9.0"},"releases":{"1.2":[{"yanked":false}],"1.9":[{"yanked":true}],"9.0":[{"yanked":false}]}}"#);
+        let locator = RefLocator::Purl("pkg:pypi/codec?version_requirement=%3E%3D1%2C%3C2".into());
+        assert_eq!(
+            resolve_requirement(&locator, &net, &BlobCache::disabled()),
+            Some(Some(RefLocator::Purl("pkg:pypi/codec@1.2".into())))
+        );
+    }
+    #[test]
+    fn compatible_lock_pin_preserves_build_role_and_rejects_ambiguity() {
+        let mut declaration = dep(
+            RefLocator::Purl("pkg:cargo/codec?version_requirement=%5E1.2".into()),
+            None,
+        );
+        declaration.source = "Cargo.toml:build-dependencies.aliased".into();
+        declaration.evidence = "aliased = { package = codec, version = 1.2 }".into();
+        let pin = dep(RefLocator::Purl("pkg:cargo/codec@1.4.2".into()), None);
+        let exact = prefer_lock_pin(&declaration, std::slice::from_ref(&pin));
+        assert_eq!(exact.locator, pin.locator);
+        assert_eq!(exact.source, declaration.source);
+        assert_eq!(exact.evidence, declaration.evidence);
+        let incompatible = dep(RefLocator::Purl("pkg:cargo/codec@2.0.0".into()), None);
+        assert_eq!(prefer_lock_pin(&declaration, &[incompatible]), declaration);
+        let second = dep(RefLocator::Purl("pkg:cargo/codec@1.3.0".into()), None);
+        assert_eq!(prefer_lock_pin(&declaration, &[pin, second]), declaration);
+    }
 
     #[test]
     fn resolve_npm_unversioned_picks_latest_tarball() {
@@ -5685,11 +5918,39 @@ mod tests {
         assert_eq!(record.pin_verified, Some(true));
     }
 
-    /// A `go.sum` `h1:` hashes the module's file tree, not the zip's bytes, so
-    /// it is not a content pin and must not park every Go dependency on
-    /// `UnverifiablePin`.
     #[test]
-    fn a_go_module_tree_hash_is_not_reported_as_an_unverified_content_pin() {
+    fn go_tree_pin_controls_fetch_outcome() {
+        let url = "https://proxy.golang.org/example.test/m/@v/v1.0.0.zip";
+        let reference = dep(
+            RefLocator::Url(url.into()),
+            Some(PinnedHash {
+                algo: HashAlgo::GoModH1,
+                value: "7gPDTdAetOil7VBHFXxFU4lStBctQ7LKO/0XF15Bdy8=".into(),
+            }),
+        );
+        for (body, outcome, verified) in [
+            ("package m\n", Outcome::Ok, true),
+            ("package changed\n", Outcome::PinMismatch, false),
+        ] {
+            let bytes = go_hash::tests::archive(
+                false,
+                zip::CompressionMethod::Deflated,
+                "example.test/m@v1.0.0/m.go",
+                body,
+            );
+            let record = fetch_ref(
+                &reference,
+                &Fixtures::default().with(url, &bytes),
+                &BlobCache::disabled(),
+            );
+            assert_eq!(record.outcome, outcome);
+            assert_eq!(record.pin_verified, Some(verified));
+        }
+    }
+
+    /// Malformed module archives cannot satisfy a declared tree hash.
+    #[test]
+    fn malformed_go_zip_is_explicitly_unverified() {
         let url = "https://proxy.golang.org/example.test/m/@v/v1.0.0.zip";
         let net = Fixtures::default().with(url, b"module zip");
         let reference = dep(
@@ -5700,7 +5961,7 @@ mod tests {
             }),
         );
         let record = fetch_ref(&reference, &net, &BlobCache::disabled());
-        assert_eq!(record.outcome, Outcome::Ok);
+        assert_eq!(record.outcome, Outcome::UnverifiablePin);
         assert_eq!(record.pin_verified, None);
     }
 
