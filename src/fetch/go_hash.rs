@@ -1,5 +1,5 @@
 //! Go module-tree integrity; no extraction or execution.
-//! Algorithm: https://go.dev/src/cmd/vendor/golang.org/x/mod/sumdb/dirhash/hash.go
+//! Algorithm: <https://go.dev/src/cmd/vendor/golang.org/x/mod/sumdb/dirhash/hash.go>
 use sha2::{Digest, Sha256};
 
 /// Go's x/mod/sumdb/dirhash.HashZip + Hash1: sorted names, each preceded by
@@ -60,6 +60,7 @@ pub(super) fn zip_h1(bytes: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub(super) mod tests {
     use super::*;
     use std::io::{Cursor, Write};
@@ -79,14 +80,18 @@ pub(super) mod tests {
             files.reverse();
         }
         for (name, value) in files {
-            zip.start_file(
+            let Ok(()) = zip.start_file(
                 name,
                 zip::write::SimpleFileOptions::default().compression_method(method),
-            )
-            .unwrap();
-            zip.write_all(value.as_bytes()).unwrap();
+            ) else {
+                return Vec::new();
+            };
+            if zip.write_all(value.as_bytes()).is_err() {
+                return Vec::new();
+            }
         }
-        zip.finish().unwrap().into_inner()
+        zip.finish()
+            .map_or_else(|_| Vec::new(), std::io::Cursor::into_inner)
     }
 
     #[test]

@@ -101,11 +101,13 @@ fn dedup(refs: &mut Vec<Reference>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod metadata_tests {
     #[test]
     fn checksum_metadata_and_conflicts_survive_discovery() {
         let bytes = b"example.test/m v1.0.0/go.mod h1:METADATA\nexample.test/m v1.0.0 h1:ONE\nexample.test/m v1.0.0 h1:TWO\n";
-        let parsed = filefacts::open_with_path(std::path::Path::new("go.sum"), bytes).unwrap();
+        let parsed = filefacts::open_with_path(std::path::Path::new("go.sum"), bytes)
+            .unwrap_or_else(|error| panic!("test input must parse: {error}"));
         for refs in [
             super::references(&parsed),
             super::references_from_facts(parsed.values().as_json(), parsed.references()),
