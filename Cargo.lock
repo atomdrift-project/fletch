@@ -806,7 +806,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.7.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#c1f0b93e866236ee35962aa122ff1599747cf4cb"
+source = "git+https://github.com/atomdrift-project/filefacts.git#9aa1dd8338e2257d1f1d2fc335abd8b2fc96c7c3"
 dependencies = [
  "aho-corasick",
  "cfb",
@@ -1606,9 +1606,9 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lru-slab"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lzma-rs"
@@ -2809,7 +2809,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.11.0"
-source = "git+https://github.com/atomdrift-project/stng.git#802a2163f6bc00adbbad3887a652d8db7cb85884"
+source = "git+https://github.com/atomdrift-project/stng.git#09476894d32aa315675c5b890bfff2b4ab356b3b"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3332,7 +3332,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#c1f0b93e866236ee35962aa122ff1599747cf4cb"
+source = "git+https://github.com/atomdrift-project/filefacts.git#9aa1dd8338e2257d1f1d2fc335abd8b2fc96c7c3"
 dependencies = [
  "cc",
  "tree-sitter",
