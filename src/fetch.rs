@@ -812,6 +812,9 @@ impl BlobCache {
         if let Ok(json) = serde_json::to_vec(meta) {
             write_replacing(&self.meta_path(key), &json);
         }
+        // A bulk fetch can outgrow the cache ceiling inside one process, long
+        // before the next daily sweep would notice.
+        crate::cache_sweep::note_write();
     }
 }
 
