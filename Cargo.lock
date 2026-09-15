@@ -806,7 +806,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.7.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#13d6a8f75b22a047438c4400bcb80cf309b23af3"
+source = "git+https://github.com/atomdrift-project/filefacts.git#a50ada02f15bed4bf57851f971ab7a2e471ed848"
 dependencies = [
  "aho-corasick",
  "cfb",
@@ -2809,7 +2809,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.12.0"
-source = "git+https://github.com/atomdrift-project/stng.git#e74a9c2f3e3b7c7645635a59fa51103221420bea"
+source = "git+https://github.com/atomdrift-project/stng.git#c3fadb03178eeeadc0602e2853b7ea04780fb52b"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3323,7 +3323,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#13d6a8f75b22a047438c4400bcb80cf309b23af3"
+source = "git+https://github.com/atomdrift-project/filefacts.git#a50ada02f15bed4bf57851f971ab7a2e471ed848"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -4137,9 +4137,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.7"
+version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"
