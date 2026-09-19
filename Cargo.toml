@@ -114,19 +114,19 @@ tempfile = "3"
 # (release-history / custody fields, NuGet `repository_commit`). Points fletch at
 # local filefacts; restore to a published filefacts rev before merging.
 
-# illumos support for tree-sitter's vendored endian.h, pulled in transitively
-# via filefacts. In 0.26.11 the only illumos arm tests __illumos__, which
-# illumos-gcc predefines but cross-rs's x86_64-unknown-illumos-gcc does not, so
-# the build hits "#error platform not supported" at endian.h:238. Upstream
-# added a __sun arm over <sys/byteorder.h> in 77cb23fc, still unreleased.
+# Forked tree-sitter, pulled in transitively via filefacts. The fork carries
+# illumos support for the vendored endian.h: stock toolchains only test
+# __illumos__, which cross-rs's x86_64-unknown-illumos-gcc does not predefine,
+# so the build hits "#error platform not supported" at endian.h:238.
 #
 # Both crates must come from the same source: tree-sitter uses its in-tree
 # tree-sitter-language, and `links = "tree-sitter-language"` permits only one
-# copy in the graph. Upstream master is 0.27.0 and unpublished — crates.io
-# tops out at 0.26.11 — so this is load-bearing for resolution, not only for
-# the fix, and every root in this tree needs an identical block: cleave,
-# filefacts, fletch, hood and scan. Remove from all five once a release
-# carries it.
+# copy in the graph. filefacts requires tree-sitter ^0.28, which is unpublished
+# (crates.io tops out at 0.27), so this block is load-bearing for resolution,
+# not only for the fix. [patch] applies only in the root crate, so every root
+# in this tree needs an identical block: cleave, filefacts, fletch, hood and
+# scan. The rev must match the one filefacts' Cargo.lock resolves the fork's
+# master to. Remove from all five once a release carries the fix.
 [patch.crates-io]
-tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
-tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "963b5a5a971021359cf091a63d4f1286bc319643" }
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", rev = "a88e37f7c2202fa9dd2869ccf9c40d022460e73b" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", rev = "a88e37f7c2202fa9dd2869ccf9c40d022460e73b" }
