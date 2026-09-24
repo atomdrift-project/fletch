@@ -58,3 +58,13 @@ fn go_scheme_and_slashes_have_one_canonical_form() {
         "pkg:GOLANG/google.golang.org/genproto#/googleapis/api/annotations/",
     ]);
 }
+
+#[test]
+fn terraform_provider_address_has_one_canonical_form() {
+    assert_agrees(&[
+        "pkg:terraform/kreuzwerker/docker@3.0.2",
+        "pkg:terraform/Kreuzwerker/Docker@3.0.2",
+        "pkg:TERRAFORM/KREUZWERKER/DOCKER@3.0.2",
+        "pkg:terraform//kreuzwerker//docker@3.0.2",
+    ]);
+}

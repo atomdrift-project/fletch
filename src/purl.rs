@@ -716,10 +716,16 @@ fn decode_component(value: &str) -> Option<String> {
 /// path. Hopper's `pkgparse.purlNamespaceRequirement` makes the same
 /// departure and must keep making it, or a coordinate one side keys the other
 /// refuses.
+///
+/// `terraform` has no spec definition at all: it is this project's invented
+/// type for a registry.terraform.io provider address,
+/// `pkg:terraform/<namespace>/<type>`. The namespace is required, and both it
+/// and the name are lowercased in [`apply_type_rules`] because the registry
+/// resolves addresses case-insensitively. Hopper's twin makes the same choices.
 fn namespace_requirement(typ: &str) -> i8 {
     match typ {
         "alpm" | "apk" | "bitbucket" | "composer" | "deb" | "git" | "github" | "huggingface"
-        | "maven" | "qpkg" | "rpm" | "swift" | "vscode-extension" => 1,
+        | "maven" | "qpkg" | "rpm" | "swift" | "terraform" | "vscode-extension" => 1,
         "bazel" | "bitnami" | "cargo" | "chrome-extension" | "cocoapods" | "conda" | "cran"
         | "gem" | "hackage" | "julia" | "mlflow" | "nuget" | "oci" | "opam" | "otp" | "pub"
         | "pypi" | "vcpkg" => -1,
@@ -814,6 +820,7 @@ fn apply_type_rules(parts: &mut CanonicalPurl) -> Option<()> {
             | "luarocks"
             | "qpkg"
             | "rpm"
+            | "terraform"
             | "vscode-extension"
             | "yocto"
     ) {
@@ -837,6 +844,7 @@ fn apply_type_rules(parts: &mut CanonicalPurl) -> Option<()> {
             | "oci"
             | "otp"
             | "pub"
+            | "terraform"
             | "vscode-extension"
     ) {
         parts.name = parts.name.to_lowercase();
@@ -1588,6 +1596,29 @@ mod normalize_tests {
         ] {
             assert_eq!(normalize(invalid), None, "type rule rejects {invalid}");
         }
+    }
+
+    #[test]
+    fn terraform_address_is_lowercased_and_requires_a_namespace() {
+        // The registry resolves provider addresses case-insensitively, so a
+        // mixed-case spelling is the same provider; the version is opaque.
+        assert_eq!(
+            norm("pkg:Terraform/Kreuzwerker/Docker@3.0.2"),
+            "pkg:terraform/kreuzwerker/docker@3.0.2"
+        );
+        assert_eq!(
+            norm("pkg:terraform/kreuzwerker/docker@4.0.0-Beta2"),
+            "pkg:terraform/kreuzwerker/docker@4.0.0-Beta2"
+        );
+        let purl = Purl::parse("pkg:terraform/GoCommunity-IO/DockerD").unwrap();
+        assert_eq!(purl.namespace(), ["gocommunity-io"]);
+        assert_eq!(purl.name(), "dockerd");
+        assert_eq!(purl.version(), None);
+        assert_eq!(
+            Purl::parse("pkg:terraform/docker@1"),
+            Err(PurlError::Type),
+            "a provider address has a namespace"
+        );
     }
 
     #[test]

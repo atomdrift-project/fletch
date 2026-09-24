@@ -1424,7 +1424,7 @@ fn locator_string(locator: &RefLocator) -> String {
 
 /// Resolve a locator to a fetchable URL, or `None` if the ecosystem isn't
 /// supported yet. Ecosystems that need a registry round-trip (PyPI, Composer,
-/// Firefox, the AUR, an unversioned npm PURL) resolve in `resolved_target`
+/// Firefox, Terraform, the AUR, an unversioned npm PURL) resolve in `resolved_target`
 /// instead; official-repo alpm (a mirror lookup) is a follow-up.
 #[must_use]
 pub fn resolve(locator: &RefLocator) -> Option<String> {
@@ -1449,7 +1449,9 @@ pub fn resolve(locator: &RefLocator) -> Option<String> {
 ///
 /// Unlike [`resolve`], this API may consult registry metadata. It currently
 /// expands the ecosystems where artifact variants or compatibility metadata
-/// matter most: npm, PyPI, RubyGems, Go modules, and Cargo crates. The returned
+/// matter most: npm, PyPI, RubyGems, Go modules, and Cargo crates, plus
+/// Terraform providers, whose one candidate carries the registry's sha256
+/// (see [`terraform_artifact`]). The returned
 /// matrix always retains all discovered variants; the legacy single-URL choice
 /// is identified by [`ArtifactCandidate::preferred`].
 ///
@@ -1506,6 +1508,9 @@ pub fn resolve_artifacts(
                     "gem" => gem_artifacts(path, version, rest, net, cache),
                     "golang" => golang_artifacts(&purl, path, version, rest, net, cache),
                     "cargo" => cargo_artifacts(&purl, path, version, rest, net, cache),
+                    "terraform" => terraform_artifact(path, version, rest, net, cache)
+                        .into_iter()
+                        .collect(),
                     _ => return None,
                 }
             };
@@ -2465,6 +2470,98 @@ fn gem_candidate_for_platform(
     }
 }
 
+/// A Terraform provider zip, from the registry's download API. That API
+/// answers one platform per request, so this builds one candidate rather than
+/// the whole matrix: the `linux_amd64` build a CI runner installs, or, for a
+/// provider that doesn't ship one (the API's 404), the first platform the
+/// version lists. The registry's `shasum` becomes the candidate's sha256 —
+/// through the artifact PURL's `checksum` the fetch record verifies it against
+/// the downloaded bytes — and a response without a well-formed one is refused
+/// rather than fetched unverified. A versionless PURL takes the provider's
+/// current `version`.
+fn terraform_artifact(
+    path: &str,
+    version: Option<&str>,
+    rest: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<ArtifactCandidate> {
+    let (namespace, name) = path.split_once('/')?;
+    if name.contains('/') {
+        return None;
+    }
+    let base = format!("https://registry.terraform.io/v1/providers/{namespace}/{name}");
+    // Each of these fills one URL path segment, and may come from the registry.
+    let segment = |value: &str| safe_coordinate(value) && !value.contains('/');
+    let json = |url: &str, ttl: Duration| {
+        cached_metadata(url, net, &cache.with_meta_ttl(ttl))
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    };
+    let version = match version {
+        Some(version) => percent_decode(version),
+        None => json(&base, meta_ttl_unpinned())?
+            .get("version")?
+            .as_str()?
+            .to_string(),
+    };
+    if !segment(&version) {
+        return None;
+    }
+    // A published release's per-platform download never changes.
+    let immutable = cache.with_meta_ttl(META_TTL_IMMUTABLE);
+    let download = |os: &str, arch: &str| {
+        cached_metadata_status(
+            &format!("{base}/{version}/download/{os}/{arch}"),
+            &[],
+            net,
+            &immutable,
+        )
+    };
+    let info = match download("linux", "amd64") {
+        Ok(bytes) => bytes,
+        Err(Some(404)) => {
+            // The version list grows, so it is read with the unpinned TTL.
+            let versions = json(&format!("{base}/versions"), meta_ttl_unpinned())?;
+            let platform = versions
+                .get("versions")?
+                .as_array()?
+                .iter()
+                .find(|v| v.get("version").and_then(serde_json::Value::as_str) == Some(&version))?
+                .pointer("/platforms/0")?;
+            let os = platform.get("os")?.as_str()?;
+            let arch = platform.get("arch")?.as_str()?;
+            if !segment(os) || !segment(arch) {
+                return None;
+            }
+            download(os, arch).ok()?
+        }
+        Err(_) => return None,
+    };
+    let info: serde_json::Value = serde_json::from_slice(&info).ok()?;
+    let url = info.get("download_url")?.as_str()?.to_string();
+    let shasum = info
+        .get("shasum")?
+        .as_str()
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))?
+        .to_ascii_lowercase();
+    if !is_web_scheme(&url) {
+        return None;
+    }
+    let mut candidate = artifact_candidate(url, "provider");
+    candidate.preferred = file_name_matches(rest, &candidate.file_name);
+    candidate
+        .qualifiers
+        .insert("file_name".into(), candidate.file_name.clone());
+    candidate.checksums.insert("sha256".into(), shasum);
+    for key in ["os", "arch"] {
+        if let Some(value) = info.get(key).and_then(serde_json::Value::as_str) {
+            candidate.attributes.insert(key.into(), value.to_string());
+        }
+    }
+    candidate.attributes.insert("version".into(), version);
+    Some(candidate)
+}
+
 fn file_name_matches(rest: &str, actual: &str) -> bool {
     purl_qualifier(rest, "file_name").is_none_or(|wanted| wanted == actual)
 }
@@ -2945,6 +3042,9 @@ fn resolved_target(
             // matrix asks the proxy which spelling it serves
             // (`golang_artifacts`), the pure resolver cannot.
             || ty == "golang"
+            // Terraform: the zip's URL and sha256 exist only in the registry's
+            // download API (`terraform_artifact`).
+            || ty == "terraform"
             || (ty == "npm"
                 && coordinate_version.is_none_or(|version| !npm_version_is_concrete(version)))
             || (ty == "gem" && coordinate_version.is_none())
@@ -4397,6 +4497,121 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// The registry's download API for one Terraform provider platform.
+    fn terraform_download(os: &str, arch: &str, bytes: &[u8]) -> (String, String) {
+        let file = format!("terraform-provider-docker_3.0.2_{os}_{arch}.zip");
+        let url = format!(
+            "https://github.com/kreuzwerker/terraform-provider-docker/releases/download/v3.0.2/{file}"
+        );
+        let info = serde_json::json!({
+            "os": os, "arch": arch, "filename": file, "download_url": url,
+            "shasum": sha256_hex(bytes).to_ascii_uppercase(),
+        });
+        (info.to_string(), url)
+    }
+
+    const TERRAFORM_DOCKER: &str = "https://registry.terraform.io/v1/providers/kreuzwerker/docker";
+
+    #[test]
+    fn terraform_fetch_verifies_the_registry_shasum() {
+        let (info, zip) = terraform_download("linux", "amd64", b"ZIP");
+        let api = format!("{TERRAFORM_DOCKER}/3.0.2/download/linux/amd64");
+        let net = Fixtures::default()
+            .with(&api, info.as_bytes())
+            .with(&zip, b"ZIP");
+        let cache = BlobCache::disabled();
+        // A mixed-case address is the same provider.
+        let reference = dep(
+            RefLocator::Purl("pkg:terraform/Kreuzwerker/Docker@3.0.2".into()),
+            None,
+        );
+        let rec = fetch_ref(&reference, &net, &cache);
+        assert_eq!(rec.outcome, Outcome::Ok);
+        assert_eq!(rec.pin_verified, Some(true));
+        assert_eq!(rec.resolved_url, zip);
+        assert_eq!(
+            rec.locator,
+            format!(
+                "pkg:terraform/kreuzwerker/docker@3.0.2?checksum=sha256:{}\
+                 &file_name=terraform-provider-docker_3.0.2_linux_amd64.zip",
+                sha256_hex(b"ZIP")
+            )
+        );
+
+        // Bytes that disagree with the registry's shasum are a finding.
+        let net = Fixtures::default()
+            .with(&api, info.as_bytes())
+            .with(&zip, b"SUBSTITUTED");
+        let rec = fetch_ref(&reference, &net, &cache);
+        assert_eq!(rec.outcome, Outcome::PinMismatch);
+        assert_eq!(rec.pin_verified, Some(false));
+
+        // Without a well-formed shasum nothing can be verified: refuse.
+        let unsigned = info.replace(&sha256_hex(b"ZIP").to_ascii_uppercase(), "abc");
+        let net = Fixtures::default()
+            .with(&api, unsigned.as_bytes())
+            .with(&zip, b"ZIP");
+        assert_eq!(
+            fetch_ref(&reference, &net, &cache).outcome,
+            Outcome::Unresolved
+        );
+    }
+
+    #[test]
+    fn terraform_falls_back_to_the_first_listed_platform() {
+        let (info, zip) = terraform_download("darwin", "arm64", b"ZIP");
+        let versions = serde_json::json!({"versions": [
+            {"version": "3.0.1", "platforms": [{"os": "linux", "arch": "amd64"}]},
+            {"version": "3.0.2", "platforms": [
+                {"os": "darwin", "arch": "arm64"}, {"os": "windows", "arch": "amd64"}
+            ]},
+        ]})
+        .to_string();
+        let net = Fixtures::default()
+            .refusing(
+                &format!("{TERRAFORM_DOCKER}/3.0.2/download/linux/amd64"),
+                404,
+            )
+            .with(&format!("{TERRAFORM_DOCKER}/versions"), versions.as_bytes())
+            .with(
+                &format!("{TERRAFORM_DOCKER}/3.0.2/download/darwin/arm64"),
+                info.as_bytes(),
+            );
+        let cache = BlobCache::disabled();
+        let locator = RefLocator::Purl("pkg:terraform/kreuzwerker/docker@3.0.2".into());
+        let (exact, url) = resolved_target(&locator, &net, &cache).unwrap();
+        assert_eq!(url, zip);
+        assert!(exact.ends_with("&file_name=terraform-provider-docker_3.0.2_darwin_arm64.zip"));
+
+        // Only a 404 means "no such platform"; an unreachable registry is not
+        // a reason to pick a different build.
+        let net = Fixtures::default()
+            .with(&format!("{TERRAFORM_DOCKER}/versions"), versions.as_bytes())
+            .with(
+                &format!("{TERRAFORM_DOCKER}/3.0.2/download/darwin/arm64"),
+                info.as_bytes(),
+            );
+        assert_eq!(resolved_target(&locator, &net, &cache), None);
+    }
+
+    #[test]
+    fn terraform_versionless_resolves_the_current_release() {
+        let (info, zip) = terraform_download("linux", "amd64", b"ZIP");
+        let net = Fixtures::default()
+            .with(
+                TERRAFORM_DOCKER,
+                br#"{"id":"kreuzwerker/docker/3.0.2","version":"3.0.2"}"#,
+            )
+            .with(
+                &format!("{TERRAFORM_DOCKER}/3.0.2/download/linux/amd64"),
+                info.as_bytes(),
+            );
+        let locator = RefLocator::Purl("pkg:terraform/kreuzwerker/docker".into());
+        let (exact, url) = resolved_target(&locator, &net, &BlobCache::disabled()).unwrap();
+        assert_eq!(url, zip);
+        assert!(exact.starts_with("pkg:terraform/kreuzwerker/docker@3.0.2?checksum=sha256:"));
     }
 
     #[test]

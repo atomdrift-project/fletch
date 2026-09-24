@@ -86,6 +86,9 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // JSR ships through npm-compatible mirrors, but its own API carries the
         // richer record (score, repo, per-version dates).
         "jsr" => jsr(&path, version, net, cache),
+        // Terraform providers: `pkg:terraform/<namespace>/<type>` on
+        // registry.terraform.io, whose addresses the PURL already lowercases.
+        "terraform" => terraform(&path, version, net, cache),
         // OS package registries each get their own PURL type so a scan can name
         // `pkg:fedora/curl` vs `pkg:arch/pacman` directly. The package name is
         // the last path segment (any vendor namespace is dropped).
@@ -1844,6 +1847,94 @@ fn jsr(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         rating: doc.get("score").and_then(Value::as_f64).map(|f| f as f32),
         ..Default::default()
     })
+}
+
+/// Terraform Registry: the v2 provider document with its provider-versions
+/// included is the whole record in one request — tier, source repository,
+/// total downloads, the deprecation `warning`, and every version's publish
+/// time. v2 marks no latest version, so the most recently published one stands
+/// in for it. `path` is the `<namespace>/<type>` provider address.
+fn terraform(
+    path: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    let (namespace, name) = path.split_once('/')?;
+    if name.contains('/') {
+        return None;
+    }
+    let doc = json_meta(
+        &format!(
+            "https://registry.terraform.io/v2/providers/{namespace}/{name}?include=provider-versions"
+        ),
+        net,
+        cache,
+    )?;
+    let attrs = doc.pointer("/data/attributes")?;
+    let text = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    // `(version, publish time, attributes)` for every included release.
+    let releases: Vec<(&str, Option<u64>, &Value)> = doc
+        .get("included")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|i| i.get("type").and_then(Value::as_str) == Some("provider-versions"))
+        .filter_map(|i| {
+            let a = i.get("attributes")?;
+            let published = a
+                .get("published-at")
+                .and_then(Value::as_str)
+                .and_then(parse_ts);
+            Some((a.get("version")?.as_str()?, published, a))
+        })
+        .collect();
+    let latest = releases
+        .iter()
+        .filter_map(|&(v, t, _)| Some((t?, v)))
+        .max()
+        .map(|(_, v)| v);
+    let version = version.or(latest).unwrap_or_default();
+    let release = releases.iter().find(|(v, _, _)| *v == version);
+
+    let mut p = Registry {
+        ecosystem: "terraform".into(),
+        name: format!("{namespace}/{name}"),
+        version: version.to_string(),
+        published_at: release.and_then(|r| r.1),
+        latest_version: latest.map(str::to_string),
+        author: text(attrs.get("owner-name")),
+        publisher: Some(namespace.to_string()),
+        // The provider-level description is often empty where the release's
+        // is not.
+        description: text(release.and_then(|r| r.2.get("description")))
+            .or_else(|| text(attrs.get("description"))),
+        repository: text(attrs.get("source")),
+        downloads_total: attrs.get("downloads").and_then(Value::as_u64),
+        // `official` and `partner` providers are vetted by HashiCorp; a
+        // `community` namespace is anyone's GitHub account.
+        publisher_verified: attrs
+            .get("tier")
+            .and_then(Value::as_str)
+            .map(|t| matches!(t, "official" | "partner")),
+        deprecated: text(attrs.get("warning")),
+        ..Default::default()
+    };
+    let mut times: Vec<u64> = releases.iter().filter_map(|r| r.1).collect();
+    if !times.is_empty() {
+        times.sort_unstable();
+        p.release_count = Some(times.len() as u32);
+        p.first_published_at = times.first().copied();
+        if let Some(this) = p.published_at {
+            p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
+        }
+        p.release_times = times;
+    }
+    Some(p)
 }
 
 /// Arch Linux official repositories: the packages site exposes a JSON search.
@@ -3927,6 +4018,67 @@ mod tests {
             Some("https://github.com/denoland/std")
         );
         assert_eq!(r.rating, Some(100.0));
+    }
+
+    #[test]
+    fn terraform_provider_normalizes() {
+        let version = |id: &str, v: &str, at: &str, description: &str| {
+            serde_json::json!({
+                "type": "provider-versions", "id": id,
+                "attributes": {"version": v, "published-at": at, "tag": format!("v{v}"),
+                    "downloads": 10, "description": description}
+            })
+        };
+        let doc = serde_json::json!({
+            "data": {"type": "providers", "id": "2322743", "attributes": {
+                "description": "", "downloads": 1463, "full-name": "kreuzwenker/docker",
+                "name": "docker", "namespace": "kreuzwenker", "owner-name": "",
+                "source": "https://github.com/kreuzwenker/terraform-provider-docker",
+                "tier": "community", "unlisted": false, "warning": "Typosquat of kreuzwerker/docker"
+            }},
+            // Deliberately out of order: the registry doesn't sort them.
+            "included": [
+                version("110184", "4.7.0", "2026-09-23T05:17:28Z", ""),
+                version("107813", "4.5.0", "2026-09-04T07:07:03Z", ""),
+                version("110116", "4.6.0", "2026-09-22T14:50:27Z", "Terraform Docker provider"),
+            ]
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://registry.terraform.io/v2/providers/kreuzwenker/docker?include=provider-versions",
+            doc.as_bytes(),
+        );
+        // The mixed-case address routes to the one lowercase provider.
+        let locator = RefLocator::Purl("pkg:terraform/Kreuzwenker/Docker@4.6.0".into());
+        let r = registry(&locator, &net, &test_cache("terraform")).expect("registry");
+        assert_eq!(r.ecosystem, "terraform");
+        assert_eq!(r.name, "kreuzwenker/docker");
+        assert_eq!(r.version, "4.6.0");
+        assert_eq!(r.published_at, Some(1_790_088_627)); // 2026-09-22T14:50:27Z
+        assert_eq!(r.latest_version.as_deref(), Some("4.7.0"));
+        assert_eq!(r.publisher.as_deref(), Some("kreuzwenker"));
+        assert_eq!(r.author, None); // an empty owner-name is unknown
+        assert_eq!(r.description.as_deref(), Some("Terraform Docker provider"));
+        assert_eq!(
+            r.repository.as_deref(),
+            Some("https://github.com/kreuzwenker/terraform-provider-docker")
+        );
+        assert_eq!(r.downloads_total, Some(1463));
+        assert_eq!(r.publisher_verified, Some(false));
+        assert_eq!(
+            r.deprecated.as_deref(),
+            Some("Typosquat of kreuzwerker/docker")
+        );
+        assert_eq!(r.release_count, Some(3));
+        assert_eq!(r.first_published_at, Some(1_788_505_623)); // 2026-09-04T07:07:03Z
+        assert_eq!(r.previous_published_at, r.first_published_at);
+
+        // Versionless: the most recently published release is current.
+        let r = terraform("kreuzwenker/docker", None, &net, &test_cache("terraform"))
+            .expect("registry");
+        assert_eq!(r.version, "4.7.0");
+        assert_eq!(r.description, None);
+        assert!(terraform("docker", None, &net, &test_cache("terraform")).is_none());
     }
 
     #[test]
