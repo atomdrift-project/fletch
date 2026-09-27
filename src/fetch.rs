@@ -1546,6 +1546,34 @@ fn resolve_requirement(
         return None;
     }
     let (resolved, checksum) = match ty.as_str() {
+        "npm" => {
+            // A manifest range is a release constraint, not a dist-tag. Resolve
+            // the highest registry version that actually satisfies it so a
+            // newer major cannot be mistaken for a dependency the package
+            // manager would install.
+            let repository = repository_base(rest, "https://registry.npmjs.org")?;
+            let url = format!("{repository}/{}", npm_registry_name(name));
+            let bytes = cached_metadata(&url, net, &cache.with_meta_ttl(meta_ttl_unpinned()))?;
+            let doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            let versions = doc.get("versions")?.as_object()?;
+            let version = if let Ok(range) = node_semver::Range::parse(&requirement) {
+                versions
+                    .keys()
+                    .filter_map(|spelling| {
+                        let version = node_semver::Version::parse(spelling).ok()?;
+                        range.satisfies(&version).then_some((version, spelling))
+                    })
+                    .max_by(|a, b| a.0.cmp(&b.0))?
+                    .1
+                    .clone()
+            } else {
+                // Non-semver registry specs are npm dist-tags (for example,
+                // `latest`, `next`, or `beta`). Preserve their existing
+                // semantics instead of treating them as invalid ranges.
+                doc.get("dist-tags")?.get(&requirement)?.as_str()?.to_string()
+            };
+            (version, None)
+        }
         "cargo" => {
             // A named/private registry is never redirected to crates.io.
             if purl_qualifier(rest, "repository_url").is_some_and(|r| {
@@ -3180,15 +3208,9 @@ fn resolve_aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> String {
         .unwrap_or_else(|| format!("https://aur.archlinux.org/cgit/aur.git/snapshot/{name}.tar.gz"))
 }
 
-// TODO(fetch-latest): a versionless npm dependency (a manifest range/tag/
-// wildcard like `^1.11.21`) is resolved to the registry's current
-// `dist-tags.latest`, not the highest version the declared range admits.
-// Implementing npm's semver range algebra (caret/tilde/comparators/unions/
-// hyphen/wildcards) would pull in a semver matcher and a long tail of edge
-// cases. For threat assessment the relevant, most-conservative answer is "what
-// does this name serve right now" — the attacker-controlled current release —
-// and the declared range is preserved as the reference's evidence. Revisit if
-// range-accurate resolution is ever needed.
+// A versionless npm PURL with no declared version requirement resolves through
+// dist-tags. Manifest ranges are resolved separately by `resolve_requirement`
+// so a current latest release outside the declared range is never substituted.
 /// Resolve a versionless npm PURL path (`left-pad`, `%40scope/util`) to the
 /// concrete `(pkg:npm/<path>@<latest>, tarball URL)` it currently points at, by
 /// reading the registry packument's `dist-tags.latest`. The registry's own
@@ -3960,6 +3982,40 @@ mod tests {
             Some(Some(RefLocator::Purl("pkg:pypi/codec@1.2".into())))
         );
     }
+
+    #[test]
+    fn npm_requirement_selects_compatible_release_and_honors_dist_tag() {
+        let packument = br#"{
+            "dist-tags": {"latest": "4.0.50", "next": "5.0.0-beta.1"},
+            "versions": {
+                "3.0.39": {},
+                "3.9.0": {},
+                "4.0.50": {},
+                "5.0.0-beta.1": {}
+            }
+        }"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/@ai-sdk/groq", packument);
+        let cache = BlobCache::disabled();
+
+        // A manifest's ^3 range must not drift to the registry's newer major.
+        let range = RefLocator::Purl(
+            "pkg:npm/%40ai-sdk/groq?version_requirement=%5E3.0.39".into(),
+        );
+        assert_eq!(
+            resolve_requirement(&range, &net, &cache),
+            Some(Some(RefLocator::Purl("pkg:npm/%40ai-sdk/groq@3.9.0".into())))
+        );
+
+        // A non-range requirement remains a dist-tag lookup.
+        let tag = RefLocator::Purl(
+            "pkg:npm/%40ai-sdk/groq?version_requirement=next".into(),
+        );
+        assert_eq!(
+            resolve_requirement(&tag, &net, &cache),
+            Some(Some(RefLocator::Purl("pkg:npm/%40ai-sdk/groq@5.0.0-beta.1".into())))
+        );
+    }
+
     #[test]
     fn compatible_lock_pin_preserves_build_role_and_rejects_ambiguity() {
         let mut declaration = dep(
