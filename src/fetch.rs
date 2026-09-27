@@ -1424,8 +1424,9 @@ fn locator_string(locator: &RefLocator) -> String {
 
 /// Resolve a locator to a fetchable URL, or `None` if the ecosystem isn't
 /// supported yet. Ecosystems that need a registry round-trip (PyPI, Composer,
-/// Firefox, Terraform, the AUR, an unversioned npm PURL) resolve in `resolved_target`
-/// instead; official-repo alpm (a mirror lookup) is a follow-up.
+/// Firefox, Terraform, the AUR, ComfyUI, Dify, an unversioned npm PURL) resolve
+/// in `resolved_target` instead; official-repo alpm (a mirror lookup) is a
+/// follow-up.
 #[must_use]
 pub fn resolve(locator: &RefLocator) -> Option<String> {
     match locator {
@@ -3155,6 +3156,27 @@ fn resolved_target(
                 requested.map_or_else(|| format!("pkg:firefox/{path}@{version}"), |_| p.clone());
             return Some((locator, url));
         }
+        // ComfyUI Registry nodes and Dify Marketplace plugins name their
+        // artifact only through their APIs (a publisher-keyed CDN path; a
+        // download key embedding Dify's own checksum), so they resolve the way
+        // AMO does: a pinned version through its per-version document, an
+        // unpinned one through the current release, refined to that version.
+        if ty == "comfyui" || ty == "dify" {
+            let (path, requested) = split_path_version(rest);
+            let (version, url) = if ty == "comfyui" {
+                resolve_comfyui(path, requested, net, cache)?
+            } else {
+                resolve_dify(path, requested, net, cache)?
+            };
+            let locator = requested.map_or_else(
+                || {
+                    let version = crate::purl::encode_component(&version);
+                    format!("pkg:{ty}/{path}@{version}")
+                },
+                |_| p.clone(),
+            );
+            return Some((locator, url));
+        }
         // The AUR serves one artifact per package: the current PKGBUILD-tree
         // snapshot, addressed by *pkgbase* (a split package's snapshot lives
         // under its base, not its own name), which the RPC names exactly.
@@ -3349,6 +3371,107 @@ fn resolve_firefox(
     }
     let url = release.pointer("/file/url")?.as_str()?.to_string();
     Some((resolved_version, url))
+}
+
+/// Resolve a ComfyUI Registry node id to `(version, archive URL)`. The CDN path
+/// is keyed by publisher rather than node id, and the archive is a `.zip` or a
+/// `.tar.gz` as uploaded, so only the install endpoint names it. With
+/// `?version=` it answers that one release; without, the current one.
+fn resolve_comfyui(
+    path: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<(String, String)> {
+    // A node id is one global segment: the registry has no namespace.
+    if path.is_empty()
+        || path.contains('/')
+        || !safe_coordinate(path)
+        || version.is_some_and(|v| !safe_coordinate(v))
+    {
+        return None;
+    }
+    let base = format!("https://api.comfy.org/nodes/{path}/install");
+    let (api, ttl) = match version {
+        Some(v) => (format!("{base}?version={v}"), META_TTL_IMMUTABLE),
+        None => (base, meta_ttl_unpinned()),
+    };
+    let bytes = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))?;
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let resolved = doc.get("version")?.as_str()?;
+    // As with AMO: a surprising response must not substitute another release,
+    // or another node, for the one requested.
+    if version.is_some_and(|want| percent_decode(want) != resolved)
+        || doc.get("node_id").and_then(serde_json::Value::as_str) != Some(&percent_decode(path))
+    {
+        return None;
+    }
+    let url = doc.get("downloadUrl")?.as_str()?;
+    is_web_scheme(url).then(|| (resolved.to_string(), url.to_string()))
+}
+
+/// Resolve a Dify Marketplace plugin (`<org>/<name>`) to `(version, .difypkg
+/// URL)`. The download endpoint is keyed by the release's unique identifier,
+/// `<org>/<name>:<version>@<checksum>`, whose checksum is Dify's own (not the
+/// package's sha256), so it is read from the per-version document — or, for an
+/// unpinned plugin, from the plugin document's current release.
+fn resolve_dify(
+    path: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<(String, String)> {
+    let (org, name) = path.split_once('/')?;
+    if org.is_empty()
+        || name.is_empty()
+        || name.contains('/')
+        || !safe_coordinate(path)
+        || version.is_some_and(|v| !safe_coordinate(v))
+    {
+        return None;
+    }
+    let base = format!("https://marketplace.dify.ai/api/v1/plugins/{org}/{name}");
+    let json = |url: &str, ttl: Duration| {
+        cached_metadata(url, net, &cache.with_meta_ttl(ttl))
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    };
+    let text = |doc: &serde_json::Value, pointer: &str| {
+        doc.pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let (resolved, identifier) = match version {
+        Some(v) => {
+            let doc = json(&format!("{base}/{v}"), META_TTL_IMMUTABLE)?;
+            (
+                text(&doc, "/data/version/version")?,
+                text(&doc, "/data/version/unique_identifier")?,
+            )
+        }
+        None => {
+            let doc = json(&base, meta_ttl_unpinned())?;
+            (
+                text(&doc, "/data/plugin/latest_version")?,
+                text(&doc, "/data/plugin/latest_package_identifier")?,
+            )
+        }
+    };
+    if version.is_some_and(|want| percent_decode(want) != resolved) {
+        return None;
+    }
+    // Held to its documented shape, so a surprising response can't point the
+    // download at another plugin's (or another release's) package.
+    let checksum = identifier.strip_prefix(&format!("{}:{resolved}@", percent_decode(path)))?;
+    if checksum.is_empty() || !checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        resolved,
+        format!(
+            "https://marketplace.dify.ai/api/v1/plugins/download?unique_identifier={}",
+            crate::purl::encode_component(&identifier)
+        ),
+    ))
 }
 
 /// Open VSX publishes the `.vsix` download URL in its JSON API. `rest` is
@@ -4733,6 +4856,119 @@ mod tests {
         assert_eq!(
             resolved_target(
                 &RefLocator::Purl("pkg:firefox/surf-click@1.0.9".into()),
+                &net,
+                &cache
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_comfyui_uses_exact_version_and_refines_latest() {
+        let base = "https://api.comfy.org/nodes/comfyui-loopstrip/install";
+        let pinned_api = format!("{base}?version=1.3.1");
+        // The CDN path is the publisher's, not derivable from the node id.
+        let zip = "https://cdn.comfy.org/serhiiyashyn-sf/comfyui-loopstrip/1.3.1/node.zip";
+        let doc = serde_json::json!({
+            "node_id": "comfyui-loopstrip", "version": "1.3.1", "downloadUrl": zip
+        })
+        .to_string();
+        let net = Fixtures::default()
+            .with(&pinned_api, doc.as_bytes())
+            .with(base, doc.as_bytes())
+            .with(zip, b"ZIP");
+        let cache = BlobCache::disabled();
+        let exact = "pkg:comfyui/comfyui-loopstrip@1.3.1";
+        for purl in [exact, "pkg:comfyui/comfyui-loopstrip"] {
+            assert_eq!(
+                resolved_target(&RefLocator::Purl(purl.into()), &net, &cache),
+                Some((exact.to_string(), zip.to_string())),
+                "{purl}"
+            );
+        }
+        let rec = fetch_ref(&dep(RefLocator::Purl(exact.into()), None), &net, &cache);
+        assert_eq!(rec.outcome, Outcome::Ok);
+        assert_eq!(rec.content_sha256.as_deref(), Some(&*sha256_hex(b"ZIP")));
+
+        // Another release or another node in the answer is refused, as is a
+        // namespaced id (the registry has none).
+        for wrong in [
+            serde_json::json!({"node_id": "comfyui-loopstrip", "version": "1.3.0", "downloadUrl": zip}),
+            serde_json::json!({"node_id": "other-node", "version": "1.3.1", "downloadUrl": zip}),
+        ] {
+            let net = Fixtures::default().with(&pinned_api, wrong.to_string().as_bytes());
+            assert_eq!(
+                resolved_target(&RefLocator::Purl(exact.into()), &net, &cache),
+                None
+            );
+        }
+        assert_eq!(
+            resolved_target(
+                &RefLocator::Purl("pkg:comfyui/owner/comfyui-loopstrip@1.3.1".into()),
+                &net,
+                &cache
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_dify_downloads_by_unique_identifier() {
+        let base = "https://marketplace.dify.ai/api/v1/plugins/fr3on/eval-loop";
+        let identifier = format!("fr3on/eval-loop:0.1.1@{}", "b2".repeat(32));
+        let pkg = format!(
+            "https://marketplace.dify.ai/api/v1/plugins/download?unique_identifier=fr3on%2Feval-loop:0.1.1%40{}",
+            "b2".repeat(32)
+        );
+        let pinned = serde_json::json!({"code": 0, "data": {"version": {
+            "version": "0.1.1", "unique_identifier": identifier
+        }}})
+        .to_string();
+        let latest = serde_json::json!({"code": 0, "data": {"plugin": {
+            "latest_version": "0.1.1", "latest_package_identifier": identifier
+        }}})
+        .to_string();
+        let net = Fixtures::default()
+            .with(&format!("{base}/0.1.1"), pinned.as_bytes())
+            .with(base, latest.as_bytes())
+            .with(&pkg, b"DIFYPKG");
+        let cache = BlobCache::disabled();
+        let exact = "pkg:dify/fr3on/eval-loop@0.1.1";
+        for purl in [exact, "pkg:dify/fr3on/eval-loop"] {
+            assert_eq!(
+                resolved_target(&RefLocator::Purl(purl.into()), &net, &cache),
+                Some((exact.to_string(), pkg.clone())),
+                "{purl}"
+            );
+        }
+        let rec = fetch_ref(&dep(RefLocator::Purl(exact.into()), None), &net, &cache);
+        assert_eq!(rec.outcome, Outcome::Ok);
+        assert_eq!(
+            rec.content_sha256.as_deref(),
+            Some(&*sha256_hex(b"DIFYPKG"))
+        );
+
+        // An identifier naming another plugin or release is refused, as is a
+        // bare name (the marketplace keys every plugin by its org).
+        for wrong in [
+            format!("evil/eval-loop:0.1.1@{}", "b2".repeat(32)),
+            format!("fr3on/eval-loop:0.1.0@{}", "b2".repeat(32)),
+            "fr3on/eval-loop:0.1.1@not-a-checksum".to_string(),
+        ] {
+            let doc = serde_json::json!({"data": {"version": {
+                "version": "0.1.1", "unique_identifier": wrong
+            }}})
+            .to_string();
+            let net = Fixtures::default().with(&format!("{base}/0.1.1"), doc.as_bytes());
+            assert_eq!(
+                resolved_target(&RefLocator::Purl(exact.into()), &net, &cache),
+                None,
+                "{wrong}"
+            );
+        }
+        assert_eq!(
+            resolved_target(
+                &RefLocator::Purl("pkg:dify/eval-loop@0.1.1".into()),
                 &net,
                 &cache
             ),

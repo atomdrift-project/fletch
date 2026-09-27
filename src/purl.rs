@@ -973,7 +973,9 @@ fn valid_version_range(value: &str) -> bool {
     })
 }
 
-fn encode_component(value: &str) -> String {
+/// Percent-encode one PURL component (everything but the unreserved set and
+/// `:`), the spelling [`normalize`] emits.
+pub(crate) fn encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'-' | b'_' | b'~' | b':') {

@@ -127,6 +127,11 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // Agent-skill registry: `pkg:clawhub/[owner/]slug`. The v1 API is
         // search-shaped; the fetcher exact-matches the slug in the results.
         "clawhub" => clawhub(last_seg(&path), net, cache),
+        // Plugin registries of ML apps: a ComfyUI custom node
+        // (`pkg:comfyui/<node_id>`) and a Dify Marketplace plugin
+        // (`pkg:dify/<org>/<name>`).
+        "comfyui" => comfyui(&path, version, net, cache),
+        "dify" => dify(&path, version, net, cache),
         // Container images: `pkg:oci/<name>?repository_url=<host%2Fpath>`,
         // the ratified registry-agnostic type (`pkg:docker` is its legacy
         // spelling — same repositories, so it routes identically). The
@@ -2388,6 +2393,109 @@ fn hf_license(doc: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A non-empty string field, owned.
+fn nonempty(v: Option<&Value>) -> Option<String> {
+    v.and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// ComfyUI Registry: the node document is the listing (publisher, repository,
+/// downloads, first listing) plus its latest release. It carries no other
+/// release, so a pinned older version gets no publish time.
+fn comfyui(
+    id: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    if id.contains('/') {
+        return None;
+    }
+    let doc = json_meta(&format!("https://api.comfy.org/nodes/{id}"), net, cache)?;
+    let latest = doc.get("latest_version");
+    let latest_version = nonempty(latest.and_then(|l| l.get("version")));
+    let version = version
+        .map(percent_decode)
+        .or_else(|| latest_version.clone())
+        .unwrap_or_default();
+    Some(Registry {
+        ecosystem: "comfyui".into(),
+        name: nonempty(doc.get("id")).unwrap_or_else(|| percent_decode(id)),
+        published_at: latest
+            .filter(|_| latest_version.as_deref() == Some(version.as_str()))
+            .and_then(|l| l.get("createdAt")?.as_str())
+            .and_then(parse_ts),
+        first_published_at: doc
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
+        version,
+        latest_version,
+        title: nonempty(doc.get("name")),
+        description: nonempty(doc.get("description")),
+        repository: nonempty(doc.get("repository")),
+        publisher: nonempty(doc.pointer("/publisher/id")),
+        downloads_total: doc.get("downloads").and_then(Value::as_u64),
+        // A banned or deleted node still answers; its status says which.
+        deprecated: nonempty(doc.get("status")).filter(|s| s != "NodeStatusActive"),
+        ..Default::default()
+    })
+}
+
+/// Dify Marketplace: the plugin document is the listing (installs, publisher
+/// org, repository, verification) plus its latest release. As with ComfyUI, a
+/// pinned older version gets no publish time.
+fn dify(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+    let (org, name) = path.split_once('/')?;
+    if name.contains('/') {
+        return None;
+    }
+    let doc = json_meta(
+        &format!("https://marketplace.dify.ai/api/v1/plugins/{org}/{name}"),
+        net,
+        cache,
+    )?;
+    let plugin = doc.pointer("/data/plugin")?;
+    let latest_version = nonempty(plugin.get("latest_version"));
+    let version = version
+        .map(percent_decode)
+        .or_else(|| latest_version.clone())
+        .unwrap_or_default();
+    Some(Registry {
+        ecosystem: "dify".into(),
+        name: nonempty(plugin.get("plugin_id")).unwrap_or_else(|| percent_decode(path)),
+        published_at: plugin
+            .get("version_updated_at")
+            .and_then(Value::as_str)
+            .filter(|_| latest_version.as_deref() == Some(version.as_str()))
+            .and_then(parse_ts),
+        first_published_at: plugin
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
+        version,
+        latest_version,
+        // Localized as `{ "en_US": … }`, underscore where AMO has a hyphen.
+        title: nonempty(plugin.pointer("/label/en_US"))
+            .or_else(|| plugin.get("label").and_then(localized)),
+        description: nonempty(plugin.pointer("/brief/en_US"))
+            .or_else(|| plugin.get("brief").and_then(localized)),
+        repository: nonempty(plugin.get("repository")),
+        publisher: Some(percent_decode(org)),
+        downloads_total: plugin.get("install_count").and_then(Value::as_u64),
+        // Dify's own and its partners' plugins are vetted; `community` is
+        // anyone's.
+        publisher_verified: plugin
+            .pointer("/verification/authorized_category")
+            .and_then(Value::as_str)
+            .map(|c| matches!(c, "langgenius" | "partner")),
+        deprecated: nonempty(plugin.get("deprecated_reason"))
+            .or_else(|| nonempty(plugin.get("status")).filter(|s| s != "active")),
+        ..Default::default()
+    })
+}
+
 /// Firefox Add-ons (addons.mozilla.org v5): the same marketplace shape as the
 /// Chrome and VS Code stores — localized name/summary, rating, weekly installs,
 /// and the current version with its review date.
@@ -3597,6 +3705,80 @@ mod tests {
         assert_eq!(r.downloads_total, Some(357));
         assert_eq!(r.rating_count, Some(4));
         assert_eq!(r.release_count, Some(12));
+    }
+
+    #[test]
+    fn comfyui_node_normalizes() {
+        let doc = serde_json::json!({
+            "id": "comfyui-loopstrip", "name": "Loop Strip",
+            "description": "Character animation nodes for ComfyUI.",
+            "repository": "https://github.com/serhiiyashyn-sf/comfyui-loopstrip",
+            "downloads": 353u64, "status": "NodeStatusActive",
+            "created_at": "2026-04-16T09:28:21.273039Z",
+            "publisher": {"id": "serhiiyashyn-sf"},
+            "latest_version": {"version": "1.3.1", "createdAt": "2026-04-21T23:53:06.619755Z"}
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://api.comfy.org/nodes/comfyui-loopstrip",
+            doc.as_bytes(),
+        );
+        let locator = RefLocator::Purl("pkg:comfyui/comfyui-loopstrip@1.3.1".into());
+        let r = registry(&locator, &net, &test_cache("comfyui")).expect("registry");
+        assert_eq!(r.ecosystem, "comfyui");
+        assert_eq!(r.name, "comfyui-loopstrip");
+        assert_eq!(r.version, "1.3.1");
+        assert_eq!(r.latest_version.as_deref(), Some("1.3.1"));
+        assert_eq!(r.published_at, Some(1_776_815_586)); // 2026-04-21T23:53:06Z
+        assert_eq!(r.first_published_at, Some(1_776_331_701)); // 2026-04-16T09:28:21Z
+        assert_eq!(r.title.as_deref(), Some("Loop Strip"));
+        assert_eq!(r.publisher.as_deref(), Some("serhiiyashyn-sf"));
+        assert_eq!(r.downloads_total, Some(353));
+        assert_eq!(r.deprecated, None);
+
+        // An older pin has no publish time in the node document.
+        let r = comfyui(
+            "comfyui-loopstrip",
+            Some("1.3.0"),
+            &net,
+            &test_cache("comfyui"),
+        )
+        .expect("registry");
+        assert_eq!(r.version, "1.3.0");
+        assert_eq!(r.published_at, None);
+    }
+
+    #[test]
+    fn dify_plugin_normalizes() {
+        let doc = serde_json::json!({"code": 0, "data": {"plugin": {
+            "plugin_id": "fr3on/eval-loop", "org": "fr3on", "name": "eval-loop",
+            "label": {"en_US": "Eval Loop"}, "brief": {"en_US": "Evaluates Q&A."},
+            "repository": "https://github.com/fr3on/eval-loop",
+            "install_count": 9u64, "status": "active", "deprecated_reason": "",
+            "verification": {"authorized_category": "community"},
+            "created_at": "2026-09-26T01:46:12.196377Z",
+            "version_updated_at": "2026-09-26T01:46:15.993933Z",
+            "latest_version": "0.1.1"
+        }}})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://marketplace.dify.ai/api/v1/plugins/fr3on/eval-loop",
+            doc.as_bytes(),
+        );
+        let locator = RefLocator::Purl("pkg:dify/fr3on/eval-loop".into());
+        let r = registry(&locator, &net, &test_cache("dify")).expect("registry");
+        assert_eq!(r.ecosystem, "dify");
+        assert_eq!(r.name, "fr3on/eval-loop");
+        assert_eq!(r.version, "0.1.1");
+        assert_eq!(r.published_at, Some(1_790_387_175)); // 2026-09-26T01:46:15Z
+        assert_eq!(r.first_published_at, Some(1_790_387_172));
+        assert_eq!(r.title.as_deref(), Some("Eval Loop"));
+        assert_eq!(r.description.as_deref(), Some("Evaluates Q&A."));
+        assert_eq!(r.publisher.as_deref(), Some("fr3on"));
+        assert_eq!(r.publisher_verified, Some(false));
+        assert_eq!(r.downloads_total, Some(9));
+        assert_eq!(r.deprecated, None);
+        assert!(dify("eval-loop", None, &net, &test_cache("dify")).is_none());
     }
 
     #[test]
