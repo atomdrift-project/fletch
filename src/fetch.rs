@@ -1571,7 +1571,10 @@ fn resolve_requirement(
                 // Non-semver registry specs are npm dist-tags (for example,
                 // `latest`, `next`, or `beta`). Preserve their existing
                 // semantics instead of treating them as invalid ranges.
-                doc.get("dist-tags")?.get(&requirement)?.as_str()?.to_string()
+                doc.get("dist-tags")?
+                    .get(&requirement)?
+                    .as_str()?
+                    .to_string()
             };
             (version, None)
         }
@@ -4121,21 +4124,21 @@ mod tests {
         let cache = BlobCache::disabled();
 
         // A manifest's ^3 range must not drift to the registry's newer major.
-        let range = RefLocator::Purl(
-            "pkg:npm/%40ai-sdk/groq?version_requirement=%5E3.0.39".into(),
-        );
+        let range = RefLocator::Purl("pkg:npm/%40ai-sdk/groq?version_requirement=%5E3.0.39".into());
         assert_eq!(
             resolve_requirement(&range, &net, &cache),
-            Some(Some(RefLocator::Purl("pkg:npm/%40ai-sdk/groq@3.9.0".into())))
+            Some(Some(RefLocator::Purl(
+                "pkg:npm/%40ai-sdk/groq@3.9.0".into()
+            )))
         );
 
         // A non-range requirement remains a dist-tag lookup.
-        let tag = RefLocator::Purl(
-            "pkg:npm/%40ai-sdk/groq?version_requirement=next".into(),
-        );
+        let tag = RefLocator::Purl("pkg:npm/%40ai-sdk/groq?version_requirement=next".into());
         assert_eq!(
             resolve_requirement(&tag, &net, &cache),
-            Some(Some(RefLocator::Purl("pkg:npm/%40ai-sdk/groq@5.0.0-beta.1".into())))
+            Some(Some(RefLocator::Purl(
+                "pkg:npm/%40ai-sdk/groq@5.0.0-beta.1".into()
+            )))
         );
     }
 
