@@ -10,10 +10,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use filefacts::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference};
 use serde::{Deserialize, Serialize};
@@ -294,7 +295,10 @@ const TTL_UNPINNED: Duration = Duration::from_secs(12 * 3600);
 ///   coordinates per scan only re-confirms what they already said. 90 days
 ///   rather than forever so a record still refreshes on a human timescale: the
 ///   schema we parse can change, and a cache that never expires can never
-///   self-heal from a bad parse.
+///   self-heal from a bad parse. The one thing a cached copy can't know is a
+///   version published after it was fetched, so a lookup whose copy doesn't
+///   list the requested version re-reads it under the unpinned TTL (see
+///   [`crate::registry::registry`]).
 /// - **Unpinned** — a `latest`/versionless lookup resolves through dist-tags,
 ///   which are repointable at will. That is where the real mutability lives, so
 ///   it keeps a tight bound.
@@ -323,7 +327,7 @@ const META_TTL_UNPINNED_DEFAULT: Duration = Duration::from_secs(3600);
 static REGISTRY_TTL_OVERRIDE_SECS: AtomicU64 = AtomicU64::new(0);
 
 /// Override both mutable registry-metadata TTLs for the process. `None` clears
-/// the override (the 4h-pinned / 1h-unpinned defaults resume). Call once at
+/// the override (the 90-day pinned / 1-hour unpinned defaults resume). Call once at
 /// startup, before any registry lookup. The immutable tier is unaffected — a
 /// released version's file list is never re-fetched regardless.
 pub fn set_registry_ttl(ttl: Option<Duration>) {
@@ -371,6 +375,12 @@ pub fn max_fetch_bytes() -> u64 {
 }
 /// Redirect-chain cap.
 const MAX_REDIRECTS: u32 = 10;
+
+/// Wall-clock ceiling on one GET or POST, redirect hops and body included. The
+/// blocking client's own timeout bounds each read, not the whole body, so a
+/// server sending a byte every few seconds could otherwise hold a worker until
+/// the size cap.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(600);
 
 /// The one network operation. Backends: [`HttpFetch`] (real, SSRF-guarded)
 /// and [`Fixtures`] (offline tests).
@@ -601,6 +611,25 @@ struct CachedMeta {
     final_url: String,
     redirects: Vec<String>,
     headers: Vec<(String, String)>,
+    /// Decompressed length of the blob. Recorded by [`BlobCache::put`], so
+    /// callers leave it `None`; absent from entries written before it existed.
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+impl CachedMeta {
+    /// The decompression ceiling for this entry's blob: the size recorded when
+    /// it was stored. An entry admitted under a larger cap than
+    /// [`max_fetch_bytes`] (an OCI export) is still served, and a blob planted
+    /// in its place can expand no further than the entry it replaced. The
+    /// sidecar is as writable as the blob, so the recorded size is itself
+    /// bounded by the largest cap any fetch path admits. An entry without one
+    /// falls back to the per-fetch cap.
+    fn read_limit(&self) -> u64 {
+        let ceiling = max_fetch_bytes().max(crate::oci::MAX_EXPORT_BYTES);
+        self.size
+            .map_or_else(max_fetch_bytes, |size| size.min(ceiling))
+    }
 }
 
 /// One raw provider document a registry lookup read, captured by a recording
@@ -685,6 +714,29 @@ impl BlobCache {
         (cache, sink)
     }
 
+    /// A clone whose reads are recorded into a fresh sink held back from this
+    /// cache's recorder, when it has one: they reach it only once
+    /// [`commit`](Self::commit)ted, so a read the caller then discards (a
+    /// superseded attempt) never shows up among its sources.
+    pub(crate) fn staged(&self) -> (Self, Option<RawSink>) {
+        if self.recorder.is_some() {
+            let (cache, sink) = self.recording();
+            (cache, Some(sink))
+        } else {
+            (self.clone(), None)
+        }
+    }
+
+    /// Forward what a [`staged`](Self::staged) clone recorded to this cache's
+    /// recorder.
+    pub(crate) fn commit(&self, staged: Option<RawSink>) {
+        if let (Some(sink), Some(staged)) = (&self.recorder, staged)
+            && let (Ok(mut sources), Ok(mut read)) = (sink.lock(), staged.lock())
+        {
+            sources.append(&mut read);
+        }
+    }
+
     /// Append a served metadata document to the recorder, if one is installed.
     fn record(&self, url: &str, status: u16, content_type: Option<&str>, bytes: &[u8]) {
         if let Some(sink) = &self.recorder
@@ -750,9 +802,14 @@ impl BlobCache {
         }
         let blob = self.blob_path(key);
         let blob_mtime = std::fs::metadata(&blob).ok()?.modified().ok()?;
-        let bytes = read_blob_capped(&blob, max_fetch_bytes())?;
         let meta: CachedMeta =
             serde_json::from_slice(&std::fs::read(self.meta_path(key)).ok()?).ok()?;
+        let bytes = read_blob_capped(&blob, meta.read_limit())?;
+        // The pair is written as two renames, so a concurrent writer can leave
+        // one file from each fetch; a length disagreement is a miss.
+        if meta.size.is_some_and(|size| bytes.len() as u64 != size) {
+            return None;
+        }
         let age = Duration::from_secs(now().saturating_sub(meta.fetched_at));
         self.mark_accessed(key, blob_mtime);
         Some((bytes, meta, age))
@@ -809,7 +866,11 @@ impl BlobCache {
         if let Ok(compressed) = zstd::encode_all(bytes, 3) {
             write_replacing(&self.blob_path(key), &compressed);
         }
-        if let Ok(json) = serde_json::to_vec(meta) {
+        let meta = CachedMeta {
+            size: Some(bytes.len() as u64),
+            ..meta.clone()
+        };
+        if let Ok(json) = serde_json::to_vec(&meta) {
             write_replacing(&self.meta_path(key), &json);
         }
         // A bulk fetch can outgrow the cache ceiling inside one process, long
@@ -832,7 +893,7 @@ fn read_blob_capped(path: &std::path::Path, limit: u64) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     zstd::stream::read::Decoder::new(std::fs::File::open(path).ok()?)
         .ok()?
-        .take(limit + 1)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;
     (bytes.len() as u64 <= limit).then_some(bytes)
@@ -920,6 +981,7 @@ pub(crate) fn store_metadata(url: &str, fetched: &Fetched, cache: &BlobCache) {
         final_url: fetched.final_url.clone(),
         redirects: fetched.redirects.clone(),
         headers: fetched.headers.clone(),
+        size: None,
     };
     cache.put(&metadata_cache_key(url), &fetched.bytes, &meta);
 }
@@ -1008,6 +1070,7 @@ fn cached_document(
         final_url: f.final_url,
         redirects: f.redirects,
         headers: f.headers,
+        size: None,
     };
     cache.put(key, &f.bytes, &meta);
     cache.record(url, meta.status, content_type_of(&meta.headers), &f.bytes);
@@ -1097,9 +1160,7 @@ fn fetch_ref_inner(
                     bytes,
                     final_url: url.clone(),
                     status: 200,
-                    headers: digest
-                        .map(|d| vec![("docker-content-digest".to_string(), d)])
-                        .unwrap_or_default(),
+                    headers: vec![("docker-content-digest".to_string(), digest)],
                     redirects: Vec::new(),
                 })
                 .map_err(FetchError::Transport)
@@ -1119,6 +1180,7 @@ fn fetch_ref_inner(
                 final_url: f.final_url,
                 redirects: f.redirects,
                 headers: f.headers,
+                size: None,
             };
             cache.put(&key, &f.bytes, &meta);
             record(r, locator, url, &f.bytes, Served::Network, &meta)
@@ -1280,12 +1342,28 @@ pub fn fetch_references_with(
                             // (served free), and concurrent workers can never
                             // claim more than `max_count` slots: the live total
                             // is an exact ceiling, not best-effort.
-                            let rec = fetch_ref_inner(targets[i], net, cache, || {
-                                net_used
-                                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                                        (n < budget.max_count).then_some(n + 1)
-                                    })
-                                    .is_ok()
+                            //
+                            // A panic in one fetch (a parser bug tripped by
+                            // hostile bytes) is that reference's failure, not
+                            // the batch's: caught here, the worker's other
+                            // results survive and the rest of the sweep runs.
+                            let rec = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                fetch_ref_inner(targets[i], net, cache, || {
+                                    net_used
+                                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                            (n < budget.max_count).then_some(n + 1)
+                                        })
+                                        .is_ok()
+                                })
+                            }))
+                            .unwrap_or_else(|panic| {
+                                FetchRecord::terminal(
+                                    locator_string(&targets[i].locator),
+                                    Outcome::Failed(format!(
+                                        "internal error: {}",
+                                        panic_message(panic.as_ref())
+                                    )),
+                                )
                             });
                             bytes_used.fetch_add(rec.size.unwrap_or(0), Ordering::Relaxed);
                             // Signal completion before the record is buffered, so
@@ -1299,7 +1377,15 @@ pub fn fetch_references_with(
                     })
                 })
                 .collect();
-            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            // Anything still unwinding came from outside a fetch (the caller's
+            // `on_fetched`), so it is the caller's to see, not ours to bury.
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect()
         });
         for chunk in collected {
             for (i, rec) in chunk {
@@ -1322,6 +1408,15 @@ pub fn fetch_references_with(
         records.push(rec);
     }
     records
+}
+
+/// The text a panic was raised with, for the record of the fetch it ended.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("panic")
 }
 
 /// Whether a reference should be fetched: a fetch target whose locator resolves
@@ -1896,6 +1991,7 @@ fn remember_goproxy_path(key: &str, canonical: &str, url: &str, cache: &BlobCach
         final_url: url.to_string(),
         redirects: Vec::new(),
         headers: Vec::new(),
+        size: None,
     };
     cache.put(key, canonical.as_bytes(), &meta);
 }
@@ -2673,14 +2769,7 @@ fn resolve_purl_with_file_selection(purl: &str, honor_file_name: bool) -> Option
     let (path, version) = split_path_version(rest);
     // Vetted once here rather than at each of the arms below, every one of
     // which interpolates these into a URL.
-    let version_is_safe = version.is_none_or(|value| {
-        if ty == "maven" {
-            safe_coordinate_inner(value, true)
-        } else {
-            safe_coordinate(value)
-        }
-    });
-    if !safe_coordinate(path) || !version_is_safe {
+    if !safe_purl_coordinates(&ty, path, version) {
         return None;
     }
     match ty.as_str() {
@@ -2948,6 +3037,28 @@ pub(crate) fn safe_coordinate(value: &str) -> bool {
     safe_coordinate_inner(value, false)
 }
 
+/// [`safe_coordinate`] over a PURL's coordinate path and version, as every
+/// resolver that builds a URL from them applies it. Only a Maven version may
+/// carry an encoded space.
+fn safe_purl_coordinates(ty: &str, path: &str, version: Option<&str>) -> bool {
+    safe_coordinate(path) && version.is_none_or(|v| safe_coordinate_inner(v, ty == "maven"))
+}
+
+/// Whether `value` is a VS Code Marketplace publisher ID — the rule `vsce`
+/// enforces (`^[a-z0-9][a-z0-9-]*$`, any case), which also keeps it a single
+/// hostname label of at most 63 bytes. The publisher is interpolated into a
+/// hostname, where [`safe_coordinate`]'s path rules are not enough.
+fn is_vscode_publisher(value: &str) -> bool {
+    value.len() <= 63
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
 fn safe_coordinate_inner(value: &str, allow_encoded_space: bool) -> bool {
     let decoded = percent_decode(value);
     value.bytes().filter(|byte| *byte == b'/').count()
@@ -2980,31 +3091,42 @@ fn resolve_oci_ref(rest: &str) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let mut repo = None;
+    let mut repository_url = None;
     let mut tag = None;
     for q in quals.split('&') {
         if let Some((k, v)) = q.split_once('=') {
             match k {
-                "repository_url" => repo = Some(percent_decode(v)),
+                "repository_url" => repository_url = Some(v),
                 "tag" => tag = Some(v.to_string()),
                 _ => {}
             }
         }
     }
-    let repo = repo.unwrap_or_else(|| {
-        // Host-less refs live on Docker Hub; single-segment ones under library/.
-        match name.split_once('/') {
-            Some((first, _)) if first.contains('.') || first.contains(':') => name.to_string(),
-            Some(_) => format!("docker.io/{name}"),
-            None => format!("docker.io/library/{name}"),
-        }
-    });
+    let repo = oci_repository(name, repository_url);
     Some(match (version, tag.as_deref()) {
         (Some(d), _) if d.starts_with("sha256:") => format!("oci://{repo}@{d}"),
         // A legacy pkg:docker version slot may carry a plain tag.
         (Some(t), _) | (None, Some(t)) => format!("oci://{repo}:{t}"),
         (None, None) => format!("oci://{repo}:latest"),
     })
+}
+
+/// The registry-qualified repository a `pkg:oci`/`pkg:docker` name denotes:
+/// its percent-encoded `repository_url` qualifier, decoded, when present;
+/// otherwise Docker Hub's implied coordinates. A host-less name lives on
+/// Docker Hub, and only a single-segment one under `library/` — `myorg/nginx`
+/// is `docker.io/myorg/nginx`, not the official `library/nginx`. Shared by the
+/// fetcher and the registry lookup so the bytes and the reputation always
+/// describe the same repository.
+pub(crate) fn oci_repository(name: &str, repository_url: Option<&str>) -> String {
+    if let Some(url) = repository_url.filter(|u| !u.is_empty()) {
+        return percent_decode(url);
+    }
+    match name.split_once('/') {
+        Some((first, _)) if first.contains('.') || first.contains(':') => name.to_string(),
+        Some(_) => format!("docker.io/{name}"),
+        None => format!("docker.io/library/{name}"),
+    }
 }
 
 /// Decode percent-escapes (`%2F` → '/'). Malformed escapes pass through
@@ -3015,11 +3137,8 @@ pub(crate) fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        let decoded = (b[i] == b'%' && i + 2 < b.len())
-            .then(|| {
-                let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok()?;
-                u8::from_str_radix(hex, 16).ok()
-            })
+        let decoded = (b[i] == b'%')
+            .then(|| b.get(i + 1..i + 3).and_then(crate::purl::hex_pair))
             .flatten();
         match decoded {
             Some(c) => {
@@ -3066,6 +3185,11 @@ fn resolved_target(
             return None;
         }
         let (coordinate_path, coordinate_version) = split_path_version(rest);
+        // Every branch below builds registry URLs from these, as
+        // [`resolve_purl`] does; vet them once, the same way.
+        if !safe_purl_coordinates(ty, coordinate_path, coordinate_version) {
+            return None;
+        }
         // Registry metadata can refine a mutable/tagged request to a concrete
         // release and exact artifact. Use that identity for cache/provenance;
         // retain the pure resolver below as the offline compatibility path.
@@ -3502,6 +3626,10 @@ fn resolve_vscode(rest: &str, net: &dyn Fetch) -> Option<String> {
     let (path, version) = split_path_version(rest);
     let version = version.map(str::to_string);
     let (publisher, name) = path.split_once('/')?;
+    // The publisher becomes a label of the gallery's hostname.
+    if !is_vscode_publisher(publisher) {
+        return None;
+    }
     let version = match version {
         Some(v) => v,
         None => {
@@ -3528,7 +3656,8 @@ fn resolve_vscode(rest: &str, net: &dyn Fetch) -> Option<String> {
                 .ok()?;
             let json: serde_json::Value = serde_json::from_slice(&resp.bytes).ok()?;
             json.pointer("/results/0/extensions/0/versions/0/version")
-                .and_then(serde_json::Value::as_str)?
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| safe_coordinate(v))?
                 .to_string()
         }
     };
@@ -3747,16 +3876,30 @@ fn is_blocked_v6(v6: Ipv6Addr) -> bool {
 #[derive(Debug)]
 struct SafeResolver;
 
+/// [`SafeResolver`]'s refusal. A type of its own so [`map_send_err`] can pick
+/// it out of reqwest's error chain, where it sits beside ordinary connect
+/// failures (no such host, connection refused).
+#[derive(Debug, thiserror::Error)]
+#[error("refused non-public host: {0}")]
+struct NonPublicHost(String);
+
 impl reqwest::dns::Resolve for SafeResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        type BoxError = Box<dyn std::error::Error + Send + Sync>;
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let resolved = (host.as_str(), 0u16)
-                .to_socket_addrs()
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+            // getaddrinfo blocks, and the blocking client drives every request
+            // on one runtime thread, so resolve off it as reqwest's own
+            // resolver does.
+            let lookup = host.clone();
+            let resolved =
+                tokio::task::spawn_blocking(move || (lookup.as_str(), 0u16).to_socket_addrs())
+                    .await
+                    .map_err(BoxError::from)?
+                    .map_err(BoxError::from)?;
             let safe: Vec<SocketAddr> = resolved.filter(|a| !is_blocked_ip(a.ip())).collect();
             if safe.is_empty() {
-                return Err(format!("refused non-public host: {host}").into());
+                return Err(BoxError::from(NonPublicHost(host)));
             }
             Ok(Box::new(safe.into_iter()) as reqwest::dns::Addrs)
         })
@@ -3779,6 +3922,10 @@ impl HttpFetch {
             .user_agent("fletch")
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
+            // Through a proxy, the proxy resolves the target host and
+            // SafeResolver only ever sees the proxy's, so `HTTPS_PROXY` in the
+            // environment would switch the SSRF guard off.
+            .no_proxy()
             // We follow redirects by hand (per-hop scheme check + chain).
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(SafeResolver))
@@ -3787,32 +3934,63 @@ impl HttpFetch {
     }
 }
 
-/// Read a response body under the per-fetch byte ceiling ([`max_fetch_bytes`]).
-/// A declared `Content-Length` over the cap is rejected before a single body
-/// byte is read — the common case for an oversize artifact, which a registry or
-/// CDN sizes honestly — so we don't pull tens of MB only to discard them. The
-/// streaming `take` cap remains the authoritative backstop for a missing or
-/// dishonest header.
-fn read_body_capped(resp: reqwest::blocking::Response) -> Result<Vec<u8>, FetchError> {
+/// Read a response body under the per-fetch byte ceiling ([`max_fetch_bytes`])
+/// and the request's `deadline`. A declared `Content-Length` over the cap is
+/// rejected before a single body byte is read — the common case for an
+/// oversize artifact, which a registry or CDN sizes honestly — so we don't pull
+/// tens of MB only to discard them. The streaming cap in [`read_bounded`]
+/// remains the authoritative backstop for a missing or dishonest header.
+fn read_body_capped(
+    resp: reqwest::blocking::Response,
+    deadline: Instant,
+) -> Result<Vec<u8>, FetchError> {
     let limit = max_fetch_bytes();
     if let Some(len) = resp.content_length()
         && len > limit
     {
         return Err(FetchError::TooLarge);
     }
+    read_bounded(resp, limit, deadline)
+}
+
+/// Read `r` to the end, refusing more than `limit` bytes and giving up once
+/// `deadline` passes. The deadline is checked between reads, so it can be
+/// overrun by at most one read's own timeout.
+fn read_bounded(mut r: impl Read, limit: u64, deadline: Instant) -> Result<Vec<u8>, FetchError> {
     let mut bytes = Vec::new();
-    resp.take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| FetchError::Transport(e.to_string()))?;
-    if bytes.len() as u64 > limit {
-        return Err(FetchError::TooLarge);
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(FetchError::Timeout);
+        }
+        let n = match r.read(&mut chunk) {
+            Ok(0) => return Ok(bytes),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(FetchError::Transport(e.to_string())),
+        };
+        if (bytes.len() + n) as u64 > limit {
+            return Err(FetchError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk[..n]);
     }
-    Ok(bytes)
+}
+
+/// Whether a caller header rides along on a redirect hop. A hop to another
+/// origin drops the credential-bearing ones, as reqwest's own redirect policy
+/// would; everything else (`Accept`, registry-specific selectors) is kept.
+fn forward_header(name: &str, same_origin: bool) -> bool {
+    same_origin
+        || !["authorization", "cookie", "proxy-authorization"]
+            .iter()
+            .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
 }
 
 impl HttpFetch {
     /// The shared GET path: per-hop https + SSRF enforcement, redirect following,
-    /// and the response-size cap. `headers` are attached to every hop. Both
+    /// the response-size cap and the [`REQUEST_DEADLINE`]. `headers` are
+    /// attached to every hop, less credentials once a hop leaves the starting
+    /// origin ([`forward_header`]). Both
     /// [`Fetch::get`] and [`Fetch::get_with`] funnel through here so the security
     /// floor is defined exactly once.
     fn get_inner(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
@@ -3828,16 +4006,24 @@ impl HttpFetch {
         headers: &[(&str, &str)],
         any_status: bool,
     ) -> Result<Fetched, FetchError> {
+        let deadline = Instant::now() + REQUEST_DEADLINE;
         let mut current =
             reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
+        let origin = current.origin();
         let mut redirects = Vec::new();
 
         for _ in 0..=MAX_REDIRECTS {
+            if Instant::now() >= deadline {
+                return Err(FetchError::Timeout);
+            }
             // Re-checked on every hop, so a redirect can't escape the floor.
             guard_host(&current)?;
+            let same_origin = current.origin() == origin;
             let mut req = self.client.get(current.clone());
             for (name, value) in headers {
-                req = req.header(*name, *value);
+                if forward_header(name, same_origin) {
+                    req = req.header(*name, *value);
+                }
             }
             let resp = req.send().map_err(map_send_err)?;
             let status = resp.status();
@@ -3868,7 +4054,7 @@ impl HttpFetch {
             }
 
             let headers = response_headers(&resp);
-            let bytes = read_body_capped(resp)?;
+            let bytes = read_body_capped(resp, deadline)?;
             return Ok(Fetched {
                 bytes,
                 final_url: current.to_string(),
@@ -3900,6 +4086,7 @@ impl Fetch for HttpFetch {
         body: &[u8],
         headers: &[(&str, &str)],
     ) -> Result<Fetched, FetchError> {
+        let deadline = Instant::now() + REQUEST_DEADLINE;
         let target = reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
         guard_host(&target)?;
         let mut req = self.client.post(target.clone()).body(body.to_vec());
@@ -3914,7 +4101,7 @@ impl Fetch for HttpFetch {
             return Err(FetchError::Status(status.as_u16()));
         }
         let headers = response_headers(&resp);
-        let bytes = read_body_capped(resp)?;
+        let bytes = read_body_capped(resp, deadline)?;
         Ok(Fetched {
             bytes,
             final_url: target.to_string(),
@@ -3975,13 +4162,23 @@ fn guard_host(url: &reqwest::Url) -> Result<(), FetchError> {
 // though it only inspects it.
 #[allow(clippy::needless_pass_by_value)]
 fn map_send_err(e: reqwest::Error) -> FetchError {
+    // reqwest's own message stops at "error sending request for url (…)"; the
+    // cause (the resolver's refusal, a DNS or TLS failure) is in the chain.
+    let mut message = e.to_string();
+    let mut refused = false;
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        refused |= cause.is::<NonPublicHost>();
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
     if e.is_timeout() {
         FetchError::Timeout
-    } else if e.is_connect() {
-        // The SafeResolver's refusal surfaces here.
-        FetchError::Refused(e.to_string())
+    } else if refused {
+        FetchError::Refused(message)
     } else {
-        FetchError::Transport(e.to_string())
+        FetchError::Transport(message)
     }
 }
 
@@ -5260,6 +5457,70 @@ mod tests {
         assert_eq!(rec.pin_verified, Some(false));
     }
 
+    /// A backend that panics when asked for one URL, as a parser bug tripped
+    /// by hostile bytes would, and otherwise serves `inner`.
+    struct PanicsOn {
+        url: &'static str,
+        inner: Fixtures,
+    }
+
+    impl Fetch for PanicsOn {
+        fn get(&self, url: &str) -> Result<Fetched, FetchError> {
+            if url == self.url {
+                panic!("hostile bytes");
+            }
+            self.inner.get(url)
+        }
+    }
+
+    #[test]
+    fn a_panicking_fetch_fails_alone() {
+        let ok = "https://ok.test/a.sh";
+        let bad = "https://bad.test/b.sh";
+        let net = PanicsOn {
+            url: bad,
+            inner: Fixtures::default().with(ok, b"A"),
+        };
+        let refs: Vec<Reference> = [bad, ok]
+            .into_iter()
+            .map(|url| dep(RefLocator::Url(url.into()), None))
+            .collect();
+        let recs = fetch_references(
+            &refs,
+            "src",
+            true,
+            &net,
+            &BlobCache::disabled(),
+            FetchBudget::default(),
+        );
+        // The panic is that reference's failure, not a budget cut, and the
+        // other reference is still fetched.
+        assert_eq!(
+            recs[0].outcome,
+            Outcome::Failed("internal error: hostile bytes".into())
+        );
+        assert_eq!(recs[1].outcome, Outcome::Ok);
+    }
+
+    #[test]
+    fn a_panic_in_the_callers_callback_reaches_the_caller() {
+        let url = "https://ok.test/a.sh";
+        let net = Fixtures::default().with(url, b"A");
+        let refs = [dep(RefLocator::Url(url.into()), None)];
+        let run = std::panic::catch_unwind(|| {
+            fetch_references_with(
+                &refs,
+                "src",
+                true,
+                &net,
+                &BlobCache::disabled(),
+                FetchBudget::default(),
+                &|_, _| panic!("caller bug"),
+            )
+        });
+        assert!(run.is_err(), "the caller's panic must not be swallowed");
+    }
+
     #[test]
     fn fetch_references_selection_and_budget() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5922,6 +6183,67 @@ mod tests {
         std::fs::write(&exact, zstd::encode_all(&b"12345"[..], 3).expect("c")).expect("w");
         assert_eq!(read_blob_capped(&exact, 5).map(|b| b.len()), Some(5));
         assert_eq!(read_blob_capped(&exact, 4), None);
+        // An unbounded ceiling must not wrap the `+1` read to zero bytes.
+        assert_eq!(read_blob_capped(&exact, u64::MAX).map(|b| b.len()), Some(5));
+    }
+
+    #[test]
+    fn a_body_read_honours_the_cap_and_an_unbounded_ceiling() {
+        let later = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            read_bounded(&b"12345"[..], 5, later).ok(),
+            Some(b"12345".to_vec())
+        );
+        assert!(matches!(
+            read_bounded(&b"12345"[..], 4, later),
+            Err(FetchError::TooLarge)
+        ));
+        // `u64::MAX` is a legal `set_max_fetch_bytes` value and must read the
+        // whole body, not wrap to an empty one.
+        assert_eq!(
+            read_bounded(&b"12345"[..], u64::MAX, later).ok(),
+            Some(b"12345".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_trickling_body_is_cut_off_at_the_deadline() {
+        // Never-ending, one byte per read, each read well inside any per-read
+        // timeout: only the whole-request deadline stops it.
+        struct Trickle;
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(1));
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(30);
+        assert!(matches!(
+            read_bounded(Trickle, u64::MAX, deadline),
+            Err(FetchError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn credentials_do_not_follow_a_cross_origin_redirect() {
+        for name in ["Authorization", "cookie", "Proxy-Authorization"] {
+            assert!(
+                forward_header(name, true),
+                "{name} stays on the same origin"
+            );
+            assert!(
+                !forward_header(name, false),
+                "{name} must not leave the origin"
+            );
+        }
+        // Non-credential headers a registry needs survive the hop.
+        for name in ["Accept", "Content-Type", "Snap-Device-Series"] {
+            assert!(
+                forward_header(name, false),
+                "{name} must survive a redirect"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -6032,6 +6354,122 @@ mod tests {
                 Err(FetchError::Refused(_)) => {}
                 other => panic!("{url} should be refused, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn a_resolver_refusal_says_why() {
+        // `localhost` comes from the hosts file, so this stays offline. The
+        // name passes the literal-IP guard and is refused by the resolver,
+        // whose reason must survive reqwest's "error sending request" wrapper.
+        let net = HttpFetch::new().expect("client");
+        match net.get("https://localhost/x") {
+            Err(FetchError::Refused(why)) => {
+                assert!(why.contains("non-public host: localhost"), "{why}");
+            }
+            other => panic!("localhost should be refused by the resolver, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pinned_lookup_rereads_a_document_that_predates_the_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path().to_path_buf());
+        let url = "https://registry.npmjs.org/foo";
+        // The packument as cached two hours ago, before 1.1.0 was published:
+        // inside the pinned TTL, past the versionless one.
+        let old = serde_json::json!({
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {"1.0.0": {}},
+            "time": {"1.0.0": "2024-01-01T00:00:00Z"}
+        });
+        cache.put(
+            &metadata_cache_key(url),
+            old.to_string().as_bytes(),
+            &CachedMeta {
+                fetched_at: now() - 2 * 3600,
+                status: 200,
+                final_url: url.into(),
+                ..CachedMeta::default()
+            },
+        );
+        let new = serde_json::json!({
+            "dist-tags": {"latest": "1.1.0"},
+            "versions": {"1.0.0": {}, "1.1.0": {"_npmUser": {"name": "mallory"}}},
+            "time": {"1.0.0": "2024-01-01T00:00:00Z", "1.1.0": "2024-06-01T00:00:00Z"}
+        })
+        .to_string();
+        let net = Fixtures::default().with(url, new.as_bytes());
+        let locator = RefLocator::Purl("pkg:npm/foo@1.1.0".into());
+
+        let (record, sources) = crate::registry::registry_with_sources(&locator, &net, &cache);
+        let record = record.expect("record");
+        // The copy that didn't list 1.1.0 was re-read, so the release is
+        // dated and its publisher known.
+        assert_eq!(record.published_at, Some(1_717_200_000)); // 2024-06-01
+        assert_eq!(record.publisher.as_deref(), Some("mallory"));
+        // Only the document the record came from is among its sources.
+        let packuments: Vec<_> = sources.iter().filter(|s| s.url == url).collect();
+        assert_eq!(packuments.len(), 1);
+        assert_eq!(packuments[0].bytes, new.as_bytes());
+    }
+
+    #[test]
+    fn a_cache_entry_is_read_back_under_its_recorded_size() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path().to_path_buf());
+        cache.put("k", b"payload", &CachedMeta::default());
+        assert_eq!(cache.any("k").map(|(b, _)| b), Some(b"payload".to_vec()));
+
+        // An entry admitted under a bigger cap than the per-fetch one (an OCI
+        // export) is read back under its own size, not refused as oversized.
+        let big = CachedMeta {
+            size: Some(max_fetch_bytes() + 1),
+            ..CachedMeta::default()
+        };
+        assert_eq!(big.read_limit(), max_fetch_bytes() + 1);
+        // A sidecar can't lift the cap past what any fetch path admits.
+        let huge = CachedMeta {
+            size: Some(u64::MAX),
+            ..CachedMeta::default()
+        };
+        assert_eq!(
+            huge.read_limit(),
+            max_fetch_bytes().max(crate::oci::MAX_EXPORT_BYTES)
+        );
+        // An entry written before sizes were recorded keeps the per-fetch cap.
+        assert_eq!(CachedMeta::default().read_limit(), max_fetch_bytes());
+
+        // A blob whose length disagrees with its sidecar is a miss.
+        let other = zstd::encode_all(&b"other"[..], 3).expect("compress");
+        std::fs::write(cache.blob_path("k"), other).expect("write");
+        assert!(cache.any("k").is_none());
+    }
+
+    #[test]
+    fn a_vscode_publisher_must_be_a_hostname_label() {
+        let url = |purl: &str| {
+            resolved_target(
+                &RefLocator::Purl(purl.into()),
+                &Fixtures::default(),
+                &BlobCache::disabled(),
+            )
+            .map(|(_, url)| url)
+        };
+        assert!(
+            url("pkg:vscode/ms-python/python@2024.1.0")
+                .is_some_and(|u| u.starts_with("https://ms-python.gallery.vsassets.io/"))
+        );
+        // The publisher is a label of the gallery's hostname, so anything that
+        // would add a label or isn't a publisher ID is refused, as is a
+        // version that climbs out of the gallery path.
+        for purl in [
+            "pkg:vscode/evil.example/x@1.0.0",
+            "pkg:vscode/a_b/x@1.0.0",
+            "pkg:vscode/-pub/x@1.0.0",
+            "pkg:vscode/pub/x@..%2F..%2Fx",
+        ] {
+            assert_eq!(url(purl), None, "{purl}");
         }
     }
 

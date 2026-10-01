@@ -307,10 +307,16 @@ fn rpm_primary_record(pkg: &str, name: &str, ecosystem: &str) -> Option<Registry
 // --- NetBSD / FreeBSD / OpenBSD ---------------------------------------------
 
 /// Map one matching `pkg_summary` stanza (`KEY=value`). `PKGNAME` is
-/// `name-version`, so the version is the tail after `name-`.
+/// `name-version`, and a pkgsrc version never contains a hyphen (revisions are
+/// `nbN`), so the version is everything after the *last* one. Splitting there
+/// rather than after `name-` keeps `git` from matching `git-base-2.45.2`.
 fn pkg_summary_record(stanza: &str, name: &str) -> Option<Registry> {
     let pkgname = field(stanza, "PKGNAME=")?;
-    let version = pkgname.strip_prefix(name)?.strip_prefix('-')?.to_string();
+    let (package, version) = pkgname.rsplit_once('-')?;
+    if package != name {
+        return None;
+    }
+    let version = version.to_string();
     Some(Registry {
         ecosystem: "netbsd".into(),
         name: name.to_string(),
@@ -632,6 +638,13 @@ mod tests {
         assert_eq!(r.author.as_deref(), Some("pkgsrc"));
         // A different package sharing no prefix must not match.
         assert!(pkg_summary_record(stanza, "wget").is_none());
+        // Nor one whose name merely starts with the one asked for.
+        let base = "PKGNAME=git-base-2.45.2nb1\nCOMMENT=GIT core\n";
+        assert!(pkg_summary_record(base, "git").is_none());
+        assert_eq!(
+            pkg_summary_record(base, "git-base").map(|r| r.version),
+            Some("2.45.2nb1".to_string())
+        );
     }
 
     #[test]

@@ -14,29 +14,37 @@
 //!   is pure and tested against fixture layers instead);
 //! - the fetch backend's SSRF guard does not see these requests, so pulls are
 //!   restricted to an allowlist of public registries — `repository_url` is
-//!   feed-supplied data and must not steer requests at internal hosts.
+//!   feed-supplied data and must not steer requests at internal hosts. For
+//!   the same reason a layer naming foreign `urls` is refused: oci-client
+//!   falls back to fetching those from any host when the registry fails.
 
 use std::collections::HashSet;
 use std::io::{Cursor, Read, Write};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use oci_client::client::{ClientConfig, ImageLayer, linux_amd64_resolver};
+use futures_util::{StreamExt as _, TryStreamExt as _};
+use oci_client::client::{
+    ClientConfig, DEFAULT_MAX_CONCURRENT_DOWNLOAD, ImageLayer, linux_amd64_resolver,
+};
 use oci_client::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
-    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
-    IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE, IMAGE_LAYER_NONDISTRIBUTABLE_MEDIA_TYPE,
+    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, OciDescriptor,
 };
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
 /// Uncompressed-tar size cap, matching forager's `maxContainerBytes` guard:
 /// a generous runaway stop for pathological images, not a package-size cap.
-const MAX_EXPORT_BYTES: u64 = 2 << 30; // 2 GiB
+pub(crate) const MAX_EXPORT_BYTES: u64 = 2 << 30; // 2 GiB
 
 /// Ceiling on how many layers an image may declare. Real images sit far below
 /// it — Docker's historical aufs limit was 127 — so this only ever fires on a
-/// manifest built to be pathological. It bounds the *per-layer* work (two tar
-/// parses and a decoder each) that the byte cap alone does not: a manifest of
-/// a hundred thousand near-empty layers costs almost no bytes.
+/// manifest built to be pathological. It bounds the *per-layer* work (a blob
+/// request, a decoder and two tar parses each) that the byte cap alone does
+/// not: a manifest of a hundred thousand near-empty layers costs almost no
+/// bytes. Checked on the manifest, before any blob is requested.
 const MAX_LAYERS: usize = 256;
 
 /// Registries an `oci://` pull may talk to. The reference host comes from a
@@ -56,24 +64,30 @@ const ALLOWED_REGISTRIES: &[&str] = &[
 
 /// The layer encodings we can flatten. zstd variants are handled by suffix in
 /// [`decompress`], but the pull-time accept list uses the ratified constants.
+/// The deprecated non-distributable types are deliberately absent: their whole
+/// purpose is a blob served from foreign `urls`, which [`vet_layers`] refuses.
 const ACCEPTED_LAYER_TYPES: &[&str] = &[
     IMAGE_LAYER_MEDIA_TYPE,
     IMAGE_LAYER_GZIP_MEDIA_TYPE,
     "application/vnd.oci.image.layer.v1.tar+zstd",
     IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
-    IMAGE_LAYER_NONDISTRIBUTABLE_MEDIA_TYPE,
-    IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE,
 ];
+
+/// Registry request timeouts. oci-client sets none by default, so a registry
+/// that stalls mid-blob would otherwise hold the fetch worker forever. The
+/// read timeout is per read; [`PULL_DEADLINE`] bounds the whole pull.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+const PULL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// Pull `reference` (`host/path:tag` or `host/path@sha256:…`, as produced by
 /// `resolve_purl`'s `oci://` pseudo-URL) and export the flattened rootfs as an
 /// xz-compressed tar. Returns the bytes and the image's manifest digest — the
 /// content-addressed identity that is stable across implementations.
-pub(crate) fn export(reference: &str) -> Result<(Vec<u8>, Option<String>), String> {
-    let mut image = pull(reference)?;
-    let digest = image.digest.take();
-    let layers = decompress_all(std::mem::take(&mut image.layers), MAX_EXPORT_BYTES)?;
+pub(crate) fn export(reference: &str) -> Result<(Vec<u8>, String), String> {
+    let (layers, digest) = pull(reference)?;
+    let layers = decompress_all(layers, MAX_EXPORT_BYTES)?;
     let tar_xz = flatten_to_tar_xz(&layers)?;
     Ok((tar_xz, digest))
 }
@@ -89,12 +103,6 @@ pub(crate) fn export(reference: &str) -> Result<(Vec<u8>, Option<String>), Strin
 /// running total is checked as each layer lands, so an oversized image is
 /// refused partway through rather than after it is all in memory.
 fn decompress_all(layers: Vec<ImageLayer>, cap: u64) -> Result<Vec<Vec<u8>>, String> {
-    if layers.len() > MAX_LAYERS {
-        return Err(format!(
-            "image declares {} layers, over the {MAX_LAYERS} ceiling",
-            layers.len()
-        ));
-    }
     let mut total: u64 = 0;
     let mut out = Vec::with_capacity(layers.len());
     for layer in layers {
@@ -110,8 +118,9 @@ fn decompress_all(layers: Vec<ImageLayer>, cap: u64) -> Result<Vec<Vec<u8>>, Str
 
 /// Anonymous pull of the linux/amd64 image — the same default platform
 /// go-containerregistry's crane resolves, so both exporters flatten the same
-/// per-platform manifest of a multi-arch index.
-fn pull(reference: &str) -> Result<oci_client::client::ImageData, String> {
+/// per-platform manifest of a multi-arch index. Returns the layers in manifest
+/// (base → top) order, which the flatten depends on, and the manifest digest.
+fn pull(reference: &str) -> Result<(Vec<ImageLayer>, String), String> {
     let re: Reference = reference
         .parse()
         .map_err(|e| format!("bad OCI reference {reference:?}: {e}"))?;
@@ -119,16 +128,144 @@ fn pull(reference: &str) -> Result<oci_client::client::ImageData, String> {
     if !ALLOWED_REGISTRIES.contains(&registry) {
         return Err(format!("registry {registry:?} not in the public allowlist"));
     }
-    let client = Client::new(ClientConfig {
-        platform_resolver: Some(Box::new(linux_amd64_resolver)),
-        ..ClientConfig::default()
-    });
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("tokio runtime: {e}"))?;
-    rt.block_on(client.pull(&re, &RegistryAuth::Anonymous, ACCEPTED_LAYER_TYPES.to_vec()))
-        .map_err(|e| format!("pull {reference}: {e}"))
+    // Built inside the runtime: the deadline's timer registers on creation.
+    block_on_isolated(|| async {
+        let client = Client::new(ClientConfig {
+            platform_resolver: Some(Box::new(linux_amd64_resolver)),
+            connect_timeout: Some(CONNECT_TIMEOUT),
+            read_timeout: Some(READ_TIMEOUT),
+            ..ClientConfig::default()
+        });
+        tokio::time::timeout(PULL_DEADLINE, pull_layers(&client, &re)).await
+    })?
+    .map_err(|e| format!("pull {reference}: {e}"))?
+    .map_err(|e| format!("pull {reference}: {e}"))
+}
+
+/// Run the future `make` builds on a fresh current-thread runtime, in a thread
+/// of its own. [`export`] is reached through the sync, public fetch API, so its
+/// caller may already be driving a tokio runtime on this thread, where
+/// `block_on` (and dropping a runtime) panics; a dedicated thread never is.
+fn block_on_isolated<F: Future>(make: impl FnOnce() -> F + Send) -> Result<F::Output, String>
+where
+    F::Output: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("tokio runtime: {e}"))?;
+                Ok(rt.block_on(make()))
+            })
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Fetch the manifest, vet it with [`vet_layers`], then download each layer
+/// into a buffer capped at its declared size.
+///
+/// Not `Client::pull`, for three reasons: it downloads every layer before any
+/// size or count check could run; it falls back to a descriptor's foreign
+/// `urls`, outside the registry allowlist; and it collects layers in
+/// completion order, where the flatten needs manifest order.
+async fn pull_layers(client: &Client, re: &Reference) -> Result<(Vec<ImageLayer>, String), String> {
+    let (manifest, digest) = client
+        .pull_image_manifest(re, &RegistryAuth::Anonymous)
+        .await
+        .map_err(|e| e.to_string())?;
+    vet_layers(&manifest.layers, MAX_EXPORT_BYTES)?;
+    let layers = futures_util::stream::iter(&manifest.layers)
+        .map(|desc| async move {
+            let mut sink = LayerSink {
+                buf: Vec::new(),
+                limit: u64::try_from(desc.size).unwrap_or(0),
+            };
+            client
+                .pull_blob(re, desc, &mut sink)
+                .await
+                .map_err(|e| format!("layer {}: {e}", desc.digest))?;
+            Ok::<_, String>(ImageLayer::new(
+                sink.buf,
+                desc.media_type.clone(),
+                desc.annotations.clone(),
+            ))
+        })
+        .buffered(DEFAULT_MAX_CONCURRENT_DOWNLOAD)
+        .try_collect()
+        .await?;
+    Ok((layers, digest))
+}
+
+/// Refuse a manifest before any blob is requested: no layers, more than
+/// [`MAX_LAYERS`], a media type [`decompress`] can't handle, a foreign `urls`
+/// fallback, or declared sizes that are negative or sum past `cap`. The sizes
+/// are then enforced on the bytes actually received by [`LayerSink`].
+fn vet_layers(layers: &[OciDescriptor], cap: u64) -> Result<(), String> {
+    if layers.is_empty() {
+        return Err("image has no layers".into());
+    }
+    if layers.len() > MAX_LAYERS {
+        return Err(format!(
+            "image declares {} layers, over the {MAX_LAYERS} ceiling",
+            layers.len()
+        ));
+    }
+    let mut total: u64 = 0;
+    for layer in layers {
+        if !ACCEPTED_LAYER_TYPES.contains(&layer.media_type.as_str()) {
+            return Err(format!(
+                "unsupported layer media type {:?}",
+                layer.media_type
+            ));
+        }
+        if layer.urls.as_ref().is_some_and(|urls| !urls.is_empty()) {
+            return Err(format!("layer {} names foreign urls", layer.digest));
+        }
+        let size = u64::try_from(layer.size)
+            .map_err(|e| format!("layer {} size {}: {e}", layer.digest, layer.size))?;
+        total = total.saturating_add(size);
+    }
+    if total > cap {
+        return Err(format!(
+            "image layers declare {total} bytes, over the {cap}-byte pull cap"
+        ));
+    }
+    Ok(())
+}
+
+/// A layer buffer that refuses bytes past the descriptor's declared size.
+/// oci-client checks the digest only once the whole blob has arrived, so
+/// without this a registry could stream far more than the manifest promised.
+struct LayerSink {
+    buf: Vec<u8>,
+    limit: u64,
+}
+
+impl tokio::io::AsyncWrite for LayerSink {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if (self.buf.len() + data.len()) as u64 > self.limit {
+            return Poll::Ready(Err(std::io::Error::other(
+                "layer is larger than its manifest size",
+            )));
+        }
+        self.buf.extend_from_slice(data);
+        Poll::Ready(Ok(data.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// Decode one layer blob to its plain tar bytes, by media-type suffix, reading
@@ -534,17 +671,81 @@ mod tests {
         assert!(one.is_err(), "a lone over-cap layer must be refused");
     }
 
+    /// A manifest descriptor for a plain layer declaring `size` bytes.
+    fn desc(size: i64) -> OciDescriptor {
+        OciDescriptor {
+            media_type: IMAGE_LAYER_MEDIA_TYPE.to_string(),
+            digest: "sha256:00".into(),
+            size,
+            ..OciDescriptor::default()
+        }
+    }
+
     #[test]
     fn absurd_layer_counts_are_refused() {
         // Near-empty layers cost almost nothing in bytes, so the byte cap can
-        // never catch this — only the count can.
-        let many: Vec<ImageLayer> = (0..MAX_LAYERS + 1).map(|_| raw_layer(0)).collect();
+        // never catch this — only the count can, and before any blob request.
+        let many: Vec<OciDescriptor> = (0..=MAX_LAYERS).map(|_| desc(0)).collect();
         assert!(
-            decompress_all(many, MAX_EXPORT_BYTES).is_err_and(|e| e.contains("layers")),
+            vet_layers(&many, MAX_EXPORT_BYTES).is_err_and(|e| e.contains("layers")),
             "a manifest over the layer ceiling must be refused"
         );
-        let ok: Vec<ImageLayer> = (0..MAX_LAYERS).map(|_| raw_layer(0)).collect();
-        assert!(decompress_all(ok, MAX_EXPORT_BYTES).is_ok());
+        assert!(vet_layers(&many[..MAX_LAYERS], MAX_EXPORT_BYTES).is_ok());
+    }
+
+    #[test]
+    fn a_manifest_is_vetted_before_any_blob_is_pulled() {
+        // Declared sizes are capped in aggregate, like the decompressed ones.
+        assert!(vet_layers(&[desc(40), desc(40)], 100).is_ok());
+        assert!(vet_layers(&[desc(40), desc(40), desc(40)], 100).is_err());
+        assert!(vet_layers(&[desc(-1)], 100).is_err());
+        assert!(vet_layers(&[], 100).is_err());
+        // oci-client would fetch a foreign url from any host, outside the
+        // registry allowlist.
+        let foreign = OciDescriptor {
+            urls: Some(vec!["https://169.254.169.254/latest".into()]),
+            ..desc(1)
+        };
+        assert!(vet_layers(&[foreign], 100).is_err_and(|e| e.contains("foreign")));
+        // As are the layer types that exist to use that fallback.
+        let nondistributable = OciDescriptor {
+            media_type: oci_client::manifest::IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE.into(),
+            ..desc(1)
+        };
+        assert!(vet_layers(&[nondistributable], 100).is_err_and(|e| e.contains("media type")));
+    }
+
+    #[test]
+    fn a_pull_from_inside_an_async_caller_does_not_panic() {
+        // `fetch_ref` is sync but public, so an async caller can reach the
+        // puller from a thread already driving a runtime, where a nested
+        // `block_on` panics.
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let got = outer.block_on(async {
+            block_on_isolated(|| async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                7
+            })
+        });
+        assert_eq!(got, Ok(7));
+    }
+
+    #[test]
+    fn a_layer_cannot_outgrow_its_declared_size() {
+        use tokio::io::AsyncWrite as _;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut sink = LayerSink {
+            buf: Vec::new(),
+            limit: 5,
+        };
+        let mut write = |data: &[u8]| Pin::new(&mut sink).poll_write(&mut cx, data);
+        assert!(matches!(write(b"1234"), Poll::Ready(Ok(4))));
+        assert!(matches!(write(b"5"), Poll::Ready(Ok(1))));
+        assert!(matches!(write(b"6"), Poll::Ready(Err(_))));
+        assert_eq!(sink.buf, b"12345");
     }
 
     #[test]
@@ -618,7 +819,10 @@ mod tests {
     #[ignore = "live network: pulls docker.io/library/hello-world"]
     fn live_export_hello_world() {
         let (tar_xz, digest) = export("docker.io/library/hello-world:latest").expect("export");
-        assert!(digest.is_some(), "manifest digest must be recorded");
+        assert!(
+            digest.starts_with("sha256:"),
+            "manifest digest must be recorded"
+        );
         let entries = entries_of(&tar_xz);
         assert!(
             entries.iter().any(|(p, _)| p == "hello"),
@@ -640,7 +844,7 @@ mod tests {
     #[ignore = "live network: pulls docker.io/library/debian"]
     fn live_export_debian_rootfs() {
         let (tar_xz, digest) = export("docker.io/library/debian:stable-slim").expect("export");
-        assert!(digest.is_some());
+        assert!(digest.starts_with("sha256:"));
         let entries = entries_of(&tar_xz);
         assert!(
             entries.iter().any(|(p, _)| p == "etc/debian_version"),

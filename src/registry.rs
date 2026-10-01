@@ -39,61 +39,93 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         return None;
     };
     let (ty, path, version) = parse_purl(purl)?;
-    // Every arm below `format!`s these into a registry endpoint, so vet them
+    // Every backend `format!`s these into a registry endpoint, so vet them
     // once here — see [`crate::fetch::safe_coordinate`].
     if !crate::fetch::safe_coordinate(&path)
         || version.as_deref().is_some_and(|v| !safe_coordinate(v))
     {
         return None;
     }
-    // This reads the package-level *packument*, which is mutable even for a
-    // versioned PURL: a release can be yanked after publish and new siblings
-    // appear. So bound staleness — a few hours for a pinned version (its facts
-    // are near-stable), tighter for a versionless lookup that tracks a moving
-    // `latest`. The truly immutable per-version file list is cached forever
-    // separately, at download-URL resolution. Selected here, the one place that
-    // knows the PURL's version-ness, and carried on the cache rather than
-    // threaded through every ecosystem fn.
-    let cache = &cache.with_meta_ttl(if version.is_some() {
+    let version = version.as_deref();
+    // Package documents are mutable, but what they say about a published
+    // version is not (see the metadata TTL notes in `fetch`), so a versioned
+    // lookup trusts its cached copy for months while a versionless one,
+    // tracking a moving `latest`, revalidates hourly. Selected here, the one
+    // place that knows the PURL's version-ness, and carried on the cache
+    // rather than threaded through every ecosystem fn.
+    let ttl = if version.is_some() {
         crate::fetch::meta_ttl_pinned()
     } else {
         crate::fetch::meta_ttl_unpinned()
-    });
-    let version = version.as_deref();
-    match ty.as_str() {
-        "npm" => npm(&path, version, net, cache),
-        "cargo" => crates(&path, version, net, cache),
-        "pypi" => pypi(&path, version, net, cache),
-        "composer" => composer(&path, version, net, cache),
-        "gem" => gem(&path, version, net, cache),
-        "golang" => golang(&path, version, net, cache),
+    };
+    let (first, staged) = cache.with_meta_ttl(ttl).staged();
+    let record = lookup(&ty, &path, version, purl, net, &first);
+    // The one fact a months-old copy can't hold is a version published after
+    // it was cached. In an ecosystem whose package document dates every
+    // version it lists, an undated pinned record means the copy didn't list
+    // it, so re-read the document under the versionless TTL before concluding
+    // so. A hijacked account's new release is exactly this case, and its
+    // publish time, publisher and install hooks are what would flag it.
+    if version.is_some()
+        && DATES_EVERY_VERSION.contains(&ty.as_str())
+        && record.as_ref().is_some_and(|r| r.published_at.is_none())
+    {
+        let fresh = cache.with_meta_ttl(crate::fetch::meta_ttl_unpinned());
+        return lookup(&ty, &path, version, purl, net, &fresh);
+    }
+    cache.commit(staged);
+    record
+}
+
+/// Ecosystems whose package document carries a publish time for every version
+/// it lists — so a requested version with none is one the document lacks.
+const DATES_EVERY_VERSION: &[&str] = &[
+    "npm", "cargo", "pypi", "composer", "gem", "hex", "pub", "conda", "jsr",
+];
+
+/// One registry lookup: dispatch on the PURL type to its backend.
+fn lookup(
+    ty: &str,
+    path: &str,
+    version: Option<&str>,
+    purl: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    match ty {
+        "npm" => npm(path, version, net, cache),
+        "cargo" => crates(path, version, net, cache),
+        "pypi" => pypi(path, version, net, cache),
+        "composer" => composer(path, version, net, cache),
+        "gem" => gem(path, version, net, cache),
+        "golang" => golang(path, version, net, cache),
         // A `pkg:github/<owner>/<repo>` source: the repo *is* the upstream. Its
         // metadata is the closest thing to a registry record.
-        "github" => github(&path, net, cache),
+        "github" => github(path, net, cache),
         // Language registries with a clean JSON API: one GET mapped onto the
         // common shape.
-        "nuget" => nuget(&path, version, net, cache),
-        "maven" => maven(&path, version, net, cache),
+        "nuget" => nuget(path, version, net, cache),
+        "maven" => maven(path, version, net, cache),
         // Hugging Face model repos: `owner/model` (or a canonical bare `model`),
         // the attacker-reachable half of the ML supply chain forager mirrors.
-        "huggingface" => huggingface(&path, version, net, cache),
-        "hex" => hex_pm(&path, version, net, cache),
-        "cran" => cran(last_seg(&path), net, cache),
-        "cpan" => cpan(last_seg(&path), net, cache),
-        "pub" => pub_dev(last_seg(&path), version, net, cache),
-        "conda" => conda(last_seg(&path), version, net, cache),
-        "clojars" => clojars(&path, net, cache),
+        "huggingface" => huggingface(path, version, net, cache),
+        "hex" => hex_pm(path, version, net, cache),
+        "cran" => cran(last_seg(path), net, cache),
+        "cpan" => cpan(last_seg(path), net, cache),
+        "pub" => pub_dev(last_seg(path), version, net, cache),
+        "conda" => conda(last_seg(path), version, net, cache),
+        "clojars" => clojars(path, net, cache),
         // JSR ships through npm-compatible mirrors, but its own API carries the
         // richer record (score, repo, per-version dates).
-        "jsr" => jsr(&path, version, net, cache),
+        "jsr" => jsr(path, version, net, cache),
         // Terraform providers: `pkg:terraform/<namespace>/<type>` on
         // registry.terraform.io, whose addresses the PURL already lowercases.
-        "terraform" => terraform(&path, version, net, cache),
+        "terraform" => terraform(path, version, net, cache),
         // OS package registries each get their own PURL type so a scan can name
         // `pkg:fedora/curl` vs `pkg:arch/pacman` directly. The package name is
         // the last path segment (any vendor namespace is dropped).
-        "arch" => arch(last_seg(&path), net, cache),
-        "fedora" => fedora(last_seg(&path), net, cache),
+        "arch" => arch(last_seg(path), net, cache),
+        "fedora" => fedora(last_seg(path), net, cache),
         // The AUR is the user-contributed, attacker-reachable half of Arch. Three
         // spellings reach it: the bare `pkg:aur/<name>` legacy type; the
         // spec-compliant `pkg:alpm/arch/<name>?repository_url=https://aur.archlinux.org`,
@@ -102,61 +134,61 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
         // which put `aur` in the namespace slot. All route to the AUR RPC; any other
         // alpm namespace is an official repo. The qualifier is stripped from `path`,
         // so the spec form is detected on the raw purl.
-        "aur" => aur(last_seg(&path), net, cache),
-        "alpm" if purl.contains("aur.archlinux.org") => aur(last_seg(&path), net, cache),
+        "aur" => aur(last_seg(path), net, cache),
+        "alpm" if purl.contains("aur.archlinux.org") => aur(last_seg(path), net, cache),
         "alpm" => match path.split_once('/') {
             Some(("aur", name)) => aur(name, net, cache),
             Some((_, name)) => arch(name, net, cache),
-            None => arch(&path, net, cache),
+            None => arch(path, net, cache),
         },
         // Distro registries with no JSON API: each metadata lookup fetches a
         // compressed index/catalog and scans it. See [`crate::distro`].
-        "alpine" => distro::alpine(last_seg(&path), net, cache),
-        "wolfi" => distro::wolfi(last_seg(&path), net, cache),
-        "debian" => distro::debian(last_seg(&path), net, cache),
-        "ubuntu" => distro::ubuntu(last_seg(&path), net, cache),
-        "opensuse" => distro::opensuse(last_seg(&path), net, cache),
-        "rpmfusion" => distro::rpmfusion(last_seg(&path), net, cache),
-        "netbsd" => distro::netbsd(last_seg(&path), net, cache),
-        "freebsd" => distro::freebsd(last_seg(&path), net, cache),
-        "openbsd" => distro::openbsd(last_seg(&path), net, cache),
+        "alpine" => distro::alpine(last_seg(path), net, cache),
+        "wolfi" => distro::wolfi(last_seg(path), net, cache),
+        "debian" => distro::debian(last_seg(path), net, cache),
+        "ubuntu" => distro::ubuntu(last_seg(path), net, cache),
+        "opensuse" => distro::opensuse(last_seg(path), net, cache),
+        "rpmfusion" => distro::rpmfusion(last_seg(path), net, cache),
+        "netbsd" => distro::netbsd(last_seg(path), net, cache),
+        "freebsd" => distro::freebsd(last_seg(path), net, cache),
+        "openbsd" => distro::openbsd(last_seg(path), net, cache),
         // Package managers and app stores.
-        "homebrew" => homebrew(last_seg(&path), net, cache),
-        "snap" => snap(last_seg(&path), net, cache),
-        "wordpress" => wordpress(last_seg(&path), net, cache),
+        "homebrew" => homebrew(last_seg(path), net, cache),
+        "snap" => snap(last_seg(path), net, cache),
+        "wordpress" => wordpress(last_seg(path), net, cache),
         // Agent-skill registry: `pkg:clawhub/[owner/]slug`. The v1 API is
         // search-shaped; the fetcher exact-matches the slug in the results.
-        "clawhub" => clawhub(last_seg(&path), net, cache),
+        "clawhub" => clawhub(last_seg(path), net, cache),
         // Plugin registries of ML apps: a ComfyUI custom node
         // (`pkg:comfyui/<node_id>`) and a Dify Marketplace plugin
         // (`pkg:dify/<org>/<name>`).
-        "comfyui" => comfyui(&path, version, net, cache),
-        "dify" => dify(&path, version, net, cache),
+        "comfyui" => comfyui(path, version, net, cache),
+        "dify" => dify(path, version, net, cache),
         // Container images: `pkg:oci/<name>?repository_url=<host%2Fpath>`,
         // the ratified registry-agnostic type (`pkg:docker` is its legacy
         // spelling — same repositories, so it routes identically). The
         // registry host picks the metadata API; the qualifier is dropped by
         // parse_purl, so it is read off the raw purl.
-        "oci" | "docker" => oci_meta(purl, &path, net, cache),
+        "oci" | "docker" => oci_meta(purl, path, net, cache),
         // Browser-extension / plugin marketplaces — the same listing shape as
         // the Chrome and VS Code stores (rating, downloads, recency).
-        "firefox" => firefox(last_seg(&path), net, cache),
-        "jetbrains" => jetbrains(last_seg(&path), net, cache),
+        "firefox" => firefox(last_seg(path), net, cache),
+        "jetbrains" => jetbrains(last_seg(path), net, cache),
         // Browser extensions: `pkg:chrome/<extension-id>`. The store's risk
         // signals (reach, rating, recency, the developer's own description of
         // what it harvests) live on the listing, not in a manifest.
         // `chrome-extension` is the ratified purl-spec spelling of the same type.
         "chrome" | "chrome-extension" => {
-            chrome(path.rsplit('/').next().unwrap_or(&path), net, cache)
+            chrome(path.rsplit('/').next().unwrap_or(path), net, cache)
         }
         // VS Code / editor extensions: `pkg:openvsx/<namespace>/<name>`. Open
         // VSX exposes a clean JSON API, so no scraping — the same marketplace
         // shape (rating, downloads, publisher, recency) as the Chrome store.
-        "openvsx" => openvsx(&path, version, net, cache),
+        "openvsx" => openvsx(path, version, net, cache),
         // The Microsoft VS Code Marketplace: `pkg:vscode/<publisher>/<name>`.
         // Its data lives behind a JSON-RPC `POST` query — same marketplace shape
         // as Open VSX, just a different transport.
-        "vscode" => vscode(&path, net, cache),
+        "vscode" => vscode(path, net, cache),
         // Spec-form aliases (purl-spec / common practice) for the same registries,
         // so a PURL generated per spec fetches identically to our legacy spelling.
         // `vscode-extension` is the ratified type; the OS types carry the distro
@@ -179,26 +211,26 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
                 .unwrap_or(purl)
                 .contains("open-vsx.org")
             {
-                openvsx(&path, version, net, cache)
+                openvsx(path, version, net, cache)
             } else {
-                vscode(&path, net, cache)
+                vscode(path, net, cache)
             }
         }
         "deb" => match path.split_once('/') {
             Some(("ubuntu", name)) => distro::ubuntu(last_seg(name), net, cache),
             Some((_, name)) => distro::debian(last_seg(name), net, cache),
-            None => distro::debian(&path, net, cache),
+            None => distro::debian(path, net, cache),
         },
         "rpm" => match path.split_once('/') {
             Some(("opensuse", name)) => distro::opensuse(last_seg(name), net, cache),
             Some(("rpmfusion", name)) => distro::rpmfusion(last_seg(name), net, cache),
             Some((_, name)) => fedora(last_seg(name), net, cache),
-            None => fedora(&path, net, cache),
+            None => fedora(path, net, cache),
         },
         "apk" => match path.split_once('/') {
             Some(("wolfi", name)) => distro::wolfi(last_seg(name), net, cache),
             Some((_, name)) => distro::alpine(last_seg(name), net, cache),
-            None => distro::alpine(&path, net, cache),
+            None => distro::alpine(path, net, cache),
         },
         _ => None,
     }
@@ -438,7 +470,8 @@ fn crates(
         .get("max_stable_version")
         .or_else(|| krate.get("max_version"))
         .and_then(Value::as_str);
-    let version = version.or(latest).unwrap_or_default();
+    let requested = version.map(percent_decode);
+    let version = requested.as_deref().or(latest).unwrap_or_default();
     let ver = doc
         .get("versions")
         .and_then(Value::as_array)
@@ -451,9 +484,14 @@ fn crates(
         ecosystem: "crates".into(),
         name: path.to_string(),
         version: version.to_string(),
+        // A version the list lacks has no date of its own; the crate's
+        // `created_at` is its first release, not this one.
         published_at: ver
             .and_then(|v| v.get("created_at"))
-            .or_else(|| krate.get("created_at"))
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_secs),
+        first_published_at: krate
+            .get("created_at")
             .and_then(Value::as_str)
             .and_then(parse_rfc3339_secs),
         latest_version: latest.map(str::to_string),
@@ -487,22 +525,29 @@ fn crates(
 
 /// PyPI: the package-level JSON API carries the `info` block, the full
 /// `releases` timeline (every version's files and upload times), `ownership`
-/// (the owning accounts), and the version's known `vulnerabilities` — all in one
-/// document, so the per-version endpoint is unnecessary. The requested version's
-/// own publish time and yank status come from its `releases` entry; identity
-/// text falls back to the latest release's `info`.
+/// (the owning accounts), and the latest release's known `vulnerabilities`.
+/// The requested version's own publish time and yank status come from its
+/// `releases` entry, and its vulnerabilities from the per-version endpoint when
+/// it is not the latest; identity text falls back to the latest release's
+/// `info`.
 fn pypi(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     let doc = json_meta(&format!("https://pypi.org/pypi/{path}/json"), net, cache)?;
     let info = doc.get("info")?;
     let releases = doc.get("releases").and_then(Value::as_object);
 
-    // Target version: the one requested, else the registry's latest.
+    // Target version: the one requested, else the registry's latest. A PURL
+    // percent-encodes what PyPI spells literally (`1.0%2Blocal`).
     let latest = info.get("version").and_then(Value::as_str);
-    let target = version.or(latest).unwrap_or_default();
+    let requested = version.map(percent_decode);
+    let target = requested.as_deref().or(latest).unwrap_or_default();
+    let target_is_latest = Some(target) == latest;
+    let vulnerability_count = |d: &Value| Some(d.get("vulnerabilities")?.as_array()?.len() as u32);
 
-    // The earliest upload across a version's files is its publish time. Prefer
-    // the target version's files from `releases`; fall back to `urls` (the
-    // latest version's files) when the timeline omits it.
+    // The earliest upload across a version's files is its publish time. The
+    // target version's files come from `releases`; `urls` lists the latest
+    // version's files, so it stands in only when the target *is* latest. A
+    // requested version the timeline lacks gets no publish time or yank status
+    // rather than latest's.
     let publish_time = |files: &[Value]| {
         files
             .iter()
@@ -513,7 +558,11 @@ fn pypi(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -
     let target_files = releases
         .and_then(|r| r.get(target))
         .and_then(Value::as_array)
-        .or_else(|| doc.get("urls").and_then(Value::as_array));
+        .or_else(|| {
+            target_is_latest
+                .then(|| doc.get("urls").and_then(Value::as_array))
+                .flatten()
+        });
     let published_at = target_files.map(Vec::as_slice).and_then(publish_time);
     // Per-version yank status (a specific version can be yanked while latest is
     // not), with the per-version reason where the file records carry one.
@@ -559,10 +608,21 @@ fn pypi(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         deprecated: yanked_reason,
-        vulnerability_count: doc
-            .get("vulnerabilities")
-            .and_then(Value::as_array)
-            .map(|a| a.len() as u32),
+        // The package document's `vulnerabilities` are the latest release's;
+        // any other listed version's come from its own endpoint.
+        vulnerability_count: if target_is_latest {
+            vulnerability_count(&doc)
+        } else if let (Some(v), Some(_)) = (version, target_files) {
+            json_meta(
+                &format!("https://pypi.org/pypi/{path}/{v}/json"),
+                net,
+                cache,
+            )
+            .as_ref()
+            .and_then(vulnerability_count)
+        } else {
+            None
+        },
         ..Default::default()
     };
 
@@ -622,24 +682,26 @@ fn composer(
     let pkg = doc.get("package")?;
 
     let versions = pkg.get("versions").and_then(Value::as_object);
-    let want = version.map(|v| v.trim_start_matches('v').to_string());
-    let ver = versions.and_then(|vs| {
-        vs.iter()
-            .find(|(k, _)| match &want {
-                Some(w) => k.trim_start_matches('v') == w,
-                None => !k.contains("dev"),
+    let latest = versions.and_then(composer_latest);
+    let requested = version.map(percent_decode);
+    let ver = match requested.as_deref() {
+        Some(want) => {
+            let want = want.trim_start_matches('v');
+            versions.and_then(|vs| {
+                vs.iter()
+                    .find(|(k, _)| k.trim_start_matches('v') == want)
+                    .map(|(_, v)| v)
             })
-            .map(|(_, v)| v)
-    });
+        }
+        None => latest,
+    };
+    let version_of = |v: &Value| v.get("version").and_then(Value::as_str).map(str::to_string);
 
     Some(Registry {
         ecosystem: "composer".into(),
         name: path.to_string(),
-        version: ver
-            .and_then(|v| v.get("version"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        version: ver.and_then(version_of).or(requested).unwrap_or_default(),
+        latest_version: latest.and_then(version_of),
         published_at: ver
             .and_then(|v| v.get("time"))
             .and_then(Value::as_str)
@@ -671,6 +733,37 @@ fn composer(
     })
 }
 
+/// Packagist's latest release: the highest stable `version_normalized`, which
+/// Packagist pads to four numeric parts (`2.10.0.0` beats `2.9.1.0`), else the
+/// highest pre-release (`3.0.0.0-beta1`). Branches (`dev-main`,
+/// `1.x-dev` → `1.9999999.9999999.9999999-dev`) never count. The `versions`
+/// map is keyed by version string, and its key order says nothing about
+/// recency.
+fn composer_latest(versions: &serde_json::Map<String, Value>) -> Option<&Value> {
+    versions
+        .values()
+        .filter_map(|v| {
+            let norm = v
+                .get("version_normalized")
+                .or_else(|| v.get("version"))?
+                .as_str()?
+                .trim_start_matches('v');
+            let (numbers, suffix) = norm
+                .split_once('-')
+                .map_or((norm, None), |(n, s)| (n, Some(s)));
+            if suffix.is_some_and(|s| s.contains("dev")) {
+                return None;
+            }
+            let numbers: Vec<u64> = numbers
+                .split('.')
+                .map(|n| n.parse().ok())
+                .collect::<Option<_>>()?;
+            Some(((suffix.is_none(), numbers), v))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, v)| v)
+}
+
 /// RubyGems: a clean JSON API. The package endpoint carries downloads, author,
 /// and links; the per-version publish date comes from the versions endpoint.
 fn gem(name: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
@@ -680,7 +773,7 @@ fn gem(name: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         cache,
     )?;
     let resolved = version
-        .map(str::to_string)
+        .map(percent_decode)
         .or_else(|| {
             doc.get("version")
                 .and_then(Value::as_str)
@@ -689,17 +782,16 @@ fn gem(name: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         .unwrap_or_default();
 
     // The gem endpoint omits dates; the versions list carries `created_at` per
-    // release. Match the resolved version, else fall back to the newest entry.
+    // release. A version the list lacks gets no date rather than the newest's.
     let published_at = json_meta(
         &format!("https://rubygems.org/api/v1/versions/{name}.json"),
         net,
         cache,
     )
     .and_then(|vs| {
-        let arr = vs.as_array()?;
-        arr.iter()
-            .find(|v| v.get("number").and_then(Value::as_str) == Some(resolved.as_str()))
-            .or_else(|| arr.first())?
+        vs.as_array()?
+            .iter()
+            .find(|v| v.get("number").and_then(Value::as_str) == Some(resolved.as_str()))?
             .get("created_at")
             .and_then(Value::as_str)
             .and_then(parse_rfc3339_secs)
@@ -1516,20 +1608,17 @@ fn hex_pm(
         .get("latest_stable_version")
         .or_else(|| doc.get("latest_version"))
         .and_then(Value::as_str);
-    let version = version.or(latest).unwrap_or_default();
+    let requested = version.map(percent_decode);
+    let version = requested.as_deref().or(latest).unwrap_or_default();
+    // A version the releases list lacks gets no date rather than the newest
+    // release's; the package's own `inserted_at` is its first release.
     let published_at = doc
         .get("releases")
         .and_then(Value::as_array)
         .and_then(|rs| {
             rs.iter()
-                .find(|r| r.get("version").and_then(Value::as_str) == Some(version))
-                .or_else(|| rs.first())?
+                .find(|r| r.get("version").and_then(Value::as_str) == Some(version))?
                 .get("inserted_at")
-                .and_then(Value::as_str)
-                .and_then(parse_ts)
-        })
-        .or_else(|| {
-            doc.get("inserted_at")
                 .and_then(Value::as_str)
                 .and_then(parse_ts)
         });
@@ -1540,6 +1629,10 @@ fn hex_pm(
         name: name.to_string(),
         version: version.to_string(),
         published_at,
+        first_published_at: doc
+            .get("inserted_at")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
         latest_version: latest.map(str::to_string),
         description: meta
             .and_then(|m| m.get("description"))
@@ -1650,18 +1743,23 @@ fn pub_dev(
 ) -> Option<Registry> {
     let doc = json_meta(&format!("https://pub.dev/api/packages/{name}"), net, cache)?;
     let latest = doc.pointer("/latest/version").and_then(Value::as_str);
-    let rel = match version.or(latest) {
-        Some(w) => doc
+    let requested = version.map(percent_decode);
+    // A version the list lacks describes no release: it gets no date rather
+    // than latest's, though its identity text still comes from latest's
+    // pubspec.
+    let rel = match requested.as_deref() {
+        Some(want) => doc
             .get("versions")
             .and_then(Value::as_array)
             .and_then(|vs| {
                 vs.iter()
-                    .find(|v| v.get("version").and_then(Value::as_str) == Some(w))
-            })
-            .or_else(|| doc.get("latest")),
+                    .find(|v| v.get("version").and_then(Value::as_str) == Some(want))
+            }),
         None => doc.get("latest"),
     };
-    let spec = rel.and_then(|r| r.get("pubspec"));
+    let spec = rel
+        .or_else(|| doc.get("latest"))
+        .and_then(|r| r.get("pubspec"));
 
     Some(Registry {
         ecosystem: "pub".into(),
@@ -1669,8 +1767,9 @@ fn pub_dev(
         version: rel
             .and_then(|r| r.get("version"))
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+            .map(str::to_string)
+            .or(requested)
+            .unwrap_or_default(),
         published_at: rel
             .and_then(|r| r.get("published"))
             .and_then(Value::as_str)
@@ -1707,31 +1806,30 @@ fn conda(
         cache,
     )?;
     let latest = doc.get("latest_version").and_then(Value::as_str);
-    let version = version.or(latest).unwrap_or_default();
-    let published_at = doc
-        .get("files")
-        .and_then(Value::as_array)
-        .and_then(|fs| {
-            fs.iter()
-                .filter(|f| f.get("version").and_then(Value::as_str) == Some(version))
-                .filter_map(|f| {
-                    f.get("upload_time")
-                        .and_then(Value::as_str)
-                        .and_then(parse_ts)
-                })
-                .min()
-        })
-        .or_else(|| {
-            doc.get("created_at")
-                .and_then(Value::as_str)
-                .and_then(parse_ts)
-        });
+    let requested = version.map(percent_decode);
+    let version = requested.as_deref().or(latest).unwrap_or_default();
+    // A version with no files gets no date; the package's `created_at` is its
+    // first upload, not this version's.
+    let published_at = doc.get("files").and_then(Value::as_array).and_then(|fs| {
+        fs.iter()
+            .filter(|f| f.get("version").and_then(Value::as_str) == Some(version))
+            .filter_map(|f| {
+                f.get("upload_time")
+                    .and_then(Value::as_str)
+                    .and_then(parse_ts)
+            })
+            .min()
+    });
 
     Some(Registry {
         ecosystem: "conda".into(),
         name: name.to_string(),
         version: version.to_string(),
         published_at,
+        first_published_at: doc
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(parse_ts),
         latest_version: latest.map(str::to_string),
         description: doc
             .get("summary")
@@ -1814,19 +1912,20 @@ fn jsr(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         cache,
     )?;
     let latest = doc.get("latestVersion").and_then(Value::as_str);
-    let want = version.or(latest).unwrap_or_default();
+    let requested = version.map(percent_decode);
+    let want = requested.as_deref().or(latest).unwrap_or_default();
 
-    // Per-version publish time comes from the versions list.
+    // Per-version publish time comes from the versions list; a version it
+    // lacks gets none rather than the newest's.
     let published_at = json_meta(
         &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}/versions"),
         net,
         cache,
     )
     .and_then(|vs| {
-        let arr = vs.as_array()?;
-        arr.iter()
-            .find(|v| v.get("version").and_then(Value::as_str) == Some(want))
-            .or_else(|| arr.first())?
+        vs.as_array()?
+            .iter()
+            .find(|v| v.get("version").and_then(Value::as_str) == Some(want))?
             .get("createdAt")
             .and_then(Value::as_str)
             .and_then(parse_ts)
@@ -2091,15 +2190,13 @@ fn clawhub(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
 /// JSON; ghcr.io does not (a token dance for a thin manifest), so its refs
 /// resolve no record and the caller fails open like any unreachable registry.
 fn oci_meta(purl: &str, path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let repo = purl
-        .split_once('?')
-        .and_then(|(_, quals)| {
-            quals.split('&').find_map(|q| {
-                let (k, v) = q.split_once('=')?;
-                (k == "repository_url" && !v.is_empty()).then(|| crate::fetch::percent_decode(v))
-            })
+    let repository_url = purl.split_once('?').and_then(|(_, quals)| {
+        quals.split('&').find_map(|q| {
+            let (k, v) = q.split_once('=')?;
+            (k == "repository_url").then_some(v)
         })
-        .unwrap_or_else(|| format!("docker.io/library/{}", last_seg(path)));
+    });
+    let repo = crate::fetch::oci_repository(path, repository_url);
     let (host, image) = repo.split_once('/')?;
     match host {
         "docker.io" => docker_hub(image, net, cache),
@@ -2878,11 +2975,20 @@ fn parse_millis(v: &Value) -> Option<u64> {
     Some(ms / 1000)
 }
 
-/// Parse a registry timestamp, tolerating a trailing zone word (`… UTC`, `…
-/// GMT`) that crandb and others append: retry on just the `YYYY-…-SS` core,
-/// which such a suffix always denotes as UTC.
+/// Parse a registry timestamp: RFC 3339, or that core followed by a space and
+/// a zone — a UTC word (`… UTC`, `… GMT`, as crandb appends) or a numeric
+/// offset (`… +0000`, pkgsrc's `BUILD_DATE`). Any other trailing text (`PST`,
+/// a 12-hour clock) can't be placed on the timeline, so it is `None` rather
+/// than a guess hours off.
 pub(crate) fn parse_ts(s: &str) -> Option<u64> {
-    parse_rfc3339_secs(s).or_else(|| s.get(..19).and_then(parse_rfc3339_secs))
+    parse_rfc3339_secs(s).or_else(|| {
+        let (core, zone) = s.trim_end().rsplit_once(' ')?;
+        match zone {
+            "UTC" | "GMT" | "Z" => parse_rfc3339_secs(core),
+            _ if zone.starts_with(['+', '-']) => parse_rfc3339_secs(&format!("{core}{zone}")),
+            _ => None,
+        }
+    })
 }
 
 /// Parse a leading `YYYY-MM-DD` to Unix seconds at UTC midnight, ignoring any
@@ -2901,45 +3007,81 @@ fn json_ptr_escape(seg: &str) -> String {
 }
 
 /// Parse an RFC 3339 / ISO 8601 timestamp to Unix seconds, covering the shapes
-/// registries emit: `2021-04-23T10:00:00.000Z`, `…+00:00`, fractional seconds of
-/// any width, space or `T` separator. `None` on anything unrecognized — an
-/// unparseable date becomes "age unknown", never a wrong age.
+/// registries emit: `2021-04-23T10:00:00.000Z`, `…+00:00`, `…+0000`, fractional
+/// seconds of any width, space or `T` separator, no zone meaning UTC. `None` on
+/// anything else, including an impossible date or time (`2021-13-45`, `25:00`)
+/// or trailing text — an unparseable date becomes "age unknown", never a
+/// wrong age.
 fn parse_rfc3339_secs(s: &str) -> Option<u64> {
     let b = s.as_bytes();
-    if b.len() < 19 {
+    // A fixed-width field of digits only: `str::parse` would also take a sign.
+    let n = |a: usize, z: usize| -> Option<i64> {
+        b.get(a..z)?.iter().try_fold(0i64, |acc, &d| {
+            d.is_ascii_digit().then(|| acc * 10 + i64::from(d - b'0'))
+        })
+    };
+    let separators = b.get(4) == Some(&b'-')
+        && b.get(7) == Some(&b'-')
+        && matches!(b.get(10), Some(b'T' | b't' | b' '))
+        && b.get(13) == Some(&b':')
+        && b.get(16) == Some(&b':');
+    if !separators {
         return None;
     }
-    let n = |a: usize, z: usize| -> Option<i64> { s.get(a..z)?.parse().ok() };
     let (year, month, day) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
     let (hour, min, sec) = (n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    // A leap second (`:60`) is legal RFC 3339.
+    if !(1..=12).contains(&month)
+        || !(1..=days_in_month(year, month)).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 60
+    {
+        return None;
+    }
 
     let mut i = 19;
     if b.get(i) == Some(&b'.') {
         i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
+        let digits = i;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
             i += 1;
+        }
+        if i == digits {
+            return None;
         }
     }
     let offset = match b.get(i) {
-        None | Some(b'Z') | Some(b'z') => 0,
-        Some(&c @ (b'+' | b'-')) => {
+        None => 0,
+        Some(b'Z' | b'z') if i + 1 == b.len() => 0,
+        Some(&sign @ (b'+' | b'-')) => {
             let oh = n(i + 1, i + 3)?;
-            let mm = if b.get(i + 3) == Some(&b':') {
-                i + 4
-            } else {
-                i + 3
+            // `+05:30`, `+0530`, or an hour-only `+05`.
+            let (om, end) = match b.get(i + 3) {
+                None => (0, i + 3),
+                Some(b':') => (n(i + 4, i + 6)?, i + 6),
+                Some(_) => (n(i + 3, i + 5)?, i + 5),
             };
-            let om = n(mm, mm + 2).unwrap_or(0);
-            if c == b'+' {
-                oh * 3600 + om * 60
-            } else {
-                -(oh * 3600 + om * 60)
+            if end != b.len() || oh > 23 || om > 59 {
+                return None;
             }
+            let secs = oh * 3600 + om * 60;
+            if sign == b'+' { secs } else { -secs }
         }
         _ => return None,
     };
     let days = days_from_civil(year, month, day);
     u64::try_from(days * 86400 + hour * 3600 + min * 60 + sec - offset).ok()
+}
+
+/// Days in `month` (1-based) of the proleptic-Gregorian `year`.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
 }
 
 /// Days since 1970-01-01 for a proleptic-Gregorian civil date (Howard
@@ -3044,7 +3186,56 @@ mod tests {
         // The Unix epoch itself.
         assert_eq!(parse_rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_rfc3339_secs("garbage"), None);
-        assert!(parse_rfc3339_secs("2021-13-01T00:00:00Z").is_some()); // no calendar validation
+        assert_eq!(
+            parse_rfc3339_secs("2021-04-23T12:00:00+0200"),
+            Some(1_619_172_000)
+        );
+        assert_eq!(
+            parse_rfc3339_secs("2021-04-23T12:00:00+02"),
+            Some(1_619_172_000)
+        );
+    }
+
+    #[test]
+    fn impossible_or_malformed_timestamps_are_unknown_not_wrong() {
+        for bad in [
+            "2021-13-01T00:00:00Z",     // month 13
+            "2021-02-29T00:00:00Z",     // not a leap year
+            "2021-04-31T00:00:00Z",     // April has 30 days
+            "2021-04-23T24:00:00Z",     // hour 24
+            "2021-13-45T99:99:99Z",     // every field out of range
+            "2021x04y23T10:00:00Z",     // wrong separators
+            "+021-04-23T10:00:00Z",     // a sign is not a digit
+            "2021-04-23T10:00:00Zjunk", // trailing text
+            "2021-04-23T10:00:00+05:30junk",
+            "2021-04-23T10:00:00.Z", // a dot with no fraction
+        ] {
+            assert_eq!(parse_rfc3339_secs(bad), None, "{bad}");
+        }
+        assert!(
+            parse_rfc3339_secs("2024-02-29T00:00:00Z").is_some(),
+            "2024 is a leap year"
+        );
+        assert!(
+            parse_rfc3339_secs("2016-12-31T23:59:60Z").is_some(),
+            "leap second"
+        );
+    }
+
+    #[test]
+    fn a_trailing_zone_is_honoured_or_refused_never_assumed() {
+        let utc = parse_rfc3339_secs("2021-04-23T10:00:00Z");
+        assert_eq!(parse_ts("2021-04-23 10:00:00 UTC"), utc);
+        assert_eq!(parse_ts("2021-04-23 10:00:00 GMT"), utc);
+        assert_eq!(parse_ts("2021-04-23 10:00:00 +0000"), utc);
+        // A non-UTC offset moves the instant instead of being dropped.
+        assert_eq!(
+            parse_ts("2021-04-23 15:30:00 +0530"),
+            utc,
+            "15:30 at +05:30 is 10:00 UTC"
+        );
+        // A zone abbreviation can't be placed, so it is unknown, not UTC.
+        assert_eq!(parse_ts("2021-04-23 10:00:00 PST"), None);
     }
 
     #[test]
@@ -3811,6 +4002,165 @@ mod tests {
         assert_eq!(r.rating_count, Some(20_000));
         assert!(r.published_at.is_some());
         assert!(r.first_published_at.is_some());
+    }
+
+    #[test]
+    fn a_namespaced_docker_image_is_not_the_official_one() {
+        // `pkg:docker/myorg/nginx` is Docker Hub's `myorg/nginx`. Looked up as
+        // `library/nginx`, it would inherit the official image's pulls and stars.
+        let doc = serde_json::json!({"name": "nginx", "namespace": "myorg", "pull_count": 3u64})
+            .to_string();
+        let net = Fixtures::default().with(
+            "https://hub.docker.com/v2/repositories/myorg/nginx",
+            doc.as_bytes(),
+        );
+        let locator = RefLocator::Purl("pkg:docker/myorg/nginx".into());
+        let r = registry(&locator, &net, &test_cache("oci-ns")).expect("registry");
+        assert_eq!(r.author.as_deref(), Some("myorg"));
+        assert_eq!(r.downloads_total, Some(3));
+        // A bare name is still the official image.
+        assert_eq!(
+            crate::fetch::oci_repository("nginx", None),
+            "docker.io/library/nginx"
+        );
+    }
+
+    #[test]
+    fn a_version_pypi_does_not_list_gets_none_of_latests_facts() {
+        let doc = serde_json::json!({
+            "info": {"version": "2.0.0"},
+            "vulnerabilities": [],
+            "urls": [{"upload_time_iso_8601": "2024-01-01T00:00:00Z", "yanked": true, "yanked_reason": "malware"}],
+            "releases": {
+                "1.0+local": [{"upload_time_iso_8601": "2021-01-01T00:00:00Z", "yanked": false}],
+                "2.0.0": [{"upload_time_iso_8601": "2024-01-01T00:00:00Z", "yanked": true, "yanked_reason": "malware"}]
+            }
+        })
+        .to_string();
+        let old_release =
+            serde_json::json!({"vulnerabilities": [{"id": "A"}, {"id": "B"}]}).to_string();
+        let net = Fixtures::default()
+            .with("https://pypi.org/pypi/w/json", doc.as_bytes())
+            .with(
+                "https://pypi.org/pypi/w/1.0%2Blocal/json",
+                old_release.as_bytes(),
+            );
+        let cache = test_cache("pypi-miss");
+
+        // Unlisted: latest's date, yank and vulnerabilities must not transfer.
+        let gone = pypi("w", Some("9.9.9"), &net, &cache).expect("record");
+        assert_eq!(gone.version, "9.9.9");
+        assert_eq!(gone.published_at, None);
+        assert_eq!(gone.deprecated, None);
+        assert_eq!(gone.vulnerability_count, None);
+
+        // A PURL's encoded `+` still finds the listed `1.0+local`, and an older
+        // release's vulnerabilities come from its own endpoint, not latest's.
+        let old = pypi("w", Some("1.0%2Blocal"), &net, &cache).expect("record");
+        assert_eq!(old.version, "1.0+local");
+        assert_eq!(old.published_at, Some(1_609_459_200)); // 2021-01-01
+        assert_eq!(old.deprecated, None);
+        assert_eq!(old.vulnerability_count, Some(2));
+    }
+
+    #[test]
+    fn composers_latest_is_the_highest_stable_release() {
+        // As map keys these sort `1.0.0` < `10.0.0` < `11…` < `9.0.0` <
+        // `dev-main`, an order that says nothing about recency.
+        let doc = serde_json::json!({"package": {"versions": {
+            "dev-main": {"version": "dev-main", "version_normalized": "9999999-dev"},
+            "1.0.0": {"version": "1.0.0", "version_normalized": "1.0.0.0", "time": "2012-01-01T00:00:00+00:00"},
+            "9.0.0": {"version": "9.0.0", "version_normalized": "9.0.0.0", "time": "2020-01-01T00:00:00+00:00"},
+            "10.0.0": {"version": "10.0.0", "version_normalized": "10.0.0.0", "time": "2021-01-01T00:00:00+00:00"},
+            "11.0.0-beta1": {"version": "11.0.0-beta1", "version_normalized": "11.0.0.0-beta1"}
+        }}})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://packagist.org/packages/acme/lib.json",
+            doc.as_bytes(),
+        );
+        let cache = test_cache("composer");
+
+        let r = composer("acme/lib", None, &net, &cache).expect("record");
+        assert_eq!(r.version, "10.0.0");
+        assert_eq!(r.latest_version.as_deref(), Some("10.0.0"));
+        assert_eq!(r.published_at, Some(1_609_459_200)); // 2021-01-01
+
+        // A requested version the package lacks keeps its own name, undated.
+        let gone = composer("acme/lib", Some("v3.0.0"), &net, &cache).expect("record");
+        assert_eq!(gone.version, "v3.0.0");
+        assert_eq!(gone.published_at, None);
+        assert_eq!(gone.latest_version.as_deref(), Some("10.0.0"));
+    }
+
+    #[test]
+    fn an_unlisted_version_is_undated_in_every_backend() {
+        // Each registry knows the package and its latest release, but not
+        // version 9.9.9. Every backend used to date it from something else: the
+        // newest release, or the package's own creation.
+        let docs = [
+            (
+                "https://crates.io/api/v1/crates/c",
+                serde_json::json!({"crate": {"max_version": "1.0.0", "created_at": "2015-01-01T00:00:00Z"},
+                    "versions": [{"num": "1.0.0", "created_at": "2024-01-01T00:00:00Z"}]}),
+            ),
+            (
+                "https://rubygems.org/api/v1/gems/g.json",
+                serde_json::json!({"version": "1.0.0"}),
+            ),
+            (
+                "https://rubygems.org/api/v1/versions/g.json",
+                serde_json::json!([{"number": "1.0.0", "created_at": "2024-01-01T00:00:00Z"}]),
+            ),
+            (
+                "https://hex.pm/api/packages/h",
+                serde_json::json!({"latest_version": "1.0.0", "inserted_at": "2015-01-01T00:00:00Z",
+                    "releases": [{"version": "1.0.0", "inserted_at": "2024-01-01T00:00:00Z"}]}),
+            ),
+            (
+                "https://pub.dev/api/packages/p",
+                serde_json::json!({"latest": {"version": "1.0.0", "published": "2024-01-01T00:00:00Z"},
+                    "versions": [{"version": "1.0.0", "published": "2024-01-01T00:00:00Z"}]}),
+            ),
+            (
+                "https://api.anaconda.org/package/conda-forge/k",
+                serde_json::json!({"latest_version": "1.0.0", "created_at": "2015-01-01T00:00:00Z",
+                    "files": [{"version": "1.0.0", "upload_time": "2024-01-01T00:00:00Z"}]}),
+            ),
+            (
+                "https://api.jsr.io/scopes/s/packages/j",
+                serde_json::json!({"latestVersion": "1.0.0"}),
+            ),
+            (
+                "https://api.jsr.io/scopes/s/packages/j/versions",
+                serde_json::json!([{"version": "1.0.0", "createdAt": "2024-01-01T00:00:00Z"}]),
+            ),
+        ];
+        let net = docs.iter().fold(Fixtures::default(), |net, (url, doc)| {
+            net.with(url, doc.to_string().as_bytes())
+        });
+        let cache = test_cache("unlisted");
+        let first_release = Some(1_420_070_400); // 2015-01-01
+        let want = Some("9.9.9");
+
+        let records = [
+            crates("c", want, &net, &cache),
+            gem("g", want, &net, &cache),
+            hex_pm("h", want, &net, &cache),
+            pub_dev("p", want, &net, &cache),
+            conda("k", want, &net, &cache),
+            jsr("%40s/j", want, &net, &cache),
+        ];
+        for r in records {
+            let r = r.expect("the package itself resolves");
+            assert_eq!(r.version, "9.9.9", "{}", r.ecosystem);
+            assert_eq!(r.published_at, None, "{}", r.ecosystem);
+            // Where a backend has the package's birth date, it lands in the
+            // field that means that.
+            if matches!(r.ecosystem.as_str(), "crates" | "hex" | "conda") {
+                assert_eq!(r.first_published_at, first_release, "{}", r.ecosystem);
+            }
+        }
     }
 
     #[test]

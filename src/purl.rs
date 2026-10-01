@@ -684,15 +684,24 @@ fn parse_subpath(raw: Option<&str>) -> Option<Vec<String>> {
     Some(subpath)
 }
 
+/// The byte a `%HH` escape's two hex digits spell. Only ASCII hex digits
+/// count: `u8::from_str_radix` alone also accepts a sign, so `%+4` would
+/// decode to `0x04`.
+pub(crate) fn hex_pair(pair: &[u8]) -> Option<u8> {
+    let [hi, lo] = pair else {
+        return None;
+    };
+    let digit = |d: &u8| char::from(*d).to_digit(16);
+    u8::try_from(digit(hi)? * 16 + digit(lo)?).ok()
+}
+
 fn decode_component(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {
-            let triplet = bytes.get(index + 1..index + 3)?;
-            let hex = std::str::from_utf8(triplet).ok()?;
-            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            decoded.push(hex_pair(bytes.get(index + 1..index + 3)?)?);
             index += 3;
         } else {
             decoded.push(bytes[index]);
@@ -2179,6 +2188,23 @@ mod url_to_purl_tests {
 #[allow(clippy::expect_used, clippy::panic)]
 mod edge_case_tests {
     use super::*;
+
+    #[test]
+    fn a_percent_escape_needs_two_hex_digits() {
+        // `from_str_radix` takes a sign, which once let `%+4` decode to 0x04.
+        for bad in ["pkg:npm/foo%+4@1", "pkg:generic/a%+41@1", "pkg:npm/foo%4@1"] {
+            assert_eq!(Purl::parse(bad), Err(PurlError::Syntax), "{bad}");
+        }
+        assert_eq!(
+            normalize("pkg:npm/foo%2d@1").as_deref(),
+            Some("pkg:npm/foo-@1")
+        );
+        assert_eq!(hex_pair(b"4f"), Some(0x4f));
+        assert_eq!(hex_pair(b"+4"), None);
+        assert_eq!(hex_pair(b"4"), None);
+        // The lenient decoder passes a malformed escape through literally.
+        assert_eq!(crate::fetch::percent_decode("a%+41%41"), "a%+41A");
+    }
 
     #[test]
     fn typed_parser_distinguishes_syntax_from_type_errors() {

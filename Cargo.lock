@@ -981,6 +981,7 @@ dependencies = [
  "dirs",
  "filefacts",
  "flate2",
+ "futures-util",
  "hex",
  "lzma-rs",
  "node-semver",
