@@ -1,0 +1,180 @@
+//! Composer / Packagist: registry metadata and artifact resolution.
+
+use filefacts::Registry;
+use serde_json::Value;
+
+use crate::ecosystem::{json_meta, parse_rfc3339_secs};
+use crate::fetch::{BlobCache, Fetch, percent_decode};
+
+/// Composer's download URL lives in Packagist's per-package metadata, not a
+/// derivable path. Fetch the v2 metadata, find the matching version, and return
+/// its `dist.url` (the exact artifact Composer would install). `name` is
+/// `vendor/package`.
+pub(crate) fn resolve_composer(name: &str, version: &str, net: &dyn Fetch) -> Option<String> {
+    let api = format!("https://repo.packagist.org/p2/{name}.json");
+    let resp = net.get(&api).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&resp.bytes).ok()?;
+    let versions = json.get("packages")?.get(name)?.as_array()?;
+    let want = version.trim_start_matches('v');
+    versions
+        .iter()
+        .find(|v| {
+            v.get("version")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.trim_start_matches('v') == want)
+        })
+        .and_then(|v| v.get("dist")?.get("url")?.as_str())
+        .map(String::from)
+}
+
+/// Composer/Packagist: the package endpoint carries lifetime downloads and a
+/// favers (stars) count alongside the per-version time, authors, and license.
+pub(crate) fn composer(
+    path: &str,
+    version: Option<&str>,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<Registry> {
+    let doc = json_meta(
+        &format!("https://packagist.org/packages/{path}.json"),
+        net,
+        cache,
+    )?;
+    let pkg = doc.get("package")?;
+
+    let versions = pkg.get("versions").and_then(Value::as_object);
+    let latest = versions.and_then(composer_latest);
+    let requested = version.map(percent_decode);
+    let ver = match requested.as_deref() {
+        Some(want) => {
+            let want = want.trim_start_matches('v');
+            versions.and_then(|vs| {
+                vs.iter()
+                    .find(|(k, _)| k.trim_start_matches('v') == want)
+                    .map(|(_, v)| v)
+            })
+        }
+        None => latest,
+    };
+    let version_of = |v: &Value| v.get("version").and_then(Value::as_str).map(str::to_string);
+
+    Some(Registry {
+        ecosystem: "composer".into(),
+        name: path.to_string(),
+        version: ver.and_then(version_of).or(requested).unwrap_or_default(),
+        latest_version: latest.and_then(version_of),
+        published_at: ver
+            .and_then(|v| v.get("time"))
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_secs),
+        author: ver
+            .and_then(|v| v.pointer("/authors/0/name"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        description: pkg
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        repository: pkg
+            .get("repository")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        license: ver
+            .and_then(|v| v.pointer("/license/0"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        downloads_total: pkg.pointer("/downloads/total").and_then(Value::as_u64),
+        downloads_recent: pkg.pointer("/downloads/monthly").and_then(Value::as_u64),
+        rating_count: pkg.get("favers").and_then(Value::as_u64),
+        maintainers: pkg
+            .get("maintainers")
+            .and_then(Value::as_array)
+            .map(|m| m.len() as u32),
+        ..Default::default()
+    })
+}
+
+/// Packagist's latest release: the highest stable `version_normalized`, which
+/// Packagist pads to four numeric parts (`2.10.0.0` beats `2.9.1.0`), else the
+/// highest pre-release (`3.0.0.0-beta1`). Branches (`dev-main`,
+/// `1.x-dev` → `1.9999999.9999999.9999999-dev`) never count. The `versions`
+/// map is keyed by version string, and its key order says nothing about
+/// recency.
+fn composer_latest(versions: &serde_json::Map<String, Value>) -> Option<&Value> {
+    versions
+        .values()
+        .filter_map(|v| {
+            let norm = v
+                .get("version_normalized")
+                .or_else(|| v.get("version"))?
+                .as_str()?
+                .trim_start_matches('v');
+            let (numbers, suffix) = norm
+                .split_once('-')
+                .map_or((norm, None), |(n, s)| (n, Some(s)));
+            if suffix.is_some_and(|s| s.contains("dev")) {
+                return None;
+            }
+            let numbers: Vec<u64> = numbers
+                .split('.')
+                .map(|n| n.parse().ok())
+                .collect::<Option<_>>()?;
+            Some(((suffix.is_none(), numbers), v))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, v)| v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ecosystem::test_cache;
+
+    use crate::fetch::Fixtures;
+
+    #[test]
+    fn resolve_composer_via_packagist_dist_url() {
+        let api = "https://repo.packagist.org/p2/monolog/monolog.json";
+        let body = br#"{"packages":{"monolog/monolog":[
+            {"version":"3.0.0","dist":{"type":"zip","url":"https://api.github.com/repos/Seldaek/monolog/zipball/abc"}},
+            {"version":"2.9.1","dist":{"type":"zip","url":"https://api.github.com/repos/Seldaek/monolog/zipball/old"}}
+        ]}}"#;
+        let net = Fixtures::default().with(api, body);
+        assert_eq!(
+            resolve_composer("monolog/monolog", "3.0.0", &net),
+            Some("https://api.github.com/repos/Seldaek/monolog/zipball/abc".to_string())
+        );
+        // Unknown version → no match.
+        assert_eq!(resolve_composer("monolog/monolog", "9.9.9", &net), None);
+    }
+
+    #[test]
+    fn composers_latest_is_the_highest_stable_release() {
+        // As map keys these sort `1.0.0` < `10.0.0` < `11…` < `9.0.0` <
+        // `dev-main`, an order that says nothing about recency.
+        let doc = serde_json::json!({"package": {"versions": {
+            "dev-main": {"version": "dev-main", "version_normalized": "9999999-dev"},
+            "1.0.0": {"version": "1.0.0", "version_normalized": "1.0.0.0", "time": "2012-01-01T00:00:00+00:00"},
+            "9.0.0": {"version": "9.0.0", "version_normalized": "9.0.0.0", "time": "2020-01-01T00:00:00+00:00"},
+            "10.0.0": {"version": "10.0.0", "version_normalized": "10.0.0.0", "time": "2021-01-01T00:00:00+00:00"},
+            "11.0.0-beta1": {"version": "11.0.0-beta1", "version_normalized": "11.0.0.0-beta1"}
+        }}})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://packagist.org/packages/acme/lib.json",
+            doc.as_bytes(),
+        );
+        let cache = test_cache("composer");
+
+        let r = composer("acme/lib", None, &net, &cache).expect("record");
+        assert_eq!(r.version, "10.0.0");
+        assert_eq!(r.latest_version.as_deref(), Some("10.0.0"));
+        assert_eq!(r.published_at, Some(1_609_459_200)); // 2021-01-01
+
+        // A requested version the package lacks keeps its own name, undated.
+        let gone = composer("acme/lib", Some("v3.0.0"), &net, &cache).expect("record");
+        assert_eq!(gone.version, "v3.0.0");
+        assert_eq!(gone.published_at, None);
+        assert_eq!(gone.latest_version.as_deref(), Some("10.0.0"));
+    }
+}

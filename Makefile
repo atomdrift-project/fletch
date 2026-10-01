@@ -21,7 +21,7 @@ help: ## Show this help
 	@echo "  build              - Build in debug mode (default)"
 	@echo "  release            - Build in release mode"
 	@echo "  test               - Run all tests"
-	@echo "  test-purl-spec     - Run the authoritative vectors in PURL_SPEC_DIR"
+	@echo "  test-purl-spec     - Run the purl-spec vectors from a newer checkout in PURL_SPEC_DIR"
 	@echo "  lint               - Run clippy with warnings denied"
 	@echo "  fix                - Auto-fix clippy lints, then format with rustfmt"
 	@echo "  fmt                - Format code with rustfmt"

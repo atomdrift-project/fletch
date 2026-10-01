@@ -23,6 +23,7 @@
 
 pub mod cache_sweep;
 pub mod distro;
+mod ecosystem;
 pub mod fetch;
 pub mod find;
 mod oci;
@@ -33,4 +34,6 @@ pub mod registry;
 // (e.g. scan) need not depend on filefacts directly just to name these types.
 pub use filefacts::{HashAlgo, PinnedHash, RefKind, RefLocator, Reference, Registry};
 pub use purl::url_to_purl;
-pub use registry::{registry, registry_with_sources};
+pub use registry::{
+    RegistryError, registry, registry_with_sources, try_registry, try_registry_with_sources,
+};

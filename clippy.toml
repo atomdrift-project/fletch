@@ -15,6 +15,13 @@ type-complexity-threshold = 500
 # Warn on single character variable names (except common ones like i, j, x, y)
 single-char-binding-names-threshold = 4
 
+# Tests may unwrap, expect and panic: a failed test should stop loudly. This
+# covers #[test] fns and everything in #[cfg(test)] modules; helper fns in the
+# tests/ integration crates still carry their own crate-level allow.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
 # Disallowed methods - methods that should never be used. Keep minimal.
 disallowed-methods = []
 

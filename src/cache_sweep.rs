@@ -199,7 +199,7 @@ pub fn max_bytes_from_env_or(var: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Entry ceiling from `var`, or the [`DEFAULT_MAX_ENTRIES`] default.
+/// Entry ceiling from `var`, or the `DEFAULT_MAX_ENTRIES` default.
 #[must_use]
 pub fn max_entries_from_env(var: &str) -> usize {
     std::env::var(var)
@@ -402,7 +402,6 @@ fn remove(e: &Entry) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::io::Write;

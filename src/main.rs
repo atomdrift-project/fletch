@@ -239,10 +239,13 @@ fn run_registry(purl: &str) -> anyhow::Result<()> {
     let cache = BlobCache::disabled();
 
     let locator = RefLocator::Purl(purl.to_string());
-    let (record, sources) = fletch::registry_with_sources(&locator, &net, &cache);
-    let Some(record) = record else {
-        // Unsupported ecosystem or the registry couldn't be reached: no record.
-        std::process::exit(2);
+    let (record, sources) = fletch::try_registry_with_sources(&locator, &net, &cache);
+    let record = match record {
+        Ok(record) => record,
+        Err(why) => {
+            eprintln!("fletch: no registry record for {purl}: {why}");
+            std::process::exit(2);
+        }
     };
 
     // Stamp the wall-clock-relative signals at collection time — the producer's
@@ -260,7 +263,6 @@ fn run_registry(purl: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::source_from_recorded;
     use fletch::fetch::RecordedSource;

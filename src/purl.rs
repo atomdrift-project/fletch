@@ -346,8 +346,6 @@ pub enum PurlError {
     Type,
 }
 
-type CanonicalPurl = Purl;
-
 impl Purl {
     /// Parse, normalize, and validate a PURL, including Fletch's historical
     /// aliases. The returned value is the only representation resolvers use.
@@ -470,6 +468,68 @@ impl Purl {
     pub fn subpath_string(&self) -> Option<String> {
         (!self.subpath.is_empty()).then(|| self.subpath.join("/"))
     }
+
+    /// The namespace and name as one `/`-joined path, every segment
+    /// percent-encoded exactly as in [`canonical`](Self::canonical)
+    /// (`%40scope/name`, `vendor/name`): the coordinate a registry URL is
+    /// built from.
+    #[must_use]
+    pub fn encoded_path(&self) -> String {
+        let name = if self.typ == "git" {
+            self.name
+                .split('/')
+                .map(encode_component)
+                .collect::<Vec<_>>()
+                .join("/")
+        } else {
+            encode_component(&self.name)
+        };
+        self.namespace
+            .iter()
+            .map(|segment| encode_component(segment))
+            .chain([name])
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// The version, percent-encoded exactly as in [`canonical`](Self::canonical).
+    #[must_use]
+    pub fn encoded_version(&self) -> Option<String> {
+        self.version.as_deref().map(encode_component)
+    }
+
+    /// One qualifier's decoded value. Keys are canonical, so lowercase.
+    #[must_use]
+    pub fn qualifier(&self, key: &str) -> Option<&str> {
+        self.qualifiers.get(key).map(String::as_str)
+    }
+
+    /// This PURL at `version`, re-canonicalized through the parser so the
+    /// type's rules apply to the new version as they would to a parsed one.
+    pub(crate) fn with_version(&self, version: &str) -> Option<Self> {
+        let mut next = self.clone();
+        next.version = Some(version.to_string());
+        Self::parse(&next.canonical()).ok()
+    }
+
+    /// This PURL with qualifier `key` set to `value`, or removed when `None`,
+    /// re-canonicalized through the parser.
+    pub(crate) fn with_qualifier(&self, key: &str, value: Option<&str>) -> Option<Self> {
+        let mut next = self.clone();
+        match value {
+            Some(value) => next.qualifiers.insert(key.to_string(), value.to_string()),
+            None => next.qualifiers.remove(key),
+        };
+        Self::parse(&next.canonical()).ok()
+    }
+}
+
+impl std::str::FromStr for Purl {
+    type Err = PurlError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw)
+    }
 }
 
 fn raw_qualifier_keys(raw: &str) -> impl Iterator<Item = &str> {
@@ -507,7 +567,7 @@ fn parse_compatible_purl(raw: &str) -> Result<Purl, PurlError> {
     Ok(folded)
 }
 
-fn parse_purl_components(raw: &str, allow_legacy_version_order: bool) -> Option<CanonicalPurl> {
+fn parse_purl_components(raw: &str, allow_legacy_version_order: bool) -> Option<Purl> {
     let raw = raw.trim();
     let (scheme, body) = raw.split_once(':')?;
     if !scheme.eq_ignore_ascii_case("pkg") {
@@ -617,7 +677,7 @@ fn parse_purl_components(raw: &str, allow_legacy_version_order: bool) -> Option<
         return None;
     }
     let subpath = parse_subpath(raw_subpath)?;
-    Some(CanonicalPurl {
+    Some(Purl {
         typ: typ.to_ascii_lowercase(),
         namespace: path,
         name,
@@ -740,7 +800,7 @@ fn namespace_requirement(typ: &str) -> i8 {
     }
 }
 
-fn apply_type_rules(parts: &mut CanonicalPurl) -> Option<()> {
+fn apply_type_rules(parts: &mut Purl) -> Option<()> {
     if parts.typ == "git" && parts.namespace.len() > 1 {
         let mut name_segments = parts.namespace.split_off(1);
         name_segments.push(std::mem::take(&mut parts.name));
@@ -910,7 +970,7 @@ fn is_guid(value: &str) -> bool {
     }) && parts.next().is_none()
 }
 
-fn validate_common_qualifiers(parts: &mut CanonicalPurl) -> Option<()> {
+fn validate_common_qualifiers(parts: &mut Purl) -> Option<()> {
     if let Some(checksum) = parts.qualifiers.get_mut("checksum") {
         let normalized = checksum
             .split(',')
@@ -995,34 +1055,11 @@ pub(crate) fn encode_component(value: &str) -> String {
     encoded
 }
 
-fn build_purl(parts: &CanonicalPurl) -> String {
-    let mut output = format!("pkg:{}/", parts.typ);
-    if !parts.namespace.is_empty() {
-        output.push_str(
-            &parts
-                .namespace
-                .iter()
-                .map(|segment| encode_component(segment))
-                .collect::<Vec<_>>()
-                .join("/"),
-        );
-        output.push('/');
-    }
-    if parts.typ == "git" {
-        output.push_str(
-            &parts
-                .name
-                .split('/')
-                .map(encode_component)
-                .collect::<Vec<_>>()
-                .join("/"),
-        );
-    } else {
-        output.push_str(&encode_component(&parts.name));
-    }
-    if let Some(version) = parts.version.as_deref() {
+fn build_purl(parts: &Purl) -> String {
+    let mut output = format!("pkg:{}/{}", parts.typ, parts.encoded_path());
+    if let Some(version) = parts.encoded_version() {
         output.push('@');
-        output.push_str(&encode_component(version));
+        output.push_str(&version);
     }
     if !parts.qualifiers.is_empty() {
         output.push('?');
@@ -1107,27 +1144,11 @@ fn normalize_legacy(raw: &str) -> Option<String> {
         format!("#{subpath}")
     };
     // Split the remainder into the coordinate path and the @version/?qualifier
-    // tail so the type can be re-keyed without disturbing either.
-    //
-    // A *leading* `@` opens an npm scope (`pkg:npm/@scope/name@1.0.0`), never a
-    // version: a coordinate path cannot begin with its own version separator.
-    // Searching from 0 would split `@scope/name@1.0.0` into an empty path and a
-    // tail of everything, and the empty-name guard below would then refuse a
-    // perfectly good PURL — every scoped npm package, which is a large part of
-    // the registry.
-    //
-    // It is a scope only when a `/` closes it, because a scope is always
-    // `@scope/name`. Where the next delimiter is a version or a qualifier
-    // instead, the `@` really does open a version over an empty name
-    // (`pkg:npm/@1.0.0`), which the guard below must still refuse.
-    let scope_sigil = usize::from(
-        rest.starts_with('@')
-            && rest[1..]
-                .find(['/', '@', '?'])
-                .is_some_and(|i| rest[1 + i..].starts_with('/')),
-    );
-    let (path, tail) = match rest[scope_sigil..].find(['@', '?']) {
-        Some(i) => rest.split_at(scope_sigil + i),
+    // tail so the type can be re-keyed without disturbing either. The input is
+    // canonical, so every literal `@` in it is the version separator (a scope
+    // and any `@` in a value are `%40`).
+    let (path, tail) = match rest.find(['@', '?']) {
+        Some(i) => rest.split_at(i),
         None => (rest, ""),
     };
     // An empty type or an empty name can only produce a degenerate key
@@ -1136,17 +1157,6 @@ fn normalize_legacy(raw: &str) -> Option<String> {
     if typ.is_empty() || last_segment(path).is_empty() {
         return None;
     }
-    // Repair the non-spec `?qualifiers@version` ordering: move the trailing
-    // version back before the qualifiers. The chunk after the last `@` is only
-    // a version when it is free of `=`/`&`/`/`, any of which would mark it as
-    // part of a qualifier value (e.g. a repository_url with userinfo) instead.
-    let tail = match tail.strip_prefix('?').and_then(|q| q.rsplit_once('@')) {
-        Some((quals, v)) if !v.is_empty() && !v.contains(['=', '&', '/']) => {
-            format!("@{v}?{quals}")
-        }
-        _ => tail.to_string(),
-    };
-    let tail = tail.as_str();
     // For the spec distro types, canonicalize the vendor namespace: it is
     // case-insensitive per spec (lowercased in canonical form), and when
     // missing it is recovered from a `distro=<vendor>-<release>` qualifier —
@@ -1154,20 +1164,6 @@ fn normalize_legacy(raw: &str) -> Option<String> {
     // only when the vendor prefix names a distro this project models
     // (`fedora-25` → fedora; a bare deb codename like `jessie` never
     // matches). The qualifier itself stays; [`identity`] strips it later.
-    // Fold a literal npm scope onto its percent-encoded spelling. The spec
-    // percent-encodes `@` inside a namespace, and that is what this module's
-    // own `url_to_purl` emits, so without the fold `@scope/name` and
-    // `%40scope/name` are one package under two keys and every bloom or index
-    // lookup made with one spelling misses the other.
-    //
-    // Applied to every type, before the distro rewrite, not only to the types
-    // where a scope is idiomatic: the split above already reads a leading `@`
-    // as part of the path whatever the type is, so `pkg:rpm/@scope/pkg` has to
-    // canonicalize the same way here as it does in hopper's twin — a rule that
-    // is type-specific on one side and universal on the other is a divergence
-    // waiting to be found by a fuzzer instead of by a test.
-    let scoped = path.strip_prefix('@').map(|scope| format!("%40{scope}"));
-    let path = scoped.as_deref().unwrap_or(path);
     let path = if matches!(typ, "deb" | "rpm" | "apk" | "alpm") {
         distro_path(typ, path, tail)
     } else {
@@ -1195,14 +1191,6 @@ fn normalize_legacy(raw: &str) -> Option<String> {
             add_qualifier(tail, "repository_url=https://open-vsx.org"),
             subpath,
         ),
-        // PyPI treats `-`/`_`/`.` as one separator and names as
-        // case-insensitive — PEP 503 is the registry's own equivalence — so
-        // the canonical name is the PEP 503 normalization. (There is no
-        // namespace; the path is the name.) npm is deliberately NOT folded:
-        // legacy mixed-case names were grandfathered in and stay distinct.
-        "pypi" => format!("pkg:pypi/{}{tail}{subpath}", normalize_pypi(path)),
-        // Composer names are case-insensitive per spec and lowercased.
-        "composer" => format!("pkg:composer/{}{tail}{subpath}", path.to_ascii_lowercase()),
         "alpm" => {
             // The AUR is its own alpm namespace: `pkg:alpm/aur/<name>`. Fold
             // the vendor-plus-qualifier spelling this project generated before
@@ -1312,7 +1300,7 @@ pub(crate) fn release_identity_at(raw: &str, version: Option<&str>) -> Option<St
                     | ("conan", "prev")
                     | ("vcpkg", "triplet")
                     | ("oci", "arch")
-                    | ("vscode" | "vscode-extension", "platform")
+                    | ("vscode-extension", "platform")
                     | ("otp", "arch" | "platform")
             )
     });
@@ -1347,7 +1335,7 @@ pub fn artifact_identity(release: &str, selectors: &BTreeMap<String, String>) ->
 /// has no `pkg:` scheme, has an invalid type, or has no `/`. Shared by the
 /// registry parser and the fetch resolver so both read any spelling
 /// [`normalize`] accepts.
-pub(crate) fn scheme_type_rest(purl: &str) -> Option<(String, &str)> {
+fn scheme_type_rest(purl: &str) -> Option<(String, &str)> {
     let s = purl.trim();
     // `get(..4)` (not a direct slice) so a multi-byte character at the
     // boundary yields None instead of a panic.
@@ -1457,7 +1445,6 @@ fn add_qualifier(tail: &str, qualifier: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod normalize_tests {
     use super::*;
 
@@ -1968,7 +1955,6 @@ mod normalize_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod url_to_purl_tests {
     use super::*;
     use crate::RefLocator;
@@ -2183,9 +2169,53 @@ mod url_to_purl_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::panic)]
 mod edge_case_tests {
     use super::*;
+
+    #[test]
+    fn version_and_kind_come_from_the_parsed_purl() {
+        for (tail, kind) in [
+            ("1.2.3", None),
+            ("1.2.3?kind=wheel", Some("wheel")),
+            ("1.2.3?kind=sdist", Some("sdist")),
+            // Other qualifiers are tolerated; `kind` is found regardless of order.
+            ("1.2.3?foo=bar&kind=wheel", Some("wheel")),
+            // A `?` with no `kind` qualifier leaves the bare version.
+            ("1.2.3?foo=bar", None),
+        ] {
+            let purl = Purl::parse(&format!("pkg:pypi/x@{tail}")).unwrap();
+            assert_eq!(purl.version(), Some("1.2.3"), "{tail}");
+            assert_eq!(purl.qualifier("kind"), kind, "{tail}");
+        }
+    }
+
+    #[test]
+    fn coordinates_tolerate_a_misplaced_version() {
+        let coordinates = |tail: &str| {
+            let purl = Purl::parse(&format!("pkg:alpm/{tail}")).unwrap();
+            (purl.encoded_path(), purl.encoded_version())
+        };
+        let at = |path: &str, version: Option<&str>| (path.to_string(), version.map(String::from));
+        // Spec order: version before qualifiers. The AUR's spec spelling folds
+        // into the `aur` namespace.
+        assert_eq!(coordinates("arch/yay@1.0-1"), at("arch/yay", Some("1.0-1")));
+        assert_eq!(
+            coordinates("arch/yay@1.0-1?repository_url=https://aur.archlinux.org"),
+            at("aur/yay", Some("1.0-1"))
+        );
+        assert_eq!(coordinates("arch/yay"), at("arch/yay", None));
+        // The non-spec `?qualifiers@version` ordering older hopper exports
+        // emitted: the trailing version is still found.
+        assert_eq!(
+            coordinates("arch/yay?repository_url=https://aur.archlinux.org@1.0-1"),
+            at("aur/yay", Some("1.0-1"))
+        );
+        // A qualifier value containing `@` (URL userinfo) is not a version.
+        assert_eq!(
+            coordinates("arch/yay?repository_url=https://user@example.com/repo"),
+            at("arch/yay", None)
+        );
+    }
 
     #[test]
     fn a_percent_escape_needs_two_hex_digits() {

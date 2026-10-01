@@ -1,4 +1,9 @@
-//! Optional conformance tests against a local package-url specification checkout.
+//! Conformance tests against the package-url specification's test vectors.
+//!
+//! The vectors are vendored under `tests/data/purl-spec` (purl-spec commit
+//! `7cd2d3442fb9c88155db17ada7c911b40ec22d41`, MIT-licensed, see its
+//! `LICENSE`), so these always run. Set `PURL_SPEC_DIR` to a newer checkout to
+//! test against it instead; the corpus counts below then say what changed.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -8,15 +13,12 @@ use std::path::{Path, PathBuf};
 
 use fletch::purl::{Purl, PurlComponents};
 
-fn documents() -> Option<Vec<PathBuf>> {
-    let root = match std::env::var_os("PURL_SPEC_DIR") {
-        Some(root) => root,
-        None if std::env::var_os("CI").is_some() => {
-            panic!("PURL_SPEC_DIR is required in CI")
-        }
-        None => return None,
-    };
-    let root = Path::new(&root);
+fn documents() -> Vec<PathBuf> {
+    let root = std::env::var_os("PURL_SPEC_DIR").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/purl-spec"),
+        PathBuf::from,
+    );
+    let root = root.as_path();
     let mut documents = vec![root.join("tests/spec/specification-test.json")];
     let type_tests = fs::read_dir(root.join("tests/types")).expect("purl-spec type tests");
     documents.extend(type_tests.filter_map(|entry| {
@@ -24,12 +26,12 @@ fn documents() -> Option<Vec<PathBuf>> {
         (path.extension().and_then(|value| value.to_str()) == Some("json")).then_some(path)
     }));
     documents.sort();
-    Some(documents)
+    documents
 }
 
-fn cases(test_type: &str) -> Option<Vec<(PathBuf, serde_json::Value)>> {
+fn cases(test_type: &str) -> Vec<(PathBuf, serde_json::Value)> {
     let mut cases = Vec::new();
-    for path in documents()? {
+    for path in documents() {
         let bytes = fs::read(&path).expect("purl-spec test document");
         let document: serde_json::Value =
             serde_json::from_slice(&bytes).expect("valid purl-spec JSON");
@@ -39,7 +41,7 @@ fn cases(test_type: &str) -> Option<Vec<(PathBuf, serde_json::Value)>> {
             }
         }
     }
-    Some(cases)
+    cases
 }
 
 fn component_purl(input: &serde_json::Value) -> Option<Purl> {
@@ -93,9 +95,7 @@ fn component_purl(input: &serde_json::Value) -> Option<Purl> {
 
 #[test]
 fn every_validate_vector_matches_local_purl_spec() {
-    let Some(cases) = cases("validate") else {
-        return;
-    };
+    let cases = cases("validate");
     let mut failures = Vec::new();
     for (path, case) in &cases {
         let input = case["input"].as_str().expect("validate input");
@@ -114,9 +114,7 @@ fn every_validate_vector_matches_local_purl_spec() {
 
 #[test]
 fn every_parse_vector_matches_local_purl_spec() {
-    let Some(cases) = cases("parse") else {
-        return;
-    };
+    let cases = cases("parse");
     let mut failures = Vec::new();
     for (path, case) in &cases {
         let input = case["input"].as_str().expect("parse input");
@@ -157,9 +155,7 @@ fn every_parse_vector_matches_local_purl_spec() {
 
 #[test]
 fn every_build_vector_matches_local_purl_spec() {
-    let Some(cases) = cases("build") else {
-        return;
-    };
+    let cases = cases("build");
     let mut failures = Vec::new();
     for (path, case) in &cases {
         let actual = component_purl(&case["input"]).map(|purl| purl.canonical());

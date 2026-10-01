@@ -22,8 +22,8 @@ use serde_json::Value;
 
 use filefacts::Registry;
 
+use crate::ecosystem::{parse_ts, strip_email};
 use crate::fetch::{BlobCache, Fetch, cached_metadata};
-use crate::registry::{parse_ts, strip_email};
 
 /// Ceiling on a single index's *decompressed* size. The 64 MiB download cap
 /// already bounds the compressed input; this backstops a decompression bomb
@@ -528,7 +528,6 @@ fn unescape_xml(s: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::io::Write as _;

@@ -60,7 +60,6 @@ pub(super) fn zip_h1(bytes: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 pub(super) mod tests {
     use super::*;
     use std::io::{Cursor, Write};

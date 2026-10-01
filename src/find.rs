@@ -102,7 +102,6 @@ fn dedup(refs: &mut Vec<Reference>) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod metadata_tests {
     #[test]
     fn checksum_metadata_and_conflicts_survive_discovery() {
@@ -201,7 +200,7 @@ pub fn import_calls(file_type: &str, symbols: &[Symbol]) -> Vec<Reference> {
 /// lists. Only imperative package references ([`RefKind::Command`] — install
 /// commands and dynamic imports) are candidates; URL fetches and repository
 /// identity are out of scope. Declared and hunted are matched by package
-/// ([`package_key`]: ecosystem, namespace and name; version and qualifiers
+/// (`package_key`: ecosystem, namespace and name; version and qualifiers
 /// ignored), so a hunted `mobx` is cancelled by a declared
 /// `mobx?version_requirement=%5E6`.
 ///
@@ -1660,7 +1659,6 @@ impl<'a> Iterator for UrlScan<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
