@@ -1235,18 +1235,6 @@ impl Default for FetchBudget {
     }
 }
 
-/// Per-call ceiling on concurrent fetches. Fetching is network-bound, so this
-/// is independent of the CPU pool; it scales with the host and is clamped so a
-/// long reference list can't spawn an unbounded number of sockets, while a
-/// small host still parallelizes. Uses scoped OS threads rather than a shared
-/// rayon/CPU pool so a fetching worker never starves concurrent analysis.
-fn fetch_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(4)
-        .clamp(2, 16)
-}
-
 /// Fetch every selectable reference, in declaration order, under `budget`,
 /// returning one [`FetchRecord`] edge per attempt (including budget-skipped
 /// ones), each stamped with `source_sha256` (the file that declared the
@@ -1254,7 +1242,7 @@ fn fetch_concurrency() -> usize {
 /// raw-URL targets; without it only registry packages (PURLs) are fetched.
 /// Identity references (a repository) are never fetched.
 ///
-/// Fetches run concurrently across a bounded pool (`fetch_concurrency`); the
+/// Fetches run concurrently across a bounded pool of scoped threads; the
 /// returned order is always declaration order regardless of completion order.
 /// `max_count` bounds *live* fetches only: a slot is claimed atomically the
 /// moment a cache miss is about to hit the network, so the live total never
@@ -1321,7 +1309,16 @@ pub fn fetch_references_with(
         // Live fetches issued so far. A cache hit never bumps this, so a warm
         // re-run serves every reference regardless of `max_count`.
         let net_used = AtomicUsize::new(0);
-        let workers = fetch_concurrency().min(fetch_n);
+        // Fetching is network-bound, so the pool scales with the host but is
+        // independent of the CPU pool: clamped so a long reference list can't
+        // open an unbounded number of sockets while a small host still
+        // parallelizes. Scoped OS threads rather than a shared rayon/CPU pool,
+        // so a fetching worker never starves concurrent analysis.
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4)
+            .clamp(2, 16)
+            .min(fetch_n);
         let collected: Vec<Vec<(usize, FetchRecord)>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..workers)
                 .map(|_| {
@@ -1476,7 +1473,9 @@ fn record(
     };
     // A declared tree hash is an integrity requirement too. Malformed or
     // over-budget archives must remain explicitly unverified.
-    let declares_content_pin = r.pinned_hash.is_some() || purl_declares_checksum(&locator);
+    let declares_content_pin = r.pinned_hash.is_some()
+        || crate::purl::Purl::parse(&locator)
+            .is_ok_and(|purl| purl.qualifiers().contains_key("checksum"));
     let outcome = if pin_verified == Some(false) {
         Outcome::PinMismatch
     } else if pin_verified.is_none() && declares_content_pin {
@@ -1502,12 +1501,6 @@ fn record(
         pin_verified,
         outcome,
     }
-}
-
-fn purl_declares_checksum(locator: &str) -> bool {
-    crate::purl::Purl::parse(locator)
-        .ok()
-        .is_some_and(|purl| purl.qualifiers().contains_key("checksum"))
 }
 
 /// The canonical locator string (the PURL or URL).
@@ -2321,8 +2314,7 @@ fn pypi_artifacts(
             .position(|candidate| candidate.file_name == file_name)
     } else {
         (!candidates.is_empty()).then_some(0)
-    }
-    .or_else(|| (exact.is_none() && !candidates.is_empty()).then_some(0));
+    };
     for (index, candidate) in candidates.iter_mut().enumerate() {
         candidate.preferred = Some(index) == preferred;
     }
@@ -2694,16 +2686,8 @@ fn file_name_matches(rest: &str, actual: &str) -> bool {
     purl_qualifier(rest, "file_name").is_none_or(|wanted| wanted == actual)
 }
 
-fn selected_artifact_url(rest: &str, url: String) -> Option<String> {
-    file_name_matches(rest, &file_name_from_url(&url)).then_some(url)
-}
-
 fn maybe_selected_artifact_url(rest: &str, url: String, honor_file_name: bool) -> Option<String> {
-    if honor_file_name {
-        selected_artifact_url(rest, url)
-    } else {
-        Some(url)
-    }
+    (!honor_file_name || file_name_matches(rest, &file_name_from_url(&url))).then_some(url)
 }
 
 /// Whether a URL names a web scheme this module's own client can carry.
@@ -3357,19 +3341,6 @@ fn resolve_aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> String {
         .unwrap_or_else(|| format!("https://aur.archlinux.org/cgit/aur.git/snapshot/{name}.tar.gz"))
 }
 
-// A versionless npm PURL with no declared version requirement resolves through
-// dist-tags. Manifest ranges are resolved separately by `resolve_requirement`
-// so a current latest release outside the declared range is never substituted.
-/// Resolve a versionless npm PURL path (`left-pad`, `%40scope/util`) to the
-/// concrete `(pkg:npm/<path>@<latest>, tarball URL)` it currently points at, by
-/// reading the registry packument's `dist-tags.latest`. The registry's own
-/// tarball URL is preferred over the derived one. `None` if the packument can't
-/// be fetched/parsed or names no latest version.
-#[cfg(test)]
-fn resolve_npm_unversioned(path: &str, rest: &str, net: &dyn Fetch) -> Option<(String, String)> {
-    resolve_npm_dist_tag(path, rest, "latest", net)
-}
-
 fn npm_version_is_concrete(version: &str) -> bool {
     let version = percent_decode(version);
     let version = version.strip_prefix('v').unwrap_or(&version);
@@ -3386,6 +3357,9 @@ fn npm_version_is_concrete(version: &str) -> bool {
         })
 }
 
+/// A versionless npm PURL with no declared version requirement resolves through
+/// dist-tags. Manifest ranges are resolved separately by `resolve_requirement`
+/// so a current latest release outside the declared range is never substituted.
 fn resolve_npm_dist_tag(
     path: &str,
     rest: &str,
@@ -3429,34 +3403,6 @@ fn split_version_kind(version: &str) -> (&str, Option<&str>) {
         .split('&')
         .find_map(|kv| kv.strip_prefix("kind="));
     (bare, kind)
-}
-
-/// PyPI publishes no deterministic download URL (the `files.pythonhosted.org`
-/// path carries an undrivable hash segment), so ask the JSON API and pick an
-/// artifact from the version's files.
-///
-/// Default is wheel-first with an sdist fallback, mirroring what a modern `pip
-/// install` actually runs on the victim's machine; `?kind=sdist` flips the
-/// preference to the source distribution (one per version, carrying `setup.py` /
-/// `pyproject.toml` — the install-hook attack surface), and `?kind=wheel` is the
-/// default's explicit form. Whichever is preferred, the other is the fallback so
-/// a package that ships only one kind still resolves.
-#[cfg(test)]
-fn resolve_pypi(
-    name: &str,
-    version: &str,
-    kind: Option<&str>,
-    net: &dyn Fetch,
-    cache: &BlobCache,
-) -> Option<String> {
-    let rest = kind.map_or_else(
-        || format!("{name}@{version}"),
-        |value| format!("{name}@{version}?kind={value}"),
-    );
-    pypi_artifacts(name, Some(version), &rest, net, cache)
-        .into_iter()
-        .find(|candidate| candidate.preferred)
-        .map(|candidate| candidate.url)
 }
 
 /// Resolve a Firefox Add-ons slug to the XPI AMO serves. A requested version
@@ -3990,17 +3936,11 @@ impl HttpFetch {
     /// The shared GET path: per-hop https + SSRF enforcement, redirect following,
     /// the response-size cap and the [`REQUEST_DEADLINE`]. `headers` are
     /// attached to every hop, less credentials once a hop leaves the starting
-    /// origin ([`forward_header`]). Both
-    /// [`Fetch::get`] and [`Fetch::get_with`] funnel through here so the security
-    /// floor is defined exactly once.
-    fn get_inner(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.get_inner_opts(url, headers, false)
-    }
-
-    /// `any_status`: return a non-success response as a [`Fetched`] rather
-    /// than a [`FetchError::Status`]; redirects and the host guard apply
-    /// either way.
-    fn get_inner_opts(
+    /// origin ([`forward_header`]). Every GET funnels through here so the
+    /// security floor is defined exactly once. `any_status` returns a
+    /// non-success response as a [`Fetched`] rather than a
+    /// [`FetchError::Status`]; redirects and the host guard apply either way.
+    fn get_inner(
         &self,
         url: &str,
         headers: &[(&str, &str)],
@@ -4069,15 +4009,15 @@ impl HttpFetch {
 
 impl Fetch for HttpFetch {
     fn get(&self, url: &str) -> Result<Fetched, FetchError> {
-        self.get_inner(url, &[])
+        self.get_inner(url, &[], false)
     }
 
     fn get_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.get_inner(url, headers)
+        self.get_inner(url, headers, false)
     }
 
     fn get_any_status(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.get_inner_opts(url, headers, true)
+        self.get_inner(url, headers, true)
     }
 
     fn post(
@@ -4278,6 +4218,46 @@ impl Fetch for Fixtures {
 mod tests {
     use super::*;
     use filefacts::RefKind;
+
+    /// Resolve a versionless npm PURL path (`left-pad`, `%40scope/util`) to the
+    /// concrete `(pkg:npm/<path>@<latest>, tarball URL)` it currently points at, by
+    /// reading the registry packument's `dist-tags.latest`. The registry's own
+    /// tarball URL is preferred over the derived one. `None` if the packument can't
+    /// be fetched/parsed or names no latest version.
+    fn resolve_npm_unversioned(
+        path: &str,
+        rest: &str,
+        net: &dyn Fetch,
+    ) -> Option<(String, String)> {
+        resolve_npm_dist_tag(path, rest, "latest", net)
+    }
+
+    /// PyPI publishes no deterministic download URL (the `files.pythonhosted.org`
+    /// path carries an undrivable hash segment), so ask the JSON API and pick an
+    /// artifact from the version's files.
+    ///
+    /// Default is wheel-first with an sdist fallback, mirroring what a modern `pip
+    /// install` actually runs on the victim's machine; `?kind=sdist` flips the
+    /// preference to the source distribution (one per version, carrying `setup.py` /
+    /// `pyproject.toml` — the install-hook attack surface), and `?kind=wheel` is the
+    /// default's explicit form. Whichever is preferred, the other is the fallback so
+    /// a package that ships only one kind still resolves.
+    fn resolve_pypi(
+        name: &str,
+        version: &str,
+        kind: Option<&str>,
+        net: &dyn Fetch,
+        cache: &BlobCache,
+    ) -> Option<String> {
+        let rest = kind.map_or_else(
+            || format!("{name}@{version}"),
+            |value| format!("{name}@{version}?kind={value}"),
+        );
+        pypi_artifacts(name, Some(version), &rest, net, cache)
+            .into_iter()
+            .find(|candidate| candidate.preferred)
+            .map(|candidate| candidate.url)
+    }
 
     #[test]
     fn cargo_requirement_selects_compatible_non_yanked_release() {

@@ -118,7 +118,9 @@ fn pypi(path: &str) -> Option<String> {
             encode_component(file)
         ));
     }
-    let stem = strip_any_suffix(file, &[".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".tgz"])?;
+    let stem = [".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".tgz"]
+        .iter()
+        .find_map(|suffix| file.strip_suffix(suffix))?;
     let (name, version) = stem.rsplit_once('-')?;
     starts_with_digit(version).then(|| {
         format!(
@@ -292,11 +294,6 @@ fn starts_with_digit(s: &str) -> bool {
     s.bytes().next().is_some_and(|b| b.is_ascii_digit())
 }
 
-/// Strip the first matching suffix from `s`, or `None` if none match.
-fn strip_any_suffix<'a>(s: &'a str, suffixes: &[&str]) -> Option<&'a str> {
-    suffixes.iter().find_map(|suf| s.strip_suffix(suf))
-}
-
 /// A decoded, validated package URL with one canonical spelling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Purl {
@@ -362,9 +359,14 @@ impl Purl {
     /// this rejects qualifier keys that need compatibility case-folding.
     pub fn parse_strict(raw: &str) -> Result<Self, PurlError> {
         let mut parsed = parse_purl_components(raw, false).ok_or(PurlError::Syntax)?;
+        // The type-specific qualifiers the spec's `parse` vectors hold to their
+        // exact lowercase spelling.
         if raw_qualifier_keys(raw).any(|key| {
             key.bytes().any(|byte| byte.is_ascii_uppercase())
-                && is_strict_type_qualifier(&parsed.typ, &key.to_ascii_lowercase())
+                && matches!(
+                    (parsed.typ.as_str(), key.to_ascii_lowercase().as_str()),
+                    ("gem", "platform") | ("rpm", "arch" | "epoch")
+                )
         }) {
             return Err(PurlError::Syntax);
         }
@@ -477,10 +479,6 @@ fn raw_qualifier_keys(raw: &str) -> impl Iterator<Item = &str> {
     qualifiers
         .split('&')
         .filter_map(|pair| pair.split_once('=').map(|(key, _)| key))
-}
-
-fn is_strict_type_qualifier(typ: &str, key: &str) -> bool {
-    matches!((typ, key), ("gem", "platform") | ("rpm", "arch" | "epoch"))
 }
 
 impl fmt::Display for Purl {

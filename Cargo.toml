@@ -87,12 +87,10 @@ sha1 = "0.11"
 base64 = "0.22"
 hex = "0.4"
 zstd = "0.13"
-# Decompressors for OS-distro package indices (Alpine APKINDEX, Debian
-# Packages, openSUSE primary.xml, BSD catalogs). Both are pure Rust — flate2
-# defaults to the miniz_oxide backend — so the binary stays fully static with no
-# system liblzma/zlib linkage. zstd (above) covers the third index codec.
+# gzip for OS-distro package indices (Alpine APKINDEX, Debian Packages,
+# openSUSE primary.xml, BSD catalogs); zstd (above) and xz2 (below) cover the
+# other index codecs. flate2 defaults to the pure-Rust miniz_oxide backend.
 flate2 = "1"
-lzma-rs = "0.3"
 roxmltree = "0.21"
 thiserror = "2"
 tracing = "0.1"
@@ -113,10 +111,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tempfile = "3"
-
-# Temporary local patch for cross-repo development of the Registry struct
-# (release-history / custody fields, NuGet `repository_commit`). Points fletch at
-# local filefacts; restore to a published filefacts rev before merging.
 
 # Forked tree-sitter, pulled in transitively via filefacts. The fork carries
 # illumos support for the vendored endian.h: stock toolchains only test

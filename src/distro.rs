@@ -16,7 +16,7 @@
 //! (release, architecture) are pinned to current defaults below; they track the
 //! distributions over time exactly as the upstream index URLs do.
 
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Read};
 
 use serde_json::Value;
 
@@ -257,7 +257,7 @@ fn rpm_repo_lookup(
     let reader: Box<dyn Read> = match href.rsplit('.').next()? {
         "zst" => Box::new(zstd::stream::read::Decoder::new(Cursor::new(bytes)).ok()?),
         "gz" => Box::new(gunzip(bytes)),
-        "xz" => Box::new(Cursor::new(unxz(bytes)?)),
+        "xz" => Box::new(xz2::read::XzDecoder::new_multi_decoder(Cursor::new(bytes))),
         _ => return None,
     };
     each_xml_package(reader.take(DECOMP_CAP), |pkg| {
@@ -385,37 +385,6 @@ fn unzstd(bytes: Vec<u8>) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Fully decompress an xz stream into a capped buffer (lzma-rs has no streaming
-/// reader; an `.xz` primary index is bounded by `DECOMP_CAP`).
-fn unxz(bytes: Vec<u8>) -> Option<Vec<u8>> {
-    let mut sink = CappedSink {
-        buf: Vec::new(),
-        cap: DECOMP_CAP as usize,
-    };
-    lzma_rs::xz_decompress(&mut Cursor::new(bytes), &mut sink).ok()?;
-    Some(sink.buf)
-}
-
-/// A `Write` that refuses to grow past `cap`, bounding a decompression bomb.
-struct CappedSink {
-    buf: Vec<u8>,
-    cap: usize,
-}
-
-impl Write for CappedSink {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if self.buf.len() + data.len() > self.cap {
-            return Err(std::io::Error::other("decompressed output exceeds cap"));
-        }
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Find a member by exact name (or `…/name`) in an uncompressed POSIX/ustar tar,
 /// transparently spanning the concatenated archives an `APKINDEX` packs.
 fn tar_find(data: &[u8], member: &str) -> Option<Vec<u8>> {
@@ -431,7 +400,11 @@ fn tar_find(data: &[u8], member: &str) -> Option<Vec<u8>> {
         // The size is attacker-supplied, so narrow it by `try_from` rather than
         // `as`: on a 32-bit target a declared size above `usize::MAX` would
         // otherwise wrap to a small one and walk the archive off its real frame.
-        let size = usize::try_from(octal(&header[124..136])?).ok()?;
+        // The field is space/NUL-padded octal.
+        let size = std::str::from_utf8(&header[124..136])
+            .ok()?
+            .trim_matches(|c| c == ' ' || c == '\0');
+        let size = usize::try_from(u64::from_str_radix(size, 8).ok()?).ok()?;
         let start = pos + 512;
         let end = start.checked_add(size)?;
         if end > data.len() {
@@ -443,14 +416,6 @@ fn tar_find(data: &[u8], member: &str) -> Option<Vec<u8>> {
         pos = start + size.div_ceil(512) * 512;
     }
     None
-}
-
-/// Parse a tar header's space/NUL-padded octal numeric field.
-fn octal(field: &[u8]) -> Option<u64> {
-    let s = std::str::from_utf8(field)
-        .ok()?
-        .trim_matches(|c| c == ' ' || c == '\0');
-    u64::from_str_radix(s, 8).ok()
 }
 
 // --- index scanners ---------------------------------------------------------
@@ -566,6 +531,7 @@ fn unescape_xml(s: &str) -> String {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
     fn apkindex_record_maps_fields() {
@@ -719,12 +685,26 @@ mod tests {
     }
 
     #[test]
-    fn capped_sink_rejects_overflow() {
-        let mut sink = CappedSink {
-            buf: Vec::new(),
-            cap: 4,
-        };
-        assert!(sink.write_all(b"ok").is_ok());
-        assert!(sink.write_all(b"too much").is_err());
+    fn an_xz_primary_index_is_read_like_the_other_codecs() {
+        // The xz branch streams through the same `DECOMP_CAP`-bounded reader as
+        // gzip and zstd.
+        let primary = br#"<metadata><package type="rpm"><name>curl</name>
+            <version epoch="0" ver="8.5.0" rel="1.2"/></package></metadata>"#;
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+        xz.write_all(primary).unwrap();
+        let xz = xz.finish().unwrap();
+        let repomd = br#"<repomd><data type="primary"><location href="repodata/p-primary.xml.xz"/></data></repomd>"#;
+        let net = crate::fetch::Fixtures::default()
+            .with("https://repo.test/repodata/repomd.xml", repomd)
+            .with("https://repo.test/repodata/p-primary.xml.xz", &xz);
+        let r = rpm_repo_lookup(
+            "https://repo.test",
+            "curl",
+            "opensuse",
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("record");
+        assert_eq!(r.version, "8.5.0-1.2");
     }
 }

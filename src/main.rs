@@ -92,8 +92,12 @@ fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("usage: fletch purl <purl> | fletch purl -"))?;
             if purl == "-" {
                 run_purl_batch()
+            } else if fletch::registry::parse_purl(&purl).is_none() {
+                // Exit `2` (empty stdout) for a string that isn't a PURL at
+                // all, so a caller can tell "not a purl" from a usage error.
+                std::process::exit(2);
             } else {
-                run_purl(&purl)
+                print_json(&probe_purl(&purl))
             }
         }
         _ => {
@@ -173,20 +177,6 @@ fn run_purl_batch() -> anyhow::Result<()> {
     }
     stdout.flush()?;
     Ok(())
-}
-
-/// Report how fletch parses, routes, and resolves one PURL — offline. Exit `2`
-/// (empty stdout) when the string doesn't parse as a PURL at all, so a caller
-/// can tell "not a purl" from a usage error (exit `1`).
-///
-/// This is the cross-tool consistency surface: hopper's `pkgparse` tests feed
-/// the PURLs it generates through this subcommand and assert fletch reads back
-/// the same coordinates and knows where to fetch them.
-fn run_purl(purl: &str) -> anyhow::Result<()> {
-    if fletch::registry::parse_purl(purl).is_none() {
-        std::process::exit(2);
-    }
-    print_json(&probe_purl(purl))
 }
 
 /// Write one JSON document as a line on stdout — the shape both subcommands

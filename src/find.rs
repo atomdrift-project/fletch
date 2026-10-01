@@ -1421,7 +1421,12 @@ fn pm_token_locator(eco: &str, tok: &str) -> Option<RefLocator> {
         "gem" => (!tok.is_empty()).then(|| format!("pkg:gem/{tok}"))?,
         "conda" => conda_purl_token(tok)?,
         "deno" => deno_purl_token(tok)?,
-        "composer" => composer_purl_token(tok)?,
+        // Composer names are always `vendor/name`; a `:<constraint>` is a
+        // range, not a fetchable pin.
+        "composer" => {
+            let name = tok.split(':').next().unwrap_or(tok);
+            name.contains('/').then(|| format!("pkg:composer/{name}"))?
+        }
         // OS-package ecosystems: a bare name, with an apt/apk `=version` pin kept.
         "debian" | "ubuntu" | "alpine" | "wolfi" | "fedora" | "opensuse" | "arch" | "aur"
         | "freebsd" | "netbsd" | "openbsd" => distro_purl_token(eco, tok)?,
@@ -1501,14 +1506,6 @@ fn version_purl_token(eco: &str, tok: &str, sep: char) -> Option<String> {
         Some(v) if !v.is_empty() => format!("pkg:{eco}/{name}@{v}"),
         _ => format!("pkg:{eco}/{name}"),
     })
-}
-
-/// `pkg:composer/<vendor>/<name>` from a `composer require` token, dropping any
-/// `:<constraint>` (a range, not a fetchable pin). Composer names are always
-/// `vendor/name`.
-fn composer_purl_token(tok: &str) -> Option<String> {
-    let name = tok.split(':').next().unwrap_or(tok);
-    (name.contains('/') && !name.is_empty()).then(|| format!("pkg:composer/{name}"))
 }
 
 /// `pkg:conda/<name>[@<version>]` from a `conda install` token, dropping a

@@ -178,9 +178,7 @@ fn lookup(
         // signals (reach, rating, recency, the developer's own description of
         // what it harvests) live on the listing, not in a manifest.
         // `chrome-extension` is the ratified purl-spec spelling of the same type.
-        "chrome" | "chrome-extension" => {
-            chrome(path.rsplit('/').next().unwrap_or(path), net, cache)
-        }
+        "chrome" | "chrome-extension" => chrome(last_seg(path), net, cache),
         // VS Code / editor extensions: `pkg:openvsx/<namespace>/<name>`. Open
         // VSX exposes a clean JSON API, so no scraping — the same marketplace
         // shape (rating, downloads, publisher, recency) as the Chrome store.
@@ -267,27 +265,19 @@ pub fn registry_with_sources(
 #[must_use]
 pub fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
     let canonical = crate::purl::normalize(purl)?;
-    parse_canonical_purl(&canonical)
-}
-
-fn parse_canonical_purl(purl: &str) -> Option<(String, String, Option<String>)> {
     // Scheme and type are case-insensitive per spec; the shared splitter folds
     // their case and trims, so any spelling `purl::normalize` accepts parses.
-    let (ty, rest) = crate::purl::scheme_type_rest(purl)?;
+    let (ty, rest) = crate::purl::scheme_type_rest(&canonical)?;
     // A registry record is the same whichever artifact a PURL's `?qualifiers`
     // select (`?kind=wheel`, `?repository_url=…`), so drop them up front. Splitting
     // qualifiers off before the version keeps a versionless PURL from gluing the
     // qualifier onto the name, and a qualifier value that itself contains `@` (a URL
     // with userinfo) from corrupting the version. Qualifiers a lookup *does* need
     // (the AUR's `repository_url`) are read off the raw purl, not here.
-    let (bare, quals) = match rest.split_once('?') {
-        Some((b, q)) => (b, Some(q)),
-        None => (rest, None),
-    };
+    let bare = rest.split_once('?').map_or(rest, |(bare, _)| bare);
     let (path, version) = bare
         .rsplit_once('@')
         .map_or((bare, None), |(p, v)| (p, Some(v.to_string())));
-    let _ = quals;
     Some((ty.to_string(), path.to_string(), version))
 }
 
@@ -299,7 +289,7 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
 
     let latest = doc.pointer("/dist-tags/latest").and_then(Value::as_str);
     let version = version.or(latest).unwrap_or_default();
-    let v = doc.pointer(&format!("/versions/{}", json_ptr_escape(version)));
+    let v = doc.get("versions").and_then(|vs| vs.get(version));
 
     let published_at = doc
         .get("time")
@@ -313,15 +303,13 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         version: version.to_string(),
         published_at,
         latest_version: latest.map(str::to_string),
+        // `author` is a bare string or an object with a `name`.
         author: v
             .and_then(|v| v.get("author"))
             .or_else(|| doc.get("author"))
-            .and_then(person)
-            .or_else(|| {
-                doc.pointer("/maintainers/0/name")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            }),
+            .and_then(|a| a.as_str().or_else(|| a.get("name")?.as_str()))
+            .or_else(|| doc.pointer("/maintainers/0/name").and_then(Value::as_str))
+            .map(str::to_string),
         title: None,
         description: field_str(v, &doc, "description"),
         homepage: field_str(v, &doc, "homepage"),
@@ -352,10 +340,7 @@ fn npm(path: &str, version: Option<&str>, net: &dyn Fetch, cache: &BlobCache) ->
         // versions" is a removal — for a fresh package, almost always a malware
         // takedown.
         version_removed: Some(
-            v.is_none()
-                && doc
-                    .pointer(&format!("/time/{}", json_ptr_escape(version)))
-                    .is_some(),
+            v.is_none() && doc.get("time").and_then(|t| t.get(version)).is_some(),
         ),
         ..Default::default()
     };
@@ -1675,7 +1660,12 @@ fn cran(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
             .and_then(Value::as_str)
             .map(strip_email),
         description: doc.get("Title").and_then(Value::as_str).map(str::to_string),
-        homepage: doc.get("URL").and_then(Value::as_str).and_then(first_line),
+        // CRAN crowds several URLs into one field; keep the first.
+        homepage: doc
+            .get("URL")
+            .and_then(Value::as_str)
+            .and_then(|urls| urls.lines().map(str::trim).find(|l| !l.is_empty()))
+            .map(str::to_string),
         license: doc
             .get("License")
             .and_then(Value::as_str)
@@ -2404,7 +2394,7 @@ fn wordpress(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry>
         published_at: doc
             .get("last_updated")
             .and_then(Value::as_str)
-            .and_then(parse_ymd),
+            .and_then(|s| parse_rfc3339_secs(&format!("{}T00:00:00Z", s.get(..10)?))),
         author: doc.get("author").and_then(Value::as_str).map(strip_html),
         title: doc.get("name").and_then(Value::as_str).map(str::to_string),
         homepage: doc
@@ -2865,14 +2855,6 @@ fn field_str(ver: Option<&Value>, root: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// npm `author`/`maintainer` is either a bare string or an object with `name`.
-fn person(v: &Value) -> Option<String> {
-    match v {
-        Value::String(s) => Some(s.clone()),
-        _ => v.get("name").and_then(Value::as_str).map(str::to_string),
-    }
-}
-
 /// npm `deprecated` is `false`/absent, or a truthy string reason.
 fn deprecation(v: &Value) -> Option<String> {
     match v {
@@ -2957,14 +2939,6 @@ fn strip_html(s: &str) -> String {
     out.trim().to_string()
 }
 
-/// The first non-empty line, trimmed — CRAN crowds several URLs into one field.
-fn first_line(s: &str) -> Option<String> {
-    s.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .map(str::to_string)
-}
-
 /// Unix-millis (a JSON string or number, as JetBrains emits) → Unix seconds.
 fn parse_millis(v: &Value) -> Option<u64> {
     let ms = match v {
@@ -2989,21 +2963,6 @@ pub(crate) fn parse_ts(s: &str) -> Option<u64> {
             _ => None,
         }
     })
-}
-
-/// Parse a leading `YYYY-MM-DD` to Unix seconds at UTC midnight, ignoring any
-/// trailing time/zone text (`2026-04-23 10:34pm GMT`).
-fn parse_ymd(s: &str) -> Option<u64> {
-    let y: i64 = s.get(0..4)?.parse().ok()?;
-    let m: i64 = s.get(5..7)?.parse().ok()?;
-    let d: i64 = s.get(8..10)?.parse().ok()?;
-    u64::try_from(days_from_civil(y, m, d) * 86_400).ok()
-}
-
-/// Escape a JSON-pointer path segment (`~`→`~0`, `/`→`~1`) so a version string
-/// is matched literally inside a pointer.
-fn json_ptr_escape(seg: &str) -> String {
-    seg.replace('~', "~0").replace('/', "~1")
 }
 
 /// Parse an RFC 3339 / ISO 8601 timestamp to Unix seconds, covering the shapes
