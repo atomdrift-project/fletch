@@ -19,13 +19,14 @@
 //!
 //! Consumers compose: analyze a file (cleave) → [`find`] its references →
 //! [`fetch`] them → analyze what came back. fletch never analyzes; it finds and
-//! fetches.
+//! fetches. A deployment counts what happened from the [`metrics`] events.
 
 pub mod cache_sweep;
 mod distro;
 mod ecosystem;
 pub mod fetch;
 pub mod find;
+pub mod metrics;
 mod oci;
 pub mod purl;
 pub mod registry;

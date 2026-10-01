@@ -112,6 +112,21 @@ pub fn try_registry(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
+    let started = std::time::Instant::now();
+    let result = look_up(locator, net, cache);
+    let named = match locator {
+        RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s,
+    };
+    crate::metrics::registry(named, &result, started.elapsed());
+    result
+}
+
+/// [`try_registry`]'s work.
+fn look_up(
+    locator: &RefLocator,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     let RefLocator::Purl(raw) = locator else {
         return Err(RegistryError::NotAPackage);
     };

@@ -2,7 +2,8 @@
 //! ([`HttpFetch`]), and the offline [`Fixtures`] backend for tests.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -58,6 +59,11 @@ pub struct Request<'a> {
     /// names the module path it would have accepted (see
     /// `goproxy_canonical_path`).
     pub any_status: bool,
+    /// Write the body to this file, which must not exist yet, instead of
+    /// returning it in [`Fetched::bytes`] — for an artifact, which need never
+    /// be held in memory whole. A backend that cannot may return the bytes
+    /// instead; the caller writes them out itself.
+    pub spool: Option<&'a Path>,
 }
 
 impl<'a> Request<'a> {
@@ -69,6 +75,7 @@ impl<'a> Request<'a> {
             method: Method::Get,
             headers: &[],
             any_status: false,
+            spool: None,
         }
     }
 
@@ -85,6 +92,15 @@ impl<'a> Request<'a> {
     #[must_use]
     pub fn with_headers(self, headers: &'a [(&'a str, &'a str)]) -> Self {
         Self { headers, ..self }
+    }
+
+    /// This request, its body written to `path` (see [`spool`](Self::spool)).
+    #[must_use]
+    pub fn spool_to(self, path: &'a Path) -> Self {
+        Self {
+            spool: Some(path),
+            ..self
+        }
     }
 
     /// This request, answered with whatever status the server sends (see
@@ -221,44 +237,67 @@ impl HttpFetch {
 }
 
 /// Read a response body under the per-fetch byte ceiling (`limit`) and the
-/// request's `deadline`. A declared `Content-Length` over the cap is
+/// request's `deadline` — into memory, or into the new file `spool`, leaving
+/// the returned bytes empty. A declared `Content-Length` over the cap is
 /// rejected before a single body byte is read — the common case for an
 /// oversize artifact, which a registry or CDN sizes honestly — so we don't pull
-/// tens of MB only to discard them. The streaming cap in [`read_bounded`]
+/// tens of MB only to discard them. The streaming cap in [`copy_bounded`]
 /// remains the authoritative backstop for a missing or dishonest header.
 fn read_body_capped(
     resp: reqwest::blocking::Response,
     limit: u64,
     deadline: Instant,
+    spool: Option<&Path>,
 ) -> Result<Vec<u8>, FetchError> {
     if let Some(len) = resp.content_length()
         && len > limit
     {
         return Err(FetchError::TooLarge);
     }
-    read_bounded(resp, limit, deadline)
+    let mut bytes = Vec::new();
+    let Some(path) = spool else {
+        copy_bounded(resp, &mut bytes, limit, deadline)?;
+        return Ok(bytes);
+    };
+    let spool_error = |e: std::io::Error| FetchError::Transport(format!("spool: {e}"));
+    let file = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(spool_error)?;
+    let mut out = std::io::BufWriter::new(file);
+    copy_bounded(resp, &mut out, limit, deadline)?;
+    out.flush().map_err(spool_error)?;
+    Ok(bytes)
 }
 
-/// Read `r` to the end, refusing more than `limit` bytes and giving up once
-/// `deadline` passes. The deadline is checked between reads, so it can be
-/// overrun by at most one read's own timeout.
-fn read_bounded(mut r: impl Read, limit: u64, deadline: Instant) -> Result<Vec<u8>, FetchError> {
-    let mut bytes = Vec::new();
+/// Copy `r` to its end into `out`, refusing more than `limit` bytes and giving
+/// up once `deadline` passes. The deadline is checked between reads, so it can
+/// be overrun by at most one read's own timeout.
+fn copy_bounded(
+    mut r: impl Read,
+    out: &mut impl Write,
+    limit: u64,
+    deadline: Instant,
+) -> Result<(), FetchError> {
+    let mut copied = 0u64;
     let mut chunk = [0u8; 16 * 1024];
     loop {
         if Instant::now() >= deadline {
             return Err(FetchError::Timeout);
         }
         let n = match r.read(&mut chunk) {
-            Ok(0) => return Ok(bytes),
+            Ok(0) => return Ok(()),
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(FetchError::Transport(e.to_string())),
         };
-        if (bytes.len() + n) as u64 > limit {
+        if copied + n as u64 > limit {
             return Err(FetchError::TooLarge);
         }
-        bytes.extend_from_slice(&chunk[..n]);
+        out.write_all(&chunk[..n])
+            .map_err(|e| FetchError::Transport(e.to_string()))?;
+        copied += n as u64;
     }
 }
 
@@ -285,6 +324,7 @@ impl HttpFetch {
         url: &str,
         headers: &[(&str, &str)],
         any_status: bool,
+        spool: Option<&Path>,
     ) -> Result<Fetched, FetchError> {
         let deadline = Instant::now() + REQUEST_DEADLINE;
         let mut current =
@@ -352,7 +392,7 @@ impl HttpFetch {
             }
 
             let headers = response_headers(&resp);
-            let bytes = read_body_capped(resp, self.max_bytes, deadline)?;
+            let bytes = read_body_capped(resp, self.max_bytes, deadline, spool)?;
             return Ok(Fetched {
                 bytes,
                 final_url: current.to_string(),
@@ -376,8 +416,19 @@ impl HttpFetch {
 impl Fetch for HttpFetch {
     fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
         match request.method {
-            Method::Get => self.get(request.url, request.headers, request.any_status),
-            Method::Post(body) => self.post(request.url, body, request.headers, request.any_status),
+            Method::Get => self.get(
+                request.url,
+                request.headers,
+                request.any_status,
+                request.spool,
+            ),
+            Method::Post(body) => self.post(
+                request.url,
+                body,
+                request.headers,
+                request.any_status,
+                request.spool,
+            ),
         }
     }
 
@@ -396,6 +447,7 @@ impl HttpFetch {
         body: &[u8],
         headers: &[(&str, &str)],
         any_status: bool,
+        spool: Option<&Path>,
     ) -> Result<Fetched, FetchError> {
         let deadline = Instant::now() + REQUEST_DEADLINE;
         let target = reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
@@ -428,7 +480,7 @@ impl HttpFetch {
             return Err(FetchError::Status(status.as_u16()));
         }
         let headers = response_headers(&resp);
-        let bytes = read_body_capped(resp, self.max_bytes, deadline)?;
+        let bytes = read_body_capped(resp, self.max_bytes, deadline, spool)?;
         Ok(Fetched {
             bytes,
             final_url: target.to_string(),
@@ -471,6 +523,7 @@ impl Backoff {
 
     /// Leave `host` alone for `delay`, unless it is already held longer.
     fn hold(&self, host: &str, delay: Duration, status: u16) {
+        crate::metrics::backoff(host, status, delay);
         let now = Instant::now();
         let until = now + delay;
         let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -726,6 +779,12 @@ mod tests {
             None
         );
         assert!(!format!("{net:?}").contains("ghp_secret"));
+    }
+
+    /// [`copy_bounded`] into memory.
+    fn read_bounded(r: impl Read, limit: u64, deadline: Instant) -> Result<Vec<u8>, FetchError> {
+        let mut bytes = Vec::new();
+        copy_bounded(r, &mut bytes, limit, deadline).map(|()| bytes)
     }
 
     #[test]

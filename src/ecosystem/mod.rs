@@ -185,9 +185,16 @@ fn parse_rfc3339_secs(s: &str) -> Option<u64> {
     }
     let (year, month, day) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
     let (hour, min, sec) = (n(11, 13)?, n(14, 16)?, n(17, 19)?);
+    // Days in the month of the proleptic-Gregorian year.
+    let days_in_month = match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
     // A leap second (`:60`) is legal RFC 3339.
     if !(1..=12).contains(&month)
-        || !(1..=days_in_month(year, month)).contains(&day)
+        || !(1..=days_in_month).contains(&day)
         || hour > 23
         || min > 59
         || sec > 60
@@ -227,16 +234,6 @@ fn parse_rfc3339_secs(s: &str) -> Option<u64> {
     };
     let days = days_from_civil(year, month, day);
     u64::try_from(days * 86400 + hour * 3600 + min * 60 + sec - offset).ok()
-}
-
-/// Days in `month` (1-based) of the proleptic-Gregorian `year`.
-fn days_in_month(year: i64, month: i64) -> i64 {
-    match month {
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
 }
 
 /// Days since 1970-01-01 for a proleptic-Gregorian civil date (Howard

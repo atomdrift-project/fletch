@@ -7,11 +7,11 @@ use sha2::{Digest, Sha256};
 /// prefix and directory entries, exactly as HashZip does. Never extracts or
 /// executes files. Unsupported/malformed archives and budget exhaustion are
 /// unverified, not a digest mismatch. This is integrity, not trust in a module.
-pub(super) fn zip_h1(bytes: &[u8]) -> Option<String> {
+pub(super) fn zip_h1(archive: impl std::io::Read + std::io::Seek) -> Option<String> {
     use base64::Engine as _;
-    use std::io::{Cursor, Read};
+    use std::io::Read;
     const MAX_BYTES: u64 = 500 * 1024 * 1024;
-    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
+    let mut zip = zip::ZipArchive::new(archive).ok()?;
     if zip.len() > 100_000 {
         return None;
     }
@@ -103,7 +103,10 @@ pub(super) mod tests {
         ] {
             for reverse in [false, true] {
                 let data = archive(reverse, method, "example.test/m@v1.0.0/m.go", "package m\n");
-                assert_eq!(zip_h1(&data).as_deref(), Some(expected));
+                assert_eq!(
+                    zip_h1(std::io::Cursor::new(&data)).as_deref(),
+                    Some(expected)
+                );
             }
         }
         for (name, content) in [
@@ -111,13 +114,16 @@ pub(super) mod tests {
             ("example.test/m@v1.0.0/other.go", "package m\n"),
         ] {
             let data = archive(false, zip::CompressionMethod::Stored, name, content);
-            assert_ne!(zip_h1(&data).as_deref(), Some(expected));
+            assert_ne!(
+                zip_h1(std::io::Cursor::new(&data)).as_deref(),
+                Some(expected)
+            );
         }
     }
 
     #[test]
     fn malformed_or_ambiguous_archives_are_unverified() {
-        assert_eq!(zip_h1(b"not a zip"), None);
+        assert_eq!(zip_h1(std::io::Cursor::new(b"not a zip")), None);
         for name in [
             "../escape.go",
             "/absolute.go",
@@ -125,7 +131,7 @@ pub(super) mod tests {
             "back\\slash.go",
         ] {
             let data = archive(false, zip::CompressionMethod::Stored, name, "package m\n");
-            assert_eq!(zip_h1(&data), None, "{name}");
+            assert_eq!(zip_h1(std::io::Cursor::new(&data)), None, "{name}");
         }
         let mut data = archive(
             false,
@@ -138,6 +144,10 @@ pub(super) mod tests {
             .position(|part| part == b"package m\n")
             .unwrap();
         data[position] ^= 1;
-        assert_eq!(zip_h1(&data), None, "CRC errors must not verify");
+        assert_eq!(
+            zip_h1(std::io::Cursor::new(&data)),
+            None,
+            "CRC errors must not verify"
+        );
     }
 }

@@ -249,22 +249,6 @@ fn position_in(text: &str, part: &str) -> Option<usize> {
     (start + part.len() <= text.len()).then_some(start)
 }
 
-/// How positions in a copy of the file's text map back to the file. The copy
-/// runs byte for byte with the file, except where an entry `(copy, file)`
-/// says that from position `copy` on it runs with the file from `file`.
-#[derive(Default)]
-struct Remap(Vec<(usize, usize)>);
-
-impl Remap {
-    /// The file offset of position `copy` in the copy.
-    fn file_offset(&self, copy: usize) -> usize {
-        match self.0.partition_point(|&(c, _)| c <= copy).checked_sub(1) {
-            Some(i) => self.0[i].1 + (copy - self.0[i].0),
-            None => copy,
-        }
-    }
-}
-
 /// How many times one file's text may be searched for a reference's evidence.
 /// Each search can read the whole text, so a cap keeps a file with a huge
 /// number of references from costing time quadratic in its size.
@@ -399,7 +383,7 @@ fn scan_source(text: Option<&str>, source: &str, out: &mut Found<'_>) {
     };
     let mut normalized = String::with_capacity(text.len());
     // Braces widen to ` { `, so record where the copy and the file realign.
-    let mut remap = Remap::default();
+    let mut remap: Vec<(usize, usize)> = Vec::new();
     let mut quote = None;
     let mut escaped = false;
     for (at, c) in text.char_indices() {
@@ -427,9 +411,9 @@ fn scan_source(text: Option<&str>, source: &str, out: &mut Found<'_>) {
             // (`{ "no-save": true }`), and `commands` stops collecting package
             // args at a `{`, so option keys/values are not read as packages.
             '{' | '}' => {
-                remap.0.push((normalized.len() + 1, at));
+                remap.push((normalized.len() + 1, at));
                 normalized.extend([' ', c, ' ']);
-                remap.0.push((normalized.len(), at + 1));
+                remap.push((normalized.len(), at + 1));
             }
             '.' | '(' | ')' | '[' | ']' | ',' | ':' => normalized.push(' '),
             other => normalized.push(other),
@@ -778,7 +762,13 @@ fn git_refs(text: &str, source: &str, out: &mut Found<'_>) {
         let mut rest = line;
         while let Some(i) = rest.find("git+") {
             let spec = &rest[i + 4..];
-            let token = git_url_token(spec);
+            // The git URL runs to whitespace or a shell/source delimiter.
+            let end = spec
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | '(' | ')' | '[' | ']')
+                })
+                .unwrap_or(spec.len());
+            let token = &spec[..end];
             rest = &spec[token.len()..];
             if let Some(repo) = normalize_git_target(token) {
                 out.push(RefLocator::Url(repo), RefKind::Repository, source, evidence);
@@ -791,17 +781,6 @@ fn git_refs(text: &str, source: &str, out: &mut Found<'_>) {
             out.push(RefLocator::Url(repo), RefKind::Repository, source, evidence);
         }
     }
-}
-
-/// The git-URL token at the start of `s`, up to whitespace or a shell/source
-/// delimiter (quote, comma, paren, bracket).
-fn git_url_token(s: &str) -> &str {
-    let end = s
-        .find(|c: char| {
-            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | '(' | ')' | '[' | ']')
-        })
-        .unwrap_or(s.len());
-    &s[..end]
 }
 
 /// The clone target of a `git clone [flags] <target>` line — the first
@@ -831,7 +810,7 @@ fn scan_shell(text: Option<&str>, source: &str, out: &mut Found<'_>) {
     let Some(text) = text else {
         return;
     };
-    commands(text, Some(&Remap::default()), source, out);
+    commands(text, Some(&[]), source, out);
     git_refs(text, source, out);
     urls(text, source, out);
     bare_fetch_urls(text, source, &[CURL, WGET], out);
@@ -1149,10 +1128,13 @@ fn looks_like_protocolless_url(value: &str) -> bool {
 
 /// Recognize package-manager install commands and emit a [`RefKind::Command`]
 /// per named package. Splits on command separators, joins `\` line
-/// continuations, and matches the invocation anywhere in a segment. `remap`
-/// places `scan` in the file when it is (a copy of) the file's text; `None`
-/// for text from elsewhere, which is then searched for.
-fn commands(scan: &str, remap: Option<&Remap>, source: &str, out: &mut Found<'_>) {
+/// continuations, and matches the invocation anywhere in a segment.
+///
+/// `remap` places `scan` in the file when it is (a copy of) the file's text:
+/// the copy runs byte for byte with the file, except that from each entry's
+/// `copy` position on it runs with the file from the entry's `file` position.
+/// `None` for text from elsewhere, which is then searched for.
+fn commands(scan: &str, remap: Option<&[(usize, usize)]>, source: &str, out: &mut Found<'_>) {
     // Continuations become as many spaces as they had bytes, so a position in
     // `joined` is the same position in `scan`.
     let joined = scan.replace("\\\r\n", "   ").replace("\\\n", "  ");
@@ -1167,9 +1149,26 @@ fn commands(scan: &str, remap: Option<&Remap>, source: &str, out: &mut Found<'_>
         if seg.is_empty() {
             continue;
         }
+        let offset = remap.zip(position_in(&joined, seg)).map(|(remap, at)| {
+            match remap
+                .partition_point(|&(copy, _)| copy <= at)
+                .checked_sub(1)
+            {
+                Some(i) => remap[i].1 + (at - remap[i].0),
+                None => at,
+            }
+        });
         let toks: Vec<&str> = seg.split_whitespace().collect();
         if dockerfile && toks.first().is_some_and(|t| t.eq_ignore_ascii_case("FROM")) {
-            distro = from_image(&toks[1..]).and_then(image_distro);
+            // The image: the first token after `FROM` that is not a flag
+            // (`--platform=`); a build-arg placeholder (`$BASE`) or `scratch`
+            // carries no distro.
+            distro = toks[1..]
+                .iter()
+                .copied()
+                .find(|t| !t.starts_with('-'))
+                .filter(|t| !t.starts_with('$') && *t != "scratch")
+                .and_then(image_distro);
             continue;
         }
         for i in 0..toks.len() {
@@ -1190,13 +1189,13 @@ fn commands(scan: &str, remap: Option<&Remap>, source: &str, out: &mut Found<'_>
                     break; // a redirect, or an options-object `{`, ends the list
                 }
                 if let Some(locator) = pm_token_locator(eco, arg) {
-                    match remap.zip(position_in(&joined, seg)) {
-                        Some((remap, at)) => out.push_at(
+                    match offset {
+                        Some(offset) => out.push_at(
                             locator,
                             RefKind::Command,
                             source,
                             seg.to_string(),
-                            remap.file_offset(at) as u64,
+                            offset as u64,
                         ),
                         None => out.push(locator, RefKind::Command, source, seg),
                     }
@@ -1241,17 +1240,6 @@ fn source_command_allowed(source: &str, family: &str, segment: &str) -> bool {
         }),
         _ => true,
     }
-}
-
-/// The image reference in a Dockerfile `FROM`'s tokens (those after `FROM`),
-/// skipping `--platform=`-style flags. `None` for a build-arg placeholder
-/// (`$BASE`) or `scratch`, which carry no distro.
-fn from_image<'a>(after_from: &[&'a str]) -> Option<&'a str> {
-    after_from
-        .iter()
-        .copied()
-        .find(|t| !t.starts_with('-'))
-        .filter(|t| !t.starts_with('$') && *t != "scratch")
 }
 
 /// Classify a Dockerfile base image to the distro whose package manager its
@@ -2793,12 +2781,7 @@ mod tests {
             Vec::new(),
             Some("pip install -r requirements.txt realpkg https://x.test/y.whl"),
         );
-        commands(
-            out.text.unwrap(),
-            Some(&Remap::default()),
-            "shell",
-            &mut out,
-        );
+        commands(out.text.unwrap(), Some(&[]), "shell", &mut out);
         let purls: Vec<_> = out
             .refs
             .iter()

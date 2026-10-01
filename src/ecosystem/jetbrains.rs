@@ -51,10 +51,20 @@ pub(crate) fn jetbrains(
         ecosystem: "jetbrains".into(),
         name: doc.xml_id.unwrap_or_else(|| path.to_string()),
         version: update.and_then(|u| u.version.clone()).unwrap_or_default(),
-        published_at: update.and_then(|u| u.cdate.as_ref()).and_then(parse_millis),
+        // Unix millis, a JSON string or number as JetBrains emits it.
+        published_at: update
+            .and_then(|u| u.cdate.as_ref())
+            .and_then(|cdate| match cdate {
+                Millis::Text(s) => s.parse::<u64>().ok(),
+                Millis::Number(n) => Some(*n),
+            })
+            .map(|ms| ms / 1000),
         // `vendor` is an object (`{name, …}`) in the live API; a bare name is
         // read too.
-        author: doc.vendor.and_then(Vendor::into_name),
+        author: doc.vendor.and_then(|vendor| match vendor {
+            Vendor::Name(name) => Some(name),
+            Vendor::Object { name } => name,
+        }),
         title: doc.name,
         description: doc.preview,
         homepage: urls.url.filter(|s| !s.is_empty()),
@@ -63,15 +73,6 @@ pub(crate) fn jetbrains(
         rating: doc.rating.map(|f| f as f32),
         ..Default::default()
     })
-}
-
-/// Unix-millis (a JSON string or number, as JetBrains emits) → Unix seconds.
-fn parse_millis(v: &Millis) -> Option<u64> {
-    let ms = match v {
-        Millis::Text(s) => s.parse::<u64>().ok()?,
-        Millis::Number(n) => *n,
-    };
-    Some(ms / 1000)
 }
 
 /// The Marketplace's plugin search results.
@@ -107,15 +108,6 @@ struct Plugin {
 enum Vendor {
     Name(String),
     Object { name: Option<String> },
-}
-
-impl Vendor {
-    fn into_name(self) -> Option<String> {
-        match self {
-            Self::Name(name) => Some(name),
-            Self::Object { name } => name,
-        }
-    }
 }
 
 /// A plugin's links.

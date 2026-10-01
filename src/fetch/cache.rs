@@ -2,8 +2,8 @@
 //! provenance, and the metadata TTL policy.
 
 use serde::{Deserialize, Serialize};
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -321,41 +321,100 @@ impl BlobCache {
         self.shard(key).join(format!("{key}.json"))
     }
 
-    /// Read a cache entry and its age, regardless of freshness. Both the blob
-    /// and its `.json` sidecar must be present and valid; a missing or
-    /// unreadable sidecar is a cache miss rather than fabricated default
-    /// provenance (a blob can outlive its sidecar — e.g. a partial write, or the
-    /// cache sweep evicting one of the pair — and serving `status: 0`,
-    /// `final_url: ""` provenance would silently falsify a `FetchRecord`).
+    /// Stream `key`'s entry through `read`, when it is present and — given a
+    /// `max_age` — no older than that; `read` must read the body to its end.
+    /// Both the blob and its `.json` sidecar must be present and valid; a
+    /// missing or unreadable sidecar is a cache miss rather than fabricated
+    /// default provenance (a blob can outlive its sidecar — e.g. a partial
+    /// write, or the cache sweep evicting one of the pair — and serving
+    /// `status: 0`, `final_url: ""` provenance would silently falsify a
+    /// `FetchRecord`).
     ///
-    /// Freshness (`age`) is measured from the recorded `fetched_at`, not the file
-    /// mtime. That leaves the mtime free to record *last access* — bumped on each
-    /// hit by [`mark_accessed`](Self::mark_accessed) — so the eviction sweep retains an entry that is
-    /// still in use rather than one merely fetched recently.
-    fn read(&self, key: &str) -> Option<(Vec<u8>, CachedMeta, Duration)> {
+    /// The body is decompressed under [`CachedMeta::read_limit`]. Bounded even
+    /// though we wrote the file ourselves: the cache lives in an OS cache
+    /// directory, so anything that can write there can swap an entry for a zstd
+    /// bomb. One byte past the ceiling is read, so an oversized entry is refused
+    /// outright — serving a truncated prefix would hash to something that was
+    /// never fetched. The pair is written as two renames, so a concurrent writer
+    /// can leave one file from each fetch; a length disagreement is a miss.
+    ///
+    /// Freshness is measured from the recorded `fetched_at`, not the file
+    /// mtime. That leaves the mtime free to record *last access* — bumped on
+    /// each hit by [`mark_accessed`](Self::mark_accessed) — so the eviction
+    /// sweep retains an entry that is still in use rather than one merely
+    /// fetched recently.
+    pub(crate) fn read_with<T>(
+        &self,
+        key: &str,
+        max_age: Option<Duration>,
+        read: impl FnOnce(&mut dyn Read) -> std::io::Result<T>,
+    ) -> Option<(T, CachedMeta)> {
         if !self.enabled {
             return None;
         }
-        let blob = self.blob_path(key);
-        let blob_mtime = std::fs::metadata(&blob).ok()?.modified().ok()?;
+        let blob = std::fs::File::open(self.blob_path(key)).ok()?;
+        let blob_mtime = blob.metadata().ok()?.modified().ok()?;
         let meta: CachedMeta =
             serde_json::from_slice(&std::fs::read(self.meta_path(key)).ok()?).ok()?;
-        let bytes = read_blob_capped(&blob, meta.read_limit(self.max_bytes))?;
-        // The pair is written as two renames, so a concurrent writer can leave
-        // one file from each fetch; a length disagreement is a miss.
-        if meta.size.is_some_and(|size| bytes.len() as u64 != size) {
+        let age = Duration::from_secs(now().saturating_sub(meta.fetched_at));
+        if max_age.is_some_and(|max_age| age > max_age) {
             return None;
         }
-        let age = Duration::from_secs(now().saturating_sub(meta.fetched_at));
+        let limit = meta.read_limit(self.max_bytes);
+        let mut body = Counted {
+            inner: zstd::stream::read::Decoder::new(blob)
+                .ok()?
+                .take(limit.saturating_add(1)),
+            count: 0,
+        };
+        let value = read(&mut body).ok()?;
+        if body.count > limit || meta.size.is_some_and(|size| size != body.count) {
+            return None;
+        }
         self.mark_accessed(key, blob_mtime);
-        Some((bytes, meta, age))
+        Some((value, meta))
     }
 
-    /// Record that this entry was just used, so the eviction sweep (which ages by
-    /// mtime) keeps it while it is in use. Rewrites the mtime of both the blob and
-    /// its sidecar to now, but only when the current mtime is already a day stale,
-    /// to avoid a metadata write on every cache hit. Best-effort; a failure just
-    /// means the entry ages from its previous access instead.
+    /// `key`'s entry unpacked into a spool, for a reader that must seek (a Go
+    /// module zip's tree hash) — when present and, given a `max_age`, no
+    /// older than that.
+    pub(crate) fn unpack(
+        &self,
+        key: &str,
+        max_age: Option<Duration>,
+    ) -> Option<(Spool, CachedMeta)> {
+        let spool = self.spool(key);
+        let ((), meta) = self.read_with(key, max_age, |body| {
+            let mut out = std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(spool.path())?;
+            std::io::copy(body, &mut out).map(drop)
+        })?;
+        Some((spool, meta))
+    }
+
+    /// A spool for `key`'s body: a file not yet created, removed when the
+    /// spool is dropped. It sits beside the entry it will become, on the
+    /// cache's own disk — a system temp directory is often memory-backed,
+    /// which is what spooling exists to avoid — or, for a disabled cache, in
+    /// the system temp directory.
+    pub(crate) fn spool(&self, key: &str) -> Spool {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "{key}.part.{}.{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let shard = self.shard(key);
+        let dir = if self.enabled && std::fs::create_dir_all(&shard).is_ok() {
+            shard
+        } else {
+            std::env::temp_dir()
+        };
+        Spool(dir.join(name))
+    }
+
     fn mark_accessed(&self, key: &str, blob_mtime: SystemTime) {
         const TOUCH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
         if blob_mtime.elapsed().is_ok_and(|age| age < TOUCH_INTERVAL) {
@@ -372,14 +431,13 @@ impl BlobCache {
     /// Cached bytes + provenance for `key`, if present and younger than
     /// `max_age`.
     pub(crate) fn fresh(&self, key: &str, max_age: Duration) -> Option<(Vec<u8>, CachedMeta)> {
-        let (bytes, meta, age) = self.read(key)?;
-        (age <= max_age).then_some((bytes, meta))
+        self.read_with(key, Some(max_age), read_all)
     }
 
     /// Cached bytes + provenance for `key` at any age — the fallback when a
     /// fresh fetch can't be made (the source is unreachable).
     pub(crate) fn any(&self, key: &str) -> Option<(Vec<u8>, CachedMeta)> {
-        self.read(key).map(|(bytes, meta, _)| (bytes, meta))
+        self.read_with(key, None, read_all)
     }
 
     /// The cached bytes for a locator, at any age — for re-analysing a
@@ -393,21 +451,26 @@ impl BlobCache {
     /// Store `bytes` and `meta` for `key`. Best-effort — a write failure is
     /// non-fatal (the next run re-fetches).
     pub(crate) fn put(&self, key: &str, bytes: &[u8], meta: &CachedMeta) {
-        if !self.enabled {
+        self.store(key, bytes, bytes.len() as u64, meta);
+    }
+
+    /// Store the `size`-byte `body` and `meta` for `key`, compressing it as it
+    /// streams. Best-effort, as [`put`](Self::put).
+    pub(crate) fn store(&self, key: &str, body: impl Read, size: u64, meta: &CachedMeta) {
+        if !self.enabled || std::fs::create_dir_all(self.shard(key)).is_err() {
             return;
         }
-        if std::fs::create_dir_all(self.shard(key)).is_err() {
+        if !write_replacing(&self.blob_path(key), |out| {
+            zstd::stream::copy_encode(body, out, 3)
+        }) {
             return;
-        }
-        if let Ok(compressed) = zstd::encode_all(bytes, 3) {
-            write_replacing(&self.blob_path(key), &compressed);
         }
         let meta = CachedMeta {
-            size: Some(bytes.len() as u64),
+            size: Some(size),
             ..meta.clone()
         };
         if let Ok(json) = serde_json::to_vec(&meta) {
-            write_replacing(&self.meta_path(key), &json);
+            write_replacing(&self.meta_path(key), |out| out.write_all(&json));
         }
         // A bulk fetch can outgrow the cache ceiling inside one process, long
         // before the next daily sweep would notice.
@@ -415,28 +478,44 @@ impl BlobCache {
     }
 }
 
-/// Decompress a cache blob, refusing one that expands past `limit`.
-///
-/// Bounded even though we wrote the file ourselves: the cache lives in an OS
-/// cache directory, so anything that can write there can swap an entry for a
-/// zstd bomb. Every other decompressor in this crate is capped, and leaving
-/// this one open is only safe for as long as that assumption holds. Reads one
-/// byte past the ceiling so an oversized entry is rejected outright — serving a
-/// truncated prefix would hash to something that was never fetched.
-///
-/// `None` on any failure, which the caller already treats as a cache miss.
-fn read_blob_capped(path: &std::path::Path, limit: u64) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    zstd::stream::read::Decoder::new(std::fs::File::open(path).ok()?)
-        .ok()?
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() as u64 <= limit).then_some(bytes)
+/// A temporary file a fetched body is written to, removed when dropped.
+pub(crate) struct Spool(PathBuf);
+
+impl Spool {
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
 }
 
-/// Write `bytes` to `path` through a fresh temporary file and rename it into
-/// place. Best-effort, like the rest of the cache.
+impl Drop for Spool {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// A reader that counts what passes through it.
+struct Counted<R> {
+    inner: R,
+    count: u64,
+}
+
+impl<R: Read> Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+}
+
+/// Read a body to its end.
+fn read_all(body: &mut dyn Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    body.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Write `path` through a fresh temporary file, with `write`, and rename it
+/// into place; `true` when it landed. Best-effort, like the rest of the cache.
 ///
 /// Two properties a plain `fs::write` does not have. The rename is atomic, so
 /// a concurrent reader sees either the whole old entry or the whole new one,
@@ -446,9 +525,10 @@ fn read_blob_capped(path: &std::path::Path, limit: u64) -> Option<Vec<u8>> {
 /// the destination was. So an entry someone pre-created as a symlink — a live
 /// risk wherever `XDG_CACHE_HOME` is shared, as on a CI runner — is destroyed
 /// rather than followed into an arbitrary file.
-fn write_replacing(path: &std::path::Path, bytes: &[u8]) {
-    use std::io::Write as _;
-
+fn write_replacing(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> bool {
     // Unique per process and per call, so two writers never collide on the
     // temporary and neither is left waiting on a stale one.
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -461,11 +541,12 @@ fn write_replacing(path: &std::path::Path, bytes: &[u8]) {
         .create_new(true)
         .write(true)
         .open(&tmp)
-        .and_then(|mut f| f.write_all(bytes));
+        .and_then(|mut f| write(&mut f));
     if written.is_ok() && std::fs::rename(&tmp, path).is_ok() {
-        return;
+        return true;
     }
     let _ = std::fs::remove_file(&tmp);
+    false
 }
 
 /// The `Content-Type` header value (case-insensitive), if any.
@@ -578,6 +659,7 @@ fn cached_document(
     send: impl FnOnce() -> Result<Fetched, FetchError>,
 ) -> Result<Vec<u8>, FetchError> {
     if let Some((bytes, meta)) = cache.fresh(key, cache.meta_ttl) {
+        crate::metrics::metadata(url, "cache", Some(bytes.len()));
         cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
         return Ok(bytes);
     }
@@ -587,12 +669,15 @@ fn cached_document(
             // A stale copy still beats no answer, and outranks the refusal:
             // the document was true once, where the status is only true now.
             if let Some((bytes, meta)) = cache.any(key) {
+                crate::metrics::metadata(url, "stale_cache", Some(bytes.len()));
                 cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
                 return Ok(bytes);
             }
+            crate::metrics::metadata(url, "failed", None);
             return Err(e);
         }
     };
+    crate::metrics::metadata(url, "network", Some(f.bytes.len()));
     let meta = CachedMeta {
         fetched_at: now(),
         status: f.status,
@@ -659,29 +744,38 @@ mod tests {
         // decompressed into memory. The cap is a parameter so this costs
         // kilobytes instead of the 256 MiB production ceiling.
         let dir = tempfile::tempdir().expect("tempdir");
-        let blob = dir.path().join("bomb.zst");
+        let cache = |cap| BlobCache::with_dir(dir.path().to_path_buf()).with_max_bytes(cap);
+        // An entry from before sizes were recorded: read under the cap alone.
+        let plant = |key: &str, blob: &[u8]| {
+            let c = cache(0);
+            std::fs::create_dir_all(c.blob_path(key).parent().expect("shard")).expect("mkdir");
+            std::fs::write(c.blob_path(key), blob).expect("plant blob");
+            let meta = serde_json::to_vec(&CachedMeta::default()).expect("meta");
+            std::fs::write(c.meta_path(key), meta).expect("plant meta");
+        };
         let bomb = zstd::encode_all(&vec![0u8; 1 << 20][..], 3).expect("compress");
         assert!(bomb.len() < 4096, "1 MiB of zeros should compress tiny");
-        std::fs::write(&blob, &bomb).expect("plant");
+        plant("bomb", &bomb);
 
-        assert_eq!(
-            read_blob_capped(&blob, 1024),
-            None,
+        assert!(
+            cache(1024).any("bomb").is_none(),
             "an entry expanding past the cap must not be served"
         );
         // The same entry is served whole when it fits.
         assert_eq!(
-            read_blob_capped(&blob, 1 << 20).map(|b| b.len()),
+            cache(1 << 20).any("bomb").map(|(b, _)| b.len()),
             Some(1 << 20)
         );
         // A blob exactly at the ceiling is still valid — the `+1` read must not
         // reject the boundary case.
-        let exact = dir.path().join("exact.zst");
-        std::fs::write(&exact, zstd::encode_all(&b"12345"[..], 3).expect("c")).expect("w");
-        assert_eq!(read_blob_capped(&exact, 5).map(|b| b.len()), Some(5));
-        assert_eq!(read_blob_capped(&exact, 4), None);
+        plant(
+            "exact",
+            &zstd::encode_all(&b"12345"[..], 3).expect("compress"),
+        );
+        assert_eq!(cache(5).any("exact").map(|(b, _)| b.len()), Some(5));
+        assert!(cache(4).any("exact").is_none());
         // An unbounded ceiling must not wrap the `+1` read to zero bytes.
-        assert_eq!(read_blob_capped(&exact, u64::MAX).map(|b| b.len()), Some(5));
+        assert_eq!(cache(u64::MAX).any("exact").map(|(b, _)| b.len()), Some(5));
     }
 
     #[cfg(unix)]

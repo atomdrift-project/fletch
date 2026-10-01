@@ -141,11 +141,7 @@ fn blob_cache_budget(dir: Option<PathBuf>) -> Budget {
 fn blob_cache_max_entries() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
-        std::env::var("FLETCH_CACHE_MAX_ENTRIES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(FLETCH_DEFAULT_MAX_ENTRIES)
+        max_entries_from_env_or("FLETCH_CACHE_MAX_ENTRIES", FLETCH_DEFAULT_MAX_ENTRIES)
     })
 }
 
@@ -227,11 +223,16 @@ pub fn max_bytes_from_env_or(var: &str, default: u64) -> u64 {
 /// Entry ceiling from `var`, or the `DEFAULT_MAX_ENTRIES` default.
 #[must_use]
 pub fn max_entries_from_env(var: &str) -> usize {
+    max_entries_from_env_or(var, DEFAULT_MAX_ENTRIES)
+}
+
+/// Entry ceiling from `var`, or `default` when unset or invalid.
+fn max_entries_from_env_or(var: &str, default: usize) -> usize {
     std::env::var(var)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_MAX_ENTRIES)
+        .unwrap_or(default)
 }
 
 /// Entries this process has written since it last triggered a sweep.

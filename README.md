@@ -128,6 +128,14 @@ a token with `HttpFetch::with_github_token`. A registry that answers `429`, or
 up to 30 s; a longer pause fails the request, and every request to that host
 until it ends, without asking the host again.
 
+## Metrics
+
+Each fetch, registry lookup, metadata read, and registry back-off emits one
+`tracing` event on the `fletch::metrics` target, with stable field names
+(`event`, `ecosystem`, `outcome`, `served`, `status`, `bytes`, `elapsed_ms`, …),
+so a subscriber can count cache hit rates, outcomes by ecosystem, throttling,
+and latency. The fields are listed in `src/metrics.rs`.
+
 ## Build
 
 ```bash

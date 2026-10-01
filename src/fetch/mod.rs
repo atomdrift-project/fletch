@@ -9,7 +9,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use filefacts::{RefKind, RefLocator, Reference};
 use sha2::{Digest, Sha256};
@@ -26,7 +26,7 @@ mod verify;
 
 pub use cache::{BlobCache, RawSink, RecordedSource, refs_dir};
 pub(crate) use cache::{
-    CachedMeta, META_TTL_IMMUTABLE, cached_metadata, cached_metadata_status, cached_post,
+    CachedMeta, META_TTL_IMMUTABLE, Spool, cached_metadata, cached_metadata_status, cached_post,
     store_metadata,
 };
 pub(crate) use coordinate::{
@@ -60,7 +60,7 @@ use coordinate::safe_purl_coordinates;
 use select::{
     apply_common_candidate_qualifiers, attach_candidate_identities, maybe_selected_artifact_url,
 };
-use verify::{verify_pin, verify_purl_checksum};
+use verify::{Digests, verify_pin, verify_purl_checksum};
 
 /// The terminal result of trying to fetch one reference.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -263,6 +263,19 @@ fn fetch_ref_inner(
     cache: &BlobCache,
     claim_fetch: impl FnOnce() -> bool,
 ) -> FetchRecord {
+    let started = Instant::now();
+    let rec = fetch_and_record(r, net, cache, claim_fetch);
+    crate::metrics::fetch(&rec, started.elapsed());
+    rec
+}
+
+/// [`fetch_ref_inner`]'s work: every way one reference ends in a record.
+fn fetch_and_record(
+    r: &Reference,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+    claim_fetch: impl FnOnce() -> bool,
+) -> FetchRecord {
     let locator = locator_string(&r.locator);
 
     if !r.is_fetch_target() {
@@ -283,8 +296,8 @@ fn fetch_ref_inner(
         TTL_UNPINNED
     };
 
-    if let Some((bytes, meta)) = cache.fresh(&key, max_age) {
-        return record(r, locator, url, &bytes, Served::Cache, &meta);
+    if let Some((examined, meta)) = examine_cached(r, &locator, &key, Some(max_age), cache) {
+        return record(r, locator, url, &examined, Served::Cache, &meta);
     }
 
     if !claim_fetch() {
@@ -304,6 +317,9 @@ fn fetch_ref_inner(
     // docker-content-digest header carries the image's content-addressed
     // identity — stable across producers, where the flattened export bytes
     // are not.
+    // An artifact is spooled to disk as it arrives, judged and cached from
+    // there, and never held in memory whole.
+    let spool = cache.spool(&key);
     let fetched = if let Some(oci_ref) = url.strip_prefix("oci://") {
         if net.allows_oci() {
             crate::oci::export(oci_ref)
@@ -321,28 +337,30 @@ fn fetch_ref_inner(
             ))
         }
     } else {
-        net.send(&Request::get(&url))
+        net.send(&Request::get(&url).spool_to(spool.path()))
     };
-    match fetched {
-        Ok(f) => {
-            let meta = CachedMeta {
-                fetched_at: now(),
-                status: f.status,
-                final_url: f.final_url,
-                redirects: f.redirects,
-                headers: f.headers,
-                size: None,
-            };
-            cache.put(&key, &f.bytes, &meta);
-            record(r, locator, url, &f.bytes, Served::Network, &meta)
-        }
+    let landed = fetched.and_then(|f| {
+        let meta = CachedMeta {
+            fetched_at: now(),
+            status: f.status,
+            final_url: f.final_url,
+            redirects: f.redirects,
+            headers: f.headers,
+            size: None,
+        };
+        land(r, &locator, &key, &spool, &f.bytes, &meta, cache)
+            .map(|examined| (examined, meta))
+            .map_err(|e| FetchError::Transport(format!("spool: {e}")))
+    });
+    match landed {
+        Ok((examined, meta)) => record(r, locator, url, &examined, Served::Network, &meta),
         // The source is unreachable. Fall back to any cached copy, however
         // old — a stale answer beats none — and mark it stale. Only a genuine
         // cache miss is a failure.
-        Err(e) => match cache.any(&key) {
-            Some((bytes, meta)) => {
+        Err(e) => match examine_cached(r, &locator, &key, None, cache) {
+            Some((examined, meta)) => {
                 tracing::warn!(locator = %locator, error = %e, "fetch failed; serving stale cache");
-                record(r, locator, url, &bytes, Served::StaleCache, &meta)
+                record(r, locator, url, &examined, Served::StaleCache, &meta)
             }
             None => {
                 // A refused status *did* reach the network, and the code is the
@@ -507,11 +525,15 @@ pub fn fetch_references_with(
                                 })
                             }))
                             .unwrap_or_else(|panic| {
+                                // The text the panic was raised with.
+                                let message = panic
+                                    .downcast_ref::<&str>()
+                                    .copied()
+                                    .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                                    .unwrap_or("panic");
                                 FetchRecord::terminal(
                                     locator_string(&targets[i].locator),
-                                    Outcome::Failed(FetchError::Internal(
-                                        panic_message(panic.as_ref()).to_string(),
-                                    )),
+                                    Outcome::Failed(FetchError::Internal(message.to_string())),
                                 )
                             });
                             bytes_used.fetch_add(rec.size.unwrap_or(0), Ordering::Relaxed);
@@ -559,15 +581,6 @@ pub fn fetch_references_with(
     records
 }
 
-/// The text a panic was raised with, for the record of the fetch it ended.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("panic")
-}
-
 /// Whether a reference should be fetched: a fetch target whose locator resolves
 /// to fetchable bytes. A package coordinate (PURL) is always fetched. A raw URL
 /// is fetched when it *is* a declared dependency or a commanded package — a
@@ -588,28 +601,101 @@ fn selected(r: &Reference, fetch_urls: bool) -> bool {
         }
 }
 
-/// Build a record for bytes in hand, verifying the pin and choosing the outcome.
-fn record(
+/// What one read of a body tells: its digests, and how its pins compare.
+struct Examined {
+    digests: Digests,
+    pin_verified: Option<bool>,
+}
+
+/// Read `body` once and judge it against the reference's pins. Two
+/// independent digests can ride on one reference: the manifest's pin and a
+/// `checksum` qualifier the resolver refined into the locator. Either one
+/// disagreeing with the bytes is the verdict; failing that, either one agreeing
+/// is; only when neither could be computed is the pin unverified. A Go
+/// module-tree pin reads the body as the zip at `zip`.
+fn examine(
     r: &Reference,
-    locator: String,
-    resolved_url: String,
-    bytes: &[u8],
-    served: Served,
-    meta: &CachedMeta,
-) -> FetchRecord {
-    let content_sha256 = sha256_hex(bytes);
-    // Two independent digests can ride on one reference: the manifest's pin and
-    // a `checksum` qualifier the resolver refined into the locator. Either one
-    // disagreeing with the bytes is the verdict; failing that, either one
-    // agreeing is; only when neither could be computed is the pin unverified.
+    locator: &str,
+    body: impl std::io::Read,
+    zip: Option<&std::path::Path>,
+) -> std::io::Result<Examined> {
+    let digests = verify::digest(body, r.pinned_hash.as_ref(), locator)?;
     let pin_verified = match (
-        verify_pin(r.pinned_hash.as_ref(), bytes, &content_sha256),
-        verify_purl_checksum(&locator, bytes, &content_sha256),
+        verify_pin(r.pinned_hash.as_ref(), &digests, zip),
+        verify_purl_checksum(locator, &digests),
     ) {
         (Some(false), _) | (_, Some(false)) => Some(false),
         (Some(true), _) | (_, Some(true)) => Some(true),
         (None, None) => None,
     };
+    Ok(Examined {
+        digests,
+        pin_verified,
+    })
+}
+
+/// `key`'s cached body, judged as it streams out of the cache — when present
+/// and, given a `max_age`, no older than that. A Go module-tree pin reads the
+/// archive at random, so for one the body is unpacked to a spool first.
+fn examine_cached(
+    r: &Reference,
+    locator: &str,
+    key: &str,
+    max_age: Option<std::time::Duration>,
+    cache: &BlobCache,
+) -> Option<(Examined, CachedMeta)> {
+    if r.pinned_hash
+        .as_ref()
+        .is_some_and(|pin| pin.algo == filefacts::HashAlgo::GoModH1)
+    {
+        let (spool, meta) = cache.unpack(key, max_age)?;
+        let body = std::fs::File::open(spool.path()).ok()?;
+        let examined = examine(r, locator, body, Some(spool.path())).ok()?;
+        return Some((examined, meta));
+    }
+    cache.read_with(key, max_age, |body| examine(r, locator, body, None))
+}
+
+/// Bring a fetched body to rest: into the spool — written from `bytes` when
+/// the backend handed them back rather than spooling — judged from there, and
+/// cached.
+fn land(
+    r: &Reference,
+    locator: &str,
+    key: &str,
+    spool: &Spool,
+    bytes: &[u8],
+    meta: &CachedMeta,
+    cache: &BlobCache,
+) -> std::io::Result<Examined> {
+    if !spool.path().exists() {
+        std::fs::write(spool.path(), bytes)?;
+    }
+    let examined = examine(
+        r,
+        locator,
+        std::fs::File::open(spool.path())?,
+        Some(spool.path()),
+    )?;
+    cache.store(
+        key,
+        std::fs::File::open(spool.path())?,
+        examined.digests.size,
+        meta,
+    );
+    Ok(examined)
+}
+
+/// Build a record for an examined body, choosing the outcome.
+fn record(
+    r: &Reference,
+    locator: String,
+    resolved_url: String,
+    examined: &Examined,
+    served: Served,
+    meta: &CachedMeta,
+) -> FetchRecord {
+    let pin_verified = examined.pin_verified;
     // A declared tree hash is an integrity requirement too. Malformed or
     // over-budget archives must remain explicitly unverified.
     let declares_content_pin = r.pinned_hash.is_some()
@@ -633,8 +719,8 @@ fn record(
         status: Some(meta.status),
         headers: meta.headers.clone(),
         fetched_at: Some(meta.fetched_at),
-        content_sha256: Some(content_sha256),
-        size: Some(bytes.len() as u64),
+        content_sha256: Some(examined.digests.sha256.clone()),
+        size: Some(examined.digests.size),
         served: Some(served),
         pin_verified,
         outcome,
@@ -2923,6 +3009,69 @@ mod tests {
         let rec = fetch_ref(&r, &Fixtures::default(), &empty);
         assert!(matches!(rec.outcome, Outcome::Failed(_)));
         assert_eq!(rec.served, None);
+    }
+
+    /// A backend that streams the body to the requested spool, as `HttpFetch`
+    /// does, and hands back no bytes.
+    struct Spooling(Fixtures);
+
+    impl Fetch for Spooling {
+        fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+            let mut fetched = self.0.send(request)?;
+            if let Some(path) = request.spool {
+                std::fs::write(path, std::mem::take(&mut fetched.bytes)).expect("spool");
+            }
+            Ok(fetched)
+        }
+    }
+
+    /// A body spooled to disk is judged and cached exactly as one handed back
+    /// in memory, and no spool outlives its fetch.
+    #[test]
+    fn a_spooled_body_is_judged_and_cached_like_one_in_memory() {
+        let url = "https://registry.npmjs.org/a/-/a-1.0.0.tgz";
+        let pin = PinnedHash {
+            algo: HashAlgo::Sha256,
+            value: sha256_hex(b"ARTIFACT"),
+        };
+        let r = dep(RefLocator::Purl("pkg:npm/a@1.0.0".into()), Some(pin));
+        let backends: [&dyn Fetch; 2] = [
+            &Spooling(Fixtures::default().with(url, b"ARTIFACT")),
+            &Fixtures::default().with(url, b"ARTIFACT"),
+        ];
+        for net in backends {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cache = BlobCache::with_dir(dir.path().to_path_buf());
+            let fetched = fetch_ref(&r, net, &cache);
+            assert_eq!(fetched.outcome, Outcome::Ok);
+            assert_eq!(fetched.pin_verified, Some(true));
+            assert_eq!(fetched.size, Some(8));
+            assert_eq!(
+                fetched.content_sha256.as_deref(),
+                Some(&*sha256_hex(b"ARTIFACT"))
+            );
+            // The cache holds the body, and a hit judges it the same way.
+            assert_eq!(
+                cache.load("pkg:npm/a@1.0.0").as_deref(),
+                Some(&b"ARTIFACT"[..])
+            );
+            let hit = fetch_ref(&r, net, &cache);
+            assert_eq!(hit.served, Some(Served::Cache));
+            assert_eq!(hit.pin_verified, Some(true));
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+                .expect("cache dir")
+                .flatten()
+                .flat_map(|shard| {
+                    std::fs::read_dir(shard.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                })
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".part."))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
     }
 
     #[test]

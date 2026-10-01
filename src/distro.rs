@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor, Read};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use filefacts::Registry;
 use serde::Deserialize;
@@ -146,7 +146,8 @@ pub(crate) fn netbsd(
 ) -> Result<Registry, RegistryError> {
     lookup(
         "https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/x86_64/10.0/All/pkg_summary.gz",
-        parse_pkg_summary,
+        // A gzip `pkg_summary` of `KEY=value` stanzas.
+        |url, bytes| stanza_listings(url, BufReader::new(gunzip(bytes)), pkg_summary_listing),
         name,
         "netbsd",
         net,
@@ -232,18 +233,20 @@ type Listings = HashMap<Box<str>, Listing>;
 /// Reads an index's bytes, fetched from `url`, into its listings.
 type Parser = fn(&str, Vec<u8>) -> Result<Listings, RegistryError>;
 
-/// The indexes this process parsed most recently, newest first, keyed by URL
-/// and by the digest of the bytes parsed. A burst of lookups against one index
-/// — a Dockerfile's `apt-get install` line — decompresses and parses it once,
-/// and an index the cache has refreshed is parsed afresh. Only a few are kept:
-/// a parsed Debian or Ubuntu `universe` index is some 17 MB, openSUSE's 13 MB.
-static PARSED: Mutex<Vec<Parsed>> = Mutex::new(Vec::new());
+/// Every index this process has parsed, with the digest of the bytes parsed,
+/// by a name that stays put: the index URL, or for an RPM repository its base
+/// URL, since its primary index is renamed whenever it changes. A burst of
+/// lookups against one index — a Dockerfile's `apt-get install` line —
+/// decompresses and parses it once, and an index the cache has refreshed is
+/// parsed afresh. All are kept: there are a dozen, a parsed Debian or Ubuntu
+/// `universe` index the largest at some 17 MB.
+static PARSED: LazyLock<Mutex<HashMap<String, Arc<Slot>>>> = LazyLock::new(Mutex::default);
 
-/// How many parsed indexes [`PARSED`] keeps.
-const PARSED_KEEP: usize = 4;
+/// One index's parse, behind its own lock: lookups racing on an index wait for
+/// a single parse of it, while lookups on the others go on.
+type Slot = Mutex<Option<Parsed>>;
 
 struct Parsed {
-    url: String,
     digest: String,
     listings: Arc<Listings>,
 }
@@ -257,32 +260,42 @@ fn lookup(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
+    listings(url, url, parse, net, cache)?
+        .get(name)
+        .map(|listing| listing.record(ecosystem, name))
+        .ok_or(RegistryError::NotFound)
+}
+
+/// The listings of the index at `url`, kept as [`PARSED`]`[slot]`.
+fn listings(
+    slot: &str,
+    url: &str,
+    parse: Parser,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Arc<Listings>, RegistryError> {
     // Fetched on every lookup, parsed only when new: the fetch is what keeps
     // the index fresh and records it as a source.
     let bytes = index(url, net, cache)?;
     let digest = sha256_hex(&bytes);
-    // Held across the parse, so lookups racing on one index wait for a single
-    // parse instead of each repeating it.
-    let mut parsed = PARSED.lock().unwrap_or_else(PoisonError::into_inner);
-    let entry = match parsed
-        .iter()
-        .position(|p| p.url == url && p.digest == digest)
-    {
-        Some(i) => parsed.remove(i),
-        None => Parsed {
-            url: url.to_string(),
-            digest,
-            listings: Arc::new(parse(url, bytes)?),
-        },
-    };
-    let listings = Arc::clone(&entry.listings);
-    parsed.insert(0, entry);
-    parsed.truncate(PARSED_KEEP);
+    let slot = Arc::clone(
+        PARSED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(slot.to_string())
+            .or_default(),
+    );
+    let mut parsed = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(current) = parsed.as_ref().filter(|p| p.digest == digest) {
+        return Ok(Arc::clone(&current.listings));
+    }
+    let listings = Arc::new(parse(url, bytes)?);
+    *parsed = Some(Parsed {
+        digest,
+        listings: Arc::clone(&listings),
+    });
     drop(parsed);
-    listings
-        .get(name)
-        .map(|listing| listing.record(ecosystem, name))
-        .ok_or(RegistryError::NotFound)
+    Ok(listings)
 }
 
 /// Every listing in the stanzas of `reader`.
@@ -376,14 +389,10 @@ fn rpm_repo_lookup(
         .ok()
         .and_then(primary_href)
         .ok_or_else(|| unreadable(&repomd_url, "no primary index"))?;
-    lookup(
-        &format!("{base}/{href}"),
-        parse_primary,
-        name,
-        ecosystem,
-        net,
-        cache,
-    )
+    listings(base, &format!("{base}/{href}"), parse_primary, net, cache)?
+        .get(name)
+        .map(|listing| listing.record(ecosystem, name))
+        .ok_or(RegistryError::NotFound)
 }
 
 /// A `primary.xml`, compressed as its `.zst`/`.gz`/`.xz` suffix says.
@@ -446,11 +455,6 @@ fn rpm_listing(pkg: &str) -> Option<(Box<str>, Listing)> {
 }
 
 // --- NetBSD / FreeBSD / OpenBSD ---------------------------------------------
-
-/// A gzip `pkg_summary` of `KEY=value` stanzas.
-fn parse_pkg_summary(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
-    stanza_listings(url, BufReader::new(gunzip(bytes)), pkg_summary_listing)
-}
 
 /// One `pkg_summary` stanza. `PKGNAME` is `name-version`, and a pkgsrc version
 /// never contains a hyphen (revisions are `nbN`), so the version is everything
@@ -708,7 +712,16 @@ fn tag_text(xml: &str, tag: &str) -> Option<String> {
     let start = xml.find(&open)? + open.len();
     let rest = &xml[start..];
     let end = rest.find(&format!("</{tag}>"))?;
-    Some(unescape_xml(rest[..end].trim()))
+    // The five predefined XML entities a primary.xml summary may carry.
+    Some(
+        rest[..end]
+            .trim()
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    )
 }
 
 /// The value of attribute `attr` on the element opening with `open` (e.g.
@@ -720,15 +733,6 @@ fn attr(xml: &str, open: &str, attr: &str) -> Option<String> {
     let start = tag.find(&anchor)? + anchor.len();
     let rest = &tag[start..];
     Some(rest[..rest.find('"')?].to_string())
-}
-
-/// Decode the five predefined XML entities a primary.xml summary may carry.
-fn unescape_xml(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
 }
 
 #[cfg(test)]
@@ -909,6 +913,54 @@ mod tests {
         let refreshed = Fixtures::default().with(url, b"Package: a\nVersion: 3\n");
         assert_eq!(version(&refreshed, "a"), Ok("3".into()));
         assert_eq!(PARSES.load(Ordering::SeqCst), 2);
+    }
+
+    /// A slow parse of one index holds up lookups on that index alone.
+    #[test]
+    fn one_index_parsing_does_not_hold_up_another() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        static RELEASED: AtomicBool = AtomicBool::new(false);
+        /// Parses only once the test lets it, or after ten seconds.
+        fn slow(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
+            STARTED.store(true, Ordering::SeqCst);
+            let give_up = Instant::now() + Duration::from_secs(10);
+            while !RELEASED.load(Ordering::SeqCst) && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            stanza_listings(url, Cursor::new(bytes), deb_listing)
+        }
+        let (a, b) = (
+            "https://distro.test/slow/Packages",
+            "https://distro.test/fast/Packages",
+        );
+        let net = Fixtures::default()
+            .with(a, b"Package: a\nVersion: 1\n")
+            .with(b, b"Package: b\nVersion: 2\n");
+        let cache = BlobCache::disabled();
+        std::thread::scope(|scope| {
+            let parsing = scope.spawn(|| lookup(a, slow, "a", "debian", &net, &cache));
+            while !STARTED.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let started = Instant::now();
+            let other = lookup(b, stanza_listings_deb, "b", "debian", &net, &cache);
+            assert_eq!(other.map(|r| r.version), Ok("2".into()));
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "waited on the other parse"
+            );
+            RELEASED.store(true, Ordering::SeqCst);
+            assert_eq!(
+                parsing.join().expect("no panic").map(|r| r.version),
+                Ok("1".into())
+            );
+        });
+    }
+
+    fn stanza_listings_deb(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
+        stanza_listings(url, Cursor::new(bytes), deb_listing)
     }
 
     #[test]
