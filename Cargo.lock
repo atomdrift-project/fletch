@@ -860,7 +860,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "1.7.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#aa282ac2ef487119849d043add5dfa0ebb2f5ce2"
+source = "git+https://github.com/atomdrift-project/filefacts.git#7e743ab9ce37598c6ab26c746a0899b069cd1dcd"
 dependencies = [
  "aho-corasick",
  "cab",
@@ -1627,9 +1627,9 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "lazy_static"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 dependencies = [
  "spin",
 ]
@@ -2923,7 +2923,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "1.12.0"
-source = "git+https://github.com/atomdrift-project/stng.git#90c368c4e4020db36135e8c7810ed1996f0ca148"
+source = "git+https://github.com/atomdrift-project/stng.git?rev=98c580eaf8d6899b23d21f557dcfe27d03664514#98c580eaf8d6899b23d21f557dcfe27d03664514"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3438,7 +3438,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#aa282ac2ef487119849d043add5dfa0ebb2f5ce2"
+source = "git+https://github.com/atomdrift-project/filefacts.git#7e743ab9ce37598c6ab26c746a0899b069cd1dcd"
 dependencies = [
  "cc",
  "tree-sitter",
