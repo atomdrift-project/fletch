@@ -1,10 +1,11 @@
 //! Pub.dev: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, parse_ts};
+use crate::ecosystem::{fetch_json, null_default, parse_ts};
 use crate::fetch::{BlobCache, Fetch, percent_decode};
+use crate::registry::RegistryError;
 
 /// pub.dev: the package endpoint carries the latest release inline and every
 /// version under `versions[]`, each with its `published` time and pubspec.
@@ -13,55 +14,63 @@ pub(crate) fn pub_dev(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let doc = json_meta(&format!("https://pub.dev/api/packages/{name}"), net, cache)?;
-    let latest = doc.pointer("/latest/version").and_then(Value::as_str);
+) -> Result<Registry, RegistryError> {
+    let doc: Package = fetch_json(&format!("https://pub.dev/api/packages/{name}"), net, cache)?;
+    let latest = doc.latest.as_ref().and_then(|l| l.version.as_deref());
     let requested = version.map(percent_decode);
     // A version the list lacks describes no release: it gets no date rather
     // than latest's, though its identity text still comes from latest's
     // pubspec.
     let rel = match requested.as_deref() {
         Some(want) => doc
-            .get("versions")
-            .and_then(Value::as_array)
-            .and_then(|vs| {
-                vs.iter()
-                    .find(|v| v.get("version").and_then(Value::as_str) == Some(want))
-            }),
-        None => doc.get("latest"),
+            .versions
+            .iter()
+            .find(|v| v.version.as_deref() == Some(want)),
+        None => doc.latest.as_ref(),
     };
-    let spec = rel
-        .or_else(|| doc.get("latest"))
-        .and_then(|r| r.get("pubspec"));
+    let spec = rel.or(doc.latest.as_ref()).and_then(|r| r.pubspec.as_ref());
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "pub".into(),
         name: name.to_string(),
         version: rel
-            .and_then(|r| r.get("version"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
+            .and_then(|r| r.version.clone())
             .or(requested)
             .unwrap_or_default(),
-        published_at: rel
-            .and_then(|r| r.get("published"))
-            .and_then(Value::as_str)
-            .and_then(parse_ts),
+        published_at: rel.and_then(|r| r.published.as_deref()).and_then(parse_ts),
         latest_version: latest.map(str::to_string),
-        description: spec
-            .and_then(|s| s.get("description"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        homepage: spec
-            .and_then(|s| s.get("homepage"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        repository: spec
-            .and_then(|s| s.get("repository"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        description: spec.and_then(|s| s.description.clone()),
+        homepage: spec.and_then(|s| s.homepage.clone()),
+        repository: spec.and_then(|s| s.repository.clone()),
         ..Default::default()
     })
+}
+
+/// The parts of a pub.dev package document the registry record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Package {
+    latest: Option<PackageVersion>,
+    #[serde(deserialize_with = "null_default")]
+    versions: Vec<PackageVersion>,
+}
+
+/// One published version: its number, publish time, and pubspec.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PackageVersion {
+    version: Option<String>,
+    published: Option<String>,
+    pubspec: Option<Pubspec>,
+}
+
+/// The parts of a version's pubspec the registry record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Pubspec {
+    description: Option<String>,
+    homepage: Option<String>,
+    repository: Option<String>,
 }
 
 #[cfg(test)]

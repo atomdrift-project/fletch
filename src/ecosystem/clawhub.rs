@@ -1,10 +1,11 @@
 //! ClawHub: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::json_meta;
+use crate::ecosystem::fetch_json;
 use crate::fetch::{BlobCache, Fetch};
+use crate::registry::RegistryError;
 
 /// Homebrew: the formula JSON carries the stable version, description, license,
 /// and 30-day install analytics. It records no publish date.
@@ -13,45 +14,67 @@ use crate::fetch::{BlobCache, Fetch};
 /// disambiguates *downloads* (slugs are not unique across publishers); the
 /// metadata endpoint is slug-keyed, so a shared slug resolves to the
 /// registry's primary holder of that slug.
-pub(crate) fn clawhub(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(
+pub(crate) fn clawhub(
+    slug: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let doc: SkillDocument = fetch_json(
         &format!("https://clawhub.ai/api/v1/skills/{slug}"),
         net,
         cache,
     )?;
-    let skill = doc.get("skill")?;
+    let skill = doc.skill;
     // Epoch-millisecond timestamps, occasionally fractional; fold to seconds.
-    let ms_to_secs = |v: &Value| {
-        v.as_u64()
-            .or_else(|| v.as_f64().map(|f| f as u64))
-            .map(|ms| ms / 1_000)
-    };
-    Some(Registry {
+    let ms_to_secs = |ms: f64| ms as u64 / 1_000;
+    let stats = skill.stats.unwrap_or_default();
+    Ok(Registry {
         ecosystem: "clawhub".into(),
         name: slug.to_string(),
-        version: skill
-            .pointer("/tags/latest")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        published_at: skill.get("updatedAt").and_then(ms_to_secs),
-        first_published_at: skill.get("createdAt").and_then(ms_to_secs),
-        title: skill
-            .get("displayName")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: skill
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        downloads_total: skill.pointer("/stats/downloads").and_then(Value::as_u64),
-        rating_count: skill.pointer("/stats/stars").and_then(Value::as_u64),
-        release_count: skill
-            .pointer("/stats/versions")
-            .and_then(Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok()),
+        version: skill.tags.and_then(|t| t.latest).unwrap_or_default(),
+        published_at: skill.updated_at.map(ms_to_secs),
+        first_published_at: skill.created_at.map(ms_to_secs),
+        title: skill.display_name,
+        description: skill.summary,
+        downloads_total: stats.downloads,
+        rating_count: stats.stars,
+        release_count: stats.versions.and_then(|v| u32::try_from(v).ok()),
         ..Default::default()
     })
+}
+
+/// A ClawHub skill document: the one skill under `skill`.
+#[derive(Deserialize)]
+struct SkillDocument {
+    skill: Skill,
+}
+
+/// A ClawHub skill listing.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Skill {
+    display_name: Option<String>,
+    summary: Option<String>,
+    tags: Option<SkillTags>,
+    stats: Option<SkillStats>,
+    created_at: Option<f64>,
+    updated_at: Option<f64>,
+}
+
+/// A skill's version tags.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct SkillTags {
+    latest: Option<String>,
+}
+
+/// A skill's popularity and release counters.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct SkillStats {
+    downloads: Option<u64>,
+    stars: Option<u64>,
+    versions: Option<u64>,
 }
 
 #[cfg(test)]

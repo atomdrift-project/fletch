@@ -1,59 +1,78 @@
 //! Clojars: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::json_meta;
+use crate::ecosystem::{fetch_json, null_default, present};
 use crate::fetch::{BlobCache, Fetch};
+use crate::registry::RegistryError;
 
 /// Clojars: the artifacts API returns lifetime downloads, the SCM link, and the
 /// license, but no publish date — so `published_at` stays unknown.
-pub(crate) fn clojars(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(
+pub(crate) fn clojars(
+    path: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let doc: Artifact = fetch_json(
         &format!("https://clojars.org/api/artifacts/{path}"),
         net,
         cache,
     )?;
-    let group = doc.get("group_name").and_then(Value::as_str);
-    let jar = doc.get("jar_name").and_then(Value::as_str);
-    let name = match (group, jar) {
+    let name = match (doc.group_name.as_deref(), doc.jar_name.as_deref()) {
         (Some(g), Some(j)) if g != j => format!("{g}/{j}"),
         (_, Some(j)) => j.to_string(),
         _ => path.to_string(),
     };
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "clojars".into(),
         name,
+        // `latest_version` stands in only when `latest_release` is absent; a
+        // `null` release leaves the version empty.
         version: doc
-            .get("latest_release")
-            .or_else(|| doc.get("latest_version"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        latest_version: doc
-            .get("latest_version")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: doc
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        homepage: doc
-            .get("homepage")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        repository: doc
-            .pointer("/scm/url")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        license: doc
-            .pointer("/licenses/0/name")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        downloads_total: doc.get("downloads").and_then(Value::as_u64),
+            .latest_release
+            .unwrap_or_else(|| doc.latest_version.clone())
+            .unwrap_or_default(),
+        latest_version: doc.latest_version,
+        description: doc.description,
+        homepage: doc.homepage,
+        repository: doc.scm.and_then(|scm| scm.url),
+        license: doc.licenses.into_iter().next().and_then(|l| l.name),
+        downloads_total: doc.downloads,
         ..Default::default()
     })
+}
+
+/// The parts of a Clojars artifact document the registry record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Artifact {
+    group_name: Option<String>,
+    jar_name: Option<String>,
+    #[serde(deserialize_with = "present")]
+    latest_release: Option<Option<String>>,
+    latest_version: Option<String>,
+    description: Option<String>,
+    homepage: Option<String>,
+    scm: Option<Scm>,
+    #[serde(deserialize_with = "null_default")]
+    licenses: Vec<License>,
+    downloads: Option<u64>,
+}
+
+/// The artifact's `scm` block, read for its `url`.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Scm {
+    url: Option<String>,
+}
+
+/// One entry of the artifact's `licenses` list.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct License {
+    name: Option<String>,
 }
 
 #[cfg(test)]

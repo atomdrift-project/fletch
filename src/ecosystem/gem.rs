@@ -1,15 +1,16 @@
 //! RubyGems: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 
-use crate::ecosystem::{json_meta, parse_rfc3339_secs};
+use crate::ecosystem::{fetch_json, null_default, parse_rfc3339_secs};
 use crate::fetch::{
     ArtifactCandidate, BlobCache, Fetch, cached_metadata, meta_ttl_pinned, meta_ttl_unpinned,
     percent_decode, repository_base, safe_filename_part,
 };
 use crate::purl::Purl;
+use crate::registry::RegistryError;
 
 pub(crate) fn gem_artifacts(
     name: &str,
@@ -136,65 +137,70 @@ pub(crate) fn gem(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let doc = json_meta(
+) -> Result<Registry, RegistryError> {
+    let doc: GemInfo = fetch_json(
         &format!("https://rubygems.org/api/v1/gems/{name}.json"),
         net,
         cache,
     )?;
     let resolved = version
         .map(percent_decode)
-        .or_else(|| {
-            doc.get("version")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        .or_else(|| doc.version.clone())
         .unwrap_or_default();
 
     // The gem endpoint omits dates; the versions list carries `created_at` per
     // release. A version the list lacks gets no date rather than the newest's.
-    let published_at = json_meta(
+    let published_at = fetch_json::<Vec<GemVersion>>(
         &format!("https://rubygems.org/api/v1/versions/{name}.json"),
         net,
         cache,
     )
+    .ok()
     .and_then(|vs| {
-        vs.as_array()?
-            .iter()
-            .find(|v| v.get("number").and_then(Value::as_str) == Some(resolved.as_str()))?
-            .get("created_at")
-            .and_then(Value::as_str)
+        vs.iter()
+            .find(|v| v.number.as_deref() == Some(resolved.as_str()))?
+            .created_at
+            .as_deref()
             .and_then(parse_rfc3339_secs)
     });
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "gem".into(),
         name: name.to_string(),
         version: resolved,
         published_at,
-        author: doc
-            .get("authors")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: doc.get("info").and_then(Value::as_str).map(str::to_string),
-        homepage: doc
-            .get("homepage_uri")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        repository: doc
-            .get("source_code_uri")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        license: doc
-            .get("licenses")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        downloads_total: doc.get("downloads").and_then(Value::as_u64),
-        downloads_recent: doc.get("version_downloads").and_then(Value::as_u64),
+        author: doc.authors,
+        description: doc.info,
+        homepage: doc.homepage_uri,
+        repository: doc.source_code_uri,
+        license: doc.licenses.into_iter().next(),
+        downloads_total: doc.downloads,
+        downloads_recent: doc.version_downloads,
         ..Default::default()
     })
+}
+
+/// The RubyGems gem document (`/api/v1/gems/{name}.json`): latest version and downloads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct GemInfo {
+    version: Option<String>,
+    authors: Option<String>,
+    info: Option<String>,
+    homepage_uri: Option<String>,
+    source_code_uri: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    licenses: Vec<String>,
+    downloads: Option<u64>,
+    version_downloads: Option<u64>,
+}
+
+/// One release in the RubyGems versions list (`/api/v1/versions/{name}.json`).
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct GemVersion {
+    number: Option<String>,
+    created_at: Option<String>,
 }
 
 #[cfg(test)]

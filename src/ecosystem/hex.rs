@@ -1,10 +1,12 @@
 //! Hex: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
+use std::collections::BTreeMap;
 
-use crate::ecosystem::{json_meta, parse_ts};
+use crate::ecosystem::{fetch_json, null_default, parse_ts, present};
 use crate::fetch::{BlobCache, Fetch, percent_decode};
+use crate::registry::RegistryError;
 
 /// hex.pm: a clean JSON API. The package doc carries downloads and links; each
 /// entry in the release list has its own `inserted_at` publish time.
@@ -13,73 +15,100 @@ pub(crate) fn hex_pm(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let doc = json_meta(&format!("https://hex.pm/api/packages/{name}"), net, cache)?;
+) -> Result<Registry, RegistryError> {
+    let doc: Package = fetch_json(&format!("https://hex.pm/api/packages/{name}"), net, cache)?;
+    // `latest_version` stands in only when `latest_stable_version` is absent;
+    // a `null` stable version stays unknown.
     let latest = doc
-        .get("latest_stable_version")
-        .or_else(|| doc.get("latest_version"))
-        .and_then(Value::as_str);
+        .latest_stable_version
+        .as_ref()
+        .unwrap_or(&doc.latest_version)
+        .as_deref();
     let requested = version.map(percent_decode);
     let version = requested.as_deref().or(latest).unwrap_or_default();
     // A version the releases list lacks gets no date rather than the newest
     // release's; the package's own `inserted_at` is its first release.
     let published_at = doc
-        .get("releases")
-        .and_then(Value::as_array)
-        .and_then(|rs| {
-            rs.iter()
-                .find(|r| r.get("version").and_then(Value::as_str) == Some(version))?
-                .get("inserted_at")
-                .and_then(Value::as_str)
-                .and_then(parse_ts)
-        });
-    let meta = doc.get("meta");
+        .releases
+        .iter()
+        .find(|r| r.version.as_deref() == Some(version))
+        .and_then(|r| r.inserted_at.as_deref())
+        .and_then(parse_ts);
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "hex".into(),
         name: name.to_string(),
         version: version.to_string(),
         published_at,
-        first_published_at: doc
-            .get("inserted_at")
-            .and_then(Value::as_str)
-            .and_then(parse_ts),
+        first_published_at: doc.inserted_at.as_deref().and_then(parse_ts),
         latest_version: latest.map(str::to_string),
-        description: meta
-            .and_then(|m| m.get("description"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        license: meta
-            .and_then(|m| m.pointer("/licenses/0"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        repository: meta.and_then(|m| m.get("links")).and_then(links_repo),
-        downloads_total: doc.pointer("/downloads/all").and_then(Value::as_u64),
-        downloads_recent: doc.pointer("/downloads/recent").and_then(Value::as_u64),
+        description: doc.meta.description,
+        license: doc.meta.licenses.into_iter().next(),
+        repository: links_repo(&doc.meta.links),
+        downloads_total: doc.downloads.all,
+        downloads_recent: doc.downloads.recent,
         ..Default::default()
     })
 }
 
 /// Pick a source-repository URL from a registry's free-form links map (hex.pm),
 /// preferring a forge link, else any value.
-fn links_repo(links: &Value) -> Option<String> {
-    let map = links.as_object()?;
-    for key in [
+fn links_repo(links: &BTreeMap<String, String>) -> Option<String> {
+    [
         "GitHub",
         "Github",
         "github",
         "GitLab",
         "Repository",
         "Source",
-    ] {
-        if let Some(u) = map.get(key).and_then(Value::as_str) {
-            return Some(u.to_string());
-        }
-    }
-    map.values()
-        .filter_map(Value::as_str)
-        .next()
-        .map(str::to_string)
+    ]
+    .iter()
+    .find_map(|key| links.get(*key))
+    .or_else(|| links.values().next())
+    .cloned()
+}
+
+/// The parts of a hex.pm package document the registry record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Package {
+    #[serde(deserialize_with = "present")]
+    latest_stable_version: Option<Option<String>>,
+    latest_version: Option<String>,
+    inserted_at: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    releases: Vec<Release>,
+    #[serde(deserialize_with = "null_default")]
+    meta: Meta,
+    #[serde(deserialize_with = "null_default")]
+    downloads: Downloads,
+}
+
+/// One entry of the package's release list.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Release {
+    version: Option<String>,
+    inserted_at: Option<String>,
+}
+
+/// The publisher-supplied `meta` block.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Meta {
+    description: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    licenses: Vec<String>,
+    #[serde(deserialize_with = "null_default")]
+    links: BTreeMap<String, String>,
+}
+
+/// The `downloads` counters.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Downloads {
+    all: Option<u64>,
+    recent: Option<u64>,
 }
 
 #[cfg(test)]

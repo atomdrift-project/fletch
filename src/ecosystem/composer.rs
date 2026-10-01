@@ -1,10 +1,13 @@
 //! Composer / Packagist: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
+use std::collections::BTreeMap;
 
-use crate::ecosystem::{json_meta, parse_rfc3339_secs};
+use crate::ecosystem::{fetch_json, lenient, null_default, parse_rfc3339_secs};
 use crate::fetch::{BlobCache, Fetch, percent_decode};
+use crate::registry::RegistryError;
 
 /// Composer's download URL lives in Packagist's per-package metadata, not a
 /// derivable path. Fetch the v2 metadata, find the matching version, and return
@@ -34,15 +37,15 @@ pub(crate) fn composer(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let doc = json_meta(
+) -> Result<Registry, RegistryError> {
+    let doc: PackageDocument = fetch_json(
         &format!("https://packagist.org/packages/{path}.json"),
         net,
         cache,
     )?;
-    let pkg = doc.get("package")?;
+    let pkg = &doc.package;
 
-    let versions = pkg.get("versions").and_then(Value::as_object);
+    let versions = pkg.versions.as_ref();
     let latest = versions.and_then(composer_latest);
     let requested = version.map(percent_decode);
     let ver = match requested.as_deref() {
@@ -56,40 +59,26 @@ pub(crate) fn composer(
         }
         None => latest,
     };
-    let version_of = |v: &Value| v.get("version").and_then(Value::as_str).map(str::to_string);
+    let version_of = |v: &PackageVersion| v.version.clone();
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "composer".into(),
         name: path.to_string(),
         version: ver.and_then(version_of).or(requested).unwrap_or_default(),
         latest_version: latest.and_then(version_of),
         published_at: ver
-            .and_then(|v| v.get("time"))
-            .and_then(Value::as_str)
+            .and_then(|v| v.time.as_deref())
             .and_then(parse_rfc3339_secs),
         author: ver
-            .and_then(|v| v.pointer("/authors/0/name"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: pkg
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        repository: pkg
-            .get("repository")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        license: ver
-            .and_then(|v| v.pointer("/license/0"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        downloads_total: pkg.pointer("/downloads/total").and_then(Value::as_u64),
-        downloads_recent: pkg.pointer("/downloads/monthly").and_then(Value::as_u64),
-        rating_count: pkg.get("favers").and_then(Value::as_u64),
-        maintainers: pkg
-            .get("maintainers")
-            .and_then(Value::as_array)
-            .map(|m| m.len() as u32),
+            .and_then(|v| v.authors.first())
+            .and_then(|a| a.name.clone()),
+        description: pkg.description.clone(),
+        repository: pkg.repository.clone(),
+        license: ver.and_then(|v| v.license.first()).cloned(),
+        downloads_total: pkg.downloads.as_ref().and_then(|d| d.total),
+        downloads_recent: pkg.downloads.as_ref().and_then(|d| d.monthly),
+        rating_count: pkg.favers,
+        maintainers: pkg.maintainers.as_ref().map(|m| m.len() as u32),
         ..Default::default()
     })
 }
@@ -100,14 +89,14 @@ pub(crate) fn composer(
 /// `1.x-dev` → `1.9999999.9999999.9999999-dev`) never count. The `versions`
 /// map is keyed by version string, and its key order says nothing about
 /// recency.
-fn composer_latest(versions: &serde_json::Map<String, Value>) -> Option<&Value> {
+fn composer_latest(versions: &BTreeMap<String, PackageVersion>) -> Option<&PackageVersion> {
     versions
         .values()
         .filter_map(|v| {
             let norm = v
-                .get("version_normalized")
-                .or_else(|| v.get("version"))?
-                .as_str()?
+                .version_normalized
+                .as_deref()
+                .or(v.version.as_deref())?
                 .trim_start_matches('v');
             let (numbers, suffix) = norm
                 .split_once('-')
@@ -123,6 +112,54 @@ fn composer_latest(versions: &serde_json::Map<String, Value>) -> Option<&Value> 
         })
         .max_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(_, v)| v)
+}
+
+/// The Packagist package document (`/packages/{vendor}/{name}.json`).
+#[derive(Deserialize)]
+struct PackageDocument {
+    package: Package,
+}
+
+/// The package-level facts and every version Packagist knows.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Package {
+    /// Keyed by version string. PHP encodes an empty map as `[]`.
+    #[serde(deserialize_with = "lenient")]
+    versions: Option<BTreeMap<String, PackageVersion>>,
+    description: Option<String>,
+    repository: Option<String>,
+    downloads: Option<Downloads>,
+    favers: Option<u64>,
+    maintainers: Option<Vec<IgnoredAny>>,
+}
+
+/// One version's composer metadata, as Packagist lists it.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PackageVersion {
+    version: Option<String>,
+    version_normalized: Option<String>,
+    time: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    authors: Vec<Author>,
+    #[serde(deserialize_with = "null_default")]
+    license: Vec<String>,
+}
+
+/// One entry of a version's `authors`.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Author {
+    name: Option<String>,
+}
+
+/// The package's download counters.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Downloads {
+    total: Option<u64>,
+    monthly: Option<u64>,
 }
 
 #[cfg(test)]

@@ -1,11 +1,13 @@
 //! NuGet: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
+use serde::de::{DeserializeOwned, IgnoredAny};
 use std::io::{Cursor, Read};
 
-use crate::ecosystem::{json_meta, parse_rfc3339_secs};
-use crate::fetch::{BlobCache, Fetch, cached_metadata};
+use crate::ecosystem::{decode, fetch_json, lenient, null_default, parse_rfc3339_secs};
+use crate::fetch::{BlobCache, Fetch, cached_metadata, cached_metadata_status};
+use crate::registry::RegistryError;
 
 /// The gzip-compressed V3 registration base — per-version `catalogEntry`
 /// documents (publish time, listing, license, deprecation), keyed by lowercased
@@ -29,71 +31,51 @@ pub(crate) fn nuget(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
+) -> Result<Registry, RegistryError> {
     let id = path.to_lowercase();
-    let doc = json_meta(
+    let doc: SearchResults = fetch_json(
         &format!(
             "https://azuresearch-usnc.nuget.org/query?q=packageid:{id}&prerelease=true&semVerLevel=2.0.0"
         ),
         net,
         cache,
     )?;
-    let d = doc.pointer("/data/0")?;
-    let latest = d.get("version").and_then(Value::as_str);
+    // An exact `packageid:` query with no hit is NuGet saying there is no such
+    // package.
+    let Some(d) = doc.data.first() else {
+        return Err(RegistryError::NotFound);
+    };
+    let latest = d.version.as_deref();
     // Honor a requested version only if the registry lists it; the search-API
     // metadata below is the latest release's regardless (it exposes no
     // per-version doc), but the `.nuspec` we fetch afterward *is* per-version.
     let version = version
-        .filter(|v| {
-            d.get("versions")
-                .and_then(Value::as_array)
-                .is_some_and(|vs| {
-                    vs.iter()
-                        .any(|e| e.get("version").and_then(Value::as_str) == Some(*v))
-                })
-        })
+        .filter(|v| d.versions.iter().any(|e| e.version.as_deref() == Some(*v)))
         .or(latest)
         .unwrap_or_default()
         .to_string();
 
     let mut reg = Registry {
         ecosystem: "nuget".into(),
-        name: d
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or(path)
-            .to_string(),
+        name: d.id.as_deref().unwrap_or(path).to_string(),
         version: version.clone(),
         latest_version: latest.map(str::to_string),
-        author: d
-            .pointer("/authors/0")
-            .and_then(Value::as_str)
-            .or_else(|| d.get("authors").and_then(Value::as_str))
-            .map(str::to_string),
-        description: d
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        author: d.authors.as_ref().and_then(Authors::first),
+        description: d.description.clone(),
         homepage: d
-            .get("projectUrl")
-            .and_then(Value::as_str)
+            .project_url
+            .as_deref()
             .filter(|s| !s.is_empty())
             .map(str::to_string),
-        downloads_total: d.get("totalDownloads").and_then(Value::as_u64),
+        downloads_total: d.total_downloads,
         // `deprecation` is an object with a `message`/`reasons` when the package
         // is deprecated, absent otherwise — presence is the signal.
-        deprecated: d.get("deprecation").and_then(nuget_deprecation),
+        deprecated: d.deprecation.as_ref().map(nuget_deprecation),
         // `owners` is the curated custody set (distinct from free-text
         // `authors`); its size is the maintainer count. Absent → unknown.
-        maintainers: d
-            .get("owners")
-            .and_then(Value::as_array)
-            .map(|o| o.len() as u32),
+        maintainers: d.owners.as_ref().map(|o| o.len() as u32),
         // The search doc carries advisories for the queried package inline.
-        vulnerability_count: d
-            .get("vulnerabilities")
-            .and_then(Value::as_array)
-            .map(|v| v.len() as u32),
+        vulnerability_count: d.vulnerabilities.as_ref().map(|v| v.len() as u32),
         ..Default::default()
     };
 
@@ -118,40 +100,42 @@ pub(crate) fn nuget(
     // that drives cadence), listing state, and license/deprecation fallbacks.
     nuget_registration(&id, &version, &mut reg, net, cache);
 
-    Some(reg)
+    Ok(reg)
 }
 
-/// A NuGet `deprecation` object → a reason string, or `None` when absent/null.
-/// Shared by the search doc and the registration `catalogEntry`, which carry
-/// the same `{message, reasons, alternatePackage}` shape.
-fn nuget_deprecation(v: &Value) -> Option<String> {
-    if v.is_null() {
-        return None;
-    }
-    Some(
-        v.get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("deprecated")
-            .to_string(),
-    )
+/// A NuGet `deprecation` object → a reason string: its `message`, else
+/// `deprecated`. Shared by the search doc and the registration `catalogEntry`,
+/// which carry the same `{message, reasons, alternatePackage}` shape.
+fn nuget_deprecation(deprecation: &Deprecation) -> String {
+    deprecation
+        .message
+        .clone()
+        .unwrap_or_else(|| "deprecated".to_string())
 }
 
-/// Fetch a NuGet registration document and JSON-parse it, gunzipping first when
+/// Fetch a NuGet registration document and decode it, gunzipping first when
 /// the bytes are gzip. The `-gz-` registration resources are stored compressed
 /// and served with `Content-Encoding: gzip`, which this client (built without
 /// reqwest's `gzip` feature) hands back raw; the magic-byte check also tolerates
 /// a proxy that already decoded them. Decompression is capped against a bomb.
-fn nuget_gz_json(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Value> {
-    let bytes = cached_metadata(url, net, cache)?;
+fn nuget_gz_json<T: DeserializeOwned>(
+    url: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<T, RegistryError> {
+    let bytes = cached_metadata_status(url, &[], net, cache)?;
     if bytes.starts_with(&[0x1f, 0x8b]) {
         let mut out = Vec::new();
         flate2::read::MultiGzDecoder::new(Cursor::new(&bytes))
             .take(NUGET_DECOMP_CAP)
             .read_to_end(&mut out)
-            .ok()?;
-        serde_json::from_slice(&out).ok()
+            .map_err(|e| RegistryError::Malformed {
+                url: url.to_string(),
+                reason: e.to_string(),
+            })?;
+        decode(url, &out)
     } else {
-        serde_json::from_slice(&bytes).ok()
+        decode(url, &bytes)
     }
 }
 
@@ -170,56 +154,47 @@ fn nuget_registration(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) {
-    let Some(index) = nuget_gz_json(&format!("{NUGET_REGISTRATION}/{id}/index.json"), net, cache)
-    else {
+    let Ok(index) = nuget_gz_json::<RegistrationIndex>(
+        &format!("{NUGET_REGISTRATION}/{id}/index.json"),
+        net,
+        cache,
+    ) else {
         return;
     };
     let mut times: Vec<u64> = Vec::new();
-    for page in index
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for page in &index.items {
         // Inline items, or a page document to fetch and scan in their place.
         let fetched;
-        let items = if let Some(items) = page.get("items").and_then(Value::as_array) {
+        let items = if let Some(items) = &page.items {
             items
-        } else if let Some(url) = page.get("@id").and_then(Value::as_str) {
-            fetched = nuget_gz_json(url, net, cache);
-            match fetched
-                .as_ref()
-                .and_then(|d| d.get("items"))
-                .and_then(Value::as_array)
-            {
+        } else if let Some(url) = &page.id {
+            fetched = nuget_gz_json::<RegistrationPage>(url, net, cache).ok();
+            match fetched.as_ref().and_then(|d| d.items.as_ref()) {
                 Some(items) => items,
                 None => continue,
             }
         } else {
             continue;
         };
-        for ce in items.iter().filter_map(|leaf| leaf.get("catalogEntry")) {
-            let published = ce
-                .get("published")
-                .and_then(Value::as_str)
-                .and_then(parse_rfc3339_secs);
+        for ce in items.iter().filter_map(|leaf| leaf.catalog_entry.as_ref()) {
+            let published = ce.published.as_deref().and_then(parse_rfc3339_secs);
             if let Some(t) = published {
                 times.push(t);
             }
-            if ce.get("version").and_then(Value::as_str) == Some(want) {
+            if ce.version.as_deref() == Some(want) {
                 reg.published_at = published;
                 // `listed:false` hides a version without removing it — NuGet's
                 // analogue of a yank, and a real custody signal.
-                reg.version_removed = ce.get("listed").and_then(Value::as_bool).map(|l| !l);
+                reg.version_removed = ce.listed.map(|l| !l);
                 if reg.license.is_none() {
                     reg.license = ce
-                        .get("licenseExpression")
-                        .and_then(Value::as_str)
+                        .license_expression
+                        .as_deref()
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
                 }
                 if reg.deprecated.is_none() {
-                    reg.deprecated = ce.get("deprecation").and_then(nuget_deprecation);
+                    reg.deprecated = ce.deprecation.as_ref().map(nuget_deprecation);
                 }
             }
         }
@@ -265,6 +240,99 @@ fn nuget_nuspec(text: &str, reg: &mut Registry) {
             _ => {}
         }
     }
+}
+
+/// The search API's answer to an exact `packageid:` query.
+#[derive(Deserialize)]
+struct SearchResults {
+    data: Vec<SearchHit>,
+}
+
+/// One package in the search results: the latest release's package-level facts.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SearchHit {
+    id: Option<String>,
+    version: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    versions: Vec<SearchVersion>,
+    authors: Option<Authors>,
+    description: Option<String>,
+    project_url: Option<String>,
+    total_downloads: Option<u64>,
+    deprecation: Option<Deprecation>,
+    /// A list of accounts, or a bare string the record does not count.
+    #[serde(deserialize_with = "lenient")]
+    owners: Option<Vec<IgnoredAny>>,
+    vulnerabilities: Option<Vec<IgnoredAny>>,
+}
+
+/// One version a search hit lists.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct SearchVersion {
+    version: Option<String>,
+}
+
+/// A search hit's `authors`: a list of names, or one string.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Authors {
+    List(Vec<String>),
+    One(String),
+}
+
+impl Authors {
+    /// The first-listed author.
+    fn first(&self) -> Option<String> {
+        match self {
+            Self::List(names) => names.first().cloned(),
+            Self::One(name) => Some(name.clone()),
+        }
+    }
+}
+
+/// A `deprecation` object, from a search hit or a registration `catalogEntry`.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Deprecation {
+    message: Option<String>,
+}
+
+/// The registration index: its pages, inline or by reference.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RegistrationIndex {
+    #[serde(deserialize_with = "null_default")]
+    items: Vec<RegistrationPage>,
+}
+
+/// A registration page, in the index or fetched by `@id`: its leaves, when inline.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RegistrationPage {
+    items: Option<Vec<RegistrationLeaf>>,
+    #[serde(rename = "@id")]
+    id: Option<String>,
+}
+
+/// One version's leaf on a registration page.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RegistrationLeaf {
+    #[serde(rename = "catalogEntry")]
+    catalog_entry: Option<CatalogEntry>,
+}
+
+/// A version's catalog entry: its publish time, listing state, and license.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CatalogEntry {
+    version: Option<String>,
+    published: Option<String>,
+    listed: Option<bool>,
+    license_expression: Option<String>,
+    deprecation: Option<Deprecation>,
 }
 
 #[cfg(test)]

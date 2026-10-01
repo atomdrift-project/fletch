@@ -3,7 +3,8 @@
 use filefacts::Registry;
 
 use crate::ecosystem::days_from_civil;
-use crate::fetch::{BlobCache, Fetch, cached_metadata};
+use crate::fetch::{BlobCache, Fetch, cached_metadata_status};
+use crate::registry::RegistryError;
 
 /// Chrome Web Store: the listing has no JSON API, so scrape the public detail
 /// page. The signals that matter for an extension — what it claims to do (the
@@ -11,16 +12,23 @@ use crate::fetch::{BlobCache, Fetch, cached_metadata};
 /// rated, and when it last changed — are all rendered into the HTML. Best-effort
 /// by design: a field that moves in the markup degrades to "unknown", never a
 /// wrong value.
-pub(crate) fn chrome(id: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn chrome(
+    id: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     let url = format!("https://chromewebstore.google.com/detail/{id}");
-    let bytes = cached_metadata(&url, net, cache)?;
-    let html = std::str::from_utf8(&bytes).ok()?;
+    let bytes = cached_metadata_status(&url, &[], net, cache)?;
+    let html = std::str::from_utf8(&bytes).map_err(|e| RegistryError::Malformed {
+        url: url.clone(),
+        reason: e.to_string(),
+    })?;
 
     // og:title carries the listing name with a `- Chrome Web Store` suffix.
     let title = meta_content(html, "og:title")
         .map(|t| t.trim_end_matches(" - Chrome Web Store").trim().to_string());
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "chrome".into(),
         name: id.to_string(),
         version: String::new(),

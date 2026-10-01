@@ -1,48 +1,76 @@
 //! Homebrew: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
+use std::collections::HashMap;
 
-use crate::ecosystem::{deprecation_flag, json_meta};
+use crate::ecosystem::{fetch_json, flag};
 use crate::fetch::{BlobCache, Fetch};
+use crate::registry::RegistryError;
 
-pub(crate) fn homebrew(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(
+pub(crate) fn homebrew(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let doc: Formula = fetch_json(
         &format!("https://formulae.brew.sh/api/formula/{name}.json"),
         net,
         cache,
     )?;
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "homebrew".into(),
-        name: doc
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(name)
-            .to_string(),
-        version: doc
-            .pointer("/versions/stable")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        description: doc.get("desc").and_then(Value::as_str).map(str::to_string),
-        homepage: doc
-            .get("homepage")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        license: doc
-            .get("license")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        name: doc.name.unwrap_or_else(|| name.to_string()),
+        version: doc.versions.and_then(|v| v.stable).unwrap_or_default(),
+        description: doc.desc,
+        homepage: doc.homepage,
+        license: doc.license,
         // The 30-day analytics map counts installs per invocation; sum them.
         downloads_recent: doc
-            .pointer("/analytics/install/30d")
-            .and_then(Value::as_object)
-            .map(|m| m.values().filter_map(Value::as_u64).sum::<u64>()),
-        deprecated: deprecation_flag(&doc, "deprecated", "deprecated")
-            .or_else(|| deprecation_flag(&doc, "disabled", "disabled")),
+            .analytics
+            .and_then(|a| a.install)
+            .and_then(|i| i.last_30_days)
+            .map(|m| m.values().sum::<u64>()),
+        deprecated: flag(doc.deprecated, "deprecated").or_else(|| flag(doc.disabled, "disabled")),
         ..Default::default()
     })
+}
+
+/// A Homebrew formula document.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Formula {
+    name: Option<String>,
+    versions: Option<FormulaVersions>,
+    desc: Option<String>,
+    homepage: Option<String>,
+    license: Option<String>,
+    analytics: Option<Analytics>,
+    deprecated: Option<bool>,
+    disabled: Option<bool>,
+}
+
+/// The formula's current versions.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct FormulaVersions {
+    stable: Option<String>,
+}
+
+/// The formula's install analytics.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Analytics {
+    install: Option<InstallCounts>,
+}
+
+/// Install counts per window, each keyed by the install invocation.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct InstallCounts {
+    #[serde(rename = "30d")]
+    last_30_days: Option<HashMap<String, u64>>,
 }
 
 #[cfg(test)]

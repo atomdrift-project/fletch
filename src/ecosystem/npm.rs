@@ -1,16 +1,18 @@
 //! Npm: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
-use std::collections::BTreeMap;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::ecosystem::{email_domain, json_meta, parse_rfc3339_secs};
+use crate::ecosystem::{email_domain, fetch_json, lenient, null_default, parse_rfc3339_secs};
 use crate::fetch::{
     ArtifactCandidate, BlobCache, Fetch, artifact_candidate, cached_metadata, file_name_from_url,
     file_name_matches, meta_ttl_pinned, meta_ttl_unpinned, percent_decode, repository_base,
     resolve_purl,
 };
 use crate::purl::Purl;
+use crate::registry::RegistryError;
 
 pub(crate) fn npm_artifacts(
     path: &str,
@@ -197,19 +199,24 @@ pub(crate) fn npm(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
+) -> Result<Registry, RegistryError> {
     let name = path.replace("%40", "@");
-    let doc = json_meta(&format!("https://registry.npmjs.org/{name}"), net, cache)?;
+    let doc: Packument = fetch_json(&format!("https://registry.npmjs.org/{name}"), net, cache)?;
 
-    let latest = doc.pointer("/dist-tags/latest").and_then(Value::as_str);
-    let version = version.or(latest).unwrap_or_default();
-    let v = doc.get("versions").and_then(|vs| vs.get(version));
-
-    let published_at = doc
-        .get("time")
-        .and_then(|t| t.get(version))
-        .and_then(Value::as_str)
-        .and_then(parse_rfc3339_secs);
+    let latest = doc.dist_tags.latest.as_deref();
+    let requested = version.map(percent_decode);
+    let version = requested.as_deref().or(latest).unwrap_or_default();
+    let release = doc.versions.get(version);
+    let published = |version: &str| match doc.time.get(version)? {
+        TimeEntry::At(time) => parse_rfc3339_secs(time),
+        TimeEntry::Other(_) => None,
+    };
+    let published_at = published(version);
+    // A field from the version's own manifest, else the package root's (npm
+    // packuments carry both; the version's copy is authoritative).
+    let text = |own: Option<&String>, root: &Option<String>| {
+        own.or(root.as_ref()).filter(|s| !s.is_empty()).cloned()
+    };
 
     let mut p = Registry {
         ecosystem: "npm".into(),
@@ -217,45 +224,40 @@ pub(crate) fn npm(
         version: version.to_string(),
         published_at,
         latest_version: latest.map(str::to_string),
-        // `author` is a bare string or an object with a `name`.
-        author: v
-            .and_then(|v| v.get("author"))
-            .or_else(|| doc.get("author"))
-            .and_then(|a| a.as_str().or_else(|| a.get("name")?.as_str()))
-            .or_else(|| doc.pointer("/maintainers/0/name").and_then(Value::as_str))
+        author: release
+            .and_then(|r| r.author.as_ref())
+            .or(doc.author.as_ref())
+            .and_then(Person::name)
+            .or_else(|| doc.maintainers.as_deref()?.first()?.name())
             .map(str::to_string),
         title: None,
-        description: field_str(v, &doc, "description"),
-        homepage: field_str(v, &doc, "homepage"),
-        repository: v
-            .and_then(|v| v.pointer("/repository/url"))
-            .or_else(|| doc.pointer("/repository/url"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        license: field_str(v, &doc, "license"),
-        deprecated: v.and_then(|v| v.get("deprecated")).and_then(deprecation),
+        description: text(
+            release.and_then(|r| r.description.as_ref()),
+            &doc.description,
+        ),
+        homepage: text(release.and_then(|r| r.homepage.as_ref()), &doc.homepage),
+        repository: release
+            .and_then(|r| r.repository.as_ref())
+            .or(doc.repository.as_ref())
+            .and_then(|r| r.url.clone()),
+        license: text(release.and_then(|r| r.license.as_ref()), &doc.license),
+        deprecated: release
+            .and_then(|r| r.deprecated.as_ref())
+            .and_then(Deprecated::reason),
         // npm always lists at least one maintainer for a live package, so a
         // missing/null/empty array is the anomaly itself — record it as zero
         // rather than "unknown" so a custody trait can fire on it.
-        maintainers: Some(
-            doc.get("maintainers")
-                .and_then(Value::as_array)
-                .map_or(0, |m| m.len() as u32),
-        ),
+        maintainers: Some(doc.maintainers.as_ref().map_or(0, |m| m.len() as u32)),
         // npm replaces a taken-down malicious package with a stub whose
         // description is exactly `security holding package`. That tombstone is
         // the registry's own verdict — surface it.
-        security_hold: Some(
-            doc.get("description").and_then(Value::as_str) == Some("security holding package"),
-        ),
+        security_hold: Some(doc.description.as_deref() == Some("security holding package")),
         // An unpublished version keeps its `time` entry (and npm records a
         // `time.unpublished` block) but loses its `versions` object. A live
         // package always lists its versions, so "timestamped but gone from
         // versions" is a removal — for a fresh package, almost always a malware
         // takedown.
-        version_removed: Some(
-            v.is_none() && doc.get("time").and_then(|t| t.get(version)).is_some(),
-        ),
+        version_removed: Some(release.is_none() && doc.time.contains_key(version)),
         ..Default::default()
     };
 
@@ -263,19 +265,16 @@ pub(crate) fn npm(
     // `created`/`modified` bookkeeping keys is `version → publish time`. The
     // counts derive from this; `with_age` later turns it into the 24h/48h burst
     // metrics relative to the scan clock.
-    if let Some(time) = doc.get("time").and_then(Value::as_object) {
-        let mut times: Vec<u64> = time
-            .iter()
-            .filter(|(k, _)| k.as_str() != "created" && k.as_str() != "modified")
-            .filter_map(|(_, v)| v.as_str().and_then(parse_rfc3339_secs))
+    if !doc.time.is_empty() {
+        let mut times: Vec<u64> = doc
+            .time
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "created" | "modified"))
+            .filter_map(|k| published(k))
             .collect();
         times.sort_unstable();
         p.release_count = Some(times.len() as u32);
-        p.first_published_at = time
-            .get("created")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_secs)
-            .or_else(|| times.first().copied());
+        p.first_published_at = published("created").or_else(|| times.first().copied());
         if let Some(this) = p.published_at {
             p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
         }
@@ -285,72 +284,174 @@ pub(crate) fn npm(
     // Custody: the account that pushed *this* version (`_npmUser`) and whether
     // it is among the listed maintainers — a publisher outside that set is the
     // account-takeover tell.
-    let publisher = v
-        .and_then(|v| v.pointer("/_npmUser/name"))
-        .and_then(Value::as_str);
+    let publisher = release
+        .and_then(|r| r.npm_user.as_ref())
+        .and_then(|u| u.name.as_deref());
     p.publisher = publisher.map(str::to_string);
-    p.publisher_email_domain = v
-        .and_then(|v| v.pointer("/_npmUser/email"))
-        .and_then(Value::as_str)
+    p.publisher_email_domain = release
+        .and_then(|r| r.npm_user.as_ref())
+        .and_then(|u| u.email.as_deref())
         .and_then(email_domain);
-    if let Some(name) = publisher {
-        p.publisher_in_maintainers = doc.get("maintainers").and_then(Value::as_array).map(|ms| {
-            ms.iter()
-                .any(|m| m.get("name").and_then(Value::as_str) == Some(name))
-        });
+    if let Some(publisher) = publisher {
+        p.publisher_in_maintainers = doc
+            .maintainers
+            .as_ref()
+            .map(|ms| ms.iter().any(|m| m.name() == Some(publisher)));
     }
 
     // Artifact shape and the registry's own install-hook flag.
-    p.unpacked_size = v
-        .and_then(|v| v.pointer("/dist/unpackedSize"))
-        .and_then(Value::as_u64);
-    p.file_count = v
-        .and_then(|v| v.pointer("/dist/fileCount"))
-        .and_then(Value::as_u64)
-        .map(|n| n as u32);
-    p.has_install_script = v.map(|v| {
-        v.get("hasInstallScript")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || v.get("scripts")
-                .and_then(Value::as_object)
-                .is_some_and(|s| {
-                    s.contains_key("install")
-                        || s.contains_key("preinstall")
-                        || s.contains_key("postinstall")
-                })
+    let dist = release.and_then(|r| r.dist.as_ref());
+    p.unpacked_size = dist.and_then(|d| d.unpacked_size);
+    p.file_count = dist
+        .and_then(|d| d.file_count)
+        .and_then(|n| u32::try_from(n).ok());
+    p.has_install_script = release.map(|r| {
+        r.has_install_script.unwrap_or(false)
+            || r.scripts.as_ref().is_some_and(|scripts| {
+                ["install", "preinstall", "postinstall"]
+                    .iter()
+                    .any(|hook| scripts.contains_key(*hook))
+            })
     });
 
     // Best-effort popularity: last-month downloads from the stats endpoint.
-    if let Some(d) = json_meta(
+    p.downloads_recent = fetch_json::<Downloads>(
         &format!("https://api.npmjs.org/downloads/point/last-month/{name}"),
         net,
         cache,
     )
-    .and_then(|j| j.get("downloads").and_then(Value::as_u64))
-    {
-        p.downloads_recent = Some(d);
-    }
-    Some(p)
+    .ok()
+    .and_then(|d| d.downloads);
+    Ok(p)
 }
 
-/// A field preferred from the version object, falling back to the package root
-/// (npm packuments carry both; the version's copy is authoritative).
-fn field_str(ver: Option<&Value>, root: &Value, key: &str) -> Option<String> {
-    ver.and_then(|v| v.get(key))
-        .or_else(|| root.get(key))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+/// The parts of an npm packument the registry record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Packument {
+    #[serde(rename = "dist-tags", deserialize_with = "null_default")]
+    dist_tags: DistTags,
+    #[serde(deserialize_with = "null_default")]
+    versions: HashMap<String, Release>,
+    #[serde(deserialize_with = "null_default")]
+    time: HashMap<String, TimeEntry>,
+    #[serde(deserialize_with = "lenient")]
+    author: Option<Person>,
+    #[serde(deserialize_with = "lenient")]
+    maintainers: Option<Vec<Person>>,
+    #[serde(deserialize_with = "lenient")]
+    description: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    homepage: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    repository: Option<Repository>,
+    #[serde(deserialize_with = "lenient")]
+    license: Option<String>,
 }
 
-/// npm `deprecated` is `false`/absent, or a truthy string reason.
-fn deprecation(v: &Value) -> Option<String> {
-    match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Bool(true) => Some("deprecated".to_string()),
-        _ => None,
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct DistTags {
+    #[serde(deserialize_with = "lenient")]
+    latest: Option<String>,
+}
+
+/// One version's manifest, as the packument lists it.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Release {
+    #[serde(deserialize_with = "lenient")]
+    author: Option<Person>,
+    #[serde(deserialize_with = "lenient")]
+    description: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    homepage: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    repository: Option<Repository>,
+    #[serde(deserialize_with = "lenient")]
+    license: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    deprecated: Option<Deprecated>,
+    #[serde(rename = "_npmUser", deserialize_with = "lenient")]
+    npm_user: Option<NpmUser>,
+    #[serde(deserialize_with = "lenient")]
+    dist: Option<Dist>,
+    #[serde(rename = "hasInstallScript", deserialize_with = "lenient")]
+    has_install_script: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    scripts: Option<HashMap<String, IgnoredAny>>,
+}
+
+/// A `time` entry: a version's publish time, or npm's `unpublished` record.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TimeEntry {
+    At(String),
+    Other(IgnoredAny),
+}
+
+/// An `author` or maintainer: a bare string, or an object with a `name`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Person {
+    Name(String),
+    Object { name: Option<String> },
+}
+
+impl Person {
+    fn name(&self) -> Option<&str> {
+        match self {
+            Self::Name(name) => Some(name),
+            Self::Object { name } => name.as_deref(),
+        }
     }
+}
+
+/// `repository` read in its object form (`{type, url}`).
+#[derive(Deserialize)]
+struct Repository {
+    url: Option<String>,
+}
+
+/// `deprecated`: absent or `false`, a reason, or a bare `true`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Deprecated {
+    Reason(String),
+    Flag(bool),
+}
+
+impl Deprecated {
+    fn reason(&self) -> Option<String> {
+        match self {
+            Self::Reason(reason) => Some(reason.clone()),
+            Self::Flag(true) => Some("deprecated".to_string()),
+            Self::Flag(false) => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NpmUser {
+    #[serde(default, deserialize_with = "lenient")]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Dist {
+    #[serde(rename = "unpackedSize", default, deserialize_with = "lenient")]
+    unpacked_size: Option<u64>,
+    #[serde(rename = "fileCount", default, deserialize_with = "lenient")]
+    file_count: Option<u64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Downloads {
+    #[serde(deserialize_with = "lenient")]
+    downloads: Option<u64>,
 }
 
 #[cfg(test)]

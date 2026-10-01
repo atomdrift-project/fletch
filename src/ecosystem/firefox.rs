@@ -1,10 +1,11 @@
 //! Firefox Add-ons (AMO): registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{deprecation_flag, json_meta, localized, parse_ts};
+use crate::ecosystem::{Localized, fetch_json, flag, null_default, parse_ts};
 use crate::fetch::{BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, meta_ttl_unpinned};
+use crate::registry::RegistryError;
 
 /// Resolve a Firefox Add-ons slug to the XPI AMO serves. A requested version
 /// goes through the immutable per-version endpoint, so an old pin can never be
@@ -50,82 +51,72 @@ pub(crate) fn resolve_firefox(
 /// Firefox Add-ons (addons.mozilla.org v5): the same marketplace shape as the
 /// Chrome and VS Code stores — localized name/summary, rating, weekly installs,
 /// and the current version with its review date.
-pub(crate) fn firefox(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(
+pub(crate) fn firefox(
+    slug: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let doc: Addon = fetch_json(
         &format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/"),
         net,
         cache,
     )?;
+    let current = doc.current_version.unwrap_or_default();
+    let ratings = doc.ratings.unwrap_or_default();
 
     let mut p = Registry {
         ecosystem: "firefox".into(),
-        name: doc
-            .get("slug")
-            .and_then(Value::as_str)
-            .unwrap_or(slug)
-            .to_string(),
-        version: doc
-            .pointer("/current_version/version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        name: doc.slug.unwrap_or_else(|| slug.to_string()),
+        version: current.version.unwrap_or_default(),
         // `reviewed` (the current version's approval) is the supply-chain recency.
-        published_at: doc
-            .pointer("/current_version/reviewed")
-            .and_then(Value::as_str)
-            .or_else(|| doc.get("last_updated").and_then(Value::as_str))
+        published_at: current
+            .reviewed
+            .or(doc.last_updated)
+            .as_deref()
             .and_then(parse_ts),
         // `created` is the add-on's first listing — the package-age signal.
-        first_published_at: doc
-            .get("created")
-            .and_then(Value::as_str)
-            .and_then(parse_ts),
+        first_published_at: doc.created.as_deref().and_then(parse_ts),
         author: doc
-            .pointer("/authors/0/name")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .authors
+            .as_ref()
+            .and_then(|authors| authors.first()?.name.clone()),
         // The author set is the custody signal AMO exposes.
-        maintainers: doc
-            .get("authors")
-            .and_then(Value::as_array)
-            .map(|a| a.len() as u32),
-        title: doc.get("name").and_then(localized),
-        description: doc.get("summary").and_then(localized),
-        homepage: doc.pointer("/homepage/url").and_then(localized),
-        license: doc
-            .pointer("/current_version/license/name")
-            .and_then(localized),
+        maintainers: doc.authors.as_ref().map(|a| a.len() as u32),
+        title: doc.name.as_ref().and_then(Localized::text),
+        description: doc.summary.as_ref().and_then(Localized::text),
+        homepage: doc
+            .homepage
+            .and_then(|h| h.url)
+            .as_ref()
+            .and_then(Localized::text),
+        license: current
+            .license
+            .and_then(|l| l.name)
+            .as_ref()
+            .and_then(Localized::text),
         // `average_daily_users` is the install base (a lifetime-reach analogue);
         // `weekly_downloads` stays the recent-window figure.
-        downloads_total: doc.get("average_daily_users").and_then(Value::as_u64),
-        downloads_recent: doc.get("weekly_downloads").and_then(Value::as_u64),
-        rating: doc
-            .pointer("/ratings/average")
-            .and_then(Value::as_f64)
-            .map(|f| f as f32),
-        rating_count: doc.pointer("/ratings/count").and_then(Value::as_u64),
-        deprecated: deprecation_flag(&doc, "is_disabled", "disabled"),
+        downloads_total: doc.average_daily_users,
+        downloads_recent: doc.weekly_downloads,
+        rating: ratings.average.map(|f| f as f32),
+        rating_count: ratings.count,
+        deprecated: flag(doc.is_disabled, "disabled"),
         ..Default::default()
     };
 
     // One extra GET to the versions endpoint yields the release timeline (each
     // version's `reviewed` approval time) for the cadence metrics. Best-effort:
     // a failure leaves the package-age signal (from `created`) intact.
-    if let Some(versions) = json_meta(
+    if let Ok(versions) = fetch_json::<AddonVersions>(
         &format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/versions/?page_size=50"),
         net,
         cache,
-    )
-    .and_then(|d| d.get("results").and_then(Value::as_array).cloned())
-    {
+    ) {
         let mut times: Vec<u64> = versions
+            .results
             .iter()
-            .filter_map(|v| {
-                v.get("reviewed")
-                    .or_else(|| v.get("created"))
-                    .and_then(Value::as_str)
-                    .and_then(parse_ts)
-            })
+            .filter_map(|v| v.reviewed.as_deref().or(v.created.as_deref()))
+            .filter_map(parse_ts)
             .collect();
         times.sort_unstable();
         if !times.is_empty() {
@@ -137,7 +128,79 @@ pub(crate) fn firefox(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<
         }
     }
 
-    Some(p)
+    Ok(p)
+}
+
+/// An AMO add-on document: the listing plus its current version.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Addon {
+    slug: Option<String>,
+    current_version: Option<AddonVersion>,
+    last_updated: Option<String>,
+    created: Option<String>,
+    authors: Option<Vec<AddonAuthor>>,
+    name: Option<Localized>,
+    summary: Option<Localized>,
+    homepage: Option<AddonHomepage>,
+    average_daily_users: Option<u64>,
+    weekly_downloads: Option<u64>,
+    ratings: Option<AddonRatings>,
+    is_disabled: Option<bool>,
+}
+
+/// The add-on's current version.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AddonVersion {
+    version: Option<String>,
+    reviewed: Option<String>,
+    license: Option<AddonLicense>,
+}
+
+/// The license a version ships under.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AddonLicense {
+    name: Option<Localized>,
+}
+
+/// One author of an add-on.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AddonAuthor {
+    name: Option<String>,
+}
+
+/// An add-on's homepage link.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AddonHomepage {
+    url: Option<Localized>,
+}
+
+/// An add-on's rating summary.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AddonRatings {
+    average: Option<f64>,
+    count: Option<u64>,
+}
+
+/// One page of an add-on's versions.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AddonVersions {
+    #[serde(deserialize_with = "null_default")]
+    results: Vec<ListedVersion>,
+}
+
+/// One version on the versions page.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ListedVersion {
+    reviewed: Option<String>,
+    created: Option<String>,
 }
 
 #[cfg(test)]

@@ -1,10 +1,12 @@
 //! Arch Linux and the AUR: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 
-use crate::ecosystem::{json_meta, parse_ts};
+use crate::ecosystem::{fetch_json, null_default, parse_ts};
 use crate::fetch::{BlobCache, Fetch, cached_metadata};
+use crate::registry::RegistryError;
 
 /// The AUR snapshot URL for `name`: ask the (cached) RPC for the package's
 /// `URLPath`, which names the pkgbase snapshot. Falls back to the name-derived
@@ -28,115 +30,135 @@ pub(crate) fn resolve_aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Str
 /// AUR: the RPC `info` endpoint. The AUR has no downloads; its custody signal
 /// is the maintainer plus vote count and popularity score, and `LastModified`
 /// (when the PKGBUILD last changed) is the supply-chain-relevant "age". Official
-/// repo packages aren't in the AUR, so they return an empty result → `None`.
-pub(crate) fn aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+/// repo packages aren't in the AUR, so they return an empty result → `NotFound`.
+pub(crate) fn aur(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     let url = format!("https://aur.archlinux.org/rpc/v5/info?arg%5B%5D={name}");
-    let doc = json_meta(&url, net, cache)?;
-    let r = doc.pointer("/results/0")?;
+    let doc: AurInfo = fetch_json(&url, net, cache)?;
+    let r = doc
+        .results
+        .into_iter()
+        .next()
+        .ok_or(RegistryError::NotFound)?;
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "aur".into(),
-        name: r
-            .get("Name")
-            .and_then(Value::as_str)
-            .unwrap_or(name)
-            .to_string(),
-        version: r
-            .get("Version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        name: r.name.clone().unwrap_or_else(|| name.to_string()),
+        version: r.version.unwrap_or_default(),
         // LastModified is a Unix-seconds integer already.
-        published_at: r.get("LastModified").and_then(Value::as_u64),
+        published_at: r.last_modified,
         // FirstSubmitted is the package's birth; the gap to LastModified is the
         // dormancy a revived abandoned package would show.
-        first_published_at: r.get("FirstSubmitted").and_then(Value::as_u64),
+        first_published_at: r.first_submitted,
         // The primary maintainer plus any co-maintainers — the custody set.
-        maintainers: Some(
-            u32::from(r.get("Maintainer").and_then(Value::as_str).is_some())
-                + r.get("CoMaintainers")
-                    .and_then(Value::as_array)
-                    .map_or(0, |c| c.len() as u32),
-        ),
-        author: r
-            .get("Maintainer")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        publisher: r
-            .get("Maintainer")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        title: r.get("Name").and_then(Value::as_str).map(str::to_string),
-        description: r
-            .get("Description")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        homepage: r.get("URL").and_then(Value::as_str).map(str::to_string),
-        rating: r
-            .get("Popularity")
-            .and_then(Value::as_f64)
-            .map(|f| f as f32),
-        rating_count: r.get("NumVotes").and_then(Value::as_u64),
+        maintainers: Some(u32::from(r.maintainer.is_some()) + r.co_maintainers.len() as u32),
+        author: r.maintainer.clone(),
+        publisher: r.maintainer,
+        title: r.name,
+        description: r.description,
+        homepage: r.url,
+        rating: r.popularity.map(|f| f as f32),
+        rating_count: r.num_votes,
         deprecated: r
-            .get("OutOfDate")
-            .and_then(Value::as_u64)
+            .out_of_date
             .and_then(|t| (t > 0).then(|| "flagged out-of-date".to_string())),
         ..Default::default()
     })
 }
 
+/// An AUR RPC `info` response.
+#[derive(Deserialize)]
+struct AurInfo {
+    results: Vec<AurPackage>,
+}
+
+/// One package in an AUR RPC `info` response.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+struct AurPackage {
+    name: Option<String>,
+    version: Option<String>,
+    last_modified: Option<u64>,
+    first_submitted: Option<u64>,
+    maintainer: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    co_maintainers: Vec<IgnoredAny>,
+    description: Option<String>,
+    #[serde(rename = "URL")]
+    url: Option<String>,
+    popularity: Option<f64>,
+    num_votes: Option<u64>,
+    out_of_date: Option<u64>,
+}
+
 /// Arch Linux official repositories: the packages site exposes a JSON search.
 /// Recency comes from `last_update`; an out-of-date flag is the deprecation
-/// analogue. AUR-only packages aren't here, so they return `None`.
-pub(crate) fn arch(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(
+/// analogue. AUR-only packages aren't here, so they are `NotFound`.
+pub(crate) fn arch(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let doc: ArchSearch = fetch_json(
         &format!("https://archlinux.org/packages/search/json/?name={name}"),
         net,
         cache,
     )?;
-    let r = doc.pointer("/results/0")?;
-    let version = match (
-        r.get("pkgver").and_then(Value::as_str),
-        r.get("pkgrel").and_then(Value::as_str),
-    ) {
+    let r = doc
+        .results
+        .into_iter()
+        .next()
+        .ok_or(RegistryError::NotFound)?;
+    let version = match (r.pkgver.as_deref(), r.pkgrel.as_deref()) {
         (Some(v), Some(rel)) => format!("{v}-{rel}"),
         (Some(v), None) => v.to_string(),
         _ => String::new(),
     };
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "arch".into(),
-        name: r
-            .get("pkgname")
-            .and_then(Value::as_str)
-            .unwrap_or(name)
-            .to_string(),
+        name: r.pkgname.unwrap_or_else(|| name.to_string()),
         version,
         published_at: r
-            .get("last_update")
-            .and_then(Value::as_str)
-            .or_else(|| r.get("build_date").and_then(Value::as_str))
+            .last_update
+            .as_deref()
+            .or(r.build_date.as_deref())
             .and_then(parse_ts),
-        author: r
-            .get("packager")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: r.get("pkgdesc").and_then(Value::as_str).map(str::to_string),
-        homepage: r.get("url").and_then(Value::as_str).map(str::to_string),
-        license: r
-            .pointer("/licenses/0")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        maintainers: r
-            .get("maintainers")
-            .and_then(Value::as_array)
-            .map(|m| m.len() as u32),
-        deprecated: r
-            .get("flag_date")
-            .and_then(Value::as_str)
-            .map(|_| "flagged out-of-date".to_string()),
+        author: r.packager,
+        description: r.pkgdesc,
+        homepage: r.url,
+        license: r.licenses.into_iter().next(),
+        maintainers: r.maintainers.map(|m| m.len() as u32),
+        deprecated: r.flag_date.map(|_| "flagged out-of-date".to_string()),
         ..Default::default()
     })
+}
+
+/// An archlinux.org package search response.
+#[derive(Deserialize)]
+struct ArchSearch {
+    results: Vec<ArchPackage>,
+}
+
+/// One package in an archlinux.org search response.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ArchPackage {
+    pkgname: Option<String>,
+    pkgver: Option<String>,
+    pkgrel: Option<String>,
+    last_update: Option<String>,
+    build_date: Option<String>,
+    packager: Option<String>,
+    pkgdesc: Option<String>,
+    url: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    licenses: Vec<String>,
+    maintainers: Option<Vec<IgnoredAny>>,
+    flag_date: Option<String>,
 }
 
 #[cfg(test)]

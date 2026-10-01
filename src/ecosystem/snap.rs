@@ -1,75 +1,98 @@
 //! The Snap Store: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::parse_ts;
-use crate::fetch::{BlobCache, Fetch, cached_metadata_with};
+use crate::ecosystem::{decode, null_default, parse_ts};
+use crate::fetch::{BlobCache, Fetch, cached_metadata_status};
+use crate::registry::RegistryError;
 
 /// Snap Store: the v2 info endpoint (which requires the `Snap-Device-Series`
 /// header) returns the publisher and per-channel releases. The latest stable
 /// channel's release time and version are the supply-chain-relevant facts.
-pub(crate) fn snap(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn snap(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     let url = format!(
         "https://api.snapcraft.io/v2/snaps/info/{name}\
          ?fields=title,summary,description,license,publisher,store-url,website,version"
     );
-    let doc: Value = serde_json::from_slice(&cached_metadata_with(
-        &url,
-        &[("Snap-Device-Series", "16")],
-        net,
-        cache,
-    )?)
-    .ok()?;
-    let s = doc.get("snap")?;
+    let bytes = cached_metadata_status(&url, &[("Snap-Device-Series", "16")], net, cache)?;
+    let doc: SnapInfo = decode(&url, &bytes)?;
+    let s = doc.snap;
     // Prefer the latest/stable channel; fall back to the first mapping.
     let chan = doc
-        .get("channel-map")
-        .and_then(Value::as_array)
-        .and_then(|cm| {
-            cm.iter()
-                .find(|c| {
-                    c.pointer("/channel/track").and_then(Value::as_str) == Some("latest")
-                        && c.pointer("/channel/risk").and_then(Value::as_str) == Some("stable")
-                })
-                .or_else(|| cm.first())
-        });
+        .channel_map
+        .iter()
+        .find(|c| {
+            c.channel.track.as_deref() == Some("latest")
+                && c.channel.risk.as_deref() == Some("stable")
+        })
+        .or_else(|| doc.channel_map.first());
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "snap".into(),
         name: name.to_string(),
-        version: chan
-            .and_then(|c| c.get("version"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        version: chan.and_then(|c| c.version.clone()).unwrap_or_default(),
         published_at: chan
-            .and_then(|c| c.pointer("/channel/released-at"))
-            .and_then(Value::as_str)
+            .and_then(|c| c.channel.released_at.as_deref())
             .and_then(parse_ts),
-        author: s
-            .pointer("/publisher/display-name")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        title: s.get("title").and_then(Value::as_str).map(str::to_string),
-        description: s
-            .get("summary")
-            .and_then(Value::as_str)
-            .or_else(|| s.get("description").and_then(Value::as_str))
-            .map(str::to_string),
-        homepage: s
-            .get("website")
-            .and_then(Value::as_str)
-            .filter(|w| !w.is_empty())
-            .or_else(|| s.get("store-url").and_then(Value::as_str))
-            .map(str::to_string),
-        license: s
-            .get("license")
-            .and_then(Value::as_str)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string),
+        author: s.publisher.and_then(|p| p.display_name),
+        title: s.title,
+        description: s.summary.or(s.description),
+        homepage: s.website.filter(|w| !w.is_empty()).or(s.store_url),
+        license: s.license.filter(|l| !l.is_empty()),
         ..Default::default()
     })
+}
+
+/// A Snap Store v2 info document: the snap and its channel map.
+#[derive(Deserialize)]
+struct SnapInfo {
+    snap: SnapDetails,
+    #[serde(rename = "channel-map", default)]
+    #[serde(deserialize_with = "null_default")]
+    channel_map: Vec<ChannelMapEntry>,
+}
+
+/// The snap's store listing.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct SnapDetails {
+    title: Option<String>,
+    summary: Option<String>,
+    description: Option<String>,
+    license: Option<String>,
+    publisher: Option<SnapPublisher>,
+    store_url: Option<String>,
+    website: Option<String>,
+}
+
+/// The account a snap is published under.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct SnapPublisher {
+    display_name: Option<String>,
+}
+
+/// One release in the channel map: a channel and the version it holds.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ChannelMapEntry {
+    #[serde(deserialize_with = "null_default")]
+    channel: SnapChannel,
+    version: Option<String>,
+}
+
+/// A channel's track, risk level, and release time.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct SnapChannel {
+    track: Option<String>,
+    risk: Option<String>,
+    released_at: Option<String>,
 }
 
 #[cfg(test)]

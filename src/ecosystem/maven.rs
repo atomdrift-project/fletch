@@ -1,10 +1,11 @@
 //! Maven Central: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::json_meta;
+use crate::ecosystem::fetch_json;
 use crate::fetch::{BlobCache, Fetch};
+use crate::registry::RegistryError;
 
 /// Maven Central: the solrsearch `gav` core returns one document per release
 /// with its publish `timestamp` (ms). `path` is `<group>/<artifact>`; results
@@ -14,40 +15,54 @@ pub(crate) fn maven(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let (group, artifact) = path.split_once('/')?;
+) -> Result<Registry, RegistryError> {
+    let Some((group, artifact)) = path.split_once('/') else {
+        return Err(RegistryError::NoRecord);
+    };
     let mut q = format!("g:%22{group}%22+AND+a:%22{artifact}%22");
     if let Some(v) = version {
         q.push_str(&format!("+AND+v:%22{v}%22"));
     }
-    let doc = json_meta(
+    let doc: SolrSearch = fetch_json(
         &format!("https://search.maven.org/solrsearch/select?q={q}&core=gav&rows=20&wt=json"),
         net,
         cache,
     )?;
-    let d = doc.pointer("/response/docs/0")?;
+    // An empty result is Maven Central saying it has no such artifact or version.
+    let Some(d) = doc.response.docs.first() else {
+        return Err(RegistryError::NotFound);
+    };
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "maven".into(),
         name: format!("{group}:{artifact}"),
-        version: d
-            .get("v")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        published_at: d
-            .get("timestamp")
-            .and_then(Value::as_u64)
-            .map(|ms| ms / 1000),
+        version: d.v.clone().unwrap_or_default(),
+        published_at: d.timestamp.map(|ms| ms / 1000),
         // With a version filter the result set is that one version, so "latest"
         // is only meaningful for an unversioned query.
-        latest_version: if version.is_none() {
-            d.get("v").and_then(Value::as_str).map(str::to_string)
-        } else {
-            None
-        },
+        latest_version: if version.is_none() { d.v.clone() } else { None },
         ..Default::default()
     })
+}
+
+/// A Maven Central solrsearch answer.
+#[derive(Deserialize)]
+struct SolrSearch {
+    response: SolrResponse,
+}
+
+/// The matching documents, newest first.
+#[derive(Deserialize)]
+struct SolrResponse {
+    docs: Vec<SolrDoc>,
+}
+
+/// One release (`gav` core): its version and publish time in milliseconds.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct SolrDoc {
+    v: Option<String>,
+    timestamp: Option<u64>,
 }
 
 #[cfg(test)]

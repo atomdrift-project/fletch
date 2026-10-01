@@ -157,7 +157,7 @@ pub struct BlobCache {
     /// inert. Used to force always-fresh fetches and to keep tests hermetic.
     enabled: bool,
     /// Staleness tolerance for registry-*metadata* reads
-    /// ([`cached_metadata`], [`cached_metadata_with`], [`cached_post`]).
+    /// ([`cached_metadata`], [`cached_metadata_status`], [`cached_post`]).
     /// [`registry`](crate::registry::registry) overrides it per PURL via
     /// [`with_meta_ttl`](Self::with_meta_ttl); artifact fetches ignore it.
     pub(crate) meta_ttl: Duration,
@@ -249,7 +249,7 @@ impl BlobCache {
 
     /// A clone whose registry-*metadata* reads tolerate up to `ttl` of staleness
     /// — [`Duration::MAX`] caches indefinitely. Only [`cached_metadata`],
-    /// [`cached_metadata_with`], and [`cached_post`] consult it; artifact fetches
+    /// [`cached_metadata_status`], and [`cached_post`] consult it; artifact fetches
     /// keep their own pinned/unpinned TTLs.
     #[must_use]
     pub(crate) fn with_meta_ttl(&self, ttl: Duration) -> Self {
@@ -445,20 +445,7 @@ fn content_type_of(headers: &[(String, String)]) -> Option<&str> {
 /// counts) without re-fetching every scan. A network failure with no cached
 /// copy yields `None`; the caller treats that as "unknown".
 pub(crate) fn cached_metadata(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Vec<u8>> {
-    cached_metadata_with(url, &[], net, cache)
-}
-
-/// Like [`cached_metadata`] but attaches request `headers` to the GET, for a
-/// registry that mandates one (e.g. the Snap Store's `Snap-Device-Series`). The
-/// headers fold into the cache key so a different header set is a distinct
-/// entry; an empty set reuses [`cached_metadata`]'s key exactly.
-pub(crate) fn cached_metadata_with(
-    url: &str,
-    headers: &[(&str, &str)],
-    net: &dyn Fetch,
-    cache: &BlobCache,
-) -> Option<Vec<u8>> {
-    cached_metadata_status(url, headers, net, cache).ok()
+    cached_metadata_status(url, &[], net, cache).ok()
 }
 
 /// The cache key [`cached_metadata`] files a header-less read of `url` under.
@@ -482,7 +469,11 @@ pub(crate) fn store_metadata(url: &str, fetched: &Fetched, cache: &BlobCache) {
     cache.put(&metadata_cache_key(url), &fetched.bytes, &meta);
 }
 
-/// [`cached_metadata_with`], keeping the status of a refusal.
+/// [`cached_metadata`], keeping the status of a refusal, and attaching request
+/// `headers` for a registry that mandates one (the Snap Store's
+/// `Snap-Device-Series`). The headers fold into the cache key so a different
+/// header set is a distinct entry; an empty set reuses [`cached_metadata`]'s
+/// key exactly.
 ///
 /// A registry that answers a metadata request with a status instead of a
 /// document is sometimes *saying* something about the package rather than
@@ -522,9 +513,9 @@ pub(crate) fn cached_post(
     headers: &[(&str, &str)],
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, FetchError> {
     let key = sha256_hex(format!("post:{url}:{}", sha256_hex(body)).as_bytes());
-    cached_document(&key, url, cache, || net.post(url, body, headers)).ok()
+    cached_document(&key, url, cache, || net.post(url, body, headers))
 }
 
 /// The metadata cache flow every registry read shares: serve a fresh entry,

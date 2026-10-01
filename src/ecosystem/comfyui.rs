@@ -1,13 +1,14 @@
 //! ComfyUI custom nodes: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, nonempty, parse_ts};
+use crate::ecosystem::{fetch_json, parse_ts};
 use crate::fetch::{
     BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, is_web_scheme, meta_ttl_unpinned,
     percent_decode, safe_coordinate,
 };
+use crate::registry::RegistryError;
 
 /// Resolve a ComfyUI Registry node id to `(version, archive URL)`. The CDN path
 /// is keyed by publisher rather than node id, and the archive is a `.zip` or a
@@ -54,39 +55,77 @@ pub(crate) fn comfyui(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
+) -> Result<Registry, RegistryError> {
     if id.contains('/') {
-        return None;
+        return Err(RegistryError::NoRecord);
     }
-    let doc = json_meta(&format!("https://api.comfy.org/nodes/{id}"), net, cache)?;
-    let latest = doc.get("latest_version");
-    let latest_version = nonempty(latest.and_then(|l| l.get("version")));
+    let doc: Node = fetch_json(&format!("https://api.comfy.org/nodes/{id}"), net, cache)?;
+    let latest = doc.latest_version;
+    let latest_version = latest
+        .as_ref()
+        .and_then(|l| l.version.clone())
+        .filter(|s| !s.is_empty());
     let version = version
         .map(percent_decode)
         .or_else(|| latest_version.clone())
         .unwrap_or_default();
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "comfyui".into(),
-        name: nonempty(doc.get("id")).unwrap_or_else(|| percent_decode(id)),
+        name: doc
+            .id
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| percent_decode(id)),
         published_at: latest
             .filter(|_| latest_version.as_deref() == Some(version.as_str()))
-            .and_then(|l| l.get("createdAt")?.as_str())
+            .and_then(|l| l.created_at)
+            .as_deref()
             .and_then(parse_ts),
-        first_published_at: doc
-            .get("created_at")
-            .and_then(Value::as_str)
-            .and_then(parse_ts),
+        first_published_at: doc.created_at.as_deref().and_then(parse_ts),
         version,
         latest_version,
-        title: nonempty(doc.get("name")),
-        description: nonempty(doc.get("description")),
-        repository: nonempty(doc.get("repository")),
-        publisher: nonempty(doc.pointer("/publisher/id")),
-        downloads_total: doc.get("downloads").and_then(Value::as_u64),
+        title: doc.name.filter(|s| !s.is_empty()),
+        description: doc.description.filter(|s| !s.is_empty()),
+        repository: doc.repository.filter(|s| !s.is_empty()),
+        publisher: doc.publisher.and_then(|p| p.id).filter(|s| !s.is_empty()),
+        downloads_total: doc.downloads,
         // A banned or deleted node still answers; its status says which.
-        deprecated: nonempty(doc.get("status")).filter(|s| s != "NodeStatusActive"),
+        deprecated: doc
+            .status
+            .filter(|s| !s.is_empty())
+            .filter(|s| s != "NodeStatusActive"),
         ..Default::default()
     })
+}
+
+/// A ComfyUI Registry node document: the listing plus its latest release.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Node {
+    id: Option<String>,
+    name: Option<String>,
+    description: Option<String>,
+    repository: Option<String>,
+    created_at: Option<String>,
+    downloads: Option<u64>,
+    status: Option<String>,
+    publisher: Option<NodePublisher>,
+    latest_version: Option<NodeVersion>,
+}
+
+/// The publisher a node is listed under.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct NodePublisher {
+    id: Option<String>,
+}
+
+/// A node's latest release.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct NodeVersion {
+    version: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
 }
 
 #[cfg(test)]

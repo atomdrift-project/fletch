@@ -1,15 +1,16 @@
 //! Crates.io (Cargo): registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, parse_rfc3339_secs};
+use crate::ecosystem::{fetch_json, null_default, parse_rfc3339_secs, present};
 use crate::fetch::{
     ArtifactCandidate, BlobCache, Fetch, artifact_candidate, cached_metadata,
     deterministic_artifacts, file_name_matches, is_web_scheme, meta_ttl_pinned, percent_decode,
     purl_checksums,
 };
 use crate::purl::Purl;
+use crate::registry::RegistryError;
 
 pub(crate) fn cargo_artifacts(
     purl: &Purl,
@@ -137,67 +138,84 @@ pub(crate) fn crates(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let doc = json_meta(
+) -> Result<Registry, RegistryError> {
+    let doc: CrateResponse = fetch_json(
         &format!("https://crates.io/api/v1/crates/{path}"),
         net,
         cache,
     )?;
-    let krate = doc.get("crate")?;
+    let krate = &doc.krate;
 
     let latest = krate
-        .get("max_stable_version")
-        .or_else(|| krate.get("max_version"))
-        .and_then(Value::as_str);
+        .max_stable_version
+        .as_ref()
+        .unwrap_or(&krate.max_version)
+        .as_deref();
     let requested = version.map(percent_decode);
     let version = requested.as_deref().or(latest).unwrap_or_default();
     let ver = doc
-        .get("versions")
-        .and_then(Value::as_array)
-        .and_then(|vs| {
-            vs.iter()
-                .find(|v| v.get("num").and_then(Value::as_str) == Some(version))
-        });
+        .versions
+        .iter()
+        .find(|v| v.num.as_deref() == Some(version));
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "crates".into(),
         name: path.to_string(),
         version: version.to_string(),
         // A version the list lacks has no date of its own; the crate's
         // `created_at` is its first release, not this one.
         published_at: ver
-            .and_then(|v| v.get("created_at"))
-            .and_then(Value::as_str)
+            .and_then(|v| v.created_at.as_deref())
             .and_then(parse_rfc3339_secs),
-        first_published_at: krate
-            .get("created_at")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_secs),
+        first_published_at: krate.created_at.as_deref().and_then(parse_rfc3339_secs),
         latest_version: latest.map(str::to_string),
         author: None,
         title: None,
-        description: krate
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        homepage: krate
-            .get("homepage")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        repository: krate
-            .get("repository")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        license: ver
-            .and_then(|v| v.get("license"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        downloads_total: krate.get("downloads").and_then(Value::as_u64),
-        downloads_recent: krate.get("recent_downloads").and_then(Value::as_u64),
+        description: krate.description.clone(),
+        homepage: krate.homepage.clone(),
+        repository: krate.repository.clone(),
+        license: ver.and_then(|v| v.license.clone()),
+        downloads_total: krate.downloads,
+        downloads_recent: krate.recent_downloads,
         deprecated: ver
-            .and_then(|v| v.get("yanked"))
-            .and_then(Value::as_bool)
+            .and_then(|v| v.yanked)
             .and_then(|y| y.then(|| "yanked".to_string())),
         ..Default::default()
     })
+}
+
+/// The crates.io `/api/v1/crates/{name}` response, as far as the record reads it.
+#[derive(Deserialize)]
+struct CrateResponse {
+    #[serde(rename = "crate")]
+    krate: Crate,
+    #[serde(default, deserialize_with = "null_default")]
+    versions: Vec<CrateVersion>,
+}
+
+/// The crate-level facts: latest versions, popularity, and links.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Crate {
+    /// `null` for a crate with no stable release, and that `null` is the
+    /// answer: `max_version` stands in only when the key is absent.
+    #[serde(deserialize_with = "present")]
+    max_stable_version: Option<Option<String>>,
+    max_version: Option<String>,
+    created_at: Option<String>,
+    description: Option<String>,
+    homepage: Option<String>,
+    repository: Option<String>,
+    downloads: Option<u64>,
+    recent_downloads: Option<u64>,
+}
+
+/// One published version of the crate.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct CrateVersion {
+    num: Option<String>,
+    created_at: Option<String>,
+    license: Option<String>,
+    yanked: Option<bool>,
 }

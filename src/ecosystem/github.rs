@@ -1,10 +1,11 @@
 //! GitHub repositories: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, parse_rfc3339_secs};
+use crate::ecosystem::{fetch_json, parse_rfc3339_secs};
 use crate::fetch::{BlobCache, Fetch};
+use crate::registry::RegistryError;
 
 /// GitHub: a `pkg:github/<owner>/<repo>` reference has no package registry — the
 /// repository itself is the upstream. The REST API supplies the registry-shaped
@@ -12,52 +13,62 @@ use crate::fetch::{BlobCache, Fetch};
 /// license, and whether the repo is archived (a deprecation analogue).
 /// Unauthenticated, so subject to GitHub's 60-req/hour anonymous limit; a
 /// throttled lookup simply degrades to "unknown".
-pub(crate) fn github(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(&format!("https://api.github.com/repos/{path}"), net, cache)?;
+pub(crate) fn github(
+    path: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let doc: Repo = fetch_json(&format!("https://api.github.com/repos/{path}"), net, cache)?;
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "github".into(),
         name: path.to_string(),
         version: String::new(),
         // `pushed_at` (last code change) is the supply-chain-relevant recency.
-        published_at: doc
-            .get("pushed_at")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_secs),
-        author: doc
-            .pointer("/owner/login")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        title: doc
-            .get("full_name")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: doc
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        homepage: doc
-            .get("homepage")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        repository: doc
-            .get("html_url")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        published_at: doc.pushed_at.as_deref().and_then(parse_rfc3339_secs),
+        author: doc.owner.and_then(|o| o.login),
+        title: doc.full_name,
+        description: doc.description,
+        homepage: doc.homepage.filter(|s| !s.is_empty()),
+        repository: doc.html_url,
         license: doc
-            .pointer("/license/spdx_id")
-            .and_then(Value::as_str)
-            .filter(|&s| s != "NOASSERTION")
-            .map(str::to_string),
+            .license
+            .and_then(|l| l.spdx_id)
+            .filter(|s| s != "NOASSERTION"),
         // Stars are GitHub's endorsement count — the nearest popularity analogue.
-        rating_count: doc.get("stargazers_count").and_then(Value::as_u64),
-        deprecated: doc
-            .get("archived")
-            .and_then(Value::as_bool)
-            .and_then(|a| a.then(|| "archived".to_string())),
+        rating_count: doc.stargazers_count,
+        deprecated: doc.archived.and_then(|a| a.then(|| "archived".to_string())),
         ..Default::default()
     })
+}
+
+/// The GitHub REST repository document (`/repos/{owner}/{repo}`).
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Repo {
+    pushed_at: Option<String>,
+    owner: Option<Owner>,
+    full_name: Option<String>,
+    description: Option<String>,
+    homepage: Option<String>,
+    html_url: Option<String>,
+    license: Option<License>,
+    stargazers_count: Option<u64>,
+    archived: Option<bool>,
+}
+
+/// The account that owns the repository.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Owner {
+    login: Option<String>,
+}
+
+/// The license GitHub detected for the repository.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct License {
+    spdx_id: Option<String>,
 }
 
 #[cfg(test)]

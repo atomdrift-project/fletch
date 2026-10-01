@@ -1,97 +1,144 @@
 //! The JetBrains Marketplace: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::json_meta;
+use crate::ecosystem::fetch_json;
 use crate::fetch::{BlobCache, Fetch};
+use crate::registry::RegistryError;
 
 /// JetBrains Marketplace: resolve the plugin id (numeric, or an `xmlId` via
 /// search), then read its listing plus latest update — the same marketplace
 /// shape as the editor stores (rating, downloads, the update's publish date).
-pub(crate) fn jetbrains(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn jetbrains(
+    path: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     // A numeric path is the plugin id directly; otherwise resolve the xmlId.
     let id = if !path.is_empty() && path.bytes().all(|b| b.is_ascii_digit()) {
         path.to_string()
     } else {
-        let search = json_meta(
+        let search: PluginSearch = fetch_json(
             &format!("https://plugins.jetbrains.com/api/searchPlugins?search={path}&max=20"),
             net,
             cache,
         )?;
         search
-            .get("plugins")
-            .and_then(Value::as_array)?
+            .plugins
             .iter()
-            .find(|p| p.get("xmlId").and_then(Value::as_str) == Some(path))
-            .and_then(|p| p.get("id"))
-            .and_then(Value::as_u64)?
+            .find(|p| p.xml_id.as_deref() == Some(path))
+            .ok_or(RegistryError::NotFound)?
+            .id
             .to_string()
     };
-    let doc = json_meta(
+    let doc: Plugin = fetch_json(
         &format!("https://plugins.jetbrains.com/api/plugins/{id}"),
         net,
         cache,
     )?;
     // The latest update carries the released version and its publish time.
-    let updates = json_meta(
+    let updates = fetch_json::<Vec<PluginUpdate>>(
         &format!("https://plugins.jetbrains.com/api/plugins/{id}/updates?size=1"),
         net,
         cache,
-    );
-    let update = updates
-        .as_ref()
-        .and_then(|u| u.as_array())
-        .and_then(|a| a.first());
+    )
+    .ok();
+    let update = updates.as_ref().and_then(|u| u.first());
+    let urls = doc.urls.unwrap_or_default();
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "jetbrains".into(),
-        name: doc
-            .get("xmlId")
-            .and_then(Value::as_str)
-            .unwrap_or(path)
-            .to_string(),
-        version: update
-            .and_then(|u| u.get("version"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        published_at: update.and_then(|u| u.get("cdate")).and_then(parse_millis),
+        name: doc.xml_id.unwrap_or_else(|| path.to_string()),
+        version: update.and_then(|u| u.version.clone()).unwrap_or_default(),
+        published_at: update.and_then(|u| u.cdate.as_ref()).and_then(parse_millis),
         // `vendor` is a bare string here, an object in search results.
-        author: doc.get("vendor").and_then(|v| {
-            v.as_str()
-                .map(str::to_string)
-                .or_else(|| v.get("name").and_then(Value::as_str).map(str::to_string))
-        }),
-        title: doc.get("name").and_then(Value::as_str).map(str::to_string),
-        description: doc
-            .get("preview")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        homepage: doc
-            .pointer("/urls/url")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        repository: doc
-            .pointer("/urls/sourceCodeUrl")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        downloads_total: doc.get("downloads").and_then(Value::as_u64),
-        rating: doc.get("rating").and_then(Value::as_f64).map(|f| f as f32),
+        author: doc.vendor.and_then(Vendor::into_name),
+        title: doc.name,
+        description: doc.preview,
+        homepage: urls.url.filter(|s| !s.is_empty()),
+        repository: urls.source_code_url.filter(|s| !s.is_empty()),
+        downloads_total: doc.downloads,
+        rating: doc.rating.map(|f| f as f32),
         ..Default::default()
     })
 }
 
 /// Unix-millis (a JSON string or number, as JetBrains emits) → Unix seconds.
-fn parse_millis(v: &Value) -> Option<u64> {
+fn parse_millis(v: &Millis) -> Option<u64> {
     let ms = match v {
-        Value::String(s) => s.parse::<u64>().ok()?,
-        Value::Number(n) => n.as_u64()?,
-        _ => return None,
+        Millis::Text(s) => s.parse::<u64>().ok()?,
+        Millis::Number(n) => *n,
     };
     Some(ms / 1000)
+}
+
+/// The Marketplace's plugin search results.
+#[derive(Deserialize)]
+struct PluginSearch {
+    plugins: Vec<SearchHit>,
+}
+
+/// One plugin in the search results.
+#[derive(Deserialize)]
+struct SearchHit {
+    id: u64,
+    #[serde(rename = "xmlId")]
+    xml_id: Option<String>,
+}
+
+/// A JetBrains Marketplace plugin listing.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Plugin {
+    xml_id: Option<String>,
+    name: Option<String>,
+    preview: Option<String>,
+    vendor: Option<Vendor>,
+    urls: Option<PluginUrls>,
+    downloads: Option<u64>,
+    rating: Option<f64>,
+}
+
+/// A plugin's `vendor`: a bare name, or an object with a `name`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Vendor {
+    Name(String),
+    Object { name: Option<String> },
+}
+
+impl Vendor {
+    fn into_name(self) -> Option<String> {
+        match self {
+            Self::Name(name) => Some(name),
+            Self::Object { name } => name,
+        }
+    }
+}
+
+/// A plugin's links.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct PluginUrls {
+    url: Option<String>,
+    source_code_url: Option<String>,
+}
+
+/// One released update of a plugin.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PluginUpdate {
+    version: Option<String>,
+    cdate: Option<Millis>,
+}
+
+/// A Unix-millis timestamp, which JetBrains sends as a string or a number.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Millis {
+    Text(String),
+    Number(u64),
 }
 
 #[cfg(test)]

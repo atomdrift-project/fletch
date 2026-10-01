@@ -1,53 +1,58 @@
 //! WordPress plugins: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, parse_rfc3339_secs};
+use crate::ecosystem::{fetch_json, parse_rfc3339_secs};
 use crate::fetch::{BlobCache, Fetch};
+use crate::registry::RegistryError;
 
 /// WordPress plugin directory: the info API carries installs, rating (0–100),
 /// the author (as an HTML anchor), and the last-updated date.
-pub(crate) fn wordpress(slug: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(
+pub(crate) fn wordpress(
+    slug: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let doc: PluginInfo = fetch_json(
         &format!("https://api.wordpress.org/plugins/info/1.0/{slug}.json"),
         net,
         cache,
     )?;
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "wordpress".into(),
-        name: doc
-            .get("slug")
-            .and_then(Value::as_str)
-            .unwrap_or(slug)
-            .to_string(),
-        version: doc
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        name: doc.slug.unwrap_or_else(|| slug.to_string()),
+        version: doc.version.unwrap_or_default(),
         // `last_updated` is `2026-04-23 10:34pm GMT`; keep the date.
         published_at: doc
-            .get("last_updated")
-            .and_then(Value::as_str)
+            .last_updated
+            .as_deref()
             .and_then(|s| parse_rfc3339_secs(&format!("{}T00:00:00Z", s.get(..10)?))),
-        author: doc.get("author").and_then(Value::as_str).map(strip_html),
-        title: doc.get("name").and_then(Value::as_str).map(str::to_string),
-        homepage: doc
-            .get("homepage")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        downloads_total: doc.get("downloaded").and_then(Value::as_u64),
+        author: doc.author.as_deref().map(strip_html),
+        title: doc.name,
+        homepage: doc.homepage.filter(|s| !s.is_empty()),
+        downloads_total: doc.downloaded,
         // The directory reports rating as a 0–100 percentage; scale to 5 stars.
-        rating: doc
-            .get("rating")
-            .and_then(Value::as_f64)
-            .map(|r| (r / 20.0) as f32),
-        rating_count: doc.get("num_ratings").and_then(Value::as_u64),
+        rating: doc.rating.map(|r| (r / 20.0) as f32),
+        rating_count: doc.num_ratings,
         ..Default::default()
     })
+}
+
+/// A WordPress plugin-directory info document.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PluginInfo {
+    slug: Option<String>,
+    version: Option<String>,
+    last_updated: Option<String>,
+    author: Option<String>,
+    name: Option<String>,
+    homepage: Option<String>,
+    downloaded: Option<u64>,
+    rating: Option<f64>,
+    num_ratings: Option<u64>,
 }
 
 /// Drop HTML tags from a one-line field (WordPress wraps the author in an `<a>`).

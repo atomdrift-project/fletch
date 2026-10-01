@@ -18,12 +18,12 @@
 
 use std::io::{BufRead, BufReader, Cursor, Read};
 
-use serde_json::Value;
-
 use filefacts::Registry;
+use serde::Deserialize;
 
 use crate::ecosystem::{parse_ts, strip_email};
-use crate::fetch::{BlobCache, Fetch, cached_metadata};
+use crate::fetch::{BlobCache, Fetch, cached_metadata_status};
+use crate::registry::RegistryError;
 
 /// Ceiling on a single index's *decompressed* size. The 64 MiB download cap
 /// already bounds the compressed input; this backstops a decompression bomb
@@ -39,19 +39,27 @@ const XML_CHUNK: usize = 64 * 1024;
 /// Alpine Linux: the `main` then `community` `APKINDEX` of the current stable
 /// release. The index records the maintainer, license, homepage, and a build
 /// timestamp — a full registry record.
-pub fn alpine(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn alpine(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     const REPOS: [&str; 2] = [
         "https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz",
         "https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/x86_64/APKINDEX.tar.gz",
     ];
-    REPOS
-        .iter()
-        .find_map(|url| apkindex_lookup(url, name, "alpine", net, cache))
+    first_listing(&REPOS, |url| {
+        apkindex_lookup(url, name, "alpine", net, cache)
+    })
 }
 
 /// Wolfi (Chainguard's distroless base): a single rolling `APKINDEX`, same
 /// format as Alpine.
-pub fn wolfi(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn wolfi(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     apkindex_lookup(
         "https://packages.wolfi.dev/os/x86_64/APKINDEX.tar.gz",
         name,
@@ -63,7 +71,11 @@ pub fn wolfi(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry>
 
 /// Debian: the `stable/main` binary `Packages` index. It carries the maintainer,
 /// description, and homepage but no upload time, so age stays unknown.
-pub fn debian(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn debian(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     deb_lookup(
         "https://deb.debian.org/debian/dists/stable/main/binary-amd64/Packages.gz",
         name,
@@ -75,19 +87,25 @@ pub fn debian(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry
 
 /// Ubuntu: the current LTS `main` then `universe` binary `Packages` index, same
 /// control format as Debian.
-pub fn ubuntu(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn ubuntu(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     const REPOS: [&str; 2] = [
         "https://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz",
         "https://archive.ubuntu.com/ubuntu/dists/noble/universe/binary-amd64/Packages.gz",
     ];
-    REPOS
-        .iter()
-        .find_map(|url| deb_lookup(url, name, "ubuntu", net, cache))
+    first_listing(&REPOS, |url| deb_lookup(url, name, "ubuntu", net, cache))
 }
 
 /// openSUSE Tumbleweed (`oss` repo): the `primary.xml` referenced by `repomd.xml`
 /// carries the summary, license, homepage, and a build time.
-pub fn opensuse(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn opensuse(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     rpm_repo_lookup(
         "https://download.opensuse.org/tumbleweed/repo/oss",
         name,
@@ -99,7 +117,11 @@ pub fn opensuse(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Regist
 
 /// RPM Fusion (free, Fedora rawhide): same `repomd`/`primary.xml` layout as a
 /// Fedora repository.
-pub fn rpmfusion(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn rpmfusion(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     rpm_repo_lookup(
         "https://download1.rpmfusion.org/free/fedora/development/rawhide/Everything/x86_64/os",
         name,
@@ -111,47 +133,54 @@ pub fn rpmfusion(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Regis
 
 /// NetBSD (pkgsrc binary packages): `pkg_summary` is an RFC822-ish index with
 /// the comment, homepage, license, maintainer, and build date.
-pub fn netbsd(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let bytes = cached_metadata(
+pub(crate) fn netbsd(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let bytes = index(
         "https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/x86_64/10.0/All/pkg_summary.gz",
         net,
         cache,
     )?;
     let reader = BufReader::new(gunzip(bytes));
-    each_stanza(reader, |stanza| pkg_summary_record(stanza, name))
+    each_stanza(reader, |stanza| pkg_summary_record(stanza, name)).ok_or(RegistryError::NotFound)
 }
 
 /// FreeBSD (binary pkg): `packagesite.pkg` is a zstd-compressed tar whose
 /// `packagesite.yaml` is newline-delimited JSON, one object per package, with
 /// the comment, maintainer, homepage (`www`), and licenses.
-pub fn freebsd(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let bytes = cached_metadata(
-        "https://pkg.freebsd.org/FreeBSD:14:amd64/latest/packagesite.pkg",
-        net,
-        cache,
-    )?;
-    let tar = unzstd(bytes)?;
-    let yaml = tar_find(&tar, "packagesite.yaml")?;
-    let text = std::str::from_utf8(&yaml).ok()?;
+pub(crate) fn freebsd(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    const URL: &str = "https://pkg.freebsd.org/FreeBSD:14:amd64/latest/packagesite.pkg";
+    let tar = unzstd(index(URL, net, cache)?).ok_or_else(|| unreadable(URL, "not zstd"))?;
+    let yaml =
+        tar_find(&tar, "packagesite.yaml").ok_or_else(|| unreadable(URL, "no packagesite.yaml"))?;
+    let text = std::str::from_utf8(&yaml).map_err(|e| unreadable(URL, e))?;
     text.lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .find(|o| o.get("name").and_then(Value::as_str) == Some(name))
-        .map(|o| packagesite_record(&o, name))
+        .filter_map(|l| serde_json::from_str::<Packagesite>(l).ok())
+        .find(|p| p.name.as_deref() == Some(name))
+        .map(|p| packagesite_record(p, name))
+        .ok_or(RegistryError::NotFound)
 }
 
 /// OpenBSD: there is no metadata index — only the packages directory listing —
 /// so this recovers just the current version from the published filenames. The
 /// `snapshots` tree always reflects the live package set (a numbered release is
 /// frozen and eventually pruned).
-pub fn openbsd(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let bytes = cached_metadata(
-        "https://cdn.openbsd.org/pub/OpenBSD/snapshots/packages/amd64/index.txt",
-        net,
-        cache,
-    )?;
-    let text = std::str::from_utf8(&bytes).ok()?;
-    let version = openbsd_version(text, name)?;
-    Some(Registry {
+pub(crate) fn openbsd(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    const URL: &str = "https://cdn.openbsd.org/pub/OpenBSD/snapshots/packages/amd64/index.txt";
+    let bytes = index(URL, net, cache)?;
+    let text = std::str::from_utf8(&bytes).map_err(|e| unreadable(URL, e))?;
+    let version = openbsd_version(text, name).ok_or(RegistryError::NotFound)?;
+    Ok(Registry {
         ecosystem: "openbsd".into(),
         name: name.to_string(),
         version,
@@ -168,20 +197,21 @@ fn apkindex_lookup(
     ecosystem: &str,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let bytes = cached_metadata(url, net, cache)?;
+) -> Result<Registry, RegistryError> {
+    let bytes = index(url, net, cache)?;
     // APKINDEX.tar.gz concatenates a signature stream and the control stream;
     // decompress both, then pull the `APKINDEX` text from the archive.
     let mut out = Vec::new();
     flate2::read::MultiGzDecoder::new(Cursor::new(bytes))
         .take(DECOMP_CAP)
         .read_to_end(&mut out)
-        .ok()?;
-    let index = tar_find(&out, "APKINDEX")?;
-    let text = std::str::from_utf8(&index).ok()?;
+        .map_err(|e| unreadable(url, e))?;
+    let apkindex = tar_find(&out, "APKINDEX").ok_or_else(|| unreadable(url, "no APKINDEX"))?;
+    let text = std::str::from_utf8(&apkindex).map_err(|e| unreadable(url, e))?;
     each_stanza(BufReader::new(Cursor::new(text)), |stanza| {
         apkindex_record(stanza, name, ecosystem)
     })
+    .ok_or(RegistryError::NotFound)
 }
 
 /// Map one matching `APKINDEX` stanza (single-letter `K:value` lines).
@@ -215,11 +245,9 @@ fn deb_lookup(
     ecosystem: &str,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let bytes = cached_metadata(url, net, cache)?;
-    let reader = BufReader::new(gunzip(bytes));
-    let eco = ecosystem.to_string();
-    each_stanza(reader, |stanza| deb_record(stanza, name, &eco))
+) -> Result<Registry, RegistryError> {
+    let reader = BufReader::new(gunzip(index(url, net, cache)?));
+    each_stanza(reader, |stanza| deb_record(stanza, name, ecosystem)).ok_or(RegistryError::NotFound)
 }
 
 /// Map one matching Debian control stanza (`Key: value`, with folded
@@ -250,19 +278,28 @@ fn rpm_repo_lookup(
     ecosystem: &str,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let repomd = cached_metadata(&format!("{base}/repodata/repomd.xml"), net, cache)?;
-    let href = primary_href(std::str::from_utf8(&repomd).ok()?)?;
-    let bytes = cached_metadata(&format!("{base}/{href}"), net, cache)?;
-    let reader: Box<dyn Read> = match href.rsplit('.').next()? {
-        "zst" => Box::new(zstd::stream::read::Decoder::new(Cursor::new(bytes)).ok()?),
-        "gz" => Box::new(gunzip(bytes)),
-        "xz" => Box::new(xz2::read::XzDecoder::new_multi_decoder(Cursor::new(bytes))),
-        _ => return None,
+) -> Result<Registry, RegistryError> {
+    let repomd_url = format!("{base}/repodata/repomd.xml");
+    let repomd = index(&repomd_url, net, cache)?;
+    let href = std::str::from_utf8(&repomd)
+        .ok()
+        .and_then(primary_href)
+        .ok_or_else(|| unreadable(&repomd_url, "no primary index"))?;
+    let primary_url = format!("{base}/{href}");
+    let bytes = index(&primary_url, net, cache)?;
+    let reader: Box<dyn Read> = match href.rsplit('.').next() {
+        Some("zst") => Box::new(
+            zstd::stream::read::Decoder::new(Cursor::new(bytes))
+                .map_err(|e| unreadable(&primary_url, e))?,
+        ),
+        Some("gz") => Box::new(gunzip(bytes)),
+        Some("xz") => Box::new(xz2::read::XzDecoder::new_multi_decoder(Cursor::new(bytes))),
+        _ => return Err(unreadable(&primary_url, "unknown compression")),
     };
     each_xml_package(reader.take(DECOMP_CAP), |pkg| {
         rpm_primary_record(pkg, name, ecosystem)
     })
+    .ok_or(RegistryError::NotFound)
 }
 
 /// The `<location href="…primary.xml.*"/>` from `repomd.xml`.
@@ -330,23 +367,28 @@ fn pkg_summary_record(stanza: &str, name: &str) -> Option<Registry> {
     })
 }
 
+/// One package in FreeBSD's `packagesite.yaml`, as far as the record reads it.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Packagesite {
+    name: Option<String>,
+    version: Option<String>,
+    maintainer: Option<String>,
+    comment: Option<String>,
+    www: Option<String>,
+    licenses: Option<Vec<String>>,
+}
+
 /// Map one FreeBSD `packagesite.yaml` object.
-fn packagesite_record(o: &Value, name: &str) -> Registry {
+fn packagesite_record(p: Packagesite, name: &str) -> Registry {
     Registry {
         ecosystem: "freebsd".into(),
         name: name.to_string(),
-        version: o
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        author: o.get("maintainer").and_then(Value::as_str).map(strip_email),
-        description: o.get("comment").and_then(Value::as_str).map(str::to_string),
-        homepage: o.get("www").and_then(Value::as_str).map(str::to_string),
-        license: o
-            .pointer("/licenses/0")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        version: p.version.unwrap_or_default(),
+        author: p.maintainer.as_deref().map(strip_email),
+        description: p.comment,
+        homepage: p.www,
+        license: p.licenses.and_then(|l| l.into_iter().next()),
         ..Default::default()
     }
 }
@@ -416,6 +458,36 @@ fn tar_find(data: &[u8], member: &str) -> Option<Vec<u8>> {
         pos = start + size.div_ceil(512) * 512;
     }
     None
+}
+
+/// Fetch an index document through the metadata cache.
+fn index(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Vec<u8>, RegistryError> {
+    Ok(cached_metadata_status(url, &[], net, cache)?)
+}
+
+/// The index at `url` arrived but could not be read as one.
+fn unreadable(url: &str, reason: impl std::fmt::Display) -> RegistryError {
+    RegistryError::Malformed {
+        url: url.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+/// The first of `repos` that lists the package, in order. When none does, a
+/// repository that could not be read says more than "not found".
+fn first_listing(
+    repos: &[&str],
+    lookup: impl Fn(&str) -> Result<Registry, RegistryError>,
+) -> Result<Registry, RegistryError> {
+    let mut why = RegistryError::NotFound;
+    for repo in repos {
+        match lookup(repo) {
+            Ok(record) => return Ok(record),
+            Err(RegistryError::NotFound) => {}
+            Err(error) => why = error,
+        }
+    }
+    Err(why)
 }
 
 // --- index scanners ---------------------------------------------------------
@@ -614,12 +686,13 @@ mod tests {
 
     #[test]
     fn packagesite_record_maps_fields() {
-        let o = serde_json::json!({
+        let o = serde_json::from_value(serde_json::json!({
             "name": "curl", "version": "8.5.0", "comment": "URL transfer tool",
             "www": "https://curl.se/", "maintainer": "ports@freebsd.test",
             "licenses": ["MIT"]
-        });
-        let r = packagesite_record(&o, "curl");
+        }))
+        .unwrap();
+        let r = packagesite_record(o, "curl");
         assert_eq!(r.ecosystem, "freebsd");
         assert_eq!(r.version, "8.5.0");
         assert_eq!(r.homepage.as_deref(), Some("https://curl.se/"));

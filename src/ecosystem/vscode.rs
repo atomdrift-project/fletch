@@ -1,11 +1,14 @@
 //! The VS Code Marketplace and Open VSX: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
+use std::collections::HashMap;
 
-use crate::ecosystem::{json_meta, parse_rfc3339_secs};
+use crate::ecosystem::{decode, fetch_json, null_default, parse_rfc3339_secs};
 use crate::fetch::{BlobCache, Fetch, cached_post, safe_coordinate};
 use crate::purl::Purl;
+use crate::registry::RegistryError;
 
 /// Whether `value` is a VS Code Marketplace publisher ID — the rule `vsce`
 /// enforces (`^[a-z0-9][a-z0-9-]*$`, any case), which also keeps it a single
@@ -94,79 +97,71 @@ pub(crate) fn openvsx(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let (ns, name) = path.split_once('/')?;
+) -> Result<Registry, RegistryError> {
+    let (ns, name) = path.split_once('/').ok_or(RegistryError::NoRecord)?;
     let url = match version {
         Some(v) => format!("https://open-vsx.org/api/{ns}/{name}/{v}"),
         None => format!("https://open-vsx.org/api/{ns}/{name}"),
     };
-    let doc = json_meta(&url, net, cache)?;
+    let doc: OpenVsxExtension = fetch_json(&url, net, cache)?;
+    let login = doc.published_by.and_then(|user| user.login_name);
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "openvsx".into(),
         // The canonical extension id everyone types is `namespace.name`.
         name: format!("{ns}.{name}"),
-        version: doc
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        published_at: doc
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_secs),
-        author: doc
-            .pointer("/publishedBy/loginName")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        publisher: doc
-            .pointer("/publishedBy/loginName")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        version: doc.version.unwrap_or_default(),
+        published_at: doc.timestamp.as_deref().and_then(parse_rfc3339_secs),
+        author: login.clone(),
+        publisher: login,
         // `allVersions` maps every published version to its URL — its size is the
         // release count, free in this one response (timestamps need the versions
         // endpoint). A `restricted` namespace is owner-controlled; a `public` one
         // is open for anyone to publish under, so it is *not* verified custody.
-        release_count: doc
-            .get("allVersions")
-            .and_then(Value::as_object)
-            .map(|v| v.len() as u32),
+        release_count: doc.all_versions.map(|v| v.len() as u32),
         publisher_verified: doc
-            .get("namespaceAccess")
-            .and_then(Value::as_str)
+            .namespace_access
             .map(|a| a.eq_ignore_ascii_case("restricted")),
-        title: doc
-            .get("displayName")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: doc
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        homepage: doc
-            .get("homepage")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        repository: doc
-            .get("repository")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        license: doc
-            .get("license")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        downloads_total: doc.get("downloadCount").and_then(Value::as_u64),
-        rating: doc
-            .get("averageRating")
-            .and_then(Value::as_f64)
-            .map(|f| f as f32),
-        rating_count: doc.get("reviewCount").and_then(Value::as_u64),
+        title: doc.display_name,
+        description: doc.description,
+        homepage: doc.homepage,
+        repository: doc.repository,
+        license: doc.license,
+        downloads_total: doc.download_count,
+        rating: doc.average_rating.map(|f| f as f32),
+        rating_count: doc.review_count,
         deprecated: doc
-            .get("deprecated")
-            .and_then(Value::as_bool)
+            .deprecated
             .and_then(|d| d.then(|| "deprecated".to_string())),
         ..Default::default()
     })
+}
+
+/// An Open VSX extension document: one version of the extension.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct OpenVsxExtension {
+    version: Option<String>,
+    timestamp: Option<String>,
+    published_by: Option<OpenVsxUser>,
+    all_versions: Option<HashMap<String, IgnoredAny>>,
+    namespace_access: Option<String>,
+    display_name: Option<String>,
+    description: Option<String>,
+    homepage: Option<String>,
+    repository: Option<String>,
+    license: Option<String>,
+    download_count: Option<u64>,
+    average_rating: Option<f64>,
+    review_count: Option<u64>,
+    deprecated: Option<bool>,
+}
+
+/// The Open VSX account that published a version.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct OpenVsxUser {
+    login_name: Option<String>,
 }
 
 /// The Microsoft VS Code Marketplace. Its metadata lives behind a JSON-RPC
@@ -174,7 +169,11 @@ pub(crate) fn openvsx(
 /// `<publisher>.<name>` id. One query returns the latest version with its
 /// install count, rating, publisher, and timestamps — the same marketplace
 /// shape as Open VSX, over a different transport.
-pub(crate) fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
+pub(crate) fn vscode(
+    path: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     let ext_id = path.replace('/', ".");
     // flags 403 = IncludeVersions(1) | IncludeFiles(2) | IncludeVersionProperties(16)
     // | IncludeAssetUri(128) | IncludeStatistics(256). Dropping IncludeLatestVersionOnly
@@ -184,75 +183,55 @@ pub(crate) fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<R
     // PURL, so a `"` in it would otherwise close the string literal and let a
     // crafted coordinate restructure the query — returning some *other*
     // extension's reputation record under this one's name.
-    let body = serde_json::to_vec(&serde_json::json!({
+    let body = serde_json::json!({
         "filters": [{"criteria": [{"filterType": 7, "value": ext_id}]}],
         "flags": 403,
-    }))
-    .ok()?;
+    })
+    .to_string();
     let headers = [
         ("Content-Type", "application/json"),
         ("Accept", "application/json;api-version=3.0-preview.1"),
     ];
-    let doc: Value = serde_json::from_slice(&cached_post(
-        "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery",
-        &body,
-        &headers,
-        net,
-        cache,
-    )?)
-    .ok()?;
-    let ext = doc.pointer("/results/0/extensions/0")?;
+    let url = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery";
+    let bytes = cached_post(url, body.as_bytes(), &headers, net, cache)?;
+    let doc: ExtensionQuery = decode(url, &bytes)?;
+    // The query matched no extension: the marketplace has none by this id.
+    let ext = doc
+        .results
+        .into_iter()
+        .next()
+        .and_then(|result| result.extensions.into_iter().next())
+        .ok_or(RegistryError::NotFound)?;
 
     // `statistics` is an array of `{statisticName, value}` pairs.
     let stat = |name: &str| -> Option<f64> {
-        ext.get("statistics")?
-            .as_array()?
+        ext.statistics
             .iter()
-            .find(|s| s.get("statisticName").and_then(Value::as_str) == Some(name))?
-            .get("value")?
-            .as_f64()
+            .find(|s| s.statistic_name.as_deref() == Some(name))?
+            .value
     };
+    let publisher = ext.publisher.unwrap_or_default();
 
     let mut p = Registry {
         ecosystem: "vscode".into(),
         name: ext_id,
         version: ext
-            .pointer("/versions/0/version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+            .versions
+            .first()
+            .and_then(|v| v.version.clone())
+            .unwrap_or_default(),
         // `lastUpdated` is the supply-chain-relevant age: when the extension last
         // changed, not when it first shipped.
-        published_at: ext
-            .get("lastUpdated")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_secs),
+        published_at: ext.last_updated.as_deref().and_then(parse_rfc3339_secs),
         // `publishedDate` is the extension's birth — the package-age signal.
-        first_published_at: ext
-            .get("publishedDate")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_secs),
-        author: ext
-            .pointer("/publisher/displayName")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        first_published_at: ext.published_date.as_deref().and_then(parse_rfc3339_secs),
+        author: publisher.display_name,
         // The unique publisher account, and whether the marketplace verified its
         // domain — an unverified publisher is one anyone could have registered.
-        publisher: ext
-            .pointer("/publisher/publisherName")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        publisher_verified: ext
-            .pointer("/publisher/isDomainVerified")
-            .and_then(Value::as_bool),
-        title: ext
-            .get("displayName")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: ext
-            .get("shortDescription")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        publisher: publisher.publisher_name,
+        publisher_verified: publisher.is_domain_verified,
+        title: ext.display_name,
+        description: ext.short_description,
         downloads_total: stat("install").map(|v| v as u64),
         rating: stat("averagerating").map(|v| v as f32),
         rating_count: stat("ratingcount").map(|v| v as u64),
@@ -262,23 +241,74 @@ pub(crate) fn vscode(path: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<R
     // The full version array (one entry per published version) yields the release
     // timeline — its size is the release count, and `with_age` turns the times
     // into the 24h/48h burst metrics.
-    if let Some(versions) = ext.get("versions").and_then(Value::as_array) {
-        let mut times: Vec<u64> = versions
-            .iter()
-            .filter_map(|v| v.get("lastUpdated").and_then(Value::as_str))
-            .filter_map(parse_rfc3339_secs)
-            .collect();
-        times.sort_unstable();
-        if !times.is_empty() {
-            p.release_count = Some(times.len() as u32);
-            if let Some(this) = p.published_at {
-                p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
-            }
-            p.release_times = times;
+    let mut times: Vec<u64> = ext
+        .versions
+        .iter()
+        .filter_map(|v| v.last_updated.as_deref())
+        .filter_map(parse_rfc3339_secs)
+        .collect();
+    times.sort_unstable();
+    if !times.is_empty() {
+        p.release_count = Some(times.len() as u32);
+        if let Some(this) = p.published_at {
+            p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
         }
+        p.release_times = times;
     }
 
-    Some(p)
+    Ok(p)
+}
+
+/// The Marketplace's `extensionquery` answer: one result set per filter.
+#[derive(Deserialize)]
+struct ExtensionQuery {
+    results: Vec<QueryResult>,
+}
+
+/// The extensions one query filter matched.
+#[derive(Deserialize)]
+struct QueryResult {
+    extensions: Vec<MarketplaceExtension>,
+}
+
+/// A Marketplace extension with its versions and statistics.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct MarketplaceExtension {
+    display_name: Option<String>,
+    short_description: Option<String>,
+    publisher: Option<MarketplacePublisher>,
+    published_date: Option<String>,
+    last_updated: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    versions: Vec<MarketplaceVersion>,
+    #[serde(deserialize_with = "null_default")]
+    statistics: Vec<Statistic>,
+}
+
+/// The Marketplace publisher account behind an extension.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct MarketplacePublisher {
+    display_name: Option<String>,
+    publisher_name: Option<String>,
+    is_domain_verified: Option<bool>,
+}
+
+/// One published version of a Marketplace extension.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct MarketplaceVersion {
+    version: Option<String>,
+    last_updated: Option<String>,
+}
+
+/// One `{statisticName, value}` pair of an extension's statistics.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Statistic {
+    statistic_name: Option<String>,
+    value: Option<f64>,
 }
 
 #[cfg(test)]

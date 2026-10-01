@@ -1,16 +1,17 @@
 //! The Terraform Registry: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 use std::time::Duration;
 
-use crate::ecosystem::{json_meta, parse_ts};
+use crate::ecosystem::{fetch_json, null_default, parse_ts};
 use crate::fetch::{
     ArtifactCandidate, BlobCache, Fetch, FetchError, META_TTL_IMMUTABLE, artifact_candidate,
     cached_metadata, cached_metadata_status, file_name_matches, is_web_scheme, meta_ttl_unpinned,
     percent_decode, safe_coordinate,
 };
 use crate::purl::Purl;
+use crate::registry::RegistryError;
 
 /// A Terraform provider zip, from the registry's download API. That API
 /// answers one platform per request, so this builds one candidate rather than
@@ -114,38 +115,31 @@ pub(crate) fn terraform(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let (namespace, name) = path.split_once('/')?;
+) -> Result<Registry, RegistryError> {
+    let Some((namespace, name)) = path.split_once('/') else {
+        return Err(RegistryError::NoRecord);
+    };
     if name.contains('/') {
-        return None;
+        return Err(RegistryError::NoRecord);
     }
-    let doc = json_meta(
+    let doc: ProviderDocument = fetch_json(
         &format!(
             "https://registry.terraform.io/v2/providers/{namespace}/{name}?include=provider-versions"
         ),
         net,
         cache,
     )?;
-    let attrs = doc.pointer("/data/attributes")?;
-    let text = |v: Option<&Value>| {
-        v.and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
+    let attrs = &doc.data.attributes;
+    let text = |v: Option<&String>| v.filter(|s| !s.is_empty()).cloned();
     // `(version, publish time, attributes)` for every included release.
-    let releases: Vec<(&str, Option<u64>, &Value)> = doc
-        .get("included")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|i| i.get("type").and_then(Value::as_str) == Some("provider-versions"))
+    let releases: Vec<(&str, Option<u64>, &VersionAttributes)> = doc
+        .included
+        .iter()
+        .filter(|i| i.kind.as_deref() == Some("provider-versions"))
         .filter_map(|i| {
-            let a = i.get("attributes")?;
-            let published = a
-                .get("published-at")
-                .and_then(Value::as_str)
-                .and_then(parse_ts);
-            Some((a.get("version")?.as_str()?, published, a))
+            let a = i.attributes.as_ref()?;
+            let published = a.published_at.as_deref().and_then(parse_ts);
+            Some((a.version.as_deref()?, published, a))
         })
         .collect();
     let latest = releases
@@ -162,21 +156,21 @@ pub(crate) fn terraform(
         version: version.to_string(),
         published_at: release.and_then(|r| r.1),
         latest_version: latest.map(str::to_string),
-        author: text(attrs.get("owner-name")),
+        author: text(attrs.owner_name.as_ref()),
         publisher: Some(namespace.to_string()),
         // The provider-level description is often empty where the release's
         // is not.
-        description: text(release.and_then(|r| r.2.get("description")))
-            .or_else(|| text(attrs.get("description"))),
-        repository: text(attrs.get("source")),
-        downloads_total: attrs.get("downloads").and_then(Value::as_u64),
+        description: text(release.and_then(|r| r.2.description.as_ref()))
+            .or_else(|| text(attrs.description.as_ref())),
+        repository: text(attrs.source.as_ref()),
+        downloads_total: attrs.downloads,
         // `official` and `partner` providers are vetted by HashiCorp; a
         // `community` namespace is anyone's GitHub account.
         publisher_verified: attrs
-            .get("tier")
-            .and_then(Value::as_str)
+            .tier
+            .as_deref()
             .map(|t| matches!(t, "official" | "partner")),
-        deprecated: text(attrs.get("warning")),
+        deprecated: text(attrs.warning.as_ref()),
         ..Default::default()
     };
     let mut times: Vec<u64> = releases.iter().filter_map(|r| r.1).collect();
@@ -189,7 +183,51 @@ pub(crate) fn terraform(
         }
         p.release_times = times;
     }
-    Some(p)
+    Ok(p)
+}
+
+/// The v2 provider document, with its provider-versions included.
+#[derive(Deserialize)]
+struct ProviderDocument {
+    data: Provider,
+    #[serde(default, deserialize_with = "null_default")]
+    included: Vec<Included>,
+}
+
+/// The provider resource itself.
+#[derive(Deserialize)]
+struct Provider {
+    attributes: ProviderAttributes,
+}
+
+/// The provider's own attributes.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct ProviderAttributes {
+    owner_name: Option<String>,
+    description: Option<String>,
+    source: Option<String>,
+    downloads: Option<u64>,
+    tier: Option<String>,
+    warning: Option<String>,
+}
+
+/// An included resource; the record reads the `provider-versions` ones.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Included {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    attributes: Option<VersionAttributes>,
+}
+
+/// One provider version's attributes.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+struct VersionAttributes {
+    version: Option<String>,
+    published_at: Option<String>,
+    description: Option<String>,
 }
 
 #[cfg(test)]
@@ -259,6 +297,6 @@ mod tests {
             .expect("registry");
         assert_eq!(r.version, "4.7.0");
         assert_eq!(r.description, None);
-        assert!(terraform("docker", None, &net, &test_cache("terraform")).is_none());
+        assert!(terraform("docker", None, &net, &test_cache("terraform")).is_err());
     }
 }

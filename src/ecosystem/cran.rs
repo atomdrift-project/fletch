@@ -1,49 +1,52 @@
 //! CRAN: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, parse_ts, strip_email};
+use crate::ecosystem::{fetch_json, parse_ts, strip_email};
 use crate::fetch::{BlobCache, Fetch};
+use crate::registry::RegistryError;
 
 /// CRAN: the crandb mirror serves one JSON document per package with the
 /// description, license, maintainer, and the `Date/Publication` of the release.
-pub(crate) fn cran(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(&format!("https://crandb.r-pkg.org/{name}"), net, cache)?;
+pub(crate) fn cran(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let doc: DescriptionFile = fetch_json(&format!("https://crandb.r-pkg.org/{name}"), net, cache)?;
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "cran".into(),
-        name: doc
-            .get("Package")
-            .and_then(Value::as_str)
-            .unwrap_or(name)
-            .to_string(),
-        version: doc
-            .get("Version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        published_at: doc
-            .get("Date/Publication")
-            .and_then(Value::as_str)
-            .and_then(parse_ts),
-        author: doc
-            .get("Maintainer")
-            .and_then(Value::as_str)
-            .map(strip_email),
-        description: doc.get("Title").and_then(Value::as_str).map(str::to_string),
+        name: doc.package.unwrap_or_else(|| name.to_string()),
+        version: doc.version.unwrap_or_default(),
+        published_at: doc.date_publication.as_deref().and_then(parse_ts),
+        author: doc.maintainer.as_deref().map(strip_email),
+        description: doc.title,
         // CRAN crowds several URLs into one field; keep the first.
         homepage: doc
-            .get("URL")
-            .and_then(Value::as_str)
+            .url
+            .as_deref()
             .and_then(|urls| urls.lines().map(str::trim).find(|l| !l.is_empty()))
             .map(str::to_string),
-        license: doc
-            .get("License")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        license: doc.license,
         ..Default::default()
     })
+}
+
+/// A package's DESCRIPTION fields, as crandb serves them.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+struct DescriptionFile {
+    package: Option<String>,
+    version: Option<String>,
+    #[serde(rename = "Date/Publication")]
+    date_publication: Option<String>,
+    maintainer: Option<String>,
+    title: Option<String>,
+    #[serde(rename = "URL")]
+    url: Option<String>,
+    license: Option<String>,
 }
 
 #[cfg(test)]

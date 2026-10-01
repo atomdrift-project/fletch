@@ -22,7 +22,7 @@
 //! fetches.
 
 pub mod cache_sweep;
-pub mod distro;
+mod distro;
 mod ecosystem;
 pub mod fetch;
 pub mod find;

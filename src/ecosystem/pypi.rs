@@ -1,15 +1,17 @@
 //! PyPI: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
-use std::collections::BTreeMap;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
+use std::collections::{BTreeMap, HashMap};
 
-use crate::ecosystem::{email_domain, json_meta, parse_rfc3339_secs};
+use crate::ecosystem::{email_domain, fetch_json, null_default, parse_rfc3339_secs};
 use crate::fetch::{
     ArtifactCandidate, BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, file_name_from_url,
     meta_ttl_unpinned, percent_decode, repository_base,
 };
 use crate::purl::Purl;
+use crate::registry::RegistryError;
 
 pub(crate) fn pypi_artifacts(
     name: &str,
@@ -230,51 +232,46 @@ pub(crate) fn pypi(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let doc = json_meta(&format!("https://pypi.org/pypi/{path}/json"), net, cache)?;
-    let info = doc.get("info")?;
-    let releases = doc.get("releases").and_then(Value::as_object);
+) -> Result<Registry, RegistryError> {
+    let doc: Project = fetch_json(&format!("https://pypi.org/pypi/{path}/json"), net, cache)?;
+    let Some(info) = &doc.info else {
+        return Err(RegistryError::NoRecord);
+    };
+    let releases = doc.releases.as_ref();
 
     // Target version: the one requested, else the registry's latest. A PURL
     // percent-encodes what PyPI spells literally (`1.0%2Blocal`).
-    let latest = info.get("version").and_then(Value::as_str);
+    let latest = info.version.as_deref();
     let requested = version.map(percent_decode);
     let target = requested.as_deref().or(latest).unwrap_or_default();
     let target_is_latest = Some(target) == latest;
-    let vulnerability_count = |d: &Value| Some(d.get("vulnerabilities")?.as_array()?.len() as u32);
+    let vulnerability_count = |v: &Option<Vec<IgnoredAny>>| v.as_ref().map(|v| v.len() as u32);
 
     // The earliest upload across a version's files is its publish time. The
     // target version's files come from `releases`; `urls` lists the latest
     // version's files, so it stands in only when the target *is* latest. A
     // requested version the timeline lacks gets no publish time or yank status
     // rather than latest's.
-    let publish_time = |files: &[Value]| {
+    let publish_time = |files: &[DistFile]| {
         files
             .iter()
-            .filter_map(|u| u.get("upload_time_iso_8601").and_then(Value::as_str))
+            .filter_map(|f| f.upload_time_iso_8601.as_deref())
             .filter_map(parse_rfc3339_secs)
             .min()
     };
     let target_files = releases
         .and_then(|r| r.get(target))
-        .and_then(Value::as_array)
-        .or_else(|| {
-            target_is_latest
-                .then(|| doc.get("urls").and_then(Value::as_array))
-                .flatten()
-        });
+        .or_else(|| target_is_latest.then_some(doc.urls.as_ref()).flatten());
     let published_at = target_files.map(Vec::as_slice).and_then(publish_time);
     // Per-version yank status (a specific version can be yanked while latest is
     // not), with the per-version reason where the file records carry one.
     let yanked_reason = target_files.and_then(|fs| {
-        fs.iter()
-            .any(|f| f.get("yanked").and_then(Value::as_bool).unwrap_or(false))
-            .then(|| {
-                fs.iter()
-                    .find_map(|f| f.get("yanked_reason").and_then(Value::as_str))
-                    .unwrap_or("yanked")
-                    .to_string()
-            })
+        fs.iter().any(|f| f.yanked.unwrap_or(false)).then(|| {
+            fs.iter()
+                .find_map(|f| f.yanked_reason.as_deref())
+                .unwrap_or("yanked")
+                .to_string()
+        })
     });
 
     let mut p = Registry {
@@ -284,42 +281,35 @@ pub(crate) fn pypi(
         published_at,
         latest_version: latest.map(str::to_string),
         author: info
-            .get("author")
-            .and_then(Value::as_str)
+            .author
+            .as_deref()
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                info.get("maintainer")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-            })
+            .or_else(|| info.maintainer.as_deref().filter(|s| !s.is_empty()))
             .map(str::to_string),
-        description: info
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        description: info.summary.clone(),
         homepage: info
-            .get("home_page")
-            .and_then(Value::as_str)
+            .home_page
+            .as_deref()
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         license: info
-            .get("license")
-            .and_then(Value::as_str)
+            .license
+            .as_deref()
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         deprecated: yanked_reason,
         // The package document's `vulnerabilities` are the latest release's;
         // any other listed version's come from its own endpoint.
         vulnerability_count: if target_is_latest {
-            vulnerability_count(&doc)
+            vulnerability_count(&doc.vulnerabilities)
         } else if let (Some(v), Some(_)) = (version, target_files) {
-            json_meta(
+            fetch_json::<Release>(
                 &format!("https://pypi.org/pypi/{path}/{v}/json"),
                 net,
                 cache,
             )
-            .as_ref()
-            .and_then(vulnerability_count)
+            .ok()
+            .and_then(|release| vulnerability_count(&release.vulnerabilities))
         } else {
             None
         },
@@ -328,10 +318,7 @@ pub(crate) fn pypi(
 
     // Release timeline: one publish time per version (the earliest of its files).
     if let Some(rel) = releases {
-        let mut times: Vec<u64> = rel
-            .values()
-            .filter_map(|files| files.as_array().and_then(|fs| publish_time(fs)))
-            .collect();
+        let mut times: Vec<u64> = rel.values().filter_map(|fs| publish_time(fs)).collect();
         times.sort_unstable();
         p.release_count = Some(times.len() as u32);
         p.first_published_at = times.first().copied();
@@ -344,26 +331,80 @@ pub(crate) fn pypi(
     // Custody: the owning account (PyPI exposes roles, not a per-version
     // publisher), and the email domain from the package's author/maintainer.
     p.publisher = doc
-        .get("ownership")
-        .and_then(|o| o.get("roles"))
-        .and_then(Value::as_array)
-        .and_then(|roles| {
-            roles
+        .ownership
+        .as_ref()
+        .and_then(|o| {
+            o.roles
                 .iter()
-                .find(|r| r.get("role").and_then(Value::as_str) == Some("Owner"))
-                .or_else(|| roles.first())
+                .find(|r| r.role.as_deref() == Some("Owner"))
+                .or_else(|| o.roles.first())
         })
-        .and_then(|r| r.get("user"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+        .and_then(|r| r.user.clone());
     p.publisher_email_domain = info
-        .get("author_email")
-        .and_then(Value::as_str)
+        .author_email
+        .as_deref()
         .filter(|s| !s.is_empty())
-        .or_else(|| info.get("maintainer_email").and_then(Value::as_str))
+        .or(info.maintainer_email.as_deref())
         .and_then(email_domain);
 
-    Some(p)
+    Ok(p)
+}
+
+/// The parts of a PyPI project document (`/pypi/{name}/json`) the record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Project {
+    info: Option<ProjectInfo>,
+    releases: Option<HashMap<String, Vec<DistFile>>>,
+    urls: Option<Vec<DistFile>>,
+    vulnerabilities: Option<Vec<IgnoredAny>>,
+    ownership: Option<Ownership>,
+}
+
+/// The project's `info` block: the latest release's metadata.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ProjectInfo {
+    version: Option<String>,
+    author: Option<String>,
+    maintainer: Option<String>,
+    summary: Option<String>,
+    home_page: Option<String>,
+    license: Option<String>,
+    author_email: Option<String>,
+    maintainer_email: Option<String>,
+}
+
+/// One uploaded file of a release, as `releases` and `urls` list it.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct DistFile {
+    upload_time_iso_8601: Option<String>,
+    yanked: Option<bool>,
+    yanked_reason: Option<String>,
+}
+
+/// The project's owning accounts.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Ownership {
+    #[serde(deserialize_with = "null_default")]
+    roles: Vec<Role>,
+}
+
+/// One account's role on the project (`Owner`, `Maintainer`).
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Role {
+    role: Option<String>,
+    user: Option<String>,
+}
+
+/// The parts of a PyPI release document (`/pypi/{name}/{version}/json`) the record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Release {
+    vulnerabilities: Option<Vec<IgnoredAny>>,
 }
 
 #[cfg(test)]

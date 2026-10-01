@@ -1,14 +1,15 @@
 //! Go modules (proxy.golang.org): registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, parse_rfc3339_secs};
+use crate::ecosystem::{decode, fetch_json, parse_rfc3339_secs};
 use crate::fetch::{
     ArtifactCandidate, BlobCache, CachedMeta, Fetch, FetchError, cached_metadata_status,
     deterministic_artifacts, now, percent_decode, safe_coordinate, sha256_hex, store_metadata,
 };
 use crate::purl::Purl;
+use crate::registry::RegistryError;
 
 /// Go module zips: the proxy's URL for the module path as written, unless
 /// the proxy's refusal names the spelling it wants ([`goproxy_canonical_path`]),
@@ -203,7 +204,7 @@ pub(crate) fn golang(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
+) -> Result<Registry, RegistryError> {
     // The spelling the proxy serves — a lowercased PURL is a 404 at the proxy
     // for every request until the case is put back (see
     // `goproxy_canonical_path`).
@@ -215,13 +216,17 @@ pub(crate) fn golang(
     // A versionless lookup asks the proxy what the current release is, so the
     // answer names itself in both fields.
     let Some(version) = version else {
-        let mut record = golang_record(path, &json_meta(&latest_url, net, cache)?);
+        let mut record = golang_record(path, fetch_json(&latest_url, net, cache)?);
         record.latest_version = Some(record.version.clone()).filter(|v| !v.is_empty());
         record.version_removed = Some(false);
         record.security_hold = Some(false);
-        return Some(record);
+        return Ok(record);
     };
 
+    let info_url = format!(
+        "https://proxy.golang.org/{escaped}/@v/{}.info",
+        goproxy_escape(version)
+    );
     // Kept as a status rather than a document, because a refusal is the answer
     // here and `.ok()` would throw away which refusal it was.
     // The probe above already asked for this `.info`; when it was refused
@@ -229,23 +234,15 @@ pub(crate) fn golang(
     // another upstream round trip for the same 404.
     let info = match resolved.refused {
         Some(status) => Err(FetchError::Status(status)),
-        None => cached_metadata_status(
-            &format!(
-                "https://proxy.golang.org/{escaped}/@v/{}.info",
-                goproxy_escape(version)
-            ),
-            &[],
-            net,
-            cache,
-        ),
+        None => cached_metadata_status(&info_url, &[], net, cache),
     };
     if let Ok(bytes) = &info
-        && let Ok(doc) = serde_json::from_slice::<Value>(bytes)
+        && let Ok(doc) = decode::<VersionInfo>(&info_url, bytes)
     {
-        let mut record = golang_record(path, &doc);
+        let mut record = golang_record(path, doc);
         record.version_removed = Some(false);
         record.security_hold = Some(false);
-        return Some(record);
+        return Ok(record);
     }
 
     // The proxy would not serve this release's `.info`, so it will not serve
@@ -264,7 +261,7 @@ pub(crate) fn golang(
     // knows the module and does not offer this release. A transient failure
     // reaching `.info` also lands here, and costs a metadata-only answer about
     // a release that was in fact fetchable — the safe direction to be wrong in.
-    let mut record = golang_record(path, &json_meta(&latest_url, net, cache)?);
+    let mut record = golang_record(path, fetch_json(&latest_url, net, cache)?);
     record.latest_version = Some(std::mem::take(&mut record.version)).filter(|v| !v.is_empty());
     // The release asked about, not the one the proxy offered instead. Its
     // publish time is not knowable: it lives in the record being withheld.
@@ -281,7 +278,7 @@ pub(crate) fn golang(
     // and scan treats `security_hold` as a hostile signal precisely so it does
     // not have to.
     record.security_hold = Some(matches!(info, Err(FetchError::Status(GOPROXY_WITHHELD))));
-    Some(record)
+    Ok(record)
 }
 
 /// The status proxy.golang.org answers for a module it has taken down for
@@ -291,25 +288,32 @@ const GOPROXY_WITHHELD: u16 = 403;
 /// The registry facts one proxy document carries. `version_removed` and
 /// `latest_version` are left to the caller, the only side that knows whether
 /// this document describes the release that was asked about.
-fn golang_record(path: &str, doc: &Value) -> Registry {
+fn golang_record(path: &str, doc: VersionInfo) -> Registry {
     Registry {
         ecosystem: "golang".into(),
         name: path.to_string(),
-        version: doc
-            .get("Version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        published_at: doc
-            .get("Time")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339_secs),
-        repository: doc
-            .pointer("/Origin/URL")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        version: doc.version.unwrap_or_default(),
+        published_at: doc.time.as_deref().and_then(parse_rfc3339_secs),
+        repository: doc.origin.and_then(|o| o.url),
         ..Default::default()
     }
+}
+
+/// A module proxy `.info` (or `@latest`) document: one version of a module.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+struct VersionInfo {
+    version: Option<String>,
+    time: Option<String>,
+    origin: Option<Origin>,
+}
+
+/// Where the proxy fetched the version from.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Origin {
+    #[serde(rename = "URL")]
+    url: Option<String>,
 }
 
 #[cfg(test)]
@@ -640,13 +644,13 @@ mod tests {
         assert_eq!(r.security_hold, Some(false));
     }
 
-    /// A module the proxy does not know at all is still `None`: there is no
-    /// package here to report facts about, and inventing one would turn "not a
-    /// module" into "a module with nothing in it".
+    /// A module the proxy does not know at all still has no record: there is
+    /// no package here to report facts about, and inventing one would turn "not
+    /// a module" into "a module with nothing in it".
     #[test]
     fn golang_unknown_module_stays_unknown() {
         let net = Fixtures::default();
         let cache = BlobCache::disabled();
-        assert!(golang("example.invalid/nope", Some("v1.0.0"), &net, &cache).is_none());
+        assert!(golang("example.invalid/nope", Some("v1.0.0"), &net, &cache).is_err());
     }
 }

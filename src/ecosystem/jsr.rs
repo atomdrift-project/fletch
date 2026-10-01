@@ -1,10 +1,11 @@
 //! JSR: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, parse_ts};
+use crate::ecosystem::{fetch_json, parse_ts};
 use crate::fetch::{BlobCache, Fetch, percent_decode};
+use crate::registry::RegistryError;
 
 /// JSR: the native API's package record (description, score, repo, latest) plus
 /// the versions list (each with a `createdAt` publish time). `path` is the
@@ -14,54 +15,80 @@ pub(crate) fn jsr(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
+) -> Result<Registry, RegistryError> {
     let decoded = path.replace("%40", "@");
-    let (scope, pkg) = decoded.trim_start_matches('@').split_once('/')?;
-    let doc = json_meta(
+    let (scope, pkg) = decoded
+        .trim_start_matches('@')
+        .split_once('/')
+        .ok_or(RegistryError::NoRecord)?;
+    let doc: Package = fetch_json(
         &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}"),
         net,
         cache,
     )?;
-    let latest = doc.get("latestVersion").and_then(Value::as_str);
+    let latest = doc.latest_version.as_deref();
     let requested = version.map(percent_decode);
     let want = requested.as_deref().or(latest).unwrap_or_default();
 
     // Per-version publish time comes from the versions list; a version it
     // lacks gets none rather than the newest's.
-    let published_at = json_meta(
+    let published_at = fetch_json::<Vec<PackageVersion>>(
         &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}/versions"),
         net,
         cache,
     )
+    .ok()
     .and_then(|vs| {
-        vs.as_array()?
-            .iter()
-            .find(|v| v.get("version").and_then(Value::as_str) == Some(want))?
-            .get("createdAt")
-            .and_then(Value::as_str)
-            .and_then(parse_ts)
-    });
-    let repository = doc.get("githubRepository").and_then(|g| {
-        let owner = g.get("owner").and_then(Value::as_str)?;
-        let repo = g.get("name").and_then(Value::as_str)?;
+        vs.into_iter()
+            .find(|v| v.version.as_deref() == Some(want))?
+            .created_at
+    })
+    .as_deref()
+    .and_then(parse_ts);
+    let repository = doc.github_repository.and_then(|g| {
+        let owner = g.owner?;
+        let repo = g.name?;
         Some(format!("https://github.com/{owner}/{repo}"))
     });
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "jsr".into(),
         name: format!("@{scope}/{pkg}"),
         version: want.to_string(),
         published_at,
         latest_version: latest.map(str::to_string),
-        description: doc
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        description: doc.description,
         repository,
         // JSR's 0–100 quality score is its popularity analogue.
-        rating: doc.get("score").and_then(Value::as_f64).map(|f| f as f32),
+        rating: doc.score.map(|f| f as f32),
         ..Default::default()
     })
+}
+
+/// The parts of a JSR package record the registry record reads.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Package {
+    latest_version: Option<String>,
+    description: Option<String>,
+    github_repository: Option<GithubRepository>,
+    score: Option<f64>,
+}
+
+/// The package's linked GitHub repository.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct GithubRepository {
+    owner: Option<String>,
+    name: Option<String>,
+}
+
+/// One entry of the package's versions list.
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct PackageVersion {
+    version: Option<String>,
+    created_at: Option<String>,
 }
 
 #[cfg(test)]

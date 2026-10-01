@@ -26,8 +26,8 @@ mod verify;
 
 pub use cache::{BlobCache, RawSink, RecordedSource, refs_dir, set_registry_ttl};
 pub(crate) use cache::{
-    CachedMeta, META_TTL_IMMUTABLE, cached_metadata, cached_metadata_status, cached_metadata_with,
-    cached_post, meta_ttl_pinned, meta_ttl_unpinned, store_metadata,
+    CachedMeta, META_TTL_IMMUTABLE, cached_metadata, cached_metadata_status, cached_post,
+    meta_ttl_pinned, meta_ttl_unpinned, store_metadata,
 };
 pub(crate) use coordinate::{
     is_web_scheme, percent_decode, repository_base, safe_coordinate, safe_filename_part,

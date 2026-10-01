@@ -1,11 +1,12 @@
 //! Container images (Docker Hub, Quay, and OCI references): registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, last_seg, parse_ts};
+use crate::ecosystem::{fetch_json, last_seg, lenient, parse_ts, present};
 use crate::fetch::{BlobCache, Fetch};
 use crate::purl::Purl;
+use crate::registry::RegistryError;
 
 /// Resolve a `pkg:oci` (or legacy `pkg:docker`) purl body to the `oci://`
 /// pseudo-URL the OCI puller consumes: `oci://<repo>[@sha256:…|:tag]`. The
@@ -54,83 +55,83 @@ pub(crate) fn oci_meta(
     path: &str,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
+) -> Result<Registry, RegistryError> {
     let repo = oci_repository(path, repository_url);
-    let (host, image) = repo.split_once('/')?;
+    let (host, image) = repo.split_once('/').ok_or(RegistryError::NoRecord)?;
     match host {
         "docker.io" => docker_hub(image, net, cache),
         "quay.io" => quay(image, net, cache),
-        _ => None,
+        _ => Err(RegistryError::NoRecord),
     }
 }
 
 /// Docker Hub repository metadata: anonymous JSON with pulls, stars, the
 /// publishing namespace, and registration/update times.
-fn docker_hub(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(
+fn docker_hub(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Registry, RegistryError> {
+    let doc: HubRepository = fetch_json(
         &format!("https://hub.docker.com/v2/repositories/{image}"),
         net,
         cache,
     )?;
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "oci".into(),
-        name: doc
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(last_seg(image))
-            .to_string(),
-        published_at: doc
-            .get("last_updated")
-            .and_then(Value::as_str)
-            .and_then(parse_ts),
-        first_published_at: doc
-            .get("date_registered")
-            .and_then(Value::as_str)
-            .and_then(parse_ts),
-        author: doc
-            .get("namespace")
-            .or_else(|| doc.get("user"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: doc
-            .get("description")
-            .and_then(Value::as_str)
-            .filter(|d| !d.is_empty())
-            .map(str::to_string),
-        downloads_total: doc.get("pull_count").and_then(Value::as_u64),
-        rating_count: doc.get("star_count").and_then(Value::as_u64),
+        name: doc.name.unwrap_or_else(|| last_seg(image).to_string()),
+        published_at: doc.last_updated.as_deref().and_then(parse_ts),
+        first_published_at: doc.date_registered.as_deref().and_then(parse_ts),
+        // `user` stands in only when `namespace` is absent.
+        author: doc.namespace.unwrap_or(doc.user),
+        description: doc.description.filter(|d| !d.is_empty()),
+        downloads_total: doc.pull_count,
+        rating_count: doc.star_count,
         ..Default::default()
     })
 }
 
+/// The parts of a Docker Hub repository document the registry record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct HubRepository {
+    name: Option<String>,
+    last_updated: Option<String>,
+    date_registered: Option<String>,
+    #[serde(deserialize_with = "present")]
+    namespace: Option<Option<String>>,
+    user: Option<String>,
+    description: Option<String>,
+    pull_count: Option<u64>,
+    star_count: Option<u64>,
+}
+
 /// Quay repository metadata: anonymous JSON with the description, the owning
 /// namespace, and a Unix-seconds last-modified time.
-fn quay(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(
+fn quay(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Registry, RegistryError> {
+    let doc: QuayRepository = fetch_json(
         &format!("https://quay.io/api/v1/repository/{image}"),
         net,
         cache,
     )?;
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "oci".into(),
-        name: doc
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(last_seg(image))
-            .to_string(),
-        published_at: doc.get("last_modified").and_then(Value::as_u64),
-        author: doc
-            .get("namespace")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: doc
-            .get("description")
-            .and_then(Value::as_str)
-            .filter(|d| !d.is_empty())
-            .map(str::to_string),
-        rating_count: doc.get("popularity").and_then(Value::as_u64),
+        name: doc.name.unwrap_or_else(|| last_seg(image).to_string()),
+        published_at: doc.last_modified,
+        author: doc.namespace,
+        description: doc.description.filter(|d| !d.is_empty()),
+        rating_count: doc.popularity,
         ..Default::default()
     })
+}
+
+/// The parts of a Quay repository document the registry record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct QuayRepository {
+    name: Option<String>,
+    last_modified: Option<u64>,
+    namespace: Option<String>,
+    description: Option<String>,
+    /// Quay sends popularity as a float score, so only an integer reads as a count.
+    #[serde(deserialize_with = "lenient")]
+    popularity: Option<u64>,
 }
 
 #[cfg(test)]

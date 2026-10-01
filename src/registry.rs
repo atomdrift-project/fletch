@@ -47,9 +47,8 @@ use crate::ecosystem::terraform::terraform;
 use crate::ecosystem::vscode::{openvsx, vscode};
 use crate::ecosystem::wordpress::wordpress;
 use crate::fetch::{BlobCache, Fetch, RecordedSource, safe_coordinate};
-use std::cell::Cell;
 
-use crate::fetch::{FetchError, Fetched};
+use crate::fetch::FetchError;
 use crate::purl::{Purl, PurlError};
 use filefacts::{RefLocator, Registry};
 
@@ -75,9 +74,29 @@ pub enum RegistryError {
     /// The registry could not be reached, or refused the request.
     #[error("registry unavailable: {0}")]
     Unavailable(FetchError),
+    /// The registry's answer was not the document fletch reads: a schema
+    /// change upstream, or not JSON at all.
+    #[error("unreadable registry document {url}: {reason}")]
+    Malformed {
+        /// The document that could not be read.
+        url: String,
+        /// What was wrong with it, as the decoder put it.
+        reason: String,
+    },
     /// The registry answered, but with nothing fletch could read as a record.
     #[error("no usable record in the registry's answer")]
     NoRecord,
+}
+
+impl From<FetchError> for RegistryError {
+    /// A registry that answers 404 or 410 has no such package; any other
+    /// failure leaves the question open.
+    fn from(error: FetchError) -> Self {
+        match error {
+            FetchError::Status(404 | 410) => Self::NotFound,
+            error => Self::Unavailable(error),
+        }
+    }
 }
 
 /// Look up and normalize the registry metadata for a dependency `locator`.
@@ -115,9 +134,8 @@ pub fn try_registry(
     } else {
         crate::fetch::meta_ttl_unpinned()
     };
-    let net = LastFailure::new(net);
     let (first, staged) = cache.with_meta_ttl(ttl).staged();
-    let record = lookup(&purl, &path, version, &net, &first);
+    let record = lookup(&purl, &path, version, net, &first);
     // The one fact a months-old copy can't hold is a version published after
     // it was cached. In an ecosystem whose package document dates every
     // version it lists, an undated pinned record means the copy didn't list
@@ -129,78 +147,16 @@ pub fn try_registry(
         && record.as_ref().is_ok_and(|r| r.published_at.is_none())
     {
         let fresh = cache.with_meta_ttl(crate::fetch::meta_ttl_unpinned());
-        return lookup(&purl, &path, version, &net, &fresh).map_err(|e| net.explain(e));
+        return lookup(&purl, &path, version, net, &fresh);
     }
     cache.commit(staged);
-    record.map_err(|e| net.explain(e))
+    record
 }
 
 /// [`try_registry`], for a caller that only needs the record.
 #[must_use]
 pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
     try_registry(locator, net, cache).ok()
-}
-
-/// A [`Fetch`] that passes every request through and keeps the last failure,
-/// so a lookup that ends without a record can say whether its registry was
-/// unreachable or answered without one.
-struct LastFailure<'a> {
-    net: &'a dyn Fetch,
-    last: Cell<Option<FetchError>>,
-}
-
-impl<'a> LastFailure<'a> {
-    fn new(net: &'a dyn Fetch) -> Self {
-        Self {
-            net,
-            last: Cell::new(None),
-        }
-    }
-
-    fn note(&self, result: Result<Fetched, FetchError>) -> Result<Fetched, FetchError> {
-        if let Err(e) = &result {
-            self.last.set(Some(e.clone()));
-        }
-        result
-    }
-
-    /// Refine a lookup's "no record" by the last request that failed.
-    fn explain(&self, error: RegistryError) -> RegistryError {
-        match (error, self.last.take()) {
-            (RegistryError::NoRecord, Some(FetchError::Status(404 | 410))) => {
-                RegistryError::NotFound
-            }
-            (RegistryError::NoRecord, Some(failure)) => RegistryError::Unavailable(failure),
-            (error, _) => error,
-        }
-    }
-}
-
-impl Fetch for LastFailure<'_> {
-    fn get(&self, url: &str) -> Result<Fetched, FetchError> {
-        self.note(self.net.get(url))
-    }
-
-    fn get_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.note(self.net.get_with(url, headers))
-    }
-
-    fn get_any_status(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.note(self.net.get_any_status(url, headers))
-    }
-
-    fn post(
-        &self,
-        url: &str,
-        body: &[u8],
-        headers: &[(&str, &str)],
-    ) -> Result<Fetched, FetchError> {
-        self.note(self.net.post(url, body, headers))
-    }
-
-    fn allows_oci(&self) -> bool {
-        self.net.allows_oci()
-    }
 }
 
 /// Ecosystems whose package document carries a publish time for every version
@@ -218,7 +174,7 @@ fn lookup(
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
     let repository_url = purl.qualifier("repository_url");
-    let record = match purl.typ() {
+    match purl.typ() {
         "npm" => npm(path, version, net, cache),
         "cargo" => crates(path, version, net, cache),
         "pypi" => pypi(path, version, net, cache),
@@ -341,9 +297,8 @@ fn lookup(
             Some((_, name)) => distro::alpine(last_seg(name), net, cache),
             None => distro::alpine(path, net, cache),
         },
-        other => return Err(RegistryError::Unsupported(other.to_string())),
-    };
-    record.ok_or(RegistryError::NoRecord)
+        other => Err(RegistryError::Unsupported(other.to_string())),
+    }
 }
 
 /// Like [`try_registry`], but also returns the raw provider documents the
@@ -609,16 +564,16 @@ mod tests {
         });
         let cache = test_cache("unlisted");
         let first_release = Some(1_420_070_400); // 2015-01-01
-        let want = Some("9.9.9");
 
         let records = [
-            crates("c", want, &net, &cache),
-            gem("g", want, &net, &cache),
-            hex_pm("h", want, &net, &cache),
-            pub_dev("p", want, &net, &cache),
-            conda("k", want, &net, &cache),
-            jsr("%40s/j", want, &net, &cache),
-        ];
+            "pkg:cargo/c",
+            "pkg:gem/g",
+            "pkg:hex/h",
+            "pkg:pub/p",
+            "pkg:conda/k",
+            "pkg:jsr/%40s/j",
+        ]
+        .map(|purl| registry(&RefLocator::Purl(format!("{purl}@9.9.9")), &net, &cache));
         for r in records {
             let r = r.expect("the package itself resolves");
             assert_eq!(r.version, "9.9.9", "{}", r.ecosystem);

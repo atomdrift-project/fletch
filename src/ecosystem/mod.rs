@@ -35,9 +35,13 @@ pub(crate) mod terraform;
 pub(crate) mod vscode;
 pub(crate) mod wordpress;
 
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
-use crate::fetch::{BlobCache, Fetch, cached_metadata};
+use crate::fetch::{BlobCache, Fetch, cached_metadata_status};
+use crate::registry::RegistryError;
 
 /// The domain half of an email address (`a@b.com` → `b.com`), lowercased.
 /// `None` when there is no `@` or the domain is empty. Tolerates the
@@ -55,50 +59,93 @@ fn email_domain(email: &str) -> Option<String> {
     (!domain.is_empty()).then_some(domain)
 }
 
-/// A non-empty string field, owned.
-fn nonempty(v: Option<&Value>) -> Option<String> {
-    v.and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+/// Fetch the registry document at `url` through the metadata cache and decode
+/// it as `T`, the shape the backend reads.
+fn fetch_json<T: DeserializeOwned>(
+    url: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<T, RegistryError> {
+    decode(url, &cached_metadata_status(url, &[], net, cache)?)
 }
 
-/// The JSON document at `url`, read through the metadata cache. `None` when the
-/// registry is unreachable with nothing cached, or answers with something that
-/// isn't JSON — both mean "unknown" to every caller, so neither is an error.
-fn json_meta(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Value> {
-    serde_json::from_slice(&cached_metadata(url, net, cache)?).ok()
+/// Decode a registry document, naming it when it is not the shape expected —
+/// a schema change upstream is then a precise error instead of a silent gap.
+fn decode<T: DeserializeOwned>(url: &str, bytes: &[u8]) -> Result<T, RegistryError> {
+    serde_json::from_slice(bytes).map_err(|e| RegistryError::Malformed {
+        url: url.to_string(),
+        reason: e.to_string(),
+    })
+}
+
+/// A field that is `T` when the registry sends one, else `None`: for fields a
+/// registry sends in more than one shape (npm's `license` is a string, an
+/// object, or an array of them), so that variety costs the field and never the
+/// document. Use with `#[serde(default, deserialize_with = "lenient")]`.
+fn lenient<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
+    Ok(T::deserialize(Value::deserialize(d)?).ok())
+}
+
+/// A field read as its default when the registry sends `null` — registries
+/// say "nothing here" that way, which serde accepts only for an `Option`. Use
+/// with `#[serde(default, deserialize_with = "null_default")]`.
+fn null_default<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(
+    d: D,
+) -> Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// A field whose `null` differs from its absence: `Some(None)` when the
+/// registry sends `null`, `None` when it omits the key. Use with
+/// `#[serde(default, deserialize_with = "present")]`.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// A localized marketplace string: a bare string, or a `{ locale: text }` map
+/// (AMO keys it `en-US`, Dify `en_US`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Localized {
+    Text(String),
+    Translations(BTreeMap<String, Option<String>>),
+}
+
+impl Localized {
+    /// The non-empty translation for exactly `locale`; `None` for a bare string.
+    fn translation(&self, locale: &str) -> Option<String> {
+        let Self::Translations(map) = self else {
+            return None;
+        };
+        map.get(locale)?
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// The text to show: a non-empty bare string, else the `en-US` translation,
+    /// else the first non-empty one in locale order.
+    fn text(&self) -> Option<String> {
+        match self {
+            Self::Text(s) => (!s.is_empty()).then(|| s.clone()),
+            Self::Translations(map) => self
+                .translation("en-US")
+                .or_else(|| map.values().flatten().find(|s| !s.is_empty()).cloned()),
+        }
+    }
+}
+
+/// A boolean flag the registry sets → its `label` when set, else `None`.
+fn flag(set: Option<bool>, label: &str) -> Option<String> {
+    set.and_then(|f| f.then(|| label.to_string()))
 }
 
 /// The final path segment — the bare package name, dropping any vendor/namespace
 /// prefix an OS-package locator carries (`pkg:aur/foo`, `pkg:alpm/arch/foo`).
 pub(crate) fn last_seg(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
-}
-
-/// A boolean deprecation flag → its `label` when set, else `None`.
-fn deprecation_flag(doc: &Value, key: &str, label: &str) -> Option<String> {
-    doc.get(key)
-        .and_then(Value::as_bool)
-        .and_then(|f| f.then(|| label.to_string()))
-}
-
-/// Resolve an addons.mozilla.org localized field: a bare string, or a
-/// `{ lang: text }` map from which `en-US` (else any non-empty value) is taken.
-fn localized(v: &Value) -> Option<String> {
-    match v {
-        Value::String(s) => (!s.is_empty()).then(|| s.clone()),
-        Value::Object(map) => map
-            .get("en-US")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                map.values()
-                    .filter_map(Value::as_str)
-                    .find(|s| !s.is_empty())
-            })
-            .map(str::to_string),
-        _ => None,
-    }
 }
 
 /// `Name <email>` → `Name`; a bare name is returned unchanged. Shared with

@@ -1,58 +1,71 @@
 //! CPAN: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 
-use crate::ecosystem::{json_meta, parse_ts};
+use crate::ecosystem::{fetch_json, null_default, parse_ts};
 use crate::fetch::{BlobCache, Fetch};
+use crate::registry::RegistryError;
 
 /// CPAN: MetaCPAN's release endpoint returns the latest release of a
 /// distribution with its date, author (PAUSE id), abstract, and resources.
-pub(crate) fn cpan(dist: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    let doc = json_meta(
+pub(crate) fn cpan(
+    dist: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
+    let doc: Release = fetch_json(
         &format!("https://fastapi.metacpan.org/v1/release/{dist}"),
         net,
         cache,
     )?;
 
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "cpan".into(),
-        name: doc
-            .get("distribution")
-            .and_then(Value::as_str)
-            .unwrap_or(dist)
-            .to_string(),
-        version: doc
-            .get("version")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        name: doc.distribution.unwrap_or_else(|| dist.to_string()),
+        version: doc.version.unwrap_or_default(),
         // MetaCPAN dates are naive ISO (no zone); treat as UTC.
-        published_at: doc.get("date").and_then(Value::as_str).and_then(parse_ts),
-        author: doc
-            .get("author")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        description: doc
-            .get("abstract")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        homepage: doc
-            .pointer("/resources/homepage")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        repository: doc
-            .pointer("/resources/repository/url")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        license: doc
-            .pointer("/license/0")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        deprecated: (doc.get("status").and_then(Value::as_str) == Some("backpan"))
+        published_at: doc.date.as_deref().and_then(parse_ts),
+        author: doc.author,
+        description: doc.r#abstract,
+        homepage: doc.resources.homepage,
+        repository: doc.resources.repository.and_then(|r| r.url),
+        license: doc.license.into_iter().next(),
+        deprecated: (doc.status.as_deref() == Some("backpan"))
             .then(|| "removed from CPAN".to_string()),
         ..Default::default()
     })
+}
+
+/// The parts of a MetaCPAN release document the registry record reads.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Release {
+    distribution: Option<String>,
+    version: Option<String>,
+    date: Option<String>,
+    author: Option<String>,
+    r#abstract: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    resources: Resources,
+    #[serde(deserialize_with = "null_default")]
+    license: Vec<String>,
+    status: Option<String>,
+}
+
+/// The release's `resources` links.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Resources {
+    homepage: Option<String>,
+    repository: Option<Repository>,
+}
+
+/// `resources.repository`, read for its `url`.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Repository {
+    url: Option<String>,
 }
 
 #[cfg(test)]

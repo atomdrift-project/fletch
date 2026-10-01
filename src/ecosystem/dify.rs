@@ -1,14 +1,15 @@
 //! The Dify Marketplace: registry metadata and artifact resolution.
 
 use filefacts::Registry;
-use serde_json::Value;
+use serde::Deserialize;
 use std::time::Duration;
 
-use crate::ecosystem::{json_meta, localized, nonempty, parse_ts};
+use crate::ecosystem::{Localized, fetch_json, parse_ts};
 use crate::fetch::{
     BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, meta_ttl_unpinned, percent_decode,
     safe_coordinate,
 };
+use crate::registry::RegistryError;
 
 /// Resolve a Dify Marketplace plugin (`<org>/<name>`) to `(version, .difypkg
 /// URL)`. The download endpoint is keyed by the release's unique identifier,
@@ -82,54 +83,99 @@ pub(crate) fn dify(
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<Registry> {
-    let (org, name) = path.split_once('/')?;
+) -> Result<Registry, RegistryError> {
+    let (org, name) = path.split_once('/').ok_or(RegistryError::NoRecord)?;
     if name.contains('/') {
-        return None;
+        return Err(RegistryError::NoRecord);
     }
-    let doc = json_meta(
+    let doc: PluginDocument = fetch_json(
         &format!("https://marketplace.dify.ai/api/v1/plugins/{org}/{name}"),
         net,
         cache,
     )?;
-    let plugin = doc.pointer("/data/plugin")?;
-    let latest_version = nonempty(plugin.get("latest_version"));
+    let plugin = doc.data.plugin;
+    let latest_version = plugin.latest_version.filter(|s| !s.is_empty());
     let version = version
         .map(percent_decode)
         .or_else(|| latest_version.clone())
         .unwrap_or_default();
-    Some(Registry {
+    Ok(Registry {
         ecosystem: "dify".into(),
-        name: nonempty(plugin.get("plugin_id")).unwrap_or_else(|| percent_decode(path)),
+        name: plugin
+            .plugin_id
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| percent_decode(path)),
         published_at: plugin
-            .get("version_updated_at")
-            .and_then(Value::as_str)
+            .version_updated_at
+            .as_deref()
             .filter(|_| latest_version.as_deref() == Some(version.as_str()))
             .and_then(parse_ts),
-        first_published_at: plugin
-            .get("created_at")
-            .and_then(Value::as_str)
-            .and_then(parse_ts),
+        first_published_at: plugin.created_at.as_deref().and_then(parse_ts),
         version,
         latest_version,
         // Localized as `{ "en_US": … }`, underscore where AMO has a hyphen.
-        title: nonempty(plugin.pointer("/label/en_US"))
-            .or_else(|| plugin.get("label").and_then(localized)),
-        description: nonempty(plugin.pointer("/brief/en_US"))
-            .or_else(|| plugin.get("brief").and_then(localized)),
-        repository: nonempty(plugin.get("repository")),
+        title: plugin
+            .label
+            .and_then(|l| l.translation("en_US").or_else(|| l.text())),
+        description: plugin
+            .brief
+            .and_then(|b| b.translation("en_US").or_else(|| b.text())),
+        repository: plugin.repository.filter(|s| !s.is_empty()),
         publisher: Some(percent_decode(org)),
-        downloads_total: plugin.get("install_count").and_then(Value::as_u64),
+        downloads_total: plugin.install_count,
         // Dify's own and its partners' plugins are vetted; `community` is
         // anyone's.
         publisher_verified: plugin
-            .pointer("/verification/authorized_category")
-            .and_then(Value::as_str)
-            .map(|c| matches!(c, "langgenius" | "partner")),
-        deprecated: nonempty(plugin.get("deprecated_reason"))
-            .or_else(|| nonempty(plugin.get("status")).filter(|s| s != "active")),
+            .verification
+            .and_then(|v| v.authorized_category)
+            .map(|c| matches!(c.as_str(), "langgenius" | "partner")),
+        deprecated: plugin
+            .deprecated_reason
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                plugin
+                    .status
+                    .filter(|s| !s.is_empty())
+                    .filter(|s| s != "active")
+            }),
         ..Default::default()
     })
+}
+
+/// A Dify Marketplace plugin document: the listing under `data.plugin`.
+#[derive(Deserialize)]
+struct PluginDocument {
+    data: PluginData,
+}
+
+/// The `data` envelope of a plugin document.
+#[derive(Deserialize)]
+struct PluginData {
+    plugin: Plugin,
+}
+
+/// A Dify plugin listing with its latest release.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Plugin {
+    plugin_id: Option<String>,
+    latest_version: Option<String>,
+    version_updated_at: Option<String>,
+    created_at: Option<String>,
+    label: Option<Localized>,
+    brief: Option<Localized>,
+    repository: Option<String>,
+    install_count: Option<u64>,
+    verification: Option<Verification>,
+    deprecated_reason: Option<String>,
+    status: Option<String>,
+}
+
+/// Dify's vetting of a plugin.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Verification {
+    authorized_category: Option<String>,
 }
 
 #[cfg(test)]
@@ -171,6 +217,6 @@ mod tests {
         assert_eq!(r.publisher_verified, Some(false));
         assert_eq!(r.downloads_total, Some(9));
         assert_eq!(r.deprecated, None);
-        assert!(dify("eval-loop", None, &net, &test_cache("dify")).is_none());
+        assert!(dify("eval-loop", None, &net, &test_cache("dify")).is_err());
     }
 }
