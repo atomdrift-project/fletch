@@ -24,10 +24,10 @@ mod ssrf;
 mod transport;
 mod verify;
 
-pub use cache::{BlobCache, RawSink, RecordedSource, refs_dir, set_registry_ttl};
+pub use cache::{BlobCache, RawSink, RecordedSource, refs_dir};
 pub(crate) use cache::{
     CachedMeta, META_TTL_IMMUTABLE, cached_metadata, cached_metadata_status, cached_post,
-    meta_ttl_pinned, meta_ttl_unpinned, store_metadata,
+    store_metadata,
 };
 pub(crate) use coordinate::{
     is_web_scheme, percent_decode, repository_base, safe_coordinate, safe_filename_part,
@@ -37,8 +37,7 @@ pub(crate) use select::{
     artifact_candidate, file_name_from_url, file_name_matches, purl_checksums,
 };
 pub use transport::{
-    DEFAULT_MAX_FETCH_BYTES, Fetch, FetchError, Fetched, Fixtures, HttpFetch, max_fetch_bytes,
-    set_max_fetch_bytes,
+    DEFAULT_MAX_FETCH_BYTES, Fetch, FetchError, Fetched, Fixtures, HttpFetch, Method, Request,
 };
 
 use crate::ecosystem::arch::resolve_aur;
@@ -74,15 +73,46 @@ pub enum Outcome {
     /// A pin was declared, but Fletch cannot verify that algorithm over the
     /// downloaded bytes. Never silently treated as an unpinned success.
     UnverifiablePin,
-    /// Locator could not be resolved to a URL (unsupported ecosystem).
-    Unresolved,
+    /// The locator could not be resolved to a URL, for this reason.
+    Unresolved(Unresolved),
     /// Not a fetch target (identity / unclassified) — recorded, not fetched.
     Skipped,
     /// The per-run fetch budget was exhausted before this reference — recorded
     /// so the cap is never a silent truncation.
     BudgetExceeded,
-    /// The fetch failed; carries the reason.
-    Failed(String),
+    /// The fetch failed, for this reason.
+    Failed(FetchError),
+}
+
+/// Why a reference resolved to no URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unresolved {
+    /// The package URL does not parse.
+    InvalidPurl,
+    /// A coordinate that could restructure the registry URL it fills, which no
+    /// registry name does (see `safe_coordinate`).
+    UnsafeCoordinate,
+    /// The reference needs a registry to name its release — a range, a tag,
+    /// or no version at all — and none was named: no release matches, or the
+    /// registry could not be asked.
+    NoRelease,
+    /// fletch has no artifact source for this reference: its type has none,
+    /// or the reference lacks what that source needs.
+    Unsupported,
+}
+
+/// Where a record's bytes came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Served {
+    /// Fetched over the network just now.
+    Network,
+    /// A cache entry still inside its TTL.
+    Cache,
+    /// A cache entry past its TTL, served because the source was unreachable,
+    /// so the content may be outdated.
+    StaleCache,
 }
 
 /// A fetch edge + provenance for one reference. `source_sha256 → content_sha256`
@@ -95,8 +125,8 @@ pub enum Outcome {
 pub struct FetchRecord {
     /// sha256 of the file that declared this reference — the edge's *source*
     /// endpoint. Stamped by [`fetch_references`].
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub source_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
     /// Byte offset of the declaring reference in the source file — the
     /// citation anchor, so a finding derived from what was fetched can be
     /// pinned to the exact reference site. Stamped by [`fetch_references`]
@@ -114,9 +144,9 @@ pub struct FetchRecord {
     pub kind: RefKind,
     /// The reference's locator (PURL/URL) as emitted by filefacts.
     pub locator: String,
-    /// The URL the locator resolved to. Empty when unresolved/skipped.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub resolved_url: String,
+    /// The URL the locator resolved to. `None` when unresolved/skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_url: Option<String>,
     /// Final URL after redirects, when the fetch reached the network.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_url: Option<String>,
@@ -130,21 +160,18 @@ pub struct FetchRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<(String, String)>,
     /// Unix-seconds timestamp of the fetch (the original fetch time for a
-    /// cache hit). `0` when no fetch occurred (skipped/unresolved).
-    pub fetched_at: u64,
+    /// cache hit). `None` when no fetch occurred (skipped/unresolved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<u64>,
     /// SHA-256 of the fetched bytes — the content (hopper) lookup key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_sha256: Option<String>,
     /// Size of the fetched bytes in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
-    /// Whether the bytes came from the blob cache rather than the network.
-    pub cached: bool,
-    /// Whether the bytes were served from cache *past their TTL* because a
-    /// fresh fetch couldn't be made (the source was unreachable) — so the
-    /// content may be outdated. Always implies `cached`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub stale: bool,
+    /// Where the bytes came from; `None` when there are none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served: Option<Served>,
     /// Pin verification: `Some(true/false)` when the reference declared a
     /// verifiable content or Go module-tree pin; `None` when unpinned,
     /// unsupported, malformed, or over the verification budget.
@@ -158,23 +185,29 @@ impl FetchRecord {
     /// A record that never reached the network (skipped / unresolved).
     fn terminal(locator: String, outcome: Outcome) -> Self {
         Self {
-            source_sha256: String::new(),
+            source_sha256: None,
             source_offset: None,
             kind: RefKind::Undefined,
             locator,
-            resolved_url: String::new(),
+            resolved_url: None,
             final_url: None,
             redirects: Vec::new(),
             status: None,
             headers: Vec::new(),
-            fetched_at: 0,
+            fetched_at: None,
             content_sha256: None,
             size: None,
-            cached: false,
-            stale: false,
+            served: None,
             pin_verified: None,
             outcome,
         }
+    }
+
+    /// Whether the bytes came from the blob cache, fresh or stale, rather than
+    /// the network.
+    #[must_use]
+    pub fn cached(&self) -> bool {
+        matches!(self.served, Some(Served::Cache | Served::StaleCache))
     }
 }
 
@@ -209,7 +242,7 @@ pub fn fetch_ref(r: &Reference, net: &dyn Fetch, cache: &BlobCache) -> FetchReco
 /// a re-run over a warm cache is never throttled.
 #[must_use]
 pub fn counts_against_budget(rec: &FetchRecord) -> bool {
-    !rec.cached
+    !rec.cached()
         && matches!(
             rec.outcome,
             Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin | Outcome::Failed(_)
@@ -238,8 +271,9 @@ fn fetch_ref_inner(
     // Resolution may refine the locator: a versionless npm PURL (a manifest
     // range/tag) becomes the concrete `name@<resolved>` it currently points at,
     // so the cache key and the recorded edge name the version actually fetched.
-    let Some((locator, url)) = resolved_target(&r.locator, net, cache) else {
-        return FetchRecord::terminal(locator, Outcome::Unresolved);
+    let (locator, url) = match resolved_target(&r.locator, net, cache) {
+        Ok(target) => target,
+        Err(why) => return FetchRecord::terminal(locator, Outcome::Unresolved(why)),
     };
 
     let key = sha256_hex(locator.as_bytes());
@@ -257,7 +291,7 @@ fn fetch_ref_inner(
         // Count budget spent: record the edge without fetching so the cap is
         // never a silent truncation, and a later run can still pick it up.
         let mut rec = FetchRecord::terminal(locator, Outcome::BudgetExceeded);
-        rec.resolved_url = url;
+        rec.resolved_url = Some(url);
         return rec;
     }
 
@@ -287,7 +321,7 @@ fn fetch_ref_inner(
             ))
         }
     } else {
-        net.get(&url)
+        net.send(&Request::get(&url))
     };
     match fetched {
         Ok(f) => {
@@ -311,15 +345,17 @@ fn fetch_ref_inner(
                 record(r, locator, url, &bytes, Served::StaleCache, &meta)
             }
             None => {
-                let mut rec = FetchRecord::terminal(locator, Outcome::Failed(e.to_string()));
-                rec.resolved_url = url;
-                rec.fetched_at = now();
                 // A refused status *did* reach the network, and the code is the
                 // whole of what the server said: keep it in the field consumers
-                // read rather than only in the error text.
-                if let FetchError::Status(status) = e {
-                    rec.status = Some(status);
-                }
+                // read as well as in the failure.
+                let status = match e {
+                    FetchError::Status(status) => Some(status),
+                    _ => None,
+                };
+                let mut rec = FetchRecord::terminal(locator, Outcome::Failed(e));
+                rec.resolved_url = Some(url);
+                rec.fetched_at = Some(now());
+                rec.status = status;
                 rec
             }
         },
@@ -473,9 +509,8 @@ pub fn fetch_references_with(
                             .unwrap_or_else(|panic| {
                                 FetchRecord::terminal(
                                     locator_string(&targets[i].locator),
-                                    Outcome::Failed(format!(
-                                        "internal error: {}",
-                                        panic_message(panic.as_ref())
+                                    Outcome::Failed(FetchError::Internal(
+                                        panic_message(panic.as_ref()).to_string(),
                                     )),
                                 )
                             });
@@ -516,7 +551,7 @@ pub fn fetch_references_with(
         let mut rec = slots.get_mut(i).and_then(Option::take).unwrap_or_else(|| {
             FetchRecord::terminal(locator_string(&r.locator), Outcome::BudgetExceeded)
         });
-        rec.source_sha256 = source_sha256.to_string();
+        rec.source_sha256 = Some(source_sha256.to_string()).filter(|s| !s.is_empty());
         rec.source_offset = Some(r.offset);
         rec.kind = r.kind;
         records.push(rec);
@@ -551,19 +586,6 @@ fn selected(r: &Reference, fetch_urls: bool) -> bool {
             }
             RefLocator::Path(_) => false,
         }
-}
-
-/// Where bytes in hand came from. One choice rather than two `bool`s, because
-/// only three of the four flag combinations are real: a stale serve is by
-/// definition a cache serve, so `!cached && stale` must be unrepresentable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Served {
-    /// Fetched over the network just now.
-    Network,
-    /// A cache entry still inside its TTL.
-    Cache,
-    /// A cache entry past its TTL, served because the source was unreachable.
-    StaleCache,
 }
 
 /// Build a record for bytes in hand, verifying the pin and choosing the outcome.
@@ -601,20 +623,19 @@ fn record(
         Outcome::Ok
     };
     FetchRecord {
-        source_sha256: String::new(),
+        source_sha256: None,
         source_offset: None,
         kind: r.kind,
         locator,
-        resolved_url,
+        resolved_url: Some(resolved_url),
         final_url: Some(meta.final_url.clone()),
         redirects: meta.redirects.clone(),
         status: Some(meta.status),
         headers: meta.headers.clone(),
-        fetched_at: meta.fetched_at,
+        fetched_at: Some(meta.fetched_at),
         content_sha256: Some(content_sha256),
         size: Some(bytes.len() as u64),
-        cached: matches!(served, Served::Cache | Served::StaleCache),
-        stale: served == Served::StaleCache,
+        served: Some(served),
         pin_verified,
         outcome,
     }
@@ -768,7 +789,8 @@ fn resolve_requirement(
             // manager would install.
             let repository = repository_base(&purl, "https://registry.npmjs.org")?;
             let url = format!("{repository}/{}", npm_registry_name(name));
-            let bytes = cached_metadata(&url, net, &cache.with_meta_ttl(meta_ttl_unpinned()))?;
+            let bytes =
+                cached_metadata(&url, net, &cache.with_meta_ttl(cache.meta_ttl_unpinned()))?;
             let doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
             let versions = doc.get("versions")?.as_object()?;
             let version = if let Ok(range) = node_semver::Range::parse(requirement) {
@@ -804,7 +826,8 @@ fn resolve_requirement(
             }
             let range = requirement.parse::<semver::VersionReq>().ok()?;
             let url = format!("https://crates.io/api/v1/crates/{name}");
-            let bytes = cached_metadata(&url, net, &cache.with_meta_ttl(meta_ttl_unpinned()))?;
+            let bytes =
+                cached_metadata(&url, net, &cache.with_meta_ttl(cache.meta_ttl_unpinned()))?;
             let doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
             let candidates = doc.get("versions")?.as_array()?;
             let (version, row) = candidates
@@ -826,7 +849,8 @@ fn resolve_requirement(
             let range = requirement.parse::<pep440_rs::VersionSpecifiers>().ok()?;
             let repository = repository_base(&purl, "https://pypi.org")?;
             let url = format!("{repository}/pypi/{name}/json");
-            let bytes = cached_metadata(&url, net, &cache.with_meta_ttl(meta_ttl_unpinned()))?;
+            let bytes =
+                cached_metadata(&url, net, &cache.with_meta_ttl(cache.meta_ttl_unpinned()))?;
             let doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
             let versions = doc.get("releases")?.as_object()?;
             let (_, spelling) = versions
@@ -1110,19 +1134,23 @@ fn resolve_purl_with_file_selection(purl: &Purl, honor_file_name: bool) -> Optio
 /// PyPI and Composer have no derivable artifact URL, and a versionless npm PURL
 /// (a manifest range/tag) is *refined* to the concrete `name@version` it
 /// currently points at — that refined locator is returned so it keys the cache
-/// and names the fetch edge. `None` when the ecosystem can't be resolved.
+/// and names the fetch edge. The error says why there is no URL.
 fn resolved_target(
     locator: &RefLocator,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<(String, String)> {
-    if let Requirement::Resolved(exact) = resolve_requirement(locator, net, cache)? {
+) -> Result<(String, String), Unresolved> {
+    let RefLocator::Purl(raw) = locator else {
+        return resolve(locator)
+            .map(|url| (locator_string(locator), url))
+            .ok_or(Unresolved::Unsupported);
+    };
+    let purl = Purl::parse(raw).ok().ok_or(Unresolved::InvalidPurl)?;
+    if let Requirement::Resolved(exact) =
+        resolve_requirement(locator, net, cache).ok_or(Unresolved::NoRelease)?
+    {
         return resolved_target(&exact, net, cache);
     }
-    let RefLocator::Purl(raw) = locator else {
-        return resolve(locator).map(|url| (locator_string(locator), url));
-    };
-    let purl = Purl::parse(raw).ok()?;
     let p = purl.canonical();
     let ty = purl.typ();
     // An exact download override takes precedence even for ecosystems that
@@ -1130,10 +1158,11 @@ fn resolved_target(
     // common exact-filename selector to it just as the pure resolver does.
     if let Some(url) = purl.qualifier("download_url") {
         return (is_web_scheme(url) && file_name_matches(&purl, &file_name_from_url(url)))
-            .then(|| (p, url.to_string()));
+            .then(|| (p, url.to_string()))
+            .ok_or(Unresolved::Unsupported);
     }
     if purl.qualifier("vers").is_some() {
-        return None;
+        return Err(Unresolved::Unsupported);
     }
     let (coordinate_path, coordinate_version) = (purl.encoded_path(), purl.encoded_version());
     let (coordinate_path, coordinate_version) =
@@ -1141,7 +1170,7 @@ fn resolved_target(
     // Every branch below builds registry URLs from these, as
     // [`resolve_purl`] does; vet them once, the same way.
     if !safe_purl_coordinates(ty, coordinate_path, coordinate_version) {
-        return None;
+        return Err(Unresolved::UnsafeCoordinate);
     }
     // Registry metadata can refine a mutable/tagged request to a concrete
     // release and exact artifact. Use that identity for cache/provenance;
@@ -1175,15 +1204,20 @@ fn resolved_target(
             .or(candidate.release_purl.as_ref())
             .cloned()
             .unwrap_or(p);
-        return Some((exact, candidate.url.clone()));
+        return Ok((exact, candidate.url.clone()));
     }
     // A versionless (or tag-versioned) npm dependency is refined through
     // dist-tags.
     if ty == "npm" {
         match coordinate_version {
-            None => return resolve_npm_dist_tag(&purl, "latest", net),
+            None => {
+                return resolve_npm_dist_tag(&purl, "latest", net).ok_or(Unresolved::NoRelease);
+            }
             Some(version) if !npm_version_is_concrete(version) => {
-                return resolve_npm_dist_tag(&purl, purl.version()?, net);
+                return purl
+                    .version()
+                    .and_then(|tag| resolve_npm_dist_tag(&purl, tag, net))
+                    .ok_or(Unresolved::NoRelease);
             }
             Some(_) => {}
         }
@@ -1197,23 +1231,28 @@ fn resolved_target(
         .qualifier("repository_url")
         .is_some_and(|url| url.contains("open-vsx.org"));
     if ty == "openvsx" || (ty == "vscode-extension" && open_vsx) {
-        return resolve_openvsx(&purl, net).map(|u| (p, u));
+        return resolve_openvsx(&purl, net)
+            .map(|u| (p, u))
+            .ok_or(Unresolved::NoRelease);
     }
     // The VS Code Marketplace's `.vsix` lives at a well-known gallery URL,
     // but the latest version (when unpinned) comes from the query API.
     if ty == "vscode" || ty == "vscode-extension" {
-        return resolve_vscode(&purl, net).map(|u| (p, u));
+        return resolve_vscode(&purl, net)
+            .map(|u| (p, u))
+            .ok_or(Unresolved::NoRelease);
     }
     // PyPI may publish many files for one release. Honor its registered
     // case-sensitive `file_name` selector (and the legacy `kind` hint),
     // then feed the preferred matrix candidate through the old one-URL
     // fetch contract.
     if ty == "pypi" {
-        let version = coordinate_version?;
+        let version = coordinate_version.ok_or(Unresolved::NoRelease)?;
         return pypi_artifacts(coordinate_path, Some(version), &purl, net, cache)
             .into_iter()
             .find(|candidate| candidate.preferred)
-            .map(|candidate| (p, candidate.url));
+            .map(|candidate| (p, candidate.url))
+            .ok_or(Unresolved::NoRelease);
     }
     // AMO publishes the exact XPI URL in its API, as ComfyUI Registry nodes
     // and Dify Marketplace plugins name their artifact only through theirs
@@ -1223,15 +1262,19 @@ fn resolved_target(
     // version for provenance and cache keys.
     if matches!(ty, "firefox" | "comfyui" | "dify") {
         let (version, url) = match ty {
-            "firefox" => resolve_firefox(coordinate_path, coordinate_version, net, cache)?,
-            "comfyui" => resolve_comfyui(coordinate_path, coordinate_version, net, cache)?,
-            _ => resolve_dify(coordinate_path, coordinate_version, net, cache)?,
-        };
+            "firefox" => resolve_firefox(coordinate_path, coordinate_version, net, cache),
+            "comfyui" => resolve_comfyui(coordinate_path, coordinate_version, net, cache),
+            _ => resolve_dify(coordinate_path, coordinate_version, net, cache),
+        }
+        .ok_or(Unresolved::NoRelease)?;
         let locator = match coordinate_version {
             Some(_) => p,
-            None => purl.with_version(&version)?.canonical(),
+            None => purl
+                .with_version(&version)
+                .ok_or(Unresolved::NoRelease)?
+                .canonical(),
         };
-        return Some((locator, url));
+        return Ok((locator, url));
     }
     // The AUR serves one artifact per package: the current PKGBUILD-tree
     // snapshot, addressed by *pkgbase* (a split package's snapshot lives
@@ -1254,14 +1297,24 @@ fn resolved_target(
             .rsplit('/')
             .next()
             .unwrap_or(coordinate_path);
-        return Some((p, resolve_aur(name, net, cache)));
+        return Ok((p, resolve_aur(name, net, cache)));
     }
     if ty == "composer"
         && let Some(version) = coordinate_version
     {
-        return resolve_composer(coordinate_path, version, net).map(|u| (p, u));
+        return resolve_composer(coordinate_path, version, net)
+            .map(|u| (p, u))
+            .ok_or(Unresolved::NoRelease);
     }
-    resolve_purl(&purl).map(|url| (p, url))
+    // The matrix is this type's artifact source, so when it named nothing and
+    // the offline resolver cannot either, a release is what is missing.
+    resolve_purl(&purl)
+        .map(|url| (p, url))
+        .ok_or(if needs_matrix {
+            Unresolved::NoRelease
+        } else {
+            Unresolved::Unsupported
+        })
 }
 
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
@@ -1337,7 +1390,9 @@ mod tests {
     fn cargo_requirement_selects_compatible_non_yanked_release() {
         let net=Fixtures::default().with("https://crates.io/api/v1/crates/codec",br#"{"versions":[{"num":"2.0.0","yanked":false},{"num":"1.9.0","yanked":true},{"num":"1.4.2","yanked":false}]}"#);
         let locator = RefLocator::Purl("pkg:cargo/codec?version_requirement=%5E1.2".into());
-        let (exact, url) = resolved_target(&locator, &net, &BlobCache::disabled()).unwrap();
+        let (exact, url) = resolved_target(&locator, &net, &BlobCache::disabled())
+            .ok()
+            .unwrap();
         assert_eq!(exact, "pkg:cargo/codec@1.4.2");
         assert!(url.ends_with("codec-1.4.2.crate"));
         assert!(
@@ -1346,6 +1401,7 @@ mod tests {
                 &net,
                 &BlobCache::disabled()
             )
+            .ok()
             .is_none()
         );
     }
@@ -1456,7 +1512,8 @@ mod tests {
                 &RefLocator::Purl("pkg:npm/easy-day-js@next".into()),
                 &net,
                 &BlobCache::disabled(),
-            ),
+            )
+            .ok(),
             Some((
                 "pkg:npm/easy-day-js@2.0.0-beta.1".into(),
                 "https://registry.npmjs.org/easy-day-js/-/easy-day-js-2.0.0-beta.1.tgz".into(),
@@ -1684,7 +1741,9 @@ mod tests {
             Some(exact)
         );
         assert_eq!(
-            resolved_target(&RefLocator::Purl(purl), &net, &cache).map(|(_, url)| url),
+            resolved_target(&RefLocator::Purl(purl), &net, &cache)
+                .ok()
+                .map(|(_, url)| url),
             Some("https://x/widget-linux.whl".into())
         );
 
@@ -1808,7 +1867,7 @@ mod tests {
                 .into(),
         );
         assert_eq!(
-            resolved_target(&override_purl, &Fixtures::default(), &BlobCache::disabled()),
+            resolved_target(&override_purl, &Fixtures::default(), &BlobCache::disabled()).ok(),
             Some((
                 locator_string(&override_purl),
                 "https://mirror.test/native.tgz".into()
@@ -1819,7 +1878,9 @@ mod tests {
                 .into(),
         );
         assert!(
-            resolved_target(&wrong_file, &Fixtures::default(), &BlobCache::disabled()).is_none()
+            resolved_target(&wrong_file, &Fixtures::default(), &BlobCache::disabled())
+                .ok()
+                .is_none()
         );
         let override_matrix =
             resolve_artifacts(&wrong_file, &Fixtures::default(), &BlobCache::disabled())
@@ -1891,7 +1952,7 @@ mod tests {
         let range = RefLocator::Purl("pkg:npm/pkg?vers=vers:npm%2F%3E%3D1.0.0".into());
         let matrix = resolve_artifacts(&range, &net, &cache).expect("range matrix");
         assert!(matrix.candidates.is_empty());
-        assert!(resolved_target(&range, &net, &cache).is_none());
+        assert!(resolved_target(&range, &net, &cache).ok().is_none());
     }
 
     #[test]
@@ -1962,7 +2023,7 @@ mod tests {
         let rec = fetch_ref(&reference, &net, &cache);
         assert_eq!(rec.outcome, Outcome::Ok);
         assert_eq!(rec.pin_verified, Some(true));
-        assert_eq!(rec.resolved_url, zip);
+        assert_eq!(rec.resolved_url.as_deref(), Some(&*zip));
         assert_eq!(
             rec.locator,
             format!(
@@ -1987,7 +2048,7 @@ mod tests {
             .with(&zip, b"ZIP");
         assert_eq!(
             fetch_ref(&reference, &net, &cache).outcome,
-            Outcome::Unresolved
+            Outcome::Unresolved(Unresolved::NoRelease)
         );
     }
 
@@ -2013,7 +2074,7 @@ mod tests {
             );
         let cache = BlobCache::disabled();
         let locator = RefLocator::Purl("pkg:terraform/kreuzwerker/docker@3.0.2".into());
-        let (exact, url) = resolved_target(&locator, &net, &cache).unwrap();
+        let (exact, url) = resolved_target(&locator, &net, &cache).ok().unwrap();
         assert_eq!(url, zip);
         assert!(exact.ends_with("&file_name=terraform-provider-docker_3.0.2_darwin_arm64.zip"));
 
@@ -2025,7 +2086,7 @@ mod tests {
                 &format!("{TERRAFORM_DOCKER}/3.0.2/download/darwin/arm64"),
                 info.as_bytes(),
             );
-        assert_eq!(resolved_target(&locator, &net, &cache), None);
+        assert_eq!(resolved_target(&locator, &net, &cache).ok(), None);
     }
 
     #[test]
@@ -2041,7 +2102,9 @@ mod tests {
                 info.as_bytes(),
             );
         let locator = RefLocator::Purl("pkg:terraform/kreuzwerker/docker".into());
-        let (exact, url) = resolved_target(&locator, &net, &BlobCache::disabled()).unwrap();
+        let (exact, url) = resolved_target(&locator, &net, &BlobCache::disabled())
+            .ok()
+            .unwrap();
         assert_eq!(url, zip);
         assert!(exact.starts_with("pkg:terraform/kreuzwerker/docker@3.0.2?checksum=sha256:"));
     }
@@ -2075,7 +2138,8 @@ mod tests {
                 &RefLocator::Purl("pkg:firefox/surf-click@1.0.9".into()),
                 &net,
                 &cache
-            ),
+            )
+            .ok(),
             Some(("pkg:firefox/surf-click@1.0.9".to_string(), xpi.to_string()))
         );
         assert_eq!(
@@ -2083,7 +2147,8 @@ mod tests {
                 &RefLocator::Purl("pkg:firefox/surf-click".into()),
                 &net,
                 &cache
-            ),
+            )
+            .ok(),
             Some(("pkg:firefox/surf-click@1.0.9".to_string(), xpi.to_string()))
         );
         let rec = fetch_ref(
@@ -2095,7 +2160,7 @@ mod tests {
             &cache,
         );
         assert_eq!(rec.outcome, Outcome::Ok);
-        assert_eq!(rec.resolved_url, xpi);
+        assert_eq!(rec.resolved_url.as_deref(), Some(xpi));
         assert_eq!(rec.content_sha256.as_deref(), Some(&*sha256_hex(b"XPI")));
 
         // A mismatched per-version response is refused rather than silently
@@ -2111,7 +2176,8 @@ mod tests {
                 &RefLocator::Purl("pkg:firefox/surf-click@1.0.9".into()),
                 &net,
                 &cache
-            ),
+            )
+            .ok(),
             None
         );
     }
@@ -2134,7 +2200,7 @@ mod tests {
         let exact = "pkg:comfyui/comfyui-loopstrip@1.3.1";
         for purl in [exact, "pkg:comfyui/comfyui-loopstrip"] {
             assert_eq!(
-                resolved_target(&RefLocator::Purl(purl.into()), &net, &cache),
+                resolved_target(&RefLocator::Purl(purl.into()), &net, &cache).ok(),
                 Some((exact.to_string(), zip.to_string())),
                 "{purl}"
             );
@@ -2151,7 +2217,7 @@ mod tests {
         ] {
             let net = Fixtures::default().with(&pinned_api, wrong.to_string().as_bytes());
             assert_eq!(
-                resolved_target(&RefLocator::Purl(exact.into()), &net, &cache),
+                resolved_target(&RefLocator::Purl(exact.into()), &net, &cache).ok(),
                 None
             );
         }
@@ -2160,7 +2226,8 @@ mod tests {
                 &RefLocator::Purl("pkg:comfyui/owner/comfyui-loopstrip@1.3.1".into()),
                 &net,
                 &cache
-            ),
+            )
+            .ok(),
             None
         );
     }
@@ -2189,7 +2256,7 @@ mod tests {
         let exact = "pkg:dify/fr3on/eval-loop@0.1.1";
         for purl in [exact, "pkg:dify/fr3on/eval-loop"] {
             assert_eq!(
-                resolved_target(&RefLocator::Purl(purl.into()), &net, &cache),
+                resolved_target(&RefLocator::Purl(purl.into()), &net, &cache).ok(),
                 Some((exact.to_string(), pkg.clone())),
                 "{purl}"
             );
@@ -2214,7 +2281,7 @@ mod tests {
             .to_string();
             let net = Fixtures::default().with(&format!("{base}/0.1.1"), doc.as_bytes());
             assert_eq!(
-                resolved_target(&RefLocator::Purl(exact.into()), &net, &cache),
+                resolved_target(&RefLocator::Purl(exact.into()), &net, &cache).ok(),
                 None,
                 "{wrong}"
             );
@@ -2224,7 +2291,8 @@ mod tests {
                 &RefLocator::Purl("pkg:dify/eval-loop@0.1.1".into()),
                 &net,
                 &cache
-            ),
+            )
+            .ok(),
             None
         );
     }
@@ -2263,9 +2331,14 @@ mod tests {
             content_sha256: None,
         };
         let rec = fetch_ref(&r, &Fixtures::default(), &BlobCache::disabled());
-        assert_eq!(rec.resolved_url, "oci://docker.io/library/nginx:latest");
+        assert_eq!(
+            rec.resolved_url.as_deref(),
+            Some("oci://docker.io/library/nginx:latest")
+        );
         match &rec.outcome {
-            Outcome::Failed(e) => assert!(e.contains("not permitted"), "{e}"),
+            Outcome::Failed(FetchError::Refused(why)) => {
+                assert!(why.contains("not permitted"), "{why}")
+            }
             other => panic!("want refused-without-network, got {other:?}"),
         }
     }
@@ -2382,14 +2455,14 @@ mod tests {
 
         let rec = fetch_ref(&r, &net, &cache);
         assert_eq!(rec.outcome, Outcome::Ok);
-        assert_eq!(rec.resolved_url, url);
-        assert!(!rec.cached);
+        assert_eq!(rec.resolved_url.as_deref(), Some(url));
+        assert!(!rec.cached());
         assert_eq!(rec.size, Some(7));
         assert_eq!(
             rec.content_sha256.as_deref(),
             Some(&*sha256_hex(b"PAYLOAD"))
         );
-        assert!(rec.fetched_at > 0);
+        assert!(rec.fetched_at.is_some_and(|t| t > 0));
         assert_eq!(
             rec.headers,
             vec![("content-type".to_string(), "application/gzip".to_string())]
@@ -2397,7 +2470,7 @@ mod tests {
 
         // Cache hit reconstructs headers + timestamp from the sidecar.
         let rec2 = fetch_ref(&r, &Fixtures::default(), &cache);
-        assert!(rec2.cached);
+        assert!(rec2.cached());
         assert_eq!(rec2.outcome, Outcome::Ok);
         assert_eq!(rec2.headers, rec.headers);
         assert_eq!(rec2.fetched_at, rec.fetched_at);
@@ -2461,11 +2534,11 @@ mod tests {
     }
 
     impl Fetch for PanicsOn {
-        fn get(&self, url: &str) -> Result<Fetched, FetchError> {
-            if url == self.url {
+        fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+            if request.url == self.url {
                 panic!("hostile bytes");
             }
-            self.inner.get(url)
+            self.inner.send(request)
         }
     }
 
@@ -2493,7 +2566,7 @@ mod tests {
         // other reference is still fetched.
         assert_eq!(
             recs[0].outcome,
-            Outcome::Failed("internal error: hostile bytes".into())
+            Outcome::Failed(FetchError::Internal("hostile bytes".into()))
         );
         assert_eq!(recs[1].outcome, Outcome::Ok);
     }
@@ -2551,7 +2624,7 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].locator, "pkg:npm/foo@1.0.0");
         // Every edge is stamped with its source endpoint and binding class.
-        assert_eq!(recs[0].source_sha256, "trigsha");
+        assert_eq!(recs[0].source_sha256.as_deref(), Some("trigsha"));
         assert_eq!(recs[0].kind, RefKind::Dependency);
 
         // With fetch_urls: package + raw URL; the repository is never fetched.
@@ -2600,7 +2673,10 @@ mod tests {
             1,
             "the ref past the budget is recorded, not dropped"
         );
-        assert!(recs.iter().all(|r| r.source_sha256 == "trigsha"));
+        assert!(
+            recs.iter()
+                .all(|r| r.source_sha256.as_deref() == Some("trigsha"))
+        );
     }
 
     #[test]
@@ -2624,7 +2700,7 @@ mod tests {
         let warm = fetch_references(&refs, "s", true, &net, &cache, FetchBudget::default());
         assert_eq!(warm.len(), 2);
         assert!(
-            warm.iter().all(|r| r.outcome == Outcome::Ok && !r.cached),
+            warm.iter().all(|r| r.outcome == Outcome::Ok && !r.cached()),
             "cold run should fetch both live"
         );
 
@@ -2643,7 +2719,7 @@ mod tests {
         );
         assert_eq!(
             warm.iter()
-                .filter(|r| r.cached && r.outcome == Outcome::Ok)
+                .filter(|r| r.cached() && r.outcome == Outcome::Ok)
                 .count(),
             2,
             "a warm re-run is never throttled by the count budget"
@@ -2659,18 +2735,9 @@ mod tests {
     }
 
     impl Fetch for CountingFetch {
-        fn get(&self, url: &str) -> Result<Fetched, FetchError> {
+        fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
             self.gets.fetch_add(1, Ordering::SeqCst);
-            self.inner.get(url)
-        }
-        fn post(
-            &self,
-            url: &str,
-            body: &[u8],
-            headers: &[(&str, &str)],
-        ) -> Result<Fetched, FetchError> {
-            self.gets.fetch_add(1, Ordering::SeqCst);
-            self.inner.post(url, body, headers)
+            self.inner.send(request)
         }
     }
 
@@ -2750,7 +2817,11 @@ mod tests {
             // Warm the even-indexed refs into the cache with an unmetered run.
             let warm: Vec<Reference> = refs.iter().step_by(2).cloned().collect();
             let warmed = fetch_references(&warm, "sha", false, &fx, &cache, FetchBudget::default());
-            assert!(warmed.iter().all(|r| r.outcome == Outcome::Ok && !r.cached));
+            assert!(
+                warmed
+                    .iter()
+                    .all(|r| r.outcome == Outcome::Ok && !r.cached())
+            );
 
             let net = CountingFetch {
                 inner: fx,
@@ -2772,7 +2843,7 @@ mod tests {
             // Every pre-cached (even) ref is served from cache, regardless of budget.
             for even in (0..n).step_by(2) {
                 assert!(
-                    recs[even].cached && recs[even].outcome == Outcome::Ok,
+                    recs[even].cached() && recs[even].outcome == Outcome::Ok,
                     "attempt {attempt}: cached ref {even} should be served free"
                 );
             }
@@ -2828,13 +2899,13 @@ mod tests {
 
         // Populate the cache with a working fetch.
         let ok = Fixtures::default().with(url, b"CACHED");
-        assert!(!fetch_ref(&r, &ok, &cache).cached);
+        assert!(!fetch_ref(&r, &ok, &cache).cached());
 
         // Age the entry past the 12h unpinned TTL by backdating the recorded
         // fetch time — freshness is measured from `fetched_at`, not the file
         // mtime (which now tracks last access for the eviction sweep).
         let key = sha256_hex(b"pkg:npm/foo@1.0.0");
-        let meta_path = dir.path().join(format!("{key}.json"));
+        let meta_path = cache.meta_path(&key);
         let mut meta: CachedMeta =
             serde_json::from_slice(&std::fs::read(&meta_path).expect("read meta")).expect("parse");
         meta.fetched_at = now() - 48 * 3600;
@@ -2843,15 +2914,15 @@ mod tests {
         // The source is now unreachable (no fixture): serve the stale copy.
         let rec = fetch_ref(&r, &Fixtures::default(), &cache);
         assert_eq!(rec.outcome, Outcome::Ok);
-        assert!(rec.cached);
-        assert!(rec.stale);
+        assert!(rec.cached());
+        assert_eq!(rec.served, Some(Served::StaleCache));
         assert_eq!(rec.content_sha256.as_deref(), Some(&*sha256_hex(b"CACHED")));
 
         // With no cached copy at all, an unreachable source is a failure.
         let empty = BlobCache::with_dir(dir.path().join("empty"));
         let rec = fetch_ref(&r, &Fixtures::default(), &empty);
         assert!(matches!(rec.outcome, Outcome::Failed(_)));
-        assert!(!rec.stale);
+        assert_eq!(rec.served, None);
     }
 
     #[test]
@@ -2866,8 +2937,25 @@ mod tests {
         };
         assert_eq!(fetch_ref(&repo, &net, &cache).outcome, Outcome::Skipped);
 
-        let pypi = dep(RefLocator::Purl("pkg:pypi/requests@2.0".into()), None);
-        assert_eq!(fetch_ref(&pypi, &net, &cache).outcome, Outcome::Unresolved);
+        // Each says why it has no URL.
+        let unresolved =
+            |purl: &str| fetch_ref(&dep(RefLocator::Purl(purl.into()), None), &net, &cache).outcome;
+        assert_eq!(
+            unresolved("pkg:pypi/requests@2.0"),
+            Outcome::Unresolved(Unresolved::NoRelease)
+        );
+        assert_eq!(
+            unresolved("pkg:swift/github.com/apple/swift-nio@1.0.0"),
+            Outcome::Unresolved(Unresolved::Unsupported)
+        );
+        assert_eq!(
+            unresolved("not a purl"),
+            Outcome::Unresolved(Unresolved::InvalidPurl)
+        );
+        assert_eq!(
+            unresolved("pkg:npm/w@..%2F..%2Fx"),
+            Outcome::Unresolved(Unresolved::UnsafeCoordinate)
+        );
     }
 
     #[test]
@@ -2895,7 +2983,7 @@ mod tests {
             let cache = BlobCache::with_dir(dir.path().to_path_buf());
             let rec = fetch_ref(&dep(RefLocator::Purl(purl.into()), None), &net, &cache);
             assert_eq!(rec.outcome, Outcome::Ok, "{purl}");
-            assert_eq!(rec.resolved_url, snapshot, "{purl}");
+            assert_eq!(rec.resolved_url.as_deref(), Some(snapshot), "{purl}");
         }
 
         // RPC unreachable → the name-derived snapshot fallback still fetches.
@@ -2909,7 +2997,7 @@ mod tests {
             &cache,
         );
         assert_eq!(rec.outcome, Outcome::Ok);
-        assert_eq!(rec.resolved_url, derived);
+        assert_eq!(rec.resolved_url.as_deref(), Some(derived));
     }
 
     #[test]
@@ -2996,7 +3084,7 @@ mod tests {
             "https://10.0.0.1/x",
             "http://example.com/x", // non-https
         ] {
-            match net.get(url) {
+            match net.send(&Request::get(url)) {
                 Err(FetchError::Refused(_)) => {}
                 other => panic!("{url} should be refused, got {other:?}"),
             }
@@ -3009,7 +3097,7 @@ mod tests {
         // name passes the literal-IP guard and is refused by the resolver,
         // whose reason must survive reqwest's "error sending request" wrapper.
         let net = HttpFetch::new().expect("client");
-        match net.get("https://localhost/x") {
+        match net.send(&Request::get("https://localhost/x")) {
             Err(FetchError::Refused(why)) => {
                 assert!(why.contains("non-public host: localhost"), "{why}");
             }
@@ -3025,6 +3113,7 @@ mod tests {
                 &Fixtures::default(),
                 &BlobCache::disabled(),
             )
+            .ok()
             .map(|(_, url)| url)
         };
         assert!(
@@ -3591,7 +3680,20 @@ mod tests {
         assert_eq!(sources[0].url, "https://registry.npmjs.org/left-pad");
         assert_eq!(sources[0].status, 200);
         assert_eq!(sources[0].content_type.as_deref(), Some("application/json"));
-        let body: serde_json::Value = serde_json::from_slice(&sources[0].bytes).unwrap();
+        let bytes = sources[0].bytes.as_deref().expect("kept: no source limit");
+        assert_eq!(sources[0].size, bytes.len() as u64);
+        let body: serde_json::Value = serde_json::from_slice(bytes).unwrap();
         assert_eq!(body["dist-tags"]["latest"], "1.3.0");
+
+        // Past the cache's source limit the document is still named, with
+        // its size, but its bytes are not copied.
+        let (_, sources) = registry_with_sources(
+            &RefLocator::Purl("pkg:npm/left-pad@1.3.0".into()),
+            &net,
+            &BlobCache::disabled().with_source_limit(16),
+        );
+        assert_eq!(sources[0].url, "https://registry.npmjs.org/left-pad");
+        assert_eq!(sources[0].size, bytes.len() as u64);
+        assert_eq!(sources[0].bytes, None);
     }
 }

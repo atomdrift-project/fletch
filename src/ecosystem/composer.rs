@@ -6,7 +6,7 @@ use serde::de::IgnoredAny;
 use std::collections::BTreeMap;
 
 use crate::ecosystem::{fetch_json, lenient, null_default, parse_rfc3339_secs};
-use crate::fetch::{BlobCache, Fetch, percent_decode};
+use crate::fetch::{BlobCache, Fetch, Request, percent_decode};
 use crate::registry::RegistryError;
 
 /// Composer's download URL lives in Packagist's per-package metadata, not a
@@ -15,7 +15,7 @@ use crate::registry::RegistryError;
 /// `vendor/package`.
 pub(crate) fn resolve_composer(name: &str, version: &str, net: &dyn Fetch) -> Option<String> {
     let api = format!("https://repo.packagist.org/p2/{name}.json");
-    let resp = net.get(&api).ok()?;
+    let resp = net.send(&Request::get(&api)).ok()?;
     let json: serde_json::Value = serde_json::from_slice(&resp.bytes).ok()?;
     let versions = json.get("packages")?.get(name)?.as_array()?;
     let want = version.trim_start_matches('v');

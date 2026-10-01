@@ -3,7 +3,7 @@
 use filefacts::Registry;
 use serde::Deserialize;
 
-use crate::ecosystem::{fetch_json, last_seg, lenient, parse_ts, present};
+use crate::ecosystem::{fetch_json, last_seg, null_default, parse_ts};
 use crate::fetch::{BlobCache, Fetch};
 use crate::purl::Purl;
 use crate::registry::RegistryError;
@@ -78,8 +78,7 @@ fn docker_hub(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Registr
         name: doc.name.unwrap_or_else(|| last_seg(image).to_string()),
         published_at: doc.last_updated.as_deref().and_then(parse_ts),
         first_published_at: doc.date_registered.as_deref().and_then(parse_ts),
-        // `user` stands in only when `namespace` is absent.
-        author: doc.namespace.unwrap_or(doc.user),
+        author: doc.namespace.or(doc.user),
         description: doc.description.filter(|d| !d.is_empty()),
         downloads_total: doc.pull_count,
         rating_count: doc.star_count,
@@ -94,8 +93,7 @@ struct HubRepository {
     name: Option<String>,
     last_updated: Option<String>,
     date_registered: Option<String>,
-    #[serde(deserialize_with = "present")]
-    namespace: Option<Option<String>>,
+    namespace: Option<String>,
     user: Option<String>,
     description: Option<String>,
     pull_count: Option<u64>,
@@ -103,20 +101,31 @@ struct HubRepository {
 }
 
 /// Quay repository metadata: anonymous JSON with the description, the owning
-/// namespace, and a Unix-seconds last-modified time.
+/// namespace, and (asked for with `includeStats`) the last ~90 days of daily
+/// pulls. The repository document carries no time; its newest active tag —
+/// tags list newest first — says when it was last pushed.
 fn quay(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Registry, RegistryError> {
     let doc: QuayRepository = fetch_json(
-        &format!("https://quay.io/api/v1/repository/{image}"),
+        &format!("https://quay.io/api/v1/repository/{image}?includeStats=true"),
         net,
         cache,
     )?;
+    let last_push = fetch_json::<QuayTags>(
+        &format!("https://quay.io/api/v1/repository/{image}/tag/?limit=1&onlyActiveTags=true"),
+        net,
+        cache,
+    )
+    .ok()
+    .and_then(|t| t.tags.into_iter().next()?.start_ts);
     Ok(Registry {
         ecosystem: "oci".into(),
         name: doc.name.unwrap_or_else(|| last_seg(image).to_string()),
-        published_at: doc.last_modified,
+        published_at: last_push,
         author: doc.namespace,
         description: doc.description.filter(|d| !d.is_empty()),
-        rating_count: doc.popularity,
+        downloads_recent: doc
+            .stats
+            .map(|days| days.iter().filter_map(|d| d.count).sum()),
         ..Default::default()
     })
 }
@@ -126,12 +135,31 @@ fn quay(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Registry, Reg
 #[serde(default)]
 struct QuayRepository {
     name: Option<String>,
-    last_modified: Option<u64>,
     namespace: Option<String>,
     description: Option<String>,
-    /// Quay sends popularity as a float score, so only an integer reads as a count.
-    #[serde(deserialize_with = "lenient")]
-    popularity: Option<u64>,
+    stats: Option<Vec<QuayDay>>,
+}
+
+/// One day of a Quay repository's pull counts.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct QuayDay {
+    count: Option<u64>,
+}
+
+/// A page of a Quay repository's tags.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct QuayTags {
+    #[serde(deserialize_with = "null_default")]
+    tags: Vec<QuayTag>,
+}
+
+/// One tag: when it started pointing at its manifest, in Unix seconds.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct QuayTag {
+    start_ts: Option<u64>,
 }
 
 #[cfg(test)]
@@ -170,6 +198,54 @@ mod tests {
         assert_eq!(r.rating_count, Some(20_000));
         assert!(r.published_at.is_some());
         assert!(r.first_published_at.is_some());
+    }
+
+    #[test]
+    fn oci_quay_normalizes() {
+        let repo = serde_json::json!({
+            "namespace": "prometheus", "name": "node-exporter", "kind": "image",
+            "description": "Prometheus exporter for machine metrics",
+            "stats": [{"date": "2026-09-29", "count": 20}, {"date": "2026-09-30", "count": 22}]
+        })
+        .to_string();
+        let tags = serde_json::json!({
+            "tags": [{"name": "master", "start_ts": 1_790_343_232u64}],
+            "page": 1, "has_additional": true
+        })
+        .to_string();
+        let net = Fixtures::default()
+            .with(
+                "https://quay.io/api/v1/repository/prometheus/node-exporter?includeStats=true",
+                repo.as_bytes(),
+            )
+            .with(
+                "https://quay.io/api/v1/repository/prometheus/node-exporter/tag/?limit=1&onlyActiveTags=true",
+                tags.as_bytes(),
+            );
+        let r = super::oci_meta(
+            Some("quay.io/prometheus/node-exporter"),
+            "node-exporter",
+            &net,
+            &test_cache("oci-quay"),
+        )
+        .expect("registry");
+        assert_eq!(r.name, "node-exporter");
+        assert_eq!(r.author.as_deref(), Some("prometheus"));
+        assert_eq!(r.published_at, Some(1_790_343_232));
+        assert_eq!(r.downloads_recent, Some(42));
+    }
+
+    /// An organisation's repository has no `namespace` user behind it, and
+    /// Docker Hub can send `null` there; the publishing `user` is then who.
+    #[test]
+    fn oci_docker_hub_falls_back_to_the_user() {
+        let doc = serde_json::json!({"name": "app", "namespace": null, "user": "acme"}).to_string();
+        let net = Fixtures::default().with(
+            "https://hub.docker.com/v2/repositories/acme/app",
+            doc.as_bytes(),
+        );
+        let r = super::oci_meta(None, "acme/app", &net, &test_cache("oci-user")).expect("registry");
+        assert_eq!(r.author.as_deref(), Some("acme"));
     }
 
     #[test]

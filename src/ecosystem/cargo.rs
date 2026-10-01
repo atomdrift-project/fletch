@@ -3,11 +3,10 @@
 use filefacts::Registry;
 use serde::Deserialize;
 
-use crate::ecosystem::{fetch_json, null_default, parse_rfc3339_secs, present};
+use crate::ecosystem::{fetch_json, null_default, parse_rfc3339_secs};
 use crate::fetch::{
     ArtifactCandidate, BlobCache, Fetch, artifact_candidate, cached_metadata,
-    deterministic_artifacts, file_name_matches, is_web_scheme, meta_ttl_pinned, percent_decode,
-    purl_checksums,
+    deterministic_artifacts, file_name_matches, is_web_scheme, percent_decode, purl_checksums,
 };
 use crate::purl::Purl;
 use crate::registry::RegistryError;
@@ -34,10 +33,13 @@ pub(crate) fn cargo_artifacts(
         return Vec::new();
     };
     let config_url = format!("{repository}/config.json");
-    let Some(download) = cached_metadata(&config_url, net, &cache.with_meta_ttl(meta_ttl_pinned()))
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|config| config.get("dl")?.as_str().map(str::to_string))
-    else {
+    let Some(download) = cached_metadata(
+        &config_url,
+        net,
+        &cache.with_meta_ttl(cache.meta_ttl_pinned()),
+    )
+    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    .and_then(|config| config.get("dl")?.as_str().map(str::to_string)) else {
         return Vec::new();
     };
     let mut checksums = purl_checksums(purl);
@@ -74,7 +76,11 @@ fn cargo_index_checksum(
     let lower = name.to_ascii_lowercase();
     let prefix = cargo_registry_prefix(&lower)?;
     let index_url = format!("{repository}/{prefix}/{lower}");
-    let bytes = cached_metadata(&index_url, net, &cache.with_meta_ttl(meta_ttl_pinned()))?;
+    let bytes = cached_metadata(
+        &index_url,
+        net,
+        &cache.with_meta_ttl(cache.meta_ttl_pinned()),
+    )?;
     std::str::from_utf8(&bytes)
         .ok()?
         .lines()
@@ -146,11 +152,12 @@ pub(crate) fn crates(
     )?;
     let krate = &doc.krate;
 
+    // A crate with no stable release has a `null` max stable version; its
+    // newest pre-release is then the latest there is.
     let latest = krate
         .max_stable_version
-        .as_ref()
-        .unwrap_or(&krate.max_version)
-        .as_deref();
+        .as_deref()
+        .or(krate.max_version.as_deref());
     let requested = version.map(percent_decode);
     let version = requested.as_deref().or(latest).unwrap_or_default();
     let ver = doc
@@ -197,10 +204,7 @@ struct CrateResponse {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Crate {
-    /// `null` for a crate with no stable release, and that `null` is the
-    /// answer: `max_version` stands in only when the key is absent.
-    #[serde(deserialize_with = "present")]
-    max_stable_version: Option<Option<String>>,
+    max_stable_version: Option<String>,
     max_version: Option<String>,
     created_at: Option<String>,
     description: Option<String>,

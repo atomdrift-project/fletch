@@ -27,6 +27,7 @@
 //! deliberately well above the blob cache's 7-day pinned TTL, so the
 //! stale-on-unreachable fallback in [`crate::fetch`] keeps working.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -40,6 +41,12 @@ const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// are far larger than the derived caches elsewhere, so this tier gets more
 /// headroom. Override with `FLETCH_CACHE_MAX_BYTES`.
 const FLETCH_DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Default entry ceiling for fletch's blob cache. A worker scanning at volume
+/// reads a registry document for nearly every package it meets, so this is
+/// sized for a server, not a desktop; the 10 GiB byte ceiling still bounds a
+/// smaller machine. Spread over the cache's 256 shard directories it is about a
+/// thousand entries each. Override with `FLETCH_CACHE_MAX_ENTRIES`.
+const FLETCH_DEFAULT_MAX_ENTRIES: usize = 1 << 18;
 /// Default aggregate ceiling per component, in entries. Chosen so a cache stays
 /// comfortable for `ls`, Finder and Spotlight, and so the sweep's own walk stays
 /// cheap enough to finish inside a short-lived process.
@@ -111,8 +118,14 @@ pub fn cleanup() {
 /// directory is available (the sweep then no-ops).
 #[must_use]
 pub fn refs_budget() -> Budget {
-    let roots = crate::fetch::refs_dir()
-        .map(|path| Root { path, depth: 1 })
+    blob_cache_budget(crate::fetch::refs_dir())
+}
+
+/// fletch's blob-cache budget over `dir`, wherever that cache lives. Entries
+/// sit one level down, in the cache's shard directories.
+fn blob_cache_budget(dir: Option<PathBuf>) -> Budget {
+    let roots = dir
+        .map(|path| Root { path, depth: 2 })
         .into_iter()
         .collect();
     Budget {
@@ -120,8 +133,20 @@ pub fn refs_budget() -> Budget {
         roots,
         max_age: max_age_from_env("FLETCH_CACHE_TTL_DAYS"),
         max_bytes: max_bytes_from_env_or("FLETCH_CACHE_MAX_BYTES", FLETCH_DEFAULT_MAX_BYTES),
-        max_entries: max_entries_from_env("FLETCH_CACHE_MAX_ENTRIES"),
+        max_entries: blob_cache_max_entries(),
     }
+}
+
+/// The blob cache's entry ceiling, read from the environment once.
+fn blob_cache_max_entries() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("FLETCH_CACHE_MAX_ENTRIES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(FLETCH_DEFAULT_MAX_ENTRIES)
+    })
 }
 
 /// Sweep `budgets` on a detached thread and return immediately. The thread is
@@ -212,20 +237,18 @@ pub fn max_entries_from_env(var: &str) -> usize {
 /// Entries this process has written since it last triggered a sweep.
 static WRITES: AtomicUsize = AtomicUsize::new(0);
 
-/// Record one entry written to a swept cache, sweeping again once this process
-/// has written a full ceiling's worth.
+/// Record one entry written to the blob cache at `dir`, sweeping that
+/// directory once this process has written a full ceiling's worth.
 ///
 /// The marker gates sweeps on elapsed *time*, which a bulk fetch defeats: it can
 /// write far past the ceiling between two daily sweeps, all within one process
 /// whose startup sweep found nothing to do. Counting writes closes that gap
 /// without a second timer — an ordinary run never reaches the threshold and so
 /// never pays for this beyond one relaxed increment.
-pub fn note_write() {
-    // The cap is configurable, but reading the environment on every write is
-    // not worth it: the threshold only decides how often a long run re-sweeps.
-    if WRITES.fetch_add(1, Ordering::Relaxed) + 1 >= DEFAULT_MAX_ENTRIES {
+pub(crate) fn note_write(dir: &Path) {
+    if WRITES.fetch_add(1, Ordering::Relaxed) + 1 >= blob_cache_max_entries() {
         WRITES.store(0, Ordering::Relaxed);
-        spawn_inner(vec![refs_budget()], true);
+        spawn_inner(vec![blob_cache_budget(Some(dir.to_path_buf()))], true);
     }
 }
 
@@ -235,10 +258,11 @@ fn run_all(budgets: &[Budget], force: bool) {
     }
 }
 
-/// An entry considered for eviction: its path, whether it is a directory, and
-/// the size and mtime read once and reused by both passes.
+/// An entry considered for eviction: its paths (a directory, or the files that
+/// share a stem), whether it is a directory, and the size and mtime read once
+/// and reused by both passes.
 struct Entry {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     is_dir: bool,
     modified: SystemTime,
     bytes: u64,
@@ -336,11 +360,16 @@ fn due(root: &Path) -> bool {
 }
 
 /// Gather the cache entries at `depth` below `root` into `out`. At `depth <= 1`
-/// each child is an entry; deeper, each directory child is descended into.
+/// each child is an entry, and files sharing a stem are one: a blob and its
+/// sidecar (`<key>.zst`, `<key>.json`) are evicted together, never split into
+/// an orphan the reader cannot use. Deeper, each directory child is descended
+/// into, and a file met on the way is an entry too — one left by an older,
+/// flatter layout, which would otherwise never be reclaimed.
 fn collect(root: &Path, depth: u8, out: &mut Vec<Entry>) {
     let Ok(rd) = fs::read_dir(root) else {
         return;
     };
+    let mut files: HashMap<PathBuf, Entry> = HashMap::new();
     for e in rd.flatten() {
         let Ok(ft) = e.file_type() else {
             continue;
@@ -350,13 +379,32 @@ fn collect(root: &Path, depth: u8, out: &mut Vec<Entry>) {
             if path.file_name().is_some_and(|n| n == MARKER) {
                 continue; // never evict our own marker
             }
-            if let Some(entry) = stat_entry(path, ft.is_dir()) {
+            let Some(entry) = stat_entry(path.clone(), ft.is_dir()) else {
+                continue;
+            };
+            if entry.is_dir {
                 out.push(entry);
+                continue;
             }
+            // The pair lives or dies by its newest file, which the reader
+            // touches on access.
+            files
+                .entry(path.with_extension(""))
+                .and_modify(|pair| {
+                    pair.paths.push(path.clone());
+                    pair.bytes += entry.bytes;
+                    pair.modified = pair.modified.max(entry.modified);
+                })
+                .or_insert(entry);
         } else if ft.is_dir() {
             collect(&path, depth - 1, out);
+        } else if path.file_name().is_some_and(|n| n != MARKER)
+            && let Some(entry) = stat_entry(path, false)
+        {
+            out.push(entry);
         }
     }
+    out.extend(files.into_values());
 }
 
 fn stat_entry(path: PathBuf, is_dir: bool) -> Option<Entry> {
@@ -364,7 +412,7 @@ fn stat_entry(path: PathBuf, is_dir: bool) -> Option<Entry> {
     let modified = meta.modified().ok()?;
     let bytes = if is_dir { dir_size(&path) } else { meta.len() };
     Some(Entry {
-        path,
+        paths: vec![path],
         is_dir,
         modified,
         bytes,
@@ -392,13 +440,17 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
+/// Delete every path of `e`, each attempted even when another fails; `true`
+/// when all are gone.
 fn remove(e: &Entry) -> bool {
-    let r = if e.is_dir {
-        fs::remove_dir_all(&e.path)
-    } else {
-        fs::remove_file(&e.path)
-    };
-    r.is_ok()
+    e.paths.iter().fold(true, |all, path| {
+        let removed = if e.is_dir {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        removed.is_ok() && all
+    })
 }
 
 #[cfg(test)]
@@ -487,6 +539,70 @@ mod tests {
         assert!(!dir.join("e2.zst").exists());
         assert!(dir.join("e3.zst").exists(), "newest kept");
         assert!(dir.join("e4.zst").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A blob and its sidecar are one entry: the oldest pair goes whole, and
+    /// the cut never falls between the two files of a pair.
+    #[test]
+    fn a_blob_and_its_sidecar_are_evicted_together() {
+        let dir = scratch("pairs");
+        // Three pairs; the cut is reached after the oldest pair's blob alone
+        // would have satisfied it, were files counted one by one.
+        for (key, age) in [("a", 3u64), ("b", 2), ("c", 1)] {
+            write_aged(&dir.join(format!("{key}.zst")), 300, day(age));
+            write_aged(
+                &dir.join(format!("{key}.json")),
+                10,
+                day(age) - Duration::from_secs(60),
+            );
+        }
+        run(
+            &Budget {
+                label: "test",
+                roots: vec![Root {
+                    path: dir.clone(),
+                    depth: 1,
+                }],
+                max_age: day(3650),
+                max_bytes: 700,
+                max_entries: usize::MAX,
+            },
+            false,
+        );
+        for name in ["a.zst", "a.json"] {
+            assert!(
+                !dir.join(name).exists(),
+                "{name}: the oldest pair goes whole"
+            );
+        }
+        for name in ["b.zst", "b.json", "c.zst", "c.json"] {
+            assert!(dir.join(name).exists(), "{name} kept");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// fletch's cache keeps entries in shard directories; the sweep finds
+    /// them there, and reclaims what an older, flat layout left at the top.
+    #[test]
+    fn a_sharded_cache_is_swept_and_its_flat_leftovers_reclaimed() {
+        let dir = scratch("sharded");
+        for shard in ["ab", "cd"] {
+            fs::create_dir_all(dir.join(shard)).unwrap();
+        }
+        for name in ["ab/ab1.zst", "ab/ab1.json", "legacy.zst", "legacy.json"] {
+            write_aged(&dir.join(name), 10, day(40));
+        }
+        for name in ["cd/cd1.zst", "cd/cd1.json", "recent.zst"] {
+            write_aged(&dir.join(name), 10, day(1));
+        }
+        run(&blob_cache_budget(Some(dir.clone())), true);
+        for gone in ["ab/ab1.zst", "ab/ab1.json", "legacy.zst", "legacy.json"] {
+            assert!(!dir.join(gone).exists(), "{gone} is past retention");
+        }
+        for kept in ["cd/cd1.zst", "cd/cd1.json", "recent.zst"] {
+            assert!(dir.join(kept).exists(), "{kept} is recent");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

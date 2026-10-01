@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 
 use crate::ecosystem::{fetch_json, null_default, parse_rfc3339_secs};
 use crate::fetch::{
-    ArtifactCandidate, BlobCache, Fetch, cached_metadata, meta_ttl_pinned, meta_ttl_unpinned,
-    percent_decode, repository_base, safe_filename_part,
+    ArtifactCandidate, BlobCache, Fetch, cached_metadata, percent_decode, repository_base,
+    safe_filename_part,
 };
 use crate::purl::Purl;
 use crate::registry::RegistryError;
@@ -24,9 +24,9 @@ pub(crate) fn gem_artifacts(
     };
     let api = format!("{repository}/api/v1/versions/{name}.json");
     let ttl = if requested_version.is_some() {
-        meta_ttl_pinned()
+        cache.meta_ttl_pinned()
     } else {
-        meta_ttl_unpinned()
+        cache.meta_ttl_unpinned()
     };
     let entries = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())

@@ -4,7 +4,7 @@ use filefacts::Registry;
 use serde::Deserialize;
 
 use crate::ecosystem::{Localized, fetch_json, flag, null_default, parse_ts};
-use crate::fetch::{BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, meta_ttl_unpinned};
+use crate::fetch::{BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata};
 use crate::registry::RegistryError;
 
 /// Resolve a Firefox Add-ons slug to the XPI AMO serves. A requested version
@@ -28,7 +28,7 @@ pub(crate) fn resolve_firefox(
         ),
         None => (
             format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/"),
-            meta_ttl_unpinned(),
+            cache.meta_ttl_unpinned(),
         ),
     };
     let bytes = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))?;

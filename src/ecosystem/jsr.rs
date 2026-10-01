@@ -5,10 +5,11 @@ use serde::Deserialize;
 
 use crate::ecosystem::{fetch_json, parse_ts};
 use crate::fetch::{BlobCache, Fetch, percent_decode};
+use crate::purl::encode_component;
 use crate::registry::RegistryError;
 
 /// JSR: the native API's package record (description, score, repo, latest) plus
-/// the versions list (each with a `createdAt` publish time). `path` is the
+/// the release's own version document (its `createdAt` publish time). `path` is the
 /// `@scope/name` the locator carries, percent-encoded (`%40` is `@`).
 pub(crate) fn jsr(
     path: &str,
@@ -30,19 +31,18 @@ pub(crate) fn jsr(
     let requested = version.map(percent_decode);
     let want = requested.as_deref().or(latest).unwrap_or_default();
 
-    // Per-version publish time comes from the versions list; a version it
-    // lacks gets none rather than the newest's.
-    let published_at = fetch_json::<Vec<PackageVersion>>(
-        &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}/versions"),
+    // The release's own document dates it; a version JSR does not have is a
+    // 404 there, and gets no date rather than the newest's.
+    let published_at = fetch_json::<PackageVersion>(
+        &format!(
+            "https://api.jsr.io/scopes/{scope}/packages/{pkg}/versions/{}",
+            encode_component(want)
+        ),
         net,
         cache,
     )
     .ok()
-    .and_then(|vs| {
-        vs.into_iter()
-            .find(|v| v.version.as_deref() == Some(want))?
-            .created_at
-    })
+    .and_then(|v| v.created_at)
     .as_deref()
     .and_then(parse_ts);
     let repository = doc.github_repository.and_then(|g| {
@@ -83,11 +83,10 @@ struct GithubRepository {
     name: Option<String>,
 }
 
-/// One entry of the package's versions list.
+/// A release's version document.
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct PackageVersion {
-    version: Option<String>,
     created_at: Option<String>,
 }
 
@@ -106,9 +105,10 @@ mod tests {
             "githubRepository": {"owner": "denoland", "name": "std"}
         })
         .to_string();
-        let versions = serde_json::json!([
-            {"version": "1.1.5", "createdAt": "2021-04-23T10:00:00.000Z", "yanked": false}
-        ])
+        let release = serde_json::json!({
+            "scope": "std", "package": "path", "version": "1.1.5",
+            "createdAt": "2021-04-23T10:00:00.000Z", "yanked": false
+        })
         .to_string();
         let net = Fixtures::default()
             .with(
@@ -116,8 +116,8 @@ mod tests {
                 pkg.as_bytes(),
             )
             .with(
-                "https://api.jsr.io/scopes/std/packages/path/versions",
-                versions.as_bytes(),
+                "https://api.jsr.io/scopes/std/packages/path/versions/1.1.5",
+                release.as_bytes(),
             );
         let r = jsr("%40std/path", None, &net, &test_cache("jsr")).expect("registry");
         assert_eq!(r.ecosystem, "jsr");
@@ -129,5 +129,21 @@ mod tests {
             Some("https://github.com/denoland/std")
         );
         assert_eq!(r.rating, Some(100.0));
+
+        // The version is a path segment: encoded once, whatever the PURL
+        // percent-encoded.
+        let net = net.with(
+            "https://api.jsr.io/scopes/std/packages/path/versions/1.0.0%2Bbuild",
+            release.as_bytes(),
+        );
+        let r = jsr(
+            "%40std/path",
+            Some("1.0.0%2Bbuild"),
+            &net,
+            &test_cache("jsr"),
+        )
+        .expect("registry");
+        assert_eq!(r.version, "1.0.0+build");
+        assert_eq!(r.published_at, Some(1_619_172_000));
     }
 }

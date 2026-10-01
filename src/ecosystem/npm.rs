@@ -7,9 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::ecosystem::{email_domain, fetch_json, lenient, null_default, parse_rfc3339_secs};
 use crate::fetch::{
-    ArtifactCandidate, BlobCache, Fetch, artifact_candidate, cached_metadata, file_name_from_url,
-    file_name_matches, meta_ttl_pinned, meta_ttl_unpinned, percent_decode, repository_base,
-    resolve_purl,
+    ArtifactCandidate, BlobCache, Fetch, Request, artifact_candidate, cached_metadata,
+    file_name_from_url, file_name_matches, percent_decode, repository_base, resolve_purl,
 };
 use crate::purl::Purl;
 use crate::registry::RegistryError;
@@ -23,9 +22,9 @@ pub(crate) fn npm_artifacts(
 ) -> Vec<ArtifactCandidate> {
     let name = npm_registry_name(path);
     let ttl = if requested_version.is_some() {
-        meta_ttl_pinned()
+        cache.meta_ttl_pinned()
     } else {
-        meta_ttl_unpinned()
+        cache.meta_ttl_unpinned()
     };
     let Some(repository) = repository_base(purl, "https://registry.npmjs.org") else {
         return Vec::new();
@@ -175,7 +174,9 @@ pub(crate) fn resolve_npm_dist_tag(
 ) -> Option<(String, String)> {
     let name = npm_registry_name(&purl.encoded_path());
     let repository = repository_base(purl, "https://registry.npmjs.org")?;
-    let packument = net.get(&format!("{repository}/{name}")).ok()?;
+    let packument = net
+        .send(&Request::get(&format!("{repository}/{name}")))
+        .ok()?;
     let doc: serde_json::Value = serde_json::from_slice(&packument.bytes).ok()?;
     let version = doc.get("dist-tags")?.get(tag)?.as_str()?;
     let exact = purl.with_version(version)?;

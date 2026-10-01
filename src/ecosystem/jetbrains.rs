@@ -52,7 +52,8 @@ pub(crate) fn jetbrains(
         name: doc.xml_id.unwrap_or_else(|| path.to_string()),
         version: update.and_then(|u| u.version.clone()).unwrap_or_default(),
         published_at: update.and_then(|u| u.cdate.as_ref()).and_then(parse_millis),
-        // `vendor` is a bare string here, an object in search results.
+        // `vendor` is an object (`{name, …}`) in the live API; a bare name is
+        // read too.
         author: doc.vendor.and_then(Vendor::into_name),
         title: doc.name,
         description: doc.preview,

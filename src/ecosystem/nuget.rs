@@ -6,7 +6,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use std::io::{Cursor, Read};
 
 use crate::ecosystem::{decode, fetch_json, lenient, null_default, parse_rfc3339_secs};
-use crate::fetch::{BlobCache, Fetch, cached_metadata, cached_metadata_status};
+use crate::fetch::{BlobCache, Fetch, cached_metadata, cached_metadata_status, percent_decode};
 use crate::registry::RegistryError;
 
 /// The gzip-compressed V3 registration base — per-version `catalogEntry`
@@ -46,11 +46,20 @@ pub(crate) fn nuget(
         return Err(RegistryError::NotFound);
     };
     let latest = d.version.as_deref();
-    // Honor a requested version only if the registry lists it; the search-API
-    // metadata below is the latest release's regardless (it exposes no
-    // per-version doc), but the `.nuspec` we fetch afterward *is* per-version.
-    let version = version
-        .filter(|v| d.versions.iter().any(|e| e.version.as_deref() == Some(*v)))
+    // Honor a requested version only if the registry lists it, in the
+    // registry's spelling; the search-API metadata below is the latest
+    // release's regardless (it exposes no per-version doc), but the `.nuspec`
+    // we fetch afterward *is* per-version. A PURL percent-encodes what NuGet
+    // spells literally (`1.0.0%2Bbuild`).
+    let requested = version.map(percent_decode);
+    let version = requested
+        .as_deref()
+        .and_then(|want| {
+            d.versions
+                .iter()
+                .filter_map(|e| e.version.as_deref())
+                .find(|v| nuget_version_key(v) == nuget_version_key(want))
+        })
         .or(latest)
         .unwrap_or_default()
         .to_string();
@@ -82,11 +91,11 @@ pub(crate) fn nuget(
     // Enrich from the per-version `.nuspec`. Best-effort: the search-derived
     // record stands on its own if the manifest is missing or unparseable.
     // Flatcontainer names the manifest `{id}.nuspec` (only the `.nupkg` carries
-    // the version); the version lives in the path segment. Both are lowercased.
+    // the version); the version lives in the path segment, normalized.
     if let Some(bytes) = cached_metadata(
         &format!(
             "https://api.nuget.org/v3-flatcontainer/{id}/{v}/{id}.nuspec",
-            v = version.to_lowercase()
+            v = nuget_version_key(&version)
         ),
         net,
         cache,
@@ -101,6 +110,18 @@ pub(crate) fn nuget(
     nuget_registration(&id, &version, &mut reg, net, cache);
 
     Ok(reg)
+}
+
+/// A version as NuGet tells versions apart: case-insensitively, and without
+/// SemVer build metadata, which nuget.org drops when it normalizes a version
+/// (`1.0.0-Beta+abc` and `1.0.0-beta` are one release). Flat-container URLs
+/// spell versions this way.
+fn nuget_version_key(version: &str) -> String {
+    version
+        .split('+')
+        .next()
+        .unwrap_or(version)
+        .to_ascii_lowercase()
 }
 
 /// A NuGet `deprecation` object → a reason string: its `message`, else
@@ -181,7 +202,11 @@ fn nuget_registration(
             if let Some(t) = published {
                 times.push(t);
             }
-            if ce.version.as_deref() == Some(want) {
+            if ce
+                .version
+                .as_deref()
+                .is_some_and(|v| nuget_version_key(v) == nuget_version_key(want))
+            {
                 reg.published_at = published;
                 // `listed:false` hides a version without removing it — NuGet's
                 // analogue of a yank, and a real custody signal.
@@ -374,6 +399,40 @@ mod tests {
         // the search-derived record still stands.
         assert_eq!(r.repository, None);
         assert_eq!(r.repository_commit, None);
+    }
+
+    /// A PURL percent-encodes the `+` of build metadata, and NuGet tells
+    /// versions apart without it or letter case: the encoded request is the
+    /// release NuGet lists, and its manifest is filed under the normalized
+    /// version.
+    #[test]
+    fn nuget_matches_a_requested_version_as_nuget_does() {
+        let search = serde_json::json!({"data": [{
+            "id": "Sample.Pkg", "version": "2.0.0",
+            "versions": [{"version": "1.0.0-beta+build.7"}, {"version": "2.0.0"}]
+        }]})
+        .to_string();
+        let nuspec =
+            r#"<package><metadata><license type="expression">MIT</license></metadata></package>"#;
+        let net = Fixtures::default()
+            .with(
+                "https://azuresearch-usnc.nuget.org/query?q=packageid:sample.pkg&prerelease=true&semVerLevel=2.0.0",
+                search.as_bytes(),
+            )
+            .with(
+                "https://api.nuget.org/v3-flatcontainer/sample.pkg/1.0.0-beta/sample.pkg.nuspec",
+                nuspec.as_bytes(),
+            );
+        let r = nuget(
+            "Sample.Pkg",
+            Some("1.0.0-Beta%2Bbuild.7"),
+            &net,
+            &test_cache("nuget_version"),
+        )
+        .expect("registry");
+        assert_eq!(r.version, "1.0.0-beta+build.7", "the release asked for");
+        assert_eq!(r.latest_version.as_deref(), Some("2.0.0"));
+        assert_eq!(r.license.as_deref(), Some("MIT"), "its own manifest");
     }
 
     #[test]

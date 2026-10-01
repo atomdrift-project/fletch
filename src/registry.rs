@@ -130,9 +130,9 @@ pub fn try_registry(
     // place that knows the PURL's version-ness, and carried on the cache
     // rather than threaded through every ecosystem fn.
     let ttl = if version.is_some() {
-        crate::fetch::meta_ttl_pinned()
+        cache.meta_ttl_pinned()
     } else {
-        crate::fetch::meta_ttl_unpinned()
+        cache.meta_ttl_unpinned()
     };
     let (first, staged) = cache.with_meta_ttl(ttl).staged();
     let record = lookup(&purl, &path, version, net, &first);
@@ -146,7 +146,7 @@ pub fn try_registry(
         && DATES_EVERY_VERSION.contains(&purl.typ())
         && record.as_ref().is_ok_and(|r| r.published_at.is_none())
     {
-        let fresh = cache.with_meta_ttl(crate::fetch::meta_ttl_unpinned());
+        let fresh = cache.with_meta_ttl(cache.meta_ttl_unpinned());
         return lookup(&purl, &path, version, net, &fresh);
     }
     cache.commit(staged);
@@ -162,7 +162,7 @@ pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Opt
 /// Ecosystems whose package document carries a publish time for every version
 /// it lists — so a requested version with none is one the document lacks.
 const DATES_EVERY_VERSION: &[&str] = &[
-    "npm", "cargo", "pypi", "composer", "gem", "hex", "pub", "conda", "jsr",
+    "npm", "cargo", "pypi", "composer", "gem", "hex", "pub", "conda", "jsr", "cran",
 ];
 
 /// One registry lookup: dispatch on the PURL type to its backend.
@@ -192,7 +192,7 @@ fn lookup(
         // the attacker-reachable half of the ML supply chain forager mirrors.
         "huggingface" => huggingface(path, version, net, cache),
         "hex" => hex_pm(path, version, net, cache),
-        "cran" => cran(last_seg(path), net, cache),
+        "cran" => cran(last_seg(path), version, net, cache),
         "cpan" => cpan(last_seg(path), net, cache),
         "pub" => pub_dev(last_seg(path), version, net, cache),
         "conda" => conda(last_seg(path), version, net, cache),
@@ -241,9 +241,8 @@ fn lookup(
         "homebrew" => homebrew(last_seg(path), net, cache),
         "snap" => snap(last_seg(path), net, cache),
         "wordpress" => wordpress(last_seg(path), net, cache),
-        // Agent-skill registry: `pkg:clawhub/[owner/]slug`. The v1 API is
-        // search-shaped; the fetcher exact-matches the slug in the results.
-        "clawhub" => clawhub(last_seg(path), net, cache),
+        // Agent-skill registry: `pkg:clawhub/[owner/]slug`.
+        "clawhub" => clawhub(path, net, cache),
         // Plugin registries of ML apps: a ComfyUI custom node
         // (`pkg:comfyui/<node_id>`) and a Dify Marketplace plugin
         // (`pkg:dify/<org>/<name>`).
@@ -363,22 +362,16 @@ mod tests {
         // A pinned coordinate cannot come back holding different bytes on any
         // registry we support, so its packument is held for months; a versionless
         // lookup resolves through mutable dist-tags and keeps a tight bound.
-        assert!(crate::fetch::meta_ttl_pinned() > crate::fetch::meta_ttl_unpinned());
-        assert!(crate::fetch::meta_ttl_pinned() >= std::time::Duration::from_secs(30 * 86_400));
+        let cache = BlobCache::disabled();
+        assert!(cache.meta_ttl_pinned() > cache.meta_ttl_unpinned());
+        assert!(cache.meta_ttl_pinned() >= std::time::Duration::from_secs(30 * 86_400));
 
         // An explicit operator override still wins on both tiers, so asking for
         // tight revalidation is never silently ignored.
-        crate::fetch::set_registry_ttl(Some(std::time::Duration::from_secs(60)));
-        assert_eq!(
-            crate::fetch::meta_ttl_pinned(),
-            std::time::Duration::from_secs(60)
-        );
-        assert_eq!(
-            crate::fetch::meta_ttl_unpinned(),
-            std::time::Duration::from_secs(60)
-        );
-        crate::fetch::set_registry_ttl(None);
-        assert!(crate::fetch::meta_ttl_pinned() > crate::fetch::meta_ttl_unpinned());
+        let minute = std::time::Duration::from_secs(60);
+        let cache = cache.with_registry_ttl(Some(minute));
+        assert_eq!(cache.meta_ttl_pinned(), minute);
+        assert_eq!(cache.meta_ttl_unpinned(), minute);
     }
 
     #[test]
@@ -554,14 +547,13 @@ mod tests {
                 "https://api.jsr.io/scopes/s/packages/j",
                 serde_json::json!({"latestVersion": "1.0.0"}),
             ),
-            (
-                "https://api.jsr.io/scopes/s/packages/j/versions",
-                serde_json::json!([{"version": "1.0.0", "createdAt": "2024-01-01T00:00:00Z"}]),
-            ),
         ];
-        let net = docs.iter().fold(Fixtures::default(), |net, (url, doc)| {
-            net.with(url, doc.to_string().as_bytes())
-        });
+        let net = docs
+            .iter()
+            .fold(Fixtures::default(), |net, (url, doc)| {
+                net.with(url, doc.to_string().as_bytes())
+            })
+            .refusing("https://api.jsr.io/scopes/s/packages/j/versions/9.9.9", 404);
         let cache = test_cache("unlisted");
         let first_release = Some(1_420_070_400); // 2015-01-01
 
@@ -584,6 +576,38 @@ mod tests {
                 assert_eq!(r.first_published_at, first_release, "{}", r.ecosystem);
             }
         }
+    }
+
+    #[test]
+    fn a_package_with_no_stable_release_still_has_a_latest() {
+        // Each registry sends `null` for the stable release and names the
+        // newest pre-release beside it; that `null` used to blank the version.
+        let docs = [
+            (
+                "https://crates.io/api/v1/crates/c",
+                serde_json::json!({"crate": {"max_stable_version": null, "max_version": "0.1.0-rc.1"}}),
+            ),
+            (
+                "https://hex.pm/api/packages/h",
+                serde_json::json!({"latest_stable_version": null, "latest_version": "0.1.0-rc.1"}),
+            ),
+            (
+                "https://clojars.org/api/artifacts/k",
+                serde_json::json!({"jar_name": "k", "latest_release": null, "latest_version": "0.1.0-SNAPSHOT"}),
+            ),
+        ];
+        let net = docs.iter().fold(Fixtures::default(), |net, (url, doc)| {
+            net.with(url, doc.to_string().as_bytes())
+        });
+        let cache = test_cache("prerelease");
+        let version = |purl: &str| {
+            registry(&RefLocator::Purl(purl.into()), &net, &cache)
+                .expect("the package resolves")
+                .version
+        };
+        assert_eq!(version("pkg:cargo/c"), "0.1.0-rc.1");
+        assert_eq!(version("pkg:hex/h"), "0.1.0-rc.1");
+        assert_eq!(version("pkg:clojars/k"), "0.1.0-SNAPSHOT");
     }
 
     #[test]

@@ -3,36 +3,25 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::fetch::ssrf::{NonPublicHost, SafeResolver, guard_host};
 
 /// Default per-fetch byte ceiling — a single response is abandoned past this
-/// unless [`set_max_fetch_bytes`] adjusts it for the process.
+/// unless [`HttpFetch::with_max_bytes`] sets another.
 pub const DEFAULT_MAX_FETCH_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Process-wide per-fetch byte ceiling. Fetching is process-global (one
-/// invocation, one policy), so the limit lives in a single atomic set once at
-/// startup rather than threaded through every `get`/`fetch_ref` call — the same
-/// shape as the shared HTTP client and blob cache.
-static MAX_FETCH_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_FETCH_BYTES);
-
-/// Set the per-fetch byte ceiling for the process. Call once at startup, before
-/// any fetch; subsequent fetches read the new value.
-pub fn set_max_fetch_bytes(limit: u64) {
-    MAX_FETCH_BYTES.store(limit, Ordering::Relaxed);
-}
-
-/// The current per-fetch byte ceiling.
-#[must_use]
-pub fn max_fetch_bytes() -> u64 {
-    MAX_FETCH_BYTES.load(Ordering::Relaxed)
-}
 
 /// Redirect-chain cap.
 const MAX_REDIRECTS: u32 = 10;
+
+/// The longest a request waits out a server's request to back off. A longer
+/// one fails the request instead — and every request to that host until the
+/// time is up, without asking it again.
+const MAX_BACKOFF_WAIT: Duration = Duration::from_secs(30);
+
+/// How many back-offs one request waits out before failing.
+const BACKOFF_RETRIES: u32 = 3;
 
 /// Wall-clock ceiling on one GET or POST, redirect hops and body included. The
 /// blocking client's own timeout bounds each read, not the whole body, so a
@@ -40,46 +29,80 @@ const MAX_REDIRECTS: u32 = 10;
 /// the size cap.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(600);
 
+/// What a [`Request`] does: a GET, which follows redirects, or a POST of a
+/// body, which does not (a redirected query endpoint is an error, not a silent
+/// re-POST to another host).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method<'a> {
+    /// Retrieve the resource.
+    Get,
+    /// Send this body — for the one registry query with no GET form, the VS
+    /// Code Marketplace's JSON-RPC `extensionquery`.
+    Post(&'a [u8]),
+}
+
+/// One request to a [`Fetch`] backend: everything about it travels together,
+/// so a wrapping backend that forwards [`send`](Fetch::send) forwards it all.
+#[derive(Debug, Clone, Copy)]
+pub struct Request<'a> {
+    /// The URL to ask.
+    pub url: &'a str,
+    /// GET or POST.
+    pub method: Method<'a>,
+    /// Extra `(name, value)` headers, for a registry that mandates one (the
+    /// Snap Store 400s without `Snap-Device-Series`).
+    pub headers: &'a [(&'a str, &'a str)],
+    /// Return a status the server answered with as the [`Fetched`] it is —
+    /// status and body — instead of [`FetchError::Status`]. For the one
+    /// registry whose refusal body says something: proxy.golang.org's 404
+    /// names the module path it would have accepted (see
+    /// `goproxy_canonical_path`).
+    pub any_status: bool,
+}
+
+impl<'a> Request<'a> {
+    /// A plain GET of `url`.
+    #[must_use]
+    pub fn get(url: &'a str) -> Self {
+        Self {
+            url,
+            method: Method::Get,
+            headers: &[],
+            any_status: false,
+        }
+    }
+
+    /// A POST of `body` to `url`.
+    #[must_use]
+    pub fn post(url: &'a str, body: &'a [u8]) -> Self {
+        Self {
+            method: Method::Post(body),
+            ..Self::get(url)
+        }
+    }
+
+    /// This request, carrying `headers`.
+    #[must_use]
+    pub fn with_headers(self, headers: &'a [(&'a str, &'a str)]) -> Self {
+        Self { headers, ..self }
+    }
+
+    /// This request, answered with whatever status the server sends (see
+    /// [`any_status`](Self::any_status)).
+    #[must_use]
+    pub fn any_status(self) -> Self {
+        Self {
+            any_status: true,
+            ..self
+        }
+    }
+}
+
 /// The one network operation. Backends: [`HttpFetch`] (real, SSRF-guarded)
 /// and [`Fixtures`] (offline tests).
 pub trait Fetch {
-    /// Retrieve the bytes at `url`, following redirects.
-    fn get(&self, url: &str) -> Result<Fetched, FetchError>;
-
-    /// Retrieve the bytes at `url` with extra request `headers`, following
-    /// redirects. Defaults to a plain [`get`](Self::get) — a backend overrides
-    /// it only when a registry mandates a request header on a GET (e.g. the Snap
-    /// Store, which 400s without `Snap-Device-Series`). Test backends that key on
-    /// URL alone inherit the default unchanged.
-    fn get_with(&self, url: &str, _headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.get(url)
-    }
-
-    /// [`get_with`](Self::get_with), but a status the server *answered* with
-    /// comes back as the [`Fetched`] it is — status and body — instead of
-    /// [`FetchError::Status`]. For the one registry whose refusal body says
-    /// something: proxy.golang.org's 404 names the module path it would have
-    /// accepted (see `goproxy_canonical_path`). The default keeps the plain
-    /// behaviour, so a backend that has not opted in still reports refusals
-    /// as errors and nothing downstream changes for it.
-    fn get_any_status(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.get_with(url, headers)
-    }
-
-    /// POST `body` with the given `(name, value)` headers and return the
-    /// response. Defaults to unsupported; a backend overrides it only when a
-    /// registry needs it — e.g. the VS Code Marketplace's JSON-RPC query, which
-    /// has no GET form. POST is not redirect-followed.
-    fn post(
-        &self,
-        _url: &str,
-        _body: &[u8],
-        _headers: &[(&str, &str)],
-    ) -> Result<Fetched, FetchError> {
-        Err(FetchError::Refused(
-            "POST not supported by this backend".into(),
-        ))
-    }
+    /// Carry out `request`.
+    fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError>;
 
     /// Whether an `oci://` target may be pulled. The OCI distribution protocol
     /// (token + manifest + blob rounds) runs on the puller's own HTTP stack,
@@ -109,7 +132,8 @@ pub struct Fetched {
 }
 
 /// Why a fetch produced no bytes.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FetchError {
     /// Refused before/at connect — SSRF guard, disallowed scheme, private
     /// host, too many redirects.
@@ -127,6 +151,10 @@ pub enum FetchError {
     /// Transport / IO failure.
     #[error("transport: {0}")]
     Transport(String),
+    /// fletch itself failed while handling the reference — a parser bug
+    /// tripped by hostile bytes, contained to this one fetch.
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 /// The real network backend: an HTTPS client whose DNS resolver enforces the
@@ -135,6 +163,13 @@ pub enum FetchError {
 #[derive(Debug)]
 pub struct HttpFetch {
     client: reqwest::blocking::Client,
+    /// A response is abandoned past this many bytes.
+    max_bytes: u64,
+    /// Hosts that asked to be left alone, shared by every request through this
+    /// client, so its workers learn it once rather than each the hard way.
+    backoff: Backoff,
+    /// Sent to `api.github.com` only, lifting its anonymous rate limit.
+    github_token: Option<Secret>,
 }
 
 impl HttpFetch {
@@ -153,21 +188,49 @@ impl HttpFetch {
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(SafeResolver))
             .build()?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            max_bytes: DEFAULT_MAX_FETCH_BYTES,
+            backoff: Backoff::default(),
+            github_token: None,
+        })
+    }
+
+    /// This client, authenticating to the GitHub API with `token`. Anonymous,
+    /// the API allows 60 requests an hour per address, and both GitHub repo
+    /// lookups and Composer downloads (Packagist's dist URLs are API zipballs)
+    /// go through it. The token is sent to `api.github.com` alone — not to the
+    /// host its downloads redirect to.
+    #[must_use]
+    pub fn with_github_token(self, token: Option<String>) -> Self {
+        Self {
+            github_token: token.filter(|t| !t.is_empty()).map(Secret),
+            ..self
+        }
+    }
+
+    /// This client, abandoning any response past `limit` bytes instead of
+    /// [`DEFAULT_MAX_FETCH_BYTES`].
+    #[must_use]
+    pub fn with_max_bytes(self, limit: u64) -> Self {
+        Self {
+            max_bytes: limit,
+            ..self
+        }
     }
 }
 
-/// Read a response body under the per-fetch byte ceiling ([`max_fetch_bytes`])
-/// and the request's `deadline`. A declared `Content-Length` over the cap is
+/// Read a response body under the per-fetch byte ceiling (`limit`) and the
+/// request's `deadline`. A declared `Content-Length` over the cap is
 /// rejected before a single body byte is read — the common case for an
 /// oversize artifact, which a registry or CDN sizes honestly — so we don't pull
 /// tens of MB only to discard them. The streaming cap in [`read_bounded`]
 /// remains the authoritative backstop for a missing or dishonest header.
 fn read_body_capped(
     resp: reqwest::blocking::Response,
+    limit: u64,
     deadline: Instant,
 ) -> Result<Vec<u8>, FetchError> {
-    let limit = max_fetch_bytes();
     if let Some(len) = resp.content_length()
         && len > limit
     {
@@ -217,7 +280,7 @@ impl HttpFetch {
     /// security floor is defined exactly once. `any_status` returns a
     /// non-success response as a [`Fetched`] rather than a
     /// [`FetchError::Status`]; redirects and the host guard apply either way.
-    fn get_inner(
+    fn get(
         &self,
         url: &str,
         headers: &[(&str, &str)],
@@ -228,13 +291,16 @@ impl HttpFetch {
             reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
         let origin = current.origin();
         let mut redirects = Vec::new();
+        let (mut hops, mut waits) = (0, 0);
 
-        for _ in 0..=MAX_REDIRECTS {
+        loop {
             if Instant::now() >= deadline {
                 return Err(FetchError::Timeout);
             }
             // Re-checked on every hop, so a redirect can't escape the floor.
             guard_host(&current)?;
+            let host = current.host_str().unwrap_or_default().to_string();
+            self.backoff.wait(&host, deadline)?;
             let same_origin = current.origin() == origin;
             let mut req = self.client.get(current.clone());
             for (name, value) in headers {
@@ -242,10 +308,25 @@ impl HttpFetch {
                     req = req.header(*name, *value);
                 }
             }
+            if let Some(token) = self.token_for(&host, headers) {
+                req = req.bearer_auth(token);
+            }
             let resp = req.send().map_err(map_send_err)?;
             let status = resp.status();
 
+            if let Some(delay) = back_off_delay(status, resp.headers(), waits) {
+                self.backoff.hold(&host, delay, status.as_u16());
+                if waits < BACKOFF_RETRIES && delay <= MAX_BACKOFF_WAIT {
+                    waits += 1;
+                    continue;
+                }
+                return Err(FetchError::Status(status.as_u16()));
+            }
             if status.is_redirection() {
+                if hops == MAX_REDIRECTS {
+                    return Err(FetchError::Refused("too many redirects".into()));
+                }
+                hops += 1;
                 // Some servers (e.g. the Chrome Web Store) send a non-ASCII
                 // `Location` with raw UTF-8 in the path; `to_str()` rejects that,
                 // so fall back to a lossy decode and let `Url::join` percent-
@@ -271,7 +352,7 @@ impl HttpFetch {
             }
 
             let headers = response_headers(&resp);
-            let bytes = read_body_capped(resp, deadline)?;
+            let bytes = read_body_capped(resp, self.max_bytes, deadline)?;
             return Ok(Fetched {
                 bytes,
                 final_url: current.to_string(),
@@ -280,45 +361,74 @@ impl HttpFetch {
                 redirects,
             });
         }
-        Err(FetchError::Refused("too many redirects".into()))
+    }
+
+    /// The GitHub token, when `host` is the GitHub API and the caller has not
+    /// supplied credentials of its own.
+    fn token_for(&self, host: &str, headers: &[(&str, &str)]) -> Option<&str> {
+        let caller_auth = headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+        (host == "api.github.com" && !caller_auth).then_some(self.github_token.as_ref()?.0.as_str())
     }
 }
 
 impl Fetch for HttpFetch {
-    fn get(&self, url: &str) -> Result<Fetched, FetchError> {
-        self.get_inner(url, &[], false)
+    fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+        match request.method {
+            Method::Get => self.get(request.url, request.headers, request.any_status),
+            Method::Post(body) => self.post(request.url, body, request.headers, request.any_status),
+        }
     }
 
-    fn get_with(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.get_inner(url, headers, false)
+    // The real-network backend is the one place container pulls are welcome:
+    // the puller's public-registry allowlist covers the SSRF posture that
+    // guard_host provides for plain URL fetches.
+    fn allows_oci(&self) -> bool {
+        true
     }
+}
 
-    fn get_any_status(&self, url: &str, headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        self.get_inner(url, headers, true)
-    }
-
+impl HttpFetch {
     fn post(
         &self,
         url: &str,
         body: &[u8],
         headers: &[(&str, &str)],
+        any_status: bool,
     ) -> Result<Fetched, FetchError> {
         let deadline = Instant::now() + REQUEST_DEADLINE;
         let target = reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
         guard_host(&target)?;
-        let mut req = self.client.post(target.clone()).body(body.to_vec());
-        for (name, value) in headers {
-            req = req.header(*name, *value);
-        }
-        let resp = req.send().map_err(map_send_err)?;
+        let host = target.host_str().unwrap_or_default().to_string();
+        let mut waits = 0;
+        let resp = loop {
+            self.backoff.wait(&host, deadline)?;
+            let mut req = self.client.post(target.clone()).body(body.to_vec());
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            if let Some(token) = self.token_for(&host, headers) {
+                req = req.bearer_auth(token);
+            }
+            let resp = req.send().map_err(map_send_err)?;
+            let Some(delay) = back_off_delay(resp.status(), resp.headers(), waits) else {
+                break resp;
+            };
+            self.backoff.hold(&host, delay, resp.status().as_u16());
+            if waits == BACKOFF_RETRIES || delay > MAX_BACKOFF_WAIT {
+                return Err(FetchError::Status(resp.status().as_u16()));
+            }
+            waits += 1;
+        };
         let status = resp.status();
         // POST is not redirect-followed: a redirected query endpoint is an error
         // here, not a silent re-POST to another host.
-        if !status.is_success() {
+        if !status.is_success() && !any_status {
             return Err(FetchError::Status(status.as_u16()));
         }
         let headers = response_headers(&resp);
-        let bytes = read_body_capped(resp, deadline)?;
+        let bytes = read_body_capped(resp, self.max_bytes, deadline)?;
         Ok(Fetched {
             bytes,
             final_url: target.to_string(),
@@ -327,12 +437,87 @@ impl Fetch for HttpFetch {
             redirects: Vec::new(),
         })
     }
+}
 
-    // The real-network backend is the one place container pulls are welcome:
-    // the puller's public-registry allowlist covers the SSRF posture that
-    // guard_host provides for plain URL fetches.
-    fn allows_oci(&self) -> bool {
-        true
+/// Hosts that asked to be left alone (`429`, `Retry-After`, an exhausted rate
+/// limit): until when, and the status that asked.
+#[derive(Debug, Default)]
+struct Backoff(Mutex<HashMap<String, (Instant, u16)>>);
+
+impl Backoff {
+    /// Wait until `host` may be asked again — when that is within
+    /// [`MAX_BACKOFF_WAIT`] and before `deadline`; otherwise fail now with the
+    /// status that asked for the pause, leaving the host alone.
+    fn wait(&self, host: &str, deadline: Instant) -> Result<(), FetchError> {
+        let held = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(host)
+            .copied();
+        let Some((until, status)) = held else {
+            return Ok(());
+        };
+        let pause = until.saturating_duration_since(Instant::now());
+        if pause.is_zero() {
+            return Ok(());
+        }
+        if pause > MAX_BACKOFF_WAIT || Instant::now() + pause >= deadline {
+            return Err(FetchError::Status(status));
+        }
+        std::thread::sleep(pause);
+        Ok(())
+    }
+
+    /// Leave `host` alone for `delay`, unless it is already held longer.
+    fn hold(&self, host: &str, delay: Duration, status: u16) {
+        let now = Instant::now();
+        let until = now + delay;
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        held.retain(|_, (when, _)| *when > now);
+        let entry = held.entry(host.to_string()).or_insert((until, status));
+        if entry.0 < until {
+            *entry = (until, status);
+        }
+        drop(held);
+    }
+}
+
+/// How long a response asks us to wait before asking again, when it asks: a
+/// `429`, a `503` with `Retry-After`, or a rate limit GitHub has exhausted or
+/// throttled (a `403` with `x-ratelimit-remaining: 0`, reset at
+/// `x-ratelimit-reset`, or with `Retry-After`). A `429` that names no time
+/// backs off 1 s, 2 s, 4 s.
+fn back_off_delay(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    waits: u32,
+) -> Option<Duration> {
+    let number = |name: &str| headers.get(name)?.to_str().ok()?.trim().parse::<u64>().ok();
+    let retry_after = number("retry-after").map(Duration::from_secs);
+    let exhausted = number("x-ratelimit-remaining") == Some(0);
+    let reset = number("x-ratelimit-reset")
+        .map(|at| Duration::from_secs(at.saturating_sub(crate::fetch::now())));
+    match status.as_u16() {
+        429 => Some(
+            retry_after
+                .or(reset.filter(|_| exhausted))
+                .unwrap_or(Duration::from_secs(1 << waits.min(5))),
+        ),
+        503 => retry_after,
+        403 if exhausted || retry_after.is_some() => {
+            Some(retry_after.or(reset).unwrap_or(Duration::from_secs(60)))
+        }
+        _ => None,
+    }
+}
+
+/// A credential, kept out of `Debug` output.
+struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
     }
 }
 
@@ -378,8 +563,8 @@ fn map_send_err(e: reqwest::Error) -> FetchError {
 pub struct Fixtures {
     responses: HashMap<String, Fetched>,
     refusals: HashMap<String, u16>,
-    /// Bodies for refusals, served only through
-    /// [`get_any_status`](Fetch::get_any_status).
+    /// Bodies for refusals, served only to an
+    /// [`any_status`](Request::any_status) request.
     refusal_bodies: HashMap<String, Vec<u8>>,
 }
 
@@ -399,7 +584,7 @@ impl Fixtures {
         self
     }
     /// [`refusing`](Self::refusing), with the body the server sent along —
-    /// reachable only through [`get_any_status`](Fetch::get_any_status), the
+    /// reachable only by an [`any_status`](Request::any_status) request, the
     /// way a real client exposes it.
     #[must_use]
     pub fn refusing_with_body(mut self, url: &str, status: u16, body: &[u8]) -> Self {
@@ -429,37 +614,26 @@ impl Fixtures {
 }
 
 impl Fetch for Fixtures {
-    fn get(&self, url: &str) -> Result<Fetched, FetchError> {
-        if let Some(status) = self.refusals.get(url) {
-            return Err(FetchError::Status(*status));
+    /// A query's response is deterministic for its endpoint, so a POST is
+    /// keyed on its URL like a GET, and headers and body are ignored.
+    fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+        let url = request.url;
+        if let Some(&status) = self.refusals.get(url) {
+            if !request.any_status {
+                return Err(FetchError::Status(status));
+            }
+            return Ok(Fetched {
+                bytes: self.refusal_bodies.get(url).cloned().unwrap_or_default(),
+                final_url: url.to_string(),
+                status,
+                headers: Vec::new(),
+                redirects: Vec::new(),
+            });
         }
         self.responses
             .get(url)
             .cloned()
             .ok_or_else(|| FetchError::Transport(format!("no fixture for {url}")))
-    }
-
-    fn get_any_status(&self, url: &str, _headers: &[(&str, &str)]) -> Result<Fetched, FetchError> {
-        if let Some(status) = self.refusals.get(url) {
-            return Ok(Fetched {
-                bytes: self.refusal_bodies.get(url).cloned().unwrap_or_default(),
-                final_url: url.to_string(),
-                status: *status,
-                headers: Vec::new(),
-                redirects: Vec::new(),
-            });
-        }
-        self.get(url)
-    }
-    /// A query's response is deterministic for its endpoint, so fixtures key on
-    /// the URL and ignore the body.
-    fn post(
-        &self,
-        url: &str,
-        _body: &[u8],
-        _headers: &[(&str, &str)],
-    ) -> Result<Fetched, FetchError> {
-        self.get(url)
     }
 }
 
@@ -472,6 +646,89 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn a_server_asking_to_back_off_is_heard() {
+        use reqwest::StatusCode;
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(*name, HeaderValue::from_str(value).unwrap());
+            }
+            map
+        };
+        let none = HeaderMap::new();
+        let secs = Duration::from_secs;
+        // A 429 says how long, or backs off exponentially.
+        let asked = headers(&[("retry-after", "7")]);
+        assert_eq!(
+            back_off_delay(StatusCode::TOO_MANY_REQUESTS, &asked, 0),
+            Some(secs(7))
+        );
+        assert_eq!(
+            back_off_delay(StatusCode::TOO_MANY_REQUESTS, &none, 2),
+            Some(secs(4))
+        );
+        // A 503 waits only when asked to.
+        assert_eq!(
+            back_off_delay(StatusCode::SERVICE_UNAVAILABLE, &none, 0),
+            None
+        );
+        assert_eq!(
+            back_off_delay(StatusCode::SERVICE_UNAVAILABLE, &asked, 0),
+            Some(secs(7))
+        );
+        // GitHub's exhausted rate limit is a 403 that resets at a stated time.
+        let reset = (crate::fetch::now() + 600).to_string();
+        let exhausted = headers(&[
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", &reset),
+        ]);
+        let pause = back_off_delay(StatusCode::FORBIDDEN, &exhausted, 0).unwrap();
+        assert!(pause > secs(590) && pause <= secs(600), "{pause:?}");
+        // An ordinary refusal is an answer, not a request to wait.
+        assert_eq!(back_off_delay(StatusCode::FORBIDDEN, &none, 0), None);
+        assert_eq!(back_off_delay(StatusCode::NOT_FOUND, &asked, 0), None);
+    }
+
+    #[test]
+    fn a_host_held_back_is_waited_out_or_refused() {
+        let backoff = Backoff::default();
+        let deadline = Instant::now() + Duration::from_secs(600);
+        backoff.hold("slow.test", Duration::from_millis(20), 429);
+        let started = Instant::now();
+        assert_eq!(backoff.wait("slow.test", deadline), Ok(()));
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        // A pause past the cap fails at once, for every request to the host,
+        // without asking it again.
+        backoff.hold("limited.test", Duration::from_secs(3600), 403);
+        assert_eq!(
+            backoff.wait("limited.test", deadline),
+            Err(FetchError::Status(403))
+        );
+        assert_eq!(backoff.wait("other.test", deadline), Ok(()));
+        // A shorter hold never cuts a longer one short.
+        backoff.hold("limited.test", Duration::from_millis(1), 429);
+        assert_eq!(
+            backoff.wait("limited.test", deadline),
+            Err(FetchError::Status(403))
+        );
+    }
+
+    #[test]
+    fn the_github_token_goes_to_the_api_alone_and_never_prints() {
+        let net = HttpFetch::new()
+            .unwrap()
+            .with_github_token(Some("ghp_secret".into()));
+        assert_eq!(net.token_for("api.github.com", &[]), Some("ghp_secret"));
+        assert_eq!(net.token_for("codeload.github.com", &[]), None);
+        assert_eq!(
+            net.token_for("api.github.com", &[("Authorization", "token theirs")]),
+            None
+        );
+        assert!(!format!("{net:?}").contains("ghp_secret"));
+    }
+
+    #[test]
     fn a_body_read_honours_the_cap_and_an_unbounded_ceiling() {
         let later = Instant::now() + Duration::from_secs(60);
         assert_eq!(
@@ -482,7 +739,7 @@ mod tests {
             read_bounded(&b"12345"[..], 4, later),
             Err(FetchError::TooLarge)
         ));
-        // `u64::MAX` is a legal `set_max_fetch_bytes` value and must read the
+        // `u64::MAX` is a legal `with_max_bytes` value and must read the
         // whole body, not wrap to an empty one.
         assert_eq!(
             read_bounded(&b"12345"[..], u64::MAX, later).ok(),

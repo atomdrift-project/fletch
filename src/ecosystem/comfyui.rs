@@ -5,8 +5,8 @@ use serde::Deserialize;
 
 use crate::ecosystem::{fetch_json, parse_ts};
 use crate::fetch::{
-    BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, is_web_scheme, meta_ttl_unpinned,
-    percent_decode, safe_coordinate,
+    BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, is_web_scheme, percent_decode,
+    safe_coordinate,
 };
 use crate::registry::RegistryError;
 
@@ -31,7 +31,7 @@ pub(crate) fn resolve_comfyui(
     let base = format!("https://api.comfy.org/nodes/{path}/install");
     let (api, ttl) = match version {
         Some(v) => (format!("{base}?version={v}"), META_TTL_IMMUTABLE),
-        None => (base, meta_ttl_unpinned()),
+        None => (base, cache.meta_ttl_unpinned()),
     };
     let bytes = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))?;
     let doc: serde_json::Value = serde_json::from_slice(&bytes).ok()?;

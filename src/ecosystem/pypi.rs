@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::ecosystem::{email_domain, fetch_json, null_default, parse_rfc3339_secs};
 use crate::fetch::{
     ArtifactCandidate, BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, file_name_from_url,
-    meta_ttl_unpinned, percent_decode, repository_base,
+    percent_decode, repository_base,
 };
 use crate::purl::Purl;
 use crate::registry::RegistryError;
@@ -30,7 +30,7 @@ pub(crate) fn pypi_artifacts(
     let ttl = if version.is_some() {
         META_TTL_IMMUTABLE
     } else {
-        meta_ttl_unpinned()
+        cache.meta_ttl_unpinned()
     };
     let Some(doc) = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())

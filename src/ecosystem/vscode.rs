@@ -6,7 +6,7 @@ use serde::de::IgnoredAny;
 use std::collections::HashMap;
 
 use crate::ecosystem::{decode, fetch_json, null_default, parse_rfc3339_secs};
-use crate::fetch::{BlobCache, Fetch, cached_post, safe_coordinate};
+use crate::fetch::{BlobCache, Fetch, Request, cached_post, safe_coordinate};
 use crate::purl::Purl;
 use crate::registry::RegistryError;
 
@@ -36,7 +36,7 @@ pub(crate) fn resolve_openvsx(purl: &Purl, net: &dyn Fetch) -> Option<String> {
         Some(v) => format!("https://open-vsx.org/api/{ns}/{name}/{v}"),
         None => format!("https://open-vsx.org/api/{ns}/{name}"),
     };
-    let resp = net.get(&api).ok()?;
+    let resp = net.send(&Request::get(&api)).ok()?;
     let json: serde_json::Value = serde_json::from_slice(&resp.bytes).ok()?;
     json.pointer("/files/download")
         .and_then(serde_json::Value::as_str)
@@ -70,12 +70,9 @@ pub(crate) fn resolve_vscode(purl: &Purl, net: &dyn Fetch) -> Option<String> {
                 ("Content-Type", "application/json"),
                 ("Accept", "application/json;api-version=3.0-preview.1"),
             ];
+            let query = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery";
             let resp = net
-                .post(
-                    "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery",
-                    &body,
-                    &headers,
-                )
+                .send(&Request::post(query, &body).with_headers(&headers))
                 .ok()?;
             let json: serde_json::Value = serde_json::from_slice(&resp.bytes).ok()?;
             json.pointer("/results/0/extensions/0/versions/0/version")
@@ -400,22 +397,16 @@ mod tests {
 
     #[test]
     fn vscode_query_body_cannot_be_restructured_by_a_crafted_id() {
-        use crate::fetch::{FetchError, Fetched};
+        use crate::fetch::{FetchError, Fetched, Method};
 
         /// Captures the POST body so the emitted request can be inspected.
         #[derive(Default, Debug)]
         struct CaptureBody(std::sync::Mutex<Vec<u8>>);
         impl Fetch for CaptureBody {
-            fn get(&self, _url: &str) -> Result<Fetched, FetchError> {
-                Err(FetchError::Refused("get not used".into()))
-            }
-            fn post(
-                &self,
-                _url: &str,
-                body: &[u8],
-                _headers: &[(&str, &str)],
-            ) -> Result<Fetched, FetchError> {
-                if let Ok(mut seen) = self.0.lock() {
+            fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+                if let Method::Post(body) = request.method
+                    && let Ok(mut seen) = self.0.lock()
+                {
                     *seen = body.to_vec();
                 }
                 Err(FetchError::Refused("captured".into()))

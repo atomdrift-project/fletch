@@ -7,8 +7,8 @@ use std::time::Duration;
 use crate::ecosystem::{fetch_json, null_default, parse_ts};
 use crate::fetch::{
     ArtifactCandidate, BlobCache, Fetch, FetchError, META_TTL_IMMUTABLE, artifact_candidate,
-    cached_metadata, cached_metadata_status, file_name_matches, is_web_scheme, meta_ttl_unpinned,
-    percent_decode, safe_coordinate,
+    cached_metadata, cached_metadata_status, file_name_matches, is_web_scheme, percent_decode,
+    safe_coordinate,
 };
 use crate::purl::Purl;
 use crate::registry::RegistryError;
@@ -42,7 +42,7 @@ pub(crate) fn terraform_artifact(
     };
     let version = match version {
         Some(version) => percent_decode(version),
-        None => json(&base, meta_ttl_unpinned())?
+        None => json(&base, cache.meta_ttl_unpinned())?
             .get("version")?
             .as_str()?
             .to_string(),
@@ -64,7 +64,7 @@ pub(crate) fn terraform_artifact(
         Ok(bytes) => bytes,
         Err(FetchError::Status(404)) => {
             // The version list grows, so it is read with the unpinned TTL.
-            let versions = json(&format!("{base}/versions"), meta_ttl_unpinned())?;
+            let versions = json(&format!("{base}/versions"), cache.meta_ttl_unpinned())?;
             let platform = versions
                 .get("versions")?
                 .as_array()?
@@ -147,7 +147,9 @@ pub(crate) fn terraform(
         .filter_map(|&(v, t, _)| Some((t?, v)))
         .max()
         .map(|(_, v)| v);
-    let version = version.or(latest).unwrap_or_default();
+    // A PURL percent-encodes what the registry spells literally (`1.0.0%2Bbuild`).
+    let requested = version.map(percent_decode);
+    let version = requested.as_deref().or(latest).unwrap_or_default();
     let release = releases.iter().find(|(v, _, _)| *v == version);
 
     let mut p = Registry {
@@ -238,6 +240,30 @@ mod tests {
     use filefacts::RefLocator;
 
     use crate::fetch::Fixtures;
+
+    /// A PURL percent-encodes the `+` the registry spells literally.
+    #[test]
+    fn terraform_decodes_the_requested_version() {
+        let doc = serde_json::json!({
+            "data": {"type": "providers", "attributes": {}},
+            "included": [{"type": "provider-versions", "attributes":
+                {"version": "1.0.0+ent", "published-at": "2021-04-23T10:00:00Z"}}]
+        })
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://registry.terraform.io/v2/providers/acme/vault?include=provider-versions",
+            doc.as_bytes(),
+        );
+        let r = terraform(
+            "acme/vault",
+            Some("1.0.0%2Bent"),
+            &net,
+            &test_cache("tf-meta"),
+        )
+        .expect("registry");
+        assert_eq!(r.version, "1.0.0+ent");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+    }
 
     #[test]
     fn terraform_provider_normalizes() {

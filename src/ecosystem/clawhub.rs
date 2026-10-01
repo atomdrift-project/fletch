@@ -7,23 +7,25 @@ use crate::ecosystem::fetch_json;
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
-/// Homebrew: the formula JSON carries the stable version, description, license,
-/// and 30-day install analytics. It records no publish date.
 /// ClawHub agent-skill registry: `GET /api/v1/skills/{slug}` returns the one
-/// skill (404 for an unknown slug). The purl's optional owner namespace
-/// disambiguates *downloads* (slugs are not unique across publishers); the
-/// metadata endpoint is slug-keyed, so a shared slug resolves to the
-/// registry's primary holder of that slug.
+/// skill (404 for an unknown slug). Slugs are not unique across publishers, so
+/// `path` is the purl's `[owner/]slug` and the owner handle picks the
+/// publisher; a slug several publishers share, asked for without one, is
+/// refused (409, naming the owners).
 pub(crate) fn clawhub(
-    slug: &str,
+    path: &str,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let doc: SkillDocument = fetch_json(
-        &format!("https://clawhub.ai/api/v1/skills/{slug}"),
-        net,
-        cache,
-    )?;
+    let (owner, slug) = path
+        .rsplit_once('/')
+        .map_or((None, path), |(owner, slug)| (Some(owner), slug));
+    let mut url = format!("https://clawhub.ai/api/v1/skills/{slug}");
+    if let Some(owner) = owner {
+        url.push_str("?ownerHandle=");
+        url.push_str(owner);
+    }
+    let doc: SkillDocument = fetch_json(&url, net, cache)?;
     let skill = doc.skill;
     // Epoch-millisecond timestamps, occasionally fractional; fold to seconds.
     let ms_to_secs = |ms: f64| ms as u64 / 1_000;
@@ -108,5 +110,24 @@ mod tests {
         assert_eq!(r.downloads_total, Some(357));
         assert_eq!(r.rating_count, Some(4));
         assert_eq!(r.release_count, Some(12));
+    }
+
+    /// A slug two publishers share answers 409 without an owner; the purl's
+    /// owner namespace names which publisher's skill this is.
+    #[test]
+    fn clawhub_owner_picks_the_publisher() {
+        let doc = serde_json::json!({"skill": {"slug": "web-search", "tags": {"latest": "2.0.0"}}})
+            .to_string();
+        let net = Fixtures::default()
+            .refusing("https://clawhub.ai/api/v1/skills/web-search", 409)
+            .with(
+                "https://clawhub.ai/api/v1/skills/web-search?ownerHandle=acme",
+                doc.as_bytes(),
+            );
+        let cache = test_cache("clawhub-owner");
+        let r = clawhub("acme/web-search", &net, &cache).expect("registry");
+        assert_eq!(r.name, "web-search");
+        assert_eq!(r.version, "2.0.0");
+        assert!(clawhub("web-search", &net, &cache).is_err());
     }
 }

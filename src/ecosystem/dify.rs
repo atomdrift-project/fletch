@@ -6,8 +6,7 @@ use std::time::Duration;
 
 use crate::ecosystem::{Localized, fetch_json, parse_ts};
 use crate::fetch::{
-    BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, meta_ttl_unpinned, percent_decode,
-    safe_coordinate,
+    BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, percent_decode, safe_coordinate,
 };
 use crate::registry::RegistryError;
 
@@ -50,7 +49,7 @@ pub(crate) fn resolve_dify(
             )
         }
         None => {
-            let doc = json(&base, meta_ttl_unpinned())?;
+            let doc = json(&base, cache.meta_ttl_unpinned())?;
             (
                 text(&doc, "/data/plugin/latest_version")?,
                 text(&doc, "/data/plugin/latest_package_identifier")?,

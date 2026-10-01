@@ -4,7 +4,7 @@ use filefacts::Registry;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-use crate::ecosystem::{fetch_json, null_default, parse_ts, present};
+use crate::ecosystem::{fetch_json, null_default, parse_ts};
 use crate::fetch::{BlobCache, Fetch, percent_decode};
 use crate::registry::RegistryError;
 
@@ -17,13 +17,12 @@ pub(crate) fn hex_pm(
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
     let doc: Package = fetch_json(&format!("https://hex.pm/api/packages/{name}"), net, cache)?;
-    // `latest_version` stands in only when `latest_stable_version` is absent;
-    // a `null` stable version stays unknown.
+    // A package with no stable release has a `null` latest stable version;
+    // its newest pre-release is then the latest there is.
     let latest = doc
         .latest_stable_version
-        .as_ref()
-        .unwrap_or(&doc.latest_version)
-        .as_deref();
+        .as_deref()
+        .or(doc.latest_version.as_deref());
     let requested = version.map(percent_decode);
     let version = requested.as_deref().or(latest).unwrap_or_default();
     // A version the releases list lacks gets no date rather than the newest
@@ -72,8 +71,7 @@ fn links_repo(links: &BTreeMap<String, String>) -> Option<String> {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Package {
-    #[serde(deserialize_with = "present")]
-    latest_stable_version: Option<Option<String>>,
+    latest_stable_version: Option<String>,
     latest_version: Option<String>,
     inserted_at: Option<String>,
     #[serde(deserialize_with = "null_default")]

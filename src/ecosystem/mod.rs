@@ -95,15 +95,6 @@ fn null_default<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
-/// A field whose `null` differs from its absence: `Some(None)` when the
-/// registry sends `null`, `None` when it omits the key. Use with
-/// `#[serde(default, deserialize_with = "present")]`.
-fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
-    d: D,
-) -> Result<Option<Option<T>>, D::Error> {
-    Option::<T>::deserialize(d).map(Some)
-}
-
 /// A localized marketplace string: a bare string, or a `{ locale: text }` map
 /// (AMO keys it `en-US`, Dify `en_US`).
 #[derive(Deserialize)]

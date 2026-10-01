@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::ecosystem::{decode, fetch_json, parse_rfc3339_secs};
 use crate::fetch::{
-    ArtifactCandidate, BlobCache, CachedMeta, Fetch, FetchError, cached_metadata_status,
+    ArtifactCandidate, BlobCache, CachedMeta, Fetch, FetchError, Request, cached_metadata_status,
     deterministic_artifacts, now, percent_decode, safe_coordinate, sha256_hex, store_metadata,
 };
 use crate::purl::Purl;
@@ -91,7 +91,7 @@ pub(crate) fn goproxy_canonical_path(
         ),
         None => format!("https://proxy.golang.org/{escaped}/@latest"),
     };
-    let Ok(fetched) = net.get_any_status(&url, &[]) else {
+    let Ok(fetched) = net.send(&Request::get(&url).any_status()) else {
         return GoproxyPath {
             path: path.to_string(),
             refused: None,
@@ -236,14 +236,20 @@ pub(crate) fn golang(
         Some(status) => Err(FetchError::Status(status)),
         None => cached_metadata_status(&info_url, &[], net, cache),
     };
-    if let Ok(bytes) = &info
-        && let Ok(doc) = decode::<VersionInfo>(&info_url, bytes)
-    {
-        let mut record = golang_record(path, doc);
-        record.version_removed = Some(false);
-        record.security_hold = Some(false);
-        return Ok(record);
-    }
+    let refusal = match info {
+        Ok(bytes) => {
+            let mut record = golang_record(path, decode(&info_url, &bytes)?);
+            record.version_removed = Some(false);
+            record.security_hold = Some(false);
+            return Ok(record);
+        }
+        Err(FetchError::Status(status @ (GOPROXY_WITHHELD | 404 | 410))) => status,
+        // Unreachable, overloaded, rate-limited: the proxy has said nothing
+        // about this release, so there is no removal to report. The caller
+        // fails open and fetches, which is what a release that may well be
+        // there deserves.
+        Err(failure) => return Err(failure.into()),
+    };
 
     // The proxy would not serve this release's `.info`, so it will not serve
     // its `.zip` either: both come from the same index entry, and a retracted,
@@ -258,9 +264,9 @@ pub(crate) fn golang(
     // where it should be reporting a missing artifact.
     //
     // `version_removed` is set from the same evidence npm's is: the registry
-    // knows the module and does not offer this release. A transient failure
-    // reaching `.info` also lands here, and costs a metadata-only answer about
-    // a release that was in fact fetchable — the safe direction to be wrong in.
+    // knows the module and refused this release. Only a refusal lands here —
+    // a release reported removed is one scan will not fetch, so a timeout or
+    // a 5xx must not be mistaken for one.
     let mut record = golang_record(path, fetch_json(&latest_url, net, cache)?);
     record.latest_version = Some(std::mem::take(&mut record.version)).filter(|v| !v.is_empty());
     // The release asked about, not the one the proxy offered instead. Its
@@ -277,7 +283,7 @@ pub(crate) fn golang(
     // above would report a module Go has taken down as quietly unpublished,
     // and scan treats `security_hold` as a hostile signal precisely so it does
     // not have to.
-    record.security_hold = Some(matches!(info, Err(FetchError::Status(GOPROXY_WITHHELD))));
+    record.security_hold = Some(refusal == GOPROXY_WITHHELD);
     Ok(record)
 }
 
@@ -563,12 +569,17 @@ mod tests {
             "Origin": {"VCS": "git", "URL": "https://gitlab.com/NebulousLabs/Sia"}
         })
         .to_string();
-        // Only `@latest` answers: the retracted release's `.info` is absent,
-        // exactly as the proxy serves it.
-        let net = Fixtures::default().with(
-            "https://proxy.golang.org/gitlab.com/!nebulous!labs/!sia/@latest",
-            latest.as_bytes(),
-        );
+        // Only `@latest` answers: the proxy refuses the release's `.info` as
+        // gone (the protocol's other "not found", beside 404).
+        let net = Fixtures::default()
+            .refusing(
+                "https://proxy.golang.org/gitlab.com/!nebulous!labs/!sia/@v/v1.5.5-rc2.info",
+                410,
+            )
+            .with(
+                "https://proxy.golang.org/gitlab.com/!nebulous!labs/!sia/@latest",
+                latest.as_bytes(),
+            );
         let cache = BlobCache::disabled();
         let r = golang(
             "gitlab.com/NebulousLabs/Sia",
@@ -642,6 +653,35 @@ mod tests {
         let r = golang("example.com/m", Some("v9.9.9"), &net, &cache).expect("registry");
         assert_eq!(r.version_removed, Some(true));
         assert_eq!(r.security_hold, Some(false));
+    }
+
+    /// A proxy that could not be asked has not refused anything. Reporting
+    /// the release removed would stop scan fetching bytes that are very
+    /// likely there, so the lookup fails instead, and the caller fails open.
+    #[test]
+    fn golang_unreachable_info_is_not_a_removal() {
+        let info = "https://proxy.golang.org/example.com/m/@v/v1.0.0.info";
+        let latest = serde_json::json!({"Version": "v1.5.9"}).to_string();
+        let cache = BlobCache::disabled();
+        let lookup = |net: Fixtures| {
+            let net = net.with(
+                "https://proxy.golang.org/example.com/m/@latest",
+                latest.as_bytes(),
+            );
+            golang("example.com/m", Some("v1.0.0"), &net, &cache)
+        };
+        assert_eq!(
+            lookup(Fixtures::default().refusing(info, 503)).err(),
+            Some(RegistryError::Unavailable(FetchError::Status(503)))
+        );
+        assert!(matches!(
+            lookup(Fixtures::default()),
+            Err(RegistryError::Unavailable(FetchError::Transport(_)))
+        ));
+        assert!(matches!(
+            lookup(Fixtures::default().with(info, b"<html>")),
+            Err(RegistryError::Malformed { .. })
+        ));
     }
 
     /// A module the proxy does not know at all still has no record: there is

@@ -381,12 +381,14 @@ fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, String> {
 /// regenerating long-name/long-link extensions so paths the source encoded
 /// via PAX/GNU records survive the transplant.
 ///
-/// The entry *name* is the cleaned path; the link *target* is copied verbatim,
-/// deliberately. Absolute and `..`-relative targets are how a real rootfs is
-/// built (`usr/sbin/x -> ../bin/y`, `/etc/alternatives/…`), so rewriting them
-/// would misrepresent the filesystem being analyzed — and the target is data
-/// about the image, not a path this process ever resolves. Extracting the
-/// result safely is the consumer's problem, as it is for any container image.
+/// The entry *name* is the cleaned path. A symlink's *target* is copied
+/// verbatim, deliberately: absolute and `..`-relative targets are how a real
+/// rootfs is built (`usr/sbin/x -> ../bin/y`, `/etc/alternatives/…`), so
+/// rewriting them would misrepresent the filesystem being analyzed. A hard
+/// link's target is another way of naming an entry *in the archive*, so it is
+/// cleaned exactly as names are: it then matches the entry it links to, and
+/// cannot point an extractor outside the root (`../../etc/passwd`). One that
+/// cleans to the root names no file, and is dropped like a root entry.
 fn append_entry<W: Write>(
     builder: &mut tar::Builder<W>,
     entry: &mut tar::Entry<'_, Cursor<&[u8]>>,
@@ -395,10 +397,16 @@ fn append_entry<W: Write>(
     let mut header = entry.header().clone();
     let kind = header.entry_type();
     if kind.is_symlink() || kind.is_hard_link() {
-        let target = entry
+        let mut target = entry
             .link_name_bytes()
             .ok_or_else(|| "link entry without target".to_string())?
             .into_owned();
+        if kind.is_hard_link() {
+            target = clean_path(&target);
+            if target.is_empty() {
+                return Ok(());
+            }
+        }
         builder
             .append_link(&mut header, bytes_path(path), bytes_path(&target))
             .map_err(|e| format!("append link: {e}"))
@@ -788,6 +796,57 @@ mod tests {
         assert!(
             !got.iter().any(|(p, _)| p.contains("..")),
             "no emitted path may retain a traversal segment: {got:?}"
+        );
+    }
+
+    /// Hard links name another entry of the archive, so their targets are
+    /// cleaned as entry names are — matching the cleaned name of what they
+    /// link to, and anchored at the root. Symlink targets describe the image's
+    /// filesystem and are kept as written.
+    #[test]
+    fn hard_link_targets_are_cleaned_like_names() {
+        fn link(path: &str, kind: tar::EntryType, target: &str) -> Vec<u8> {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(0);
+            h.set_mode(0o644);
+            h.set_entry_type(kind);
+            h.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+            h.as_old_mut().linkname[..target.len()].copy_from_slice(target.as_bytes());
+            h.set_cksum();
+            h.as_bytes().to_vec()
+        }
+        let mut layer = hostile_layer(&[("./usr/bin/a", "A")]);
+        layer.truncate(layer.len() - 1024); // reopen past the end-of-archive
+        for entry in [
+            link("usr/bin/b", tar::EntryType::Link, "./usr/bin/a"),
+            link("x", tar::EntryType::Link, "../../../etc/passwd"),
+            link("root", tar::EntryType::Link, "../"),
+            link("usr/sbin/y", tar::EntryType::Symlink, "../bin/a"),
+        ] {
+            layer.extend_from_slice(&entry);
+        }
+        layer.extend_from_slice(&[0u8; 1024]);
+
+        let mut raw = Vec::new();
+        xz2::read::XzDecoder::new(Cursor::new(flatten_to_tar_xz(&[layer]).unwrap()))
+            .read_to_end(&mut raw)
+            .unwrap();
+        let links: Vec<(String, String)> = tar::Archive::new(Cursor::new(raw.as_slice()))
+            .entries()
+            .unwrap()
+            .filter_map(|e| {
+                let e = e.unwrap();
+                let target = e.link_name().unwrap()?.display().to_string();
+                Some((e.path().unwrap().display().to_string(), target))
+            })
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                ("usr/bin/b".into(), "usr/bin/a".into()),
+                ("x".into(), "etc/passwd".into()),
+                ("usr/sbin/y".into(), "../bin/a".into()),
+            ]
         );
     }
 

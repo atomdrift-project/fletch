@@ -117,6 +117,16 @@ can perform the reclamation.
 |---|---|---|
 | `FLETCH_CACHE_TTL_DAYS` | `30` | Age after which cached blobs are dropped |
 | `FLETCH_CACHE_MAX_BYTES` | `10737418240` | Size ceiling before oldest entries are dropped |
+| `FLETCH_CACHE_MAX_ENTRIES` | `262144` | Entry ceiling (a blob and its metadata count once), spread over 256 shard directories |
+
+## Registry etiquette
+
+`fletch registry` sends `GITHUB_TOKEN`, when set, to the GitHub API (and only
+there), lifting its anonymous limit of 60 requests an hour; library callers pass
+a token with `HttpFetch::with_github_token`. A registry that answers `429`, or
+`503` with `Retry-After`, or reports its rate limit exhausted, is waited out for
+up to 30 s; a longer pause fails the request, and every request to that host
+until it ends, without asking the host again.
 
 ## Build
 

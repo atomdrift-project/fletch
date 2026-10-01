@@ -3,7 +3,7 @@
 use filefacts::Registry;
 use serde::Deserialize;
 
-use crate::ecosystem::{fetch_json, null_default, present};
+use crate::ecosystem::{fetch_json, null_default};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
@@ -28,11 +28,11 @@ pub(crate) fn clojars(
     Ok(Registry {
         ecosystem: "clojars".into(),
         name,
-        // `latest_version` stands in only when `latest_release` is absent; a
-        // `null` release leaves the version empty.
+        // An artifact with only snapshots has a `null` latest release; its
+        // newest snapshot is then the version there is.
         version: doc
             .latest_release
-            .unwrap_or_else(|| doc.latest_version.clone())
+            .or_else(|| doc.latest_version.clone())
             .unwrap_or_default(),
         latest_version: doc.latest_version,
         description: doc.description,
@@ -50,8 +50,7 @@ pub(crate) fn clojars(
 struct Artifact {
     group_name: Option<String>,
     jar_name: Option<String>,
-    #[serde(deserialize_with = "present")]
-    latest_release: Option<Option<String>>,
+    latest_release: Option<String>,
     latest_version: Option<String>,
     description: Option<String>,
     homepage: Option<String>,

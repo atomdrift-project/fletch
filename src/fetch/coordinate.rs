@@ -49,7 +49,8 @@ pub(crate) fn safe_filename_part(value: &str) -> bool {
 ///
 /// Rejecting is safe: no registry issues a name or version containing these,
 /// so a coordinate that does is not a package. It resolves to
-/// [`Outcome::Unresolved`](crate::fetch::Outcome::Unresolved) and is recorded, never silently dropped.
+/// [`Unresolved::UnsafeCoordinate`](crate::fetch::Unresolved::UnsafeCoordinate) and is recorded,
+/// never silently dropped.
 pub(crate) fn safe_coordinate(value: &str) -> bool {
     safe_coordinate_inner(value, false)
 }

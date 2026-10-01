@@ -47,6 +47,7 @@ struct Source {
     status: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     content_type: Option<String>,
+    size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     body: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,17 +57,19 @@ struct Source {
 /// Map a recorded raw document onto the CLI's [`Source`] shape: a JSON body
 /// inline (the common npm/PyPI/crates case), anything else base64 in `body_b64`.
 fn source_from_recorded(s: RecordedSource) -> Source {
-    let (body, body_b64) = match serde_json::from_slice::<serde_json::Value>(&s.bytes) {
+    let bytes = s.bytes.unwrap_or_default();
+    let (body, body_b64) = match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(v) => (Some(v), None),
         Err(_) => (
             None,
-            Some(base64::engine::general_purpose::STANDARD.encode(&s.bytes)),
+            Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
         ),
     };
     Source {
         url: s.url,
         status: s.status,
         content_type: s.content_type,
+        size: s.size,
         body,
         body_b64,
     }
@@ -140,23 +143,12 @@ struct PurlProbe {
 struct ProbeNet(std::sync::Mutex<Vec<String>>);
 
 impl fletch::fetch::Fetch for ProbeNet {
-    fn get(&self, url: &str) -> Result<fletch::fetch::Fetched, fletch::fetch::FetchError> {
-        if let Ok(mut seen) = self.0.lock() {
-            seen.push(url.to_string());
-        }
-        Err(fletch::fetch::FetchError::Refused("probe".into()))
-    }
-
-    // The VS Code Marketplace query is a POST; record it too, so the probe
-    // reports that route instead of an empty answer.
-    fn post(
+    fn send(
         &self,
-        url: &str,
-        _body: &[u8],
-        _headers: &[(&str, &str)],
+        request: &fletch::fetch::Request<'_>,
     ) -> Result<fletch::fetch::Fetched, fletch::fetch::FetchError> {
         if let Ok(mut seen) = self.0.lock() {
-            seen.push(url.to_string());
+            seen.push(request.url.to_string());
         }
         Err(fletch::fetch::FetchError::Refused("probe".into()))
     }
@@ -217,7 +209,7 @@ fn probe_purl(purl: &str) -> PurlProbe {
         content_sha256: None,
     };
     let rec = fletch::fetch::fetch_ref(&reference, &ProbeNet::default(), &cache);
-    let download_url = (!rec.resolved_url.is_empty()).then(|| rec.resolved_url.clone());
+    let download_url = rec.resolved_url.clone();
 
     PurlProbe {
         purl: purl.to_string(),
@@ -232,7 +224,7 @@ fn probe_purl(purl: &str) -> PurlProbe {
 }
 
 fn run_registry(purl: &str) -> anyhow::Result<()> {
-    let net = HttpFetch::new()?;
+    let net = HttpFetch::new()?.with_github_token(std::env::var("GITHUB_TOKEN").ok());
     // Disable the on-disk cache so every metadata document is fetched fresh and
     // recorded — a cache hit would still be recorded, but a disabled cache keeps
     // the CLI's snapshot current rather than serving a stale prior run.
@@ -273,7 +265,8 @@ mod tests {
             url: "https://registry.example/pkg".to_string(),
             status: 200,
             content_type: Some("application/json".to_string()),
-            bytes: br#"{"hello":"world"}"#.to_vec(),
+            size: 17,
+            bytes: Some(br#"{"hello":"world"}"#.to_vec()),
         });
         assert_eq!(source.url, "https://registry.example/pkg");
         assert_eq!(source.status, 200);
@@ -289,7 +282,8 @@ mod tests {
             url: "https://store.example/detail/x".to_string(),
             status: 200,
             content_type: Some("text/html".to_string()),
-            bytes: b"<html>a chrome listing, not json</html>".to_vec(),
+            size: 39,
+            bytes: Some(b"<html>a chrome listing, not json</html>".to_vec()),
         });
         // Non-JSON bytes fall back to base64 so nothing is lost or corrupted.
         assert!(source.body.is_none());

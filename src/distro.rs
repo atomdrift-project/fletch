@@ -7,22 +7,24 @@
 //! a `repomd.xml` → `primary.xml.{zst,gz,xz}`, NetBSD a `pkg_summary.gz`,
 //! FreeBSD a `packagesite.pkg` (tar.xz). We fetch the index through the blob
 //! cache (so the multi-megabyte download is paid once per cache window), stream
-//! it through a pure-Rust decompressor, and scan it stanza-by-stanza for the one
-//! package asked about — never holding the whole decompressed index in memory.
+//! it through a decompressor stanza by stanza — never holding the whole
+//! decompressed index — and keep a compact listing of every package, so the
+//! next lookup against the same index is a map read (see [`PARSED`]).
 //!
-//! Like the rest of registry lookup this is best-effort: an unreachable mirror,
-//! an absent package, or a moved index layout yields `None`, and the caller
-//! treats that as "unknown" rather than an error. The repository coordinates
-//! (release, architecture) are pinned to current defaults below; they track the
-//! distributions over time exactly as the upstream index URLs do.
+//! An unreachable mirror, an absent package, or a moved index layout is an
+//! error saying which. The repository coordinates (release, architecture) are
+//! pinned to current defaults below; they track the distributions over time
+//! exactly as the upstream index URLs do.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Cursor, Read};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use filefacts::Registry;
 use serde::Deserialize;
 
 use crate::ecosystem::{parse_ts, strip_email};
-use crate::fetch::{BlobCache, Fetch, cached_metadata_status};
+use crate::fetch::{BlobCache, Fetch, cached_metadata_status, sha256_hex};
 use crate::registry::RegistryError;
 
 /// Ceiling on a single index's *decompressed* size. The 64 MiB download cap
@@ -49,7 +51,7 @@ pub(crate) fn alpine(
         "https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/x86_64/APKINDEX.tar.gz",
     ];
     first_listing(&REPOS, |url| {
-        apkindex_lookup(url, name, "alpine", net, cache)
+        lookup(url, parse_apkindex, name, "alpine", net, cache)
     })
 }
 
@@ -60,8 +62,9 @@ pub(crate) fn wolfi(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    apkindex_lookup(
+    lookup(
         "https://packages.wolfi.dev/os/x86_64/APKINDEX.tar.gz",
+        parse_apkindex,
         name,
         "wolfi",
         net,
@@ -76,8 +79,9 @@ pub(crate) fn debian(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    deb_lookup(
+    lookup(
         "https://deb.debian.org/debian/dists/stable/main/binary-amd64/Packages.gz",
+        parse_packages,
         name,
         "debian",
         net,
@@ -96,7 +100,9 @@ pub(crate) fn ubuntu(
         "https://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz",
         "https://archive.ubuntu.com/ubuntu/dists/noble/universe/binary-amd64/Packages.gz",
     ];
-    first_listing(&REPOS, |url| deb_lookup(url, name, "ubuntu", net, cache))
+    first_listing(&REPOS, |url| {
+        lookup(url, parse_packages, name, "ubuntu", net, cache)
+    })
 }
 
 /// openSUSE Tumbleweed (`oss` repo): the `primary.xml` referenced by `repomd.xml`
@@ -138,13 +144,14 @@ pub(crate) fn netbsd(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let bytes = index(
+    lookup(
         "https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/x86_64/10.0/All/pkg_summary.gz",
+        parse_pkg_summary,
+        name,
+        "netbsd",
         net,
         cache,
-    )?;
-    let reader = BufReader::new(gunzip(bytes));
-    each_stanza(reader, |stanza| pkg_summary_record(stanza, name)).ok_or(RegistryError::NotFound)
+    )
 }
 
 /// FreeBSD (binary pkg): `packagesite.pkg` is a zstd-compressed tar whose
@@ -155,16 +162,14 @@ pub(crate) fn freebsd(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    const URL: &str = "https://pkg.freebsd.org/FreeBSD:14:amd64/latest/packagesite.pkg";
-    let tar = unzstd(index(URL, net, cache)?).ok_or_else(|| unreadable(URL, "not zstd"))?;
-    let yaml =
-        tar_find(&tar, "packagesite.yaml").ok_or_else(|| unreadable(URL, "no packagesite.yaml"))?;
-    let text = std::str::from_utf8(&yaml).map_err(|e| unreadable(URL, e))?;
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<Packagesite>(l).ok())
-        .find(|p| p.name.as_deref() == Some(name))
-        .map(|p| packagesite_record(p, name))
-        .ok_or(RegistryError::NotFound)
+    lookup(
+        "https://pkg.freebsd.org/FreeBSD:14:amd64/latest/packagesite.pkg",
+        parse_packagesite,
+        name,
+        "freebsd",
+        net,
+        cache,
+    )
 }
 
 /// OpenBSD: there is no metadata index — only the packages directory listing —
@@ -188,90 +193,176 @@ pub(crate) fn openbsd(
     })
 }
 
-// --- APK (Alpine, Wolfi) ----------------------------------------------------
+// --- parsed indexes ---------------------------------------------------------
 
-/// Fetch one `APKINDEX.tar.gz`, extract its `APKINDEX` member, and scan it.
-fn apkindex_lookup(
+/// One package's facts from an index, kept small: a parsed Debian index holds
+/// some sixty thousand.
+#[derive(Debug, Default)]
+struct Listing {
+    version: Box<str>,
+    published_at: Option<u64>,
+    author: Option<Box<str>>,
+    description: Option<Box<str>>,
+    homepage: Option<Box<str>>,
+    license: Option<Box<str>>,
+}
+
+impl Listing {
+    /// The registry record of package `name` in `ecosystem`.
+    fn record(&self, ecosystem: &str, name: &str) -> Registry {
+        let text = |s: &Option<Box<str>>| s.as_deref().map(str::to_string);
+        Registry {
+            ecosystem: ecosystem.into(),
+            name: name.to_string(),
+            version: self.version.to_string(),
+            published_at: self.published_at,
+            author: text(&self.author),
+            description: text(&self.description),
+            homepage: text(&self.homepage),
+            license: text(&self.license),
+            ..Default::default()
+        }
+    }
+}
+
+/// An index's packages by name. Where an index lists a name twice, the first
+/// listing stands.
+type Listings = HashMap<Box<str>, Listing>;
+
+/// Reads an index's bytes, fetched from `url`, into its listings.
+type Parser = fn(&str, Vec<u8>) -> Result<Listings, RegistryError>;
+
+/// The indexes this process parsed most recently, newest first, keyed by URL
+/// and by the digest of the bytes parsed. A burst of lookups against one index
+/// — a Dockerfile's `apt-get install` line — decompresses and parses it once,
+/// and an index the cache has refreshed is parsed afresh. Only a few are kept:
+/// a parsed Debian or Ubuntu `universe` index is some 17 MB, openSUSE's 13 MB.
+static PARSED: Mutex<Vec<Parsed>> = Mutex::new(Vec::new());
+
+/// How many parsed indexes [`PARSED`] keeps.
+const PARSED_KEEP: usize = 4;
+
+struct Parsed {
+    url: String,
+    digest: String,
+    listings: Arc<Listings>,
+}
+
+/// Package `name`'s record from the index at `url`, read by `parse`.
+fn lookup(
     url: &str,
+    parse: Parser,
     name: &str,
     ecosystem: &str,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
+    // Fetched on every lookup, parsed only when new: the fetch is what keeps
+    // the index fresh and records it as a source.
     let bytes = index(url, net, cache)?;
-    // APKINDEX.tar.gz concatenates a signature stream and the control stream;
-    // decompress both, then pull the `APKINDEX` text from the archive.
+    let digest = sha256_hex(&bytes);
+    // Held across the parse, so lookups racing on one index wait for a single
+    // parse instead of each repeating it.
+    let mut parsed = PARSED.lock().unwrap_or_else(PoisonError::into_inner);
+    let entry = match parsed
+        .iter()
+        .position(|p| p.url == url && p.digest == digest)
+    {
+        Some(i) => parsed.remove(i),
+        None => Parsed {
+            url: url.to_string(),
+            digest,
+            listings: Arc::new(parse(url, bytes)?),
+        },
+    };
+    let listings = Arc::clone(&entry.listings);
+    parsed.insert(0, entry);
+    parsed.truncate(PARSED_KEEP);
+    drop(parsed);
+    listings
+        .get(name)
+        .map(|listing| listing.record(ecosystem, name))
+        .ok_or(RegistryError::NotFound)
+}
+
+/// Every listing in the stanzas of `reader`.
+fn stanza_listings<R: BufRead>(
+    url: &str,
+    reader: R,
+    listing: fn(&str) -> Option<(Box<str>, Listing)>,
+) -> Result<Listings, RegistryError> {
+    let mut listings = Listings::new();
+    stanzas(reader, |stanza| {
+        if let Some((name, found)) = listing(stanza) {
+            listings.entry(name).or_insert(found);
+        }
+    })
+    .map_err(|e| unreadable(url, e))?;
+    Ok(listings)
+}
+
+// --- APK (Alpine, Wolfi) ----------------------------------------------------
+
+/// An `APKINDEX.tar.gz`: a signature stream and the control stream, gzipped
+/// back to back, whose `APKINDEX` member holds `K:value` stanzas.
+fn parse_apkindex(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
     let mut out = Vec::new();
     flate2::read::MultiGzDecoder::new(Cursor::new(bytes))
         .take(DECOMP_CAP)
         .read_to_end(&mut out)
         .map_err(|e| unreadable(url, e))?;
     let apkindex = tar_find(&out, "APKINDEX").ok_or_else(|| unreadable(url, "no APKINDEX"))?;
-    let text = std::str::from_utf8(&apkindex).map_err(|e| unreadable(url, e))?;
-    each_stanza(BufReader::new(Cursor::new(text)), |stanza| {
-        apkindex_record(stanza, name, ecosystem)
-    })
-    .ok_or(RegistryError::NotFound)
+    stanza_listings(url, Cursor::new(apkindex), apkindex_listing)
 }
 
-/// Map one matching `APKINDEX` stanza (single-letter `K:value` lines).
-fn apkindex_record(stanza: &str, name: &str, ecosystem: &str) -> Option<Registry> {
-    if field(stanza, "P:").as_deref() != Some(name) {
-        return None;
-    }
-    Some(Registry {
-        ecosystem: ecosystem.into(),
-        name: name.to_string(),
-        version: field(stanza, "V:").unwrap_or_default(),
-        // `t:0` is a "build time unset" sentinel (reproducible builds), not a
-        // 1970 publish — treat it as unknown.
-        published_at: field(stanza, "t:")
-            .and_then(|t| t.parse::<u64>().ok())
-            .filter(|&t| t > 0),
-        author: field(stanza, "m:").map(|m| strip_email(&m)),
-        description: field(stanza, "T:"),
-        homepage: field(stanza, "U:"),
-        license: field(stanza, "L:"),
-        ..Default::default()
-    })
+/// One `APKINDEX` stanza (single-letter `K:value` lines).
+fn apkindex_listing(stanza: &str) -> Option<(Box<str>, Listing)> {
+    let name = field(stanza, "P:")?;
+    Some((
+        name.into(),
+        Listing {
+            version: field(stanza, "V:").unwrap_or_default().into(),
+            // `t:0` is a "build time unset" sentinel (reproducible builds), not
+            // a 1970 publish — treat it as unknown.
+            published_at: field(stanza, "t:")
+                .and_then(|t| t.parse::<u64>().ok())
+                .filter(|&t| t > 0),
+            author: field(stanza, "m:").map(|m| strip_email(&m).into()),
+            description: field(stanza, "T:").map(Into::into),
+            homepage: field(stanza, "U:").map(Into::into),
+            license: field(stanza, "L:").map(Into::into),
+        },
+    ))
 }
 
 // --- Debian / Ubuntu (control format) ---------------------------------------
 
-/// Fetch one gzip `Packages` index and scan its control stanzas.
-fn deb_lookup(
-    url: &str,
-    name: &str,
-    ecosystem: &str,
-    net: &dyn Fetch,
-    cache: &BlobCache,
-) -> Result<Registry, RegistryError> {
-    let reader = BufReader::new(gunzip(index(url, net, cache)?));
-    each_stanza(reader, |stanza| deb_record(stanza, name, ecosystem)).ok_or(RegistryError::NotFound)
+/// A gzip `Packages` index of control stanzas.
+fn parse_packages(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
+    stanza_listings(url, BufReader::new(gunzip(bytes)), deb_listing)
 }
 
-/// Map one matching Debian control stanza (`Key: value`, with folded
-/// continuation lines for multi-line descriptions).
-fn deb_record(stanza: &str, name: &str, ecosystem: &str) -> Option<Registry> {
-    if field(stanza, "Package:").as_deref() != Some(name) {
-        return None;
-    }
-    Some(Registry {
-        ecosystem: ecosystem.into(),
-        name: name.to_string(),
-        version: field(stanza, "Version:").unwrap_or_default(),
-        author: field(stanza, "Maintainer:").map(|m| strip_email(&m)),
-        // The control `Description` is a one-line synopsis then folded lines.
-        description: field(stanza, "Description:"),
-        homepage: field(stanza, "Homepage:"),
-        ..Default::default()
-    })
+/// One Debian control stanza (`Key: value`, with folded continuation lines
+/// for multi-line descriptions).
+fn deb_listing(stanza: &str) -> Option<(Box<str>, Listing)> {
+    let name = field(stanza, "Package:")?;
+    Some((
+        name.into(),
+        Listing {
+            version: field(stanza, "Version:").unwrap_or_default().into(),
+            author: field(stanza, "Maintainer:").map(|m| strip_email(&m).into()),
+            // The control `Description` is a one-line synopsis then folded lines.
+            description: field(stanza, "Description:").map(Into::into),
+            homepage: field(stanza, "Homepage:").map(Into::into),
+            ..Default::default()
+        },
+    ))
 }
 
 // --- RPM (openSUSE, RPM Fusion) ---------------------------------------------
 
-/// Resolve `repomd.xml` to the `primary.xml` location, fetch and decompress it
-/// (by its `.zst`/`.gz`/`.xz` suffix), and scan it for the package.
+/// Resolve `repomd.xml` to the `primary.xml` location and look the package up
+/// there.
 fn rpm_repo_lookup(
     base: &str,
     name: &str,
@@ -285,21 +376,34 @@ fn rpm_repo_lookup(
         .ok()
         .and_then(primary_href)
         .ok_or_else(|| unreadable(&repomd_url, "no primary index"))?;
-    let primary_url = format!("{base}/{href}");
-    let bytes = index(&primary_url, net, cache)?;
-    let reader: Box<dyn Read> = match href.rsplit('.').next() {
+    lookup(
+        &format!("{base}/{href}"),
+        parse_primary,
+        name,
+        ecosystem,
+        net,
+        cache,
+    )
+}
+
+/// A `primary.xml`, compressed as its `.zst`/`.gz`/`.xz` suffix says.
+fn parse_primary(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
+    let reader: Box<dyn Read> = match url.rsplit('.').next() {
         Some("zst") => Box::new(
-            zstd::stream::read::Decoder::new(Cursor::new(bytes))
-                .map_err(|e| unreadable(&primary_url, e))?,
+            zstd::stream::read::Decoder::new(Cursor::new(bytes)).map_err(|e| unreadable(url, e))?,
         ),
         Some("gz") => Box::new(gunzip(bytes)),
         Some("xz") => Box::new(xz2::read::XzDecoder::new_multi_decoder(Cursor::new(bytes))),
-        _ => return Err(unreadable(&primary_url, "unknown compression")),
+        _ => return Err(unreadable(url, "unknown compression")),
     };
-    each_xml_package(reader.take(DECOMP_CAP), |pkg| {
-        rpm_primary_record(pkg, name, ecosystem)
+    let mut listings = Listings::new();
+    xml_packages(reader.take(DECOMP_CAP), |pkg| {
+        if let Some((name, found)) = rpm_listing(pkg) {
+            listings.entry(name).or_insert(found);
+        }
     })
-    .ok_or(RegistryError::NotFound)
+    .map_err(|e| unreadable(url, e))?;
+    Ok(listings)
 }
 
 /// The `<location href="…primary.xml.*"/>` from `repomd.xml`.
@@ -313,11 +417,9 @@ fn primary_href(xml: &str) -> Option<String> {
     Some(rest[..rest.find('"')?].to_string())
 }
 
-/// Map one matching `<package>` element from `primary.xml`.
-fn rpm_primary_record(pkg: &str, name: &str, ecosystem: &str) -> Option<Registry> {
-    if tag_text(pkg, "name").as_deref() != Some(name) {
-        return None;
-    }
+/// One `<package>` element of `primary.xml`.
+fn rpm_listing(pkg: &str) -> Option<(Box<str>, Listing)> {
+    let name = tag_text(pkg, "name")?;
     // `<version epoch="0" ver="8.5.0" rel="1.2"/>`
     let version = attr(pkg, "<version", "ver")
         .map(|ver| match attr(pkg, "<version", "rel") {
@@ -325,46 +427,82 @@ fn rpm_primary_record(pkg: &str, name: &str, ecosystem: &str) -> Option<Registry
             None => ver,
         })
         .unwrap_or_default();
-    Some(Registry {
-        ecosystem: ecosystem.into(),
-        name: name.to_string(),
-        version,
-        // `<time file="…" build="…"/>` — build is Unix seconds (0 = unset).
-        published_at: attr(pkg, "<time", "build")
-            .and_then(|b| b.parse::<u64>().ok())
-            .filter(|&t| t > 0),
-        author: tag_text(pkg, "rpm:vendor").or_else(|| tag_text(pkg, "packager")),
-        description: tag_text(pkg, "summary"),
-        homepage: tag_text(pkg, "url"),
-        license: tag_text(pkg, "rpm:license"),
-        ..Default::default()
-    })
+    Some((
+        name.into(),
+        Listing {
+            version: version.into(),
+            // `<time file="…" build="…"/>` — build is Unix seconds (0 = unset).
+            published_at: attr(pkg, "<time", "build")
+                .and_then(|b| b.parse::<u64>().ok())
+                .filter(|&t| t > 0),
+            author: tag_text(pkg, "rpm:vendor")
+                .or_else(|| tag_text(pkg, "packager"))
+                .map(Into::into),
+            description: tag_text(pkg, "summary").map(Into::into),
+            homepage: tag_text(pkg, "url").map(Into::into),
+            license: tag_text(pkg, "rpm:license").map(Into::into),
+        },
+    ))
 }
 
 // --- NetBSD / FreeBSD / OpenBSD ---------------------------------------------
 
-/// Map one matching `pkg_summary` stanza (`KEY=value`). `PKGNAME` is
-/// `name-version`, and a pkgsrc version never contains a hyphen (revisions are
-/// `nbN`), so the version is everything after the *last* one. Splitting there
-/// rather than after `name-` keeps `git` from matching `git-base-2.45.2`.
-fn pkg_summary_record(stanza: &str, name: &str) -> Option<Registry> {
+/// A gzip `pkg_summary` of `KEY=value` stanzas.
+fn parse_pkg_summary(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
+    stanza_listings(url, BufReader::new(gunzip(bytes)), pkg_summary_listing)
+}
+
+/// One `pkg_summary` stanza. `PKGNAME` is `name-version`, and a pkgsrc version
+/// never contains a hyphen (revisions are `nbN`), so the version is everything
+/// after the *last* one. Splitting there rather than after `name-` keeps `git`
+/// from matching `git-base-2.45.2`.
+fn pkg_summary_listing(stanza: &str) -> Option<(Box<str>, Listing)> {
     let pkgname = field(stanza, "PKGNAME=")?;
-    let (package, version) = pkgname.rsplit_once('-')?;
-    if package != name {
-        return None;
+    let (name, version) = pkgname.rsplit_once('-')?;
+    Some((
+        name.into(),
+        Listing {
+            version: version.into(),
+            published_at: field(stanza, "BUILD_DATE=").and_then(|d| parse_ts(&d)),
+            author: field(stanza, "MAINTAINER=").map(|m| strip_email(&m).into()),
+            description: field(stanza, "COMMENT=").map(Into::into),
+            homepage: field(stanza, "HOMEPAGE=").map(Into::into),
+            license: field(stanza, "LICENSE=").map(Into::into),
+        },
+    ))
+}
+
+/// A zstd `packagesite.pkg` tar, whose `packagesite.yaml` is one JSON object
+/// per line. Streamed from the archive line by line: decompressed whole, the
+/// catalog is over a hundred megabytes.
+fn parse_packagesite(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
+    let decoder =
+        zstd::stream::read::Decoder::new(Cursor::new(bytes)).map_err(|e| unreadable(url, e))?;
+    let mut archive = tar::Archive::new(decoder.take(DECOMP_CAP));
+    for entry in archive.entries().map_err(|e| unreadable(url, e))? {
+        let entry = entry.map_err(|e| unreadable(url, e))?;
+        if !entry.path_bytes().ends_with(b"packagesite.yaml") {
+            continue;
+        }
+        let mut listings = Listings::new();
+        let mut yaml = BufReader::new(entry);
+        let mut line = Vec::new();
+        while yaml
+            .read_until(b'\n', &mut line)
+            .map_err(|e| unreadable(url, e))?
+            > 0
+        {
+            if let Some((name, found)) = serde_json::from_slice::<Packagesite>(&line)
+                .ok()
+                .and_then(packagesite_listing)
+            {
+                listings.entry(name).or_insert(found);
+            }
+            line.clear();
+        }
+        return Ok(listings);
     }
-    let version = version.to_string();
-    Some(Registry {
-        ecosystem: "netbsd".into(),
-        name: name.to_string(),
-        version,
-        published_at: field(stanza, "BUILD_DATE=").and_then(|d| parse_ts(&d)),
-        author: field(stanza, "MAINTAINER=").map(|m| strip_email(&m)),
-        description: field(stanza, "COMMENT="),
-        homepage: field(stanza, "HOMEPAGE="),
-        license: field(stanza, "LICENSE="),
-        ..Default::default()
-    })
+    Err(unreadable(url, "no packagesite.yaml"))
 }
 
 /// One package in FreeBSD's `packagesite.yaml`, as far as the record reads it.
@@ -379,18 +517,22 @@ struct Packagesite {
     licenses: Option<Vec<String>>,
 }
 
-/// Map one FreeBSD `packagesite.yaml` object.
-fn packagesite_record(p: Packagesite, name: &str) -> Registry {
-    Registry {
-        ecosystem: "freebsd".into(),
-        name: name.to_string(),
-        version: p.version.unwrap_or_default(),
-        author: p.maintainer.as_deref().map(strip_email),
-        description: p.comment,
-        homepage: p.www,
-        license: p.licenses.and_then(|l| l.into_iter().next()),
-        ..Default::default()
-    }
+/// One FreeBSD `packagesite.yaml` object.
+fn packagesite_listing(p: Packagesite) -> Option<(Box<str>, Listing)> {
+    Some((
+        p.name?.into(),
+        Listing {
+            version: p.version.unwrap_or_default().into(),
+            author: p.maintainer.as_deref().map(|m| strip_email(m).into()),
+            description: p.comment.map(Into::into),
+            homepage: p.www.map(Into::into),
+            license: p
+                .licenses
+                .and_then(|l| l.into_iter().next())
+                .map(Into::into),
+            ..Default::default()
+        },
+    ))
 }
 
 /// The version of `name` from an OpenBSD packages `index.txt` (ls-style lines
@@ -413,18 +555,6 @@ fn openbsd_version(listing: &str, name: &str) -> Option<String> {
 /// A non-gzip body surfaces as a read error when the scanner pulls from it.
 fn gunzip(bytes: Vec<u8>) -> impl Read {
     flate2::read::MultiGzDecoder::new(Cursor::new(bytes)).take(DECOMP_CAP)
-}
-
-/// Fully decompress a zstd stream into a capped buffer (FreeBSD's catalog),
-/// bounded against a bomb by `DECOMP_CAP`.
-fn unzstd(bytes: Vec<u8>) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    zstd::stream::read::Decoder::new(Cursor::new(bytes))
-        .ok()?
-        .take(DECOMP_CAP)
-        .read_to_end(&mut out)
-        .ok()?;
-    Some(out)
 }
 
 /// Find a member by exact name (or `…/name`) in an uncompressed POSIX/ustar tar,
@@ -492,63 +622,65 @@ fn first_listing(
 
 // --- index scanners ---------------------------------------------------------
 
-/// Stream `reader` and hand each blank-line-delimited stanza to `f` until it
-/// returns `Some` (early exit). Holds at most one stanza, so a 100 MiB index is
-/// scanned in constant memory.
-fn each_stanza<R: BufRead, T>(reader: R, mut f: impl FnMut(&str) -> Option<T>) -> Option<T> {
+/// Stream `reader` and hand each blank-line-delimited stanza to `f`, holding
+/// at most one stanza, so a 100 MiB index is read in constant memory. A line
+/// that is not UTF-8 is read lossily: one stray byte must not cost the index.
+fn stanzas<R: BufRead>(mut reader: R, mut f: impl FnMut(&str)) -> std::io::Result<()> {
     let mut stanza = String::new();
-    for line in reader.lines() {
-        let line = line.ok()?;
-        if line.is_empty() {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let at_end = reader.read_until(b'\n', &mut line)? == 0;
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches(['\n', '\r']);
+        if text.is_empty() {
             if !stanza.is_empty() {
-                if let Some(t) = f(&stanza) {
-                    return Some(t);
-                }
+                f(&stanza);
                 stanza.clear();
             }
+            if at_end {
+                return Ok(());
+            }
         } else {
-            stanza.push_str(&line);
+            stanza.push_str(text);
             stanza.push('\n');
         }
     }
-    (!stanza.is_empty()).then(|| f(&stanza)).flatten()
 }
 
 /// Stream `reader`, isolating each `<package …>…</package>` element and handing
-/// its text to `f` until it returns `Some`. Buffers at most one element plus a
-/// read chunk, so a multi-hundred-MiB `primary.xml` is scanned without holding
-/// it whole.
-fn each_xml_package<R: Read, T>(mut reader: R, mut f: impl FnMut(&str) -> Option<T>) -> Option<T> {
+/// its text to `f`. Buffers at most one element plus a read chunk, so a
+/// multi-hundred-MiB `primary.xml` is read without holding it whole.
+fn xml_packages<R: Read>(mut reader: R, mut f: impl FnMut(&str)) -> std::io::Result<()> {
     const OPEN: &[u8] = b"<package";
     const CLOSE: &[u8] = b"</package>";
     let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; XML_CHUNK];
+    let mut chunk = vec![0u8; XML_CHUNK];
     loop {
-        let n = reader.read(&mut chunk).ok()?;
+        let n = reader.read(&mut chunk)?;
         if n == 0 {
-            return None;
+            return Ok(());
         }
         buf.extend_from_slice(&chunk[..n]);
+        // Hand over every complete element, then drop what has been handled
+        // in one move rather than one per element.
+        let mut done = 0;
         loop {
-            let Some(start) = find_sub(&buf, OPEN) else {
-                // No element start yet; keep only a possible partial `<package`.
-                let keep = OPEN.len().saturating_sub(1).min(buf.len());
-                buf.drain(..buf.len() - keep);
+            let Some(start) = find_sub(&buf[done..], OPEN).map(|i| done + i) else {
+                // Keep only what could be a `<package` split across reads.
+                done = done.max(buf.len().saturating_sub(OPEN.len() - 1));
                 break;
             };
-            // Drop anything before the element to bound memory.
-            buf.drain(..start);
-            let Some(rel) = find_sub(&buf, CLOSE) else {
-                break; // element not yet complete; read more
+            let Some(end) = find_sub(&buf[start..], CLOSE).map(|i| start + i + CLOSE.len()) else {
+                done = start; // incomplete: read more
+                break;
             };
-            let end = rel + CLOSE.len();
-            if let Ok(text) = std::str::from_utf8(&buf[..end])
-                && let Some(t) = f(text)
-            {
-                return Some(t);
+            if let Ok(text) = std::str::from_utf8(&buf[start..end]) {
+                f(text);
             }
-            buf.drain(..end);
+            done = end;
         }
+        buf.drain(..done);
     }
 }
 
@@ -602,31 +734,34 @@ fn unescape_xml(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch::Fixtures;
     use std::io::Write as _;
 
     #[test]
-    fn apkindex_record_maps_fields() {
+    fn apkindex_listing_maps_fields() {
         let stanza = "C:Q1xxx\nP:curl\nV:8.5.0-r0\nA:x86_64\n\
                       T:URL retrieval utility\nU:https://curl.se/\nL:curl\n\
                       m:Nat <nat@example.test>\nt:1619172000\no:curl\n";
-        let r = apkindex_record(stanza, "curl", "alpine").expect("record");
+        let (name, listing) = apkindex_listing(stanza).expect("listing");
+        assert_eq!(&*name, "curl");
+        let r = listing.record("alpine", &name);
         assert_eq!(r.ecosystem, "alpine");
         assert_eq!(r.version, "8.5.0-r0");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.author.as_deref(), Some("Nat"));
         assert_eq!(r.homepage.as_deref(), Some("https://curl.se/"));
         assert_eq!(r.license.as_deref(), Some("curl"));
-        // A non-matching name in the same stanza shape yields nothing.
-        assert!(apkindex_record(stanza, "wget", "alpine").is_none());
     }
 
     #[test]
-    fn deb_record_maps_fields() {
+    fn deb_listing_maps_fields() {
         let stanza = "Package: nginx\nVersion: 1.24.0-1\n\
                       Maintainer: Debian Nginx <pkg-nginx@lists.debian.test>\n\
                       Homepage: https://nginx.org\n\
                       Description: small web server\n more text here\n";
-        let r = deb_record(stanza, "nginx", "debian").expect("record");
+        let (name, listing) = deb_listing(stanza).expect("listing");
+        assert_eq!(&*name, "nginx");
+        let r = listing.record("debian", &name);
         assert_eq!(r.version, "1.24.0-1");
         assert_eq!(r.author.as_deref(), Some("Debian Nginx"));
         assert_eq!(r.homepage.as_deref(), Some("https://nginx.org"));
@@ -635,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn rpm_primary_record_maps_fields() {
+    fn rpm_listing_maps_fields() {
         let pkg = r#"<package type="rpm"><name>curl</name><arch>x86_64</arch>
             <version epoch="0" ver="8.5.0" rel="1.2"/>
             <summary>A tool for transferring data</summary>
@@ -643,7 +778,9 @@ mod tests {
             <time file="1619172000" build="1619172000"/>
             <format><rpm:license>MIT</rpm:license><rpm:vendor>openSUSE</rpm:vendor></format>
             </package>"#;
-        let r = rpm_primary_record(pkg, "curl", "opensuse").expect("record");
+        let (name, listing) = rpm_listing(pkg).expect("listing");
+        assert_eq!(&*name, "curl");
+        let r = listing.record("opensuse", &name);
         assert_eq!(r.version, "8.5.0-1.2");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.license.as_deref(), Some("MIT"));
@@ -662,37 +799,38 @@ mod tests {
     }
 
     #[test]
-    fn pkg_summary_record_extracts_version() {
+    fn pkg_summary_listing_extracts_version() {
         let stanza = "PKGNAME=curl-8.5.0\nCOMMENT=Client for URLs\n\
                       HOMEPAGE=https://curl.se/\nLICENSE=mit\n\
                       MAINTAINER=pkgsrc <pkgsrc@example.test>\n\
                       BUILD_DATE=2021-04-23 10:00:00 +0000\n";
-        let r = pkg_summary_record(stanza, "curl").expect("record");
+        let (name, listing) = pkg_summary_listing(stanza).expect("listing");
+        assert_eq!(&*name, "curl");
+        let r = listing.record("netbsd", &name);
         assert_eq!(r.ecosystem, "netbsd");
         assert_eq!(r.version, "8.5.0");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.description.as_deref(), Some("Client for URLs"));
         assert_eq!(r.author.as_deref(), Some("pkgsrc"));
-        // A different package sharing no prefix must not match.
-        assert!(pkg_summary_record(stanza, "wget").is_none());
-        // Nor one whose name merely starts with the one asked for.
+        // A name that merely starts with another is its own package: `git`
+        // must not claim `git-base`'s listing.
         let base = "PKGNAME=git-base-2.45.2nb1\nCOMMENT=GIT core\n";
-        assert!(pkg_summary_record(base, "git").is_none());
-        assert_eq!(
-            pkg_summary_record(base, "git-base").map(|r| r.version),
-            Some("2.45.2nb1".to_string())
-        );
+        let (name, listing) = pkg_summary_listing(base).expect("listing");
+        assert_eq!(&*name, "git-base");
+        assert_eq!(&*listing.version, "2.45.2nb1");
     }
 
     #[test]
-    fn packagesite_record_maps_fields() {
+    fn packagesite_listing_maps_fields() {
         let o = serde_json::from_value(serde_json::json!({
             "name": "curl", "version": "8.5.0", "comment": "URL transfer tool",
             "www": "https://curl.se/", "maintainer": "ports@freebsd.test",
             "licenses": ["MIT"]
         }))
         .unwrap();
-        let r = packagesite_record(o, "curl");
+        let (name, listing) = packagesite_listing(o).expect("listing");
+        assert_eq!(&*name, "curl");
+        let r = listing.record("freebsd", &name);
         assert_eq!(r.ecosystem, "freebsd");
         assert_eq!(r.version, "8.5.0");
         assert_eq!(r.homepage.as_deref(), Some("https://curl.se/"));
@@ -712,26 +850,65 @@ mod tests {
     }
 
     #[test]
-    fn each_stanza_streams_and_early_exits() {
-        let text = "Package: a\nVersion: 1\n\nPackage: b\nVersion: 2\n\nPackage: c\nVersion: 3\n";
-        let got = each_stanza(BufReader::new(Cursor::new(text)), |s| {
-            deb_record(s, "b", "debian")
+    fn stanzas_are_read_one_at_a_time() {
+        // A stray non-UTF-8 byte costs only its own line.
+        let text = b"Package: a\nVersion: 1\n\nPackage: b\nDescription: caf\xe9\n\n\nPackage: c\n";
+        let mut seen = Vec::new();
+        stanzas(BufReader::new(Cursor::new(&text[..])), |s| {
+            seen.push(field(s, "Package:"));
         })
-        .expect("found b");
-        assert_eq!(got.version, "2");
+        .expect("read");
+        assert_eq!(seen, [Some("a".into()), Some("b".into()), Some("c".into())]);
+    }
+
+    /// A reader that hands out a few bytes at a time, so elements and markers
+    /// straddle reads.
+    struct Trickle<'a>(&'a [u8]);
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.len().min(buf.len()).min(5);
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
     }
 
     #[test]
-    fn each_xml_package_isolates_elements() {
+    fn xml_packages_isolates_elements_across_reads() {
         let xml = "<metadata><package><name>a</name><version ver=\"1\"/></package>\
                    <package><name>curl</name><version ver=\"9\"/>\
-                   <url>https://curl.se/</url></package></metadata>";
-        let r = each_xml_package(Cursor::new(xml), |p| {
-            rpm_primary_record(p, "curl", "opensuse")
-        })
-        .expect("found curl");
-        assert_eq!(r.version, "9");
-        assert_eq!(r.homepage.as_deref(), Some("https://curl.se/"));
+                   <url>https://curl.se/</url><packager>x</packager></package></metadata>";
+        let mut names = Vec::new();
+        xml_packages(Trickle(xml.as_bytes()), |p| names.push(tag_text(p, "name"))).expect("read");
+        assert_eq!(names, [Some("a".into()), Some("curl".into())]);
+    }
+
+    /// An index is parsed once for any number of lookups, and again only when
+    /// its bytes change.
+    #[test]
+    fn an_index_is_parsed_once_per_content() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static PARSES: AtomicUsize = AtomicUsize::new(0);
+        fn counted(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
+            PARSES.fetch_add(1, Ordering::SeqCst);
+            stanza_listings(url, Cursor::new(bytes), deb_listing)
+        }
+        let url = "https://distro.test/parsed-once/Packages";
+        let cache = BlobCache::disabled();
+        let net =
+            Fixtures::default().with(url, b"Package: a\nVersion: 1\n\nPackage: b\nVersion: 2\n");
+        let version = |net: &Fixtures, name: &str| {
+            lookup(url, counted, name, "debian", net, &cache).map(|r| r.version)
+        };
+        assert_eq!(version(&net, "a"), Ok("1".into()));
+        assert_eq!(version(&net, "b"), Ok("2".into()));
+        assert_eq!(version(&net, "z"), Err(RegistryError::NotFound));
+        assert_eq!(PARSES.load(Ordering::SeqCst), 1);
+
+        let refreshed = Fixtures::default().with(url, b"Package: a\nVersion: 3\n");
+        assert_eq!(version(&refreshed, "a"), Ok("3".into()));
+        assert_eq!(PARSES.load(Ordering::SeqCst), 2);
     }
 
     #[test]

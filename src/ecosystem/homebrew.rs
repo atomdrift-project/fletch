@@ -8,6 +8,8 @@ use crate::ecosystem::{fetch_json, flag};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
+/// Homebrew: the formula JSON carries the stable version, description, license,
+/// and 30-day install analytics. It records no publish date.
 pub(crate) fn homebrew(
     name: &str,
     net: &dyn Fetch,
