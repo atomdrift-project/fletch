@@ -66,15 +66,15 @@ fn extracted_refs(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
         // The extractor already recorded where the run sits, so cite that
         // rather than searching the file for the value. It is also the only
         // correct answer for a *decoded* string (base64, XOR): that text never
-        // appears in the raw bytes, so a search would place it at offset 0
-        // while `data_offset` points at the encoded run it came from.
+        // appears in the raw bytes, so a search would cite nothing while
+        // `data_offset` points at the encoded run it came from.
         for url in extract_urls(&s.value) {
             out.push_at(
                 RefLocator::Url(url.to_string()),
                 RefKind::UrlFetch,
                 "string",
                 s.value.clone(),
-                s.data_offset,
+                Some(s.data_offset),
             );
         }
     }
@@ -92,9 +92,7 @@ fn dedup(refs: &mut Vec<Reference>) {
         if r.kind == RefKind::Undefined {
             return true;
         }
-        seen.insert(match &r.locator {
-            RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
-        })
+        seen.insert(crate::fetch::locator_str(&r.locator).to_owned())
     });
 }
 
@@ -176,15 +174,9 @@ pub fn import_calls(file_type: &str, symbols: &[Symbol]) -> Vec<Reference> {
             continue;
         };
         if let Some((locator, kind)) = import_locator(eco, value) {
-            refs.push(Reference {
-                locator,
-                kind,
-                source: "ast-call".into(),
-                evidence: value.clone(),
-                offset: offset.unwrap_or(0),
-                pinned_hash: None,
-                content_sha256: None,
-            });
+            let mut r = Reference::new(locator, kind, "ast-call", value.clone());
+            r.offset = *offset;
+            refs.push(r);
         }
     }
     refs
@@ -264,7 +256,7 @@ struct Found<'a> {
     searches: usize,
     /// The last evidence searched for and where it was found, so the
     /// packages of one command line share one search.
-    last_search: Option<(String, u64)>,
+    last_search: Option<(String, Option<u64>)>,
 }
 
 impl<'a> Found<'a> {
@@ -280,8 +272,8 @@ impl<'a> Found<'a> {
     /// Push an imperative reference (no pin) cited by `evidence`. Evidence cut
     /// from the file's own text is placed where it sits. Evidence from elsewhere
     /// — an npm hook read from parsed JSON — is searched for: its first
-    /// occurrence, else the package name's or URL's, else `0`, which is also
-    /// where it lands once the file's searches are spent.
+    /// occurrence, else the package name's or URL's, else no offset, which is
+    /// also what it gets once the file's searches are spent.
     fn push(
         &mut self,
         locator: RefLocator,
@@ -290,7 +282,7 @@ impl<'a> Found<'a> {
         evidence: &str,
     ) {
         let offset = match self.text.and_then(|t| position_in(t, evidence)) {
-            Some(at) => at as u64,
+            Some(at) => Some(at as u64),
             None => self.search(evidence, &locator),
         };
         self.push_at(locator, kind, source, evidence.to_string(), offset);
@@ -298,20 +290,18 @@ impl<'a> Found<'a> {
 
     /// Where `evidence` (else `locator`'s anchor) first occurs in the text,
     /// within the file's search allowance.
-    fn search(&mut self, evidence: &str, locator: &RefLocator) -> u64 {
+    fn search(&mut self, evidence: &str, locator: &RefLocator) -> Option<u64> {
         if let Some((last, at)) = &self.last_search
             && last == evidence
         {
             return *at;
         }
-        let Some(text) = self.text.filter(|_| self.searches > 0) else {
-            return 0;
-        };
+        let text = self.text.filter(|_| self.searches > 0)?;
         self.searches -= 1;
         let at = text
             .find(evidence)
             .or_else(|| text.find(&anchor_from_locator(locator)))
-            .unwrap_or(0) as u64;
+            .map(|at| at as u64);
         self.last_search = Some((evidence.to_string(), at));
         at
     }
@@ -323,17 +313,11 @@ impl<'a> Found<'a> {
         kind: RefKind,
         source: impl Into<String>,
         evidence: String,
-        offset: u64,
+        offset: Option<u64>,
     ) {
-        self.refs.push(Reference {
-            locator,
-            kind,
-            source: source.into(),
-            evidence,
-            offset,
-            pinned_hash: None,
-            content_sha256: None,
-        });
+        let mut r = Reference::new(locator, kind, source, evidence);
+        r.offset = offset;
+        self.refs.push(r);
     }
 }
 
@@ -1197,7 +1181,7 @@ fn commands(scan: &str, remap: Option<&[(usize, usize)]>, source: &str, out: &mu
                     RefKind::Command,
                     source,
                     seg.to_string(),
-                    offset as u64,
+                    Some(offset as u64),
                 ),
                 None => out.push(locator, RefKind::Command, source, seg),
             }
@@ -1671,13 +1655,13 @@ fn pypi_purl_token(tok: &str) -> Option<String> {
 /// stripped).
 fn anchor_from_locator(loc: &RefLocator) -> String {
     match loc {
-        RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
         RefLocator::Purl(p) => {
             let body = p.strip_prefix("pkg:").unwrap_or(p);
             let body = body.split_once('/').map_or(body, |(_, rest)| rest); // drop type
             let name = body.split('@').next().unwrap_or(body); // drop @version
             name.replace("%40", "@")
         }
+        _ => crate::fetch::locator_str(loc).to_owned(),
     }
 }
 
@@ -1738,7 +1722,7 @@ mod tests {
                 .into_iter()
                 .filter(|r| r.kind == RefKind::Command || r.kind == RefKind::UrlFetch)
                 .map(|r| {
-                    let at = usize::try_from(r.offset).unwrap();
+                    let at = usize::try_from(r.offset.unwrap()).unwrap();
                     let word = text[at..].split_whitespace().next().unwrap_or("");
                     (format!("{:?}", r.locator), word.to_string())
                 })
@@ -1810,7 +1794,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.as_str()),
-                RefLocator::Url(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect();
         assert!(purls.contains(&"pkg:npm/evil-pkg"));
@@ -1821,7 +1805,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect();
         assert!(url_refs.contains(&"https://web.stanford.edu/~pseay/pliant/et"));
@@ -1835,7 +1819,7 @@ mod tests {
             .filter(|r| r.kind == RefKind::UrlFetch)
             .filter_map(|r| match r.locator {
                 RefLocator::Url(u) => Some(u),
-                RefLocator::Purl(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -1992,9 +1976,7 @@ mod tests {
         let syms = [call("vscode"), call("fs"), call("node:os"), call("lodash")];
         let purls: Vec<String> = import_calls("javascript", &syms)
             .iter()
-            .map(|r| match &r.locator {
-                RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
-            })
+            .map(|r| crate::fetch::locator_str(&r.locator).to_owned())
             .collect();
         assert_eq!(purls, vec!["pkg:npm/lodash".to_string()], "{purls:?}");
     }
@@ -2023,9 +2005,7 @@ mod tests {
         ];
         let found: Vec<String> = import_calls("javascript", &syms)
             .iter()
-            .map(|r| match &r.locator {
-                RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
-            })
+            .map(|r| crate::fetch::locator_str(&r.locator).to_owned())
             .collect();
         assert_eq!(
             found,
@@ -2051,10 +2031,7 @@ mod tests {
         let refs = references_from_facts(&values, &[]);
         let urls: Vec<_> = refs
             .iter()
-            .map(|r| match &r.locator {
-                RefLocator::Url(u) => u.as_str(),
-                RefLocator::Purl(p) | RefLocator::Path(p) => p.as_str(),
-            })
+            .map(|r| crate::fetch::locator_str(&r.locator))
             .collect();
         assert!(
             urls.contains(&"https://evil.test/s.sh"),
@@ -2084,7 +2061,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.as_str()),
-                RefLocator::Url(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect();
         assert!(
@@ -2271,7 +2248,7 @@ mod tests {
             .position(|w| w == b"aHR0")
             .expect("base64 token in the fixture") as u64;
         assert!(
-            decoded.iter().any(|r| r.offset == b64_at),
+            decoded.iter().any(|r| r.offset == Some(b64_at)),
             "expected a citation at the base64 token (offset {b64_at}); got {decoded:?}"
         );
     }
@@ -2284,7 +2261,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect();
         assert!(
@@ -2319,7 +2296,7 @@ mod tests {
         refs.iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.clone()),
-                RefLocator::Url(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -2462,7 +2439,7 @@ mod tests {
             .filter(|r| r.kind == RefKind::Repository)
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect();
         // git_refs classifies clone targets (incl. SSH `git@`, which the http-only
@@ -2478,7 +2455,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect();
         assert!(
@@ -2580,7 +2557,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Url(u) => Some(u.as_str()),
-                RefLocator::Purl(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect();
         assert!(
@@ -2602,15 +2579,7 @@ mod tests {
 
     /// Build a package reference of a given kind from a PURL string.
     fn pkg_ref(kind: RefKind, purl: &str) -> Reference {
-        Reference {
-            locator: RefLocator::Purl(purl.to_string()),
-            kind,
-            source: "test".into(),
-            evidence: String::new(),
-            offset: 0,
-            pinned_hash: None,
-            content_sha256: None,
-        }
+        Reference::new(RefLocator::Purl(purl.to_string()), kind, "test", "")
     }
 
     #[test]
@@ -2699,9 +2668,7 @@ mod tests {
     /// The locator text of each reference, for asserting on a result set.
     fn locators<'a>(refs: &[&'a Reference]) -> Vec<&'a str> {
         refs.iter()
-            .map(|r| match &r.locator {
-                RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.as_str(),
-            })
+            .map(|r| crate::fetch::locator_str(&r.locator))
             .collect()
     }
 
@@ -2750,15 +2717,12 @@ mod tests {
             pkg_ref(RefKind::Dependency, "pkg:npm/%40scope/pkg"),
             // Same scoped package with a version pin: still declared.
             pkg_ref(RefKind::Command, "pkg:npm/%40scope/pkg@2.0"),
-            Reference {
-                locator: RefLocator::Url("https://evil.test/x".into()),
-                kind: RefKind::UrlFetch,
-                source: "test".into(),
-                evidence: String::new(),
-                offset: 0,
-                pinned_hash: None,
-                content_sha256: None,
-            },
+            Reference::new(
+                RefLocator::Url("https://evil.test/x".into()),
+                RefKind::UrlFetch,
+                "test",
+                "",
+            ),
             pkg_ref(RefKind::Command, "pkg:pypi/evil"),
         ];
         assert_eq!(locators(&undeclared_packages(&refs)), ["pkg:pypi/evil"]);
@@ -2789,7 +2753,7 @@ mod tests {
             .iter()
             .filter_map(|r| match &r.locator {
                 RefLocator::Purl(p) => Some(p.as_str()),
-                RefLocator::Url(_) | RefLocator::Path(_) => None,
+                _ => None,
             })
             .collect();
         assert_eq!(purls, ["pkg:pypi/realpkg"]);

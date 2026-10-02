@@ -202,15 +202,7 @@ fn probe_purl(purl: &str) -> PurlProbe {
     // Resolution probe: run the real fetch path against the refusing backend.
     // A resolvable PURL surfaces its download URL on the (expectedly failed)
     // record; `Unresolved` means the fetcher has no artifact mapping.
-    let reference = Reference {
-        locator,
-        kind: RefKind::Dependency,
-        source: "cli".to_string(),
-        evidence: String::new(),
-        offset: 0,
-        pinned_hash: None,
-        content_sha256: None,
-    };
+    let reference = Reference::new(locator, RefKind::Dependency, "cli", "");
     let rec = fletch::fetch::fetch_ref(&reference, &ProbeNet::default(), &cache);
     let download_url = rec.resolved_url.clone();
 

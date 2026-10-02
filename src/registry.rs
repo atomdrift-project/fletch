@@ -115,10 +115,11 @@ pub fn try_registry(
 ) -> Result<Registry, RegistryError> {
     let started = std::time::Instant::now();
     let result = look_up(locator, net, cache);
-    let named = match locator {
-        RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s,
-    };
-    crate::metrics::registry(named, &result, started.elapsed());
+    crate::metrics::registry(
+        crate::fetch::locator_str(locator),
+        &result,
+        started.elapsed(),
+    );
     result
 }
 

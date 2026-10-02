@@ -81,14 +81,13 @@ fn events(capture: &Capture, names: &[&str]) -> Vec<Vec<String>> {
 
 #[test]
 fn fetches_lookups_and_reads_are_counted() {
-    let dep = |purl: &str| Reference {
-        locator: RefLocator::Purl(purl.into()),
-        kind: RefKind::Dependency,
-        source: "test".into(),
-        evidence: String::new(),
-        offset: 0,
-        pinned_hash: None,
-        content_sha256: None,
+    let dep = |purl: &str| {
+        Reference::new(
+            RefLocator::Purl(purl.into()),
+            RefKind::Dependency,
+            "test",
+            "",
+        )
     };
     let tarball = "https://registry.npmjs.org/a/-/a-1.0.0.tgz";
     let net = Fixtures::default()

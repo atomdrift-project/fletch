@@ -588,7 +588,7 @@ pub fn fetch_references_with(
             FetchRecord::terminal(locator_string(&r.locator), Outcome::BudgetExceeded)
         });
         rec.source_sha256 = Some(source_sha256.to_string()).filter(|s| !s.is_empty());
-        rec.source_offset = Some(r.offset);
+        rec.source_offset = r.offset;
         rec.kind = r.kind;
         records.push(rec);
     }
@@ -612,7 +612,9 @@ fn selected(r: &Reference, url_fetches: UrlFetches) -> bool {
                 matches!(r.kind, RefKind::Dependency | RefKind::Command)
                     || url_fetches == UrlFetches::Include
             }
-            RefLocator::Path(_) => false,
+            // An intra-artifact path is resolved against sibling files, and a
+            // locator kind this fletch predates names nothing it can fetch.
+            _ => false,
         }
 }
 
@@ -744,8 +746,15 @@ fn record(
 
 /// The canonical locator string (the PURL or URL).
 fn locator_string(locator: &RefLocator) -> String {
+    locator_str(locator).to_owned()
+}
+
+/// The locator's text: the PURL, URL or path as written. Empty for a locator
+/// kind this fletch predates, which names nothing it can fetch or cite.
+pub(crate) fn locator_str(locator: &RefLocator) -> &str {
     match locator {
-        RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s.clone(),
+        RefLocator::Purl(s) | RefLocator::Url(s) | RefLocator::Path(s) => s,
+        _ => "",
     }
 }
 
@@ -768,8 +777,9 @@ pub fn resolve(locator: &RefLocator) -> Option<String> {
         RefLocator::Url(u) => is_web_scheme(u).then(|| u.clone()),
         RefLocator::Purl(p) => Purl::parse(p).ok().and_then(|purl| resolve_purl(&purl)),
         // An intra-artifact file reference is resolved against the bundle's
-        // other files by a consumer, never fetched.
-        RefLocator::Path(_) => None,
+        // other files by a consumer, never fetched; nor is a locator kind this
+        // fletch predates.
+        _ => None,
     }
 }
 
@@ -809,7 +819,6 @@ pub fn resolve_artifacts(
         RefLocator::Url(url) if is_web_scheme(url) => {
             vec![artifact_candidate(url.clone(), "download")]
         }
-        RefLocator::Url(_) | RefLocator::Path(_) => return None,
         RefLocator::Purl(raw) => {
             let purl = Purl::parse(raw).ok()?;
             locator_text = purl.canonical();
@@ -846,6 +855,7 @@ pub fn resolve_artifacts(
             attach_candidate_identities(&locator_text, &mut candidates);
             candidates
         }
+        _ => return None,
     };
     Some(ArtifactMatrix {
         locator: locator_text,
@@ -2420,17 +2430,12 @@ mod tests {
         // never have a container pulled behind its back: the reference still
         // resolves (the probe's download_url), but the fetch is refused
         // rather than routed around the backend to the live registry.
-        let r = Reference {
-            locator: RefLocator::Purl(
-                "pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx".into(),
-            ),
-            kind: RefKind::Dependency,
-            source: "test".into(),
-            evidence: String::new(),
-            offset: 0,
-            pinned_hash: None,
-            content_sha256: None,
-        };
+        let r = Reference::new(
+            RefLocator::Purl("pkg:oci/nginx?repository_url=docker.io%2Flibrary%2Fnginx".into()),
+            RefKind::Dependency,
+            "test",
+            "",
+        );
         let rec = fetch_ref(&r, &Fixtures::default(), &BlobCache::disabled());
         assert_eq!(
             rec.resolved_url.as_deref(),
@@ -2487,28 +2492,21 @@ mod tests {
     }
 
     fn dep(locator: RefLocator, pin: Option<PinnedHash>) -> Reference {
-        Reference {
-            locator,
-            kind: RefKind::Dependency,
-            source: "test".into(),
-            evidence: "test".into(),
-            offset: 0,
-            pinned_hash: pin,
-            content_sha256: None,
-        }
+        let mut r = Reference::new(locator, RefKind::Dependency, "test", "test");
+        r.pinned_hash = pin;
+        r
+    }
+
+    /// `r` found as a `kind` reference.
+    fn as_kind(kind: RefKind, mut r: Reference) -> Reference {
+        r.kind = kind;
+        r
     }
 
     #[test]
     fn selected_gates_urls_by_kind_not_just_locator() {
-        let with_kind = |locator: RefLocator, kind: RefKind| Reference {
-            locator,
-            kind,
-            source: "test".into(),
-            evidence: "test".into(),
-            offset: 0,
-            pinned_hash: None,
-            content_sha256: None,
-        };
+        let with_kind =
+            |locator: RefLocator, kind: RefKind| Reference::new(locator, kind, "test", "test");
         let url = || RefLocator::Url("https://example.com/x.tar.gz".into());
         let purl = || RefLocator::Purl("pkg:npm/left-pad@1.3.0".into());
 
@@ -2721,14 +2719,14 @@ mod tests {
 
         let refs = vec![
             dep(RefLocator::Purl("pkg:npm/foo@1.0.0".into()), None),
-            Reference {
-                kind: RefKind::UrlFetch,
-                ..dep(RefLocator::Url(raw_url.into()), None)
-            },
-            Reference {
-                kind: RefKind::Repository,
-                ..dep(RefLocator::Purl("pkg:github/o/r".into()), None)
-            },
+            as_kind(
+                RefKind::UrlFetch,
+                dep(RefLocator::Url(raw_url.into()), None),
+            ),
+            as_kind(
+                RefKind::Repository,
+                dep(RefLocator::Purl("pkg:github/o/r".into()), None),
+            ),
         ];
 
         // Without URL fetches: only the package (raw URL + repo excluded).
@@ -2816,10 +2814,10 @@ mod tests {
             .with(raw_url, b"SH");
         let refs = vec![
             dep(RefLocator::Purl("pkg:npm/foo@1.0.0".into()), None),
-            Reference {
-                kind: RefKind::UrlFetch,
-                ..dep(RefLocator::Url(raw_url.into()), None)
-            },
+            as_kind(
+                RefKind::UrlFetch,
+                dep(RefLocator::Url(raw_url.into()), None),
+            ),
         ];
 
         // Warm the cache with a generous budget: both are live fetches.
@@ -3142,10 +3140,10 @@ mod tests {
         let cache = BlobCache::with_dir(dir.path().to_path_buf());
         let net = Fixtures::default();
 
-        let repo = Reference {
-            kind: RefKind::Repository,
-            ..dep(RefLocator::Purl("pkg:github/o/r".into()), None)
-        };
+        let repo = as_kind(
+            RefKind::Repository,
+            dep(RefLocator::Purl("pkg:github/o/r".into()), None),
+        );
         assert_eq!(fetch_ref(&repo, &net, &cache).outcome, Outcome::Skipped);
 
         // Each says why it has no URL.
