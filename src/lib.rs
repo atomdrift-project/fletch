@@ -17,9 +17,13 @@
 //!   [`filefacts::Registry`], so a consumer can judge a dependency before paying
 //!   to fetch and scan its bytes.
 //!
+//! Beside them, [`purl`] parses and normalizes package URLs, [`metrics`] names
+//! the events a deployment counts, and [`cache_sweep`] keeps the blob cache
+//! within its budget.
+//!
 //! Consumers compose: analyze a file (cleave) → [`find`] its references →
 //! [`fetch`] them → analyze what came back. fletch never analyzes; it finds and
-//! fetches. A deployment counts what happened from the [`metrics`] events.
+//! fetches.
 
 pub mod cache_sweep;
 mod distro;

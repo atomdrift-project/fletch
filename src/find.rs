@@ -1171,37 +1171,35 @@ fn commands(scan: &str, remap: Option<&[(usize, usize)]>, source: &str, out: &mu
                 .and_then(image_distro);
             continue;
         }
-        for i in 0..toks.len() {
-            let Some((family, consumed)) = match_pm(&toks[i..]) else {
-                continue;
-            };
-            // Source files are also scanned for programmatic installs, but a
-            // bare `go install` in a comment/docstring/string is not evidence
-            // that the source executes Go. Keep foreign Go installs when they
-            // occur in a recognized process-execution call; shell scripts and
-            // Dockerfiles retain their unrestricted command behavior.
-            if !source_command_allowed(source, family, seg) {
-                continue;
+        // The segment's first package-manager invocation; the rest of the
+        // segment is its arguments. Source files are also scanned for
+        // programmatic installs, but a bare `go install` in a
+        // comment/docstring/string is not evidence that the source executes
+        // Go: a foreign Go install counts only in a recognized
+        // process-execution call, while shell scripts and Dockerfiles keep
+        // their unrestricted command behavior.
+        let Some((family, args)) = (0..toks.len()).find_map(|i| {
+            let (family, consumed) = match_pm(&toks[i..])?;
+            source_command_allowed(source, family, seg).then(|| (family, &toks[i + consumed..]))
+        }) else {
+            continue;
+        };
+        let eco = distro_eco(family, distro);
+        // A redirect, or an options-object `{`, ends the list.
+        let packages = args
+            .iter()
+            .take_while(|arg| !arg.starts_with('>') && !arg.starts_with('<') && **arg != "{");
+        for locator in packages.filter_map(|arg| pm_token_locator(eco, arg)) {
+            match offset {
+                Some(offset) => out.push_at(
+                    locator,
+                    RefKind::Command,
+                    source,
+                    seg.to_string(),
+                    offset as u64,
+                ),
+                None => out.push(locator, RefKind::Command, source, seg),
             }
-            let eco = distro_eco(family, distro);
-            for arg in &toks[i + consumed..] {
-                if arg.starts_with('>') || arg.starts_with('<') || *arg == "{" {
-                    break; // a redirect, or an options-object `{`, ends the list
-                }
-                if let Some(locator) = pm_token_locator(eco, arg) {
-                    match offset {
-                        Some(offset) => out.push_at(
-                            locator,
-                            RefKind::Command,
-                            source,
-                            seg.to_string(),
-                            offset as u64,
-                        ),
-                        None => out.push(locator, RefKind::Command, source, seg),
-                    }
-                }
-            }
-            break; // the rest of the segment is this command's arguments
         }
     }
 }
@@ -1218,25 +1216,28 @@ fn source_command_allowed(source: &str, family: &str, segment: &str) -> bool {
     }
     let tokens: Vec<&str> = segment.split_whitespace().collect();
     match source {
-        "python" => tokens.windows(2).any(|window| {
-            (window[0] == "subprocess"
-                && matches!(
-                    window[1],
+        "python" => tokens.windows(2).any(|pair| match pair {
+            ["subprocess", call] => {
+                matches!(
+                    *call,
                     "run" | "call" | "check_call" | "check_output" | "Popen"
-                ))
-                || (window[0] == "os"
-                    && (window[1] == "system"
-                        || window[1] == "popen"
-                        || window[1].starts_with("exec")
-                        || window[1].starts_with("spawn")))
+                )
+            }
+            ["os", call] => {
+                matches!(*call, "system" | "popen")
+                    || call.starts_with("exec")
+                    || call.starts_with("spawn")
+            }
+            _ => false,
         }),
-        "javascript" | "typescript" => tokens.windows(2).any(|window| {
-            (window[0] == "child_process"
-                && matches!(
-                    window[1],
+        "javascript" | "typescript" => tokens.windows(2).any(|pair| {
+            matches!(
+                pair,
+                [
+                    "child_process",
                     "exec" | "execSync" | "spawn" | "spawnSync" | "fork"
-                ))
-                || (window[0] == "shelljs" && window[1] == "exec")
+                ] | ["shelljs", "exec"]
+            )
         }),
         _ => true,
     }

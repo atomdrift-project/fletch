@@ -67,7 +67,7 @@ const MARK_STARTED: &[u8] = b"s";
 const MARK_DONE: &[u8] = b"d";
 
 /// A cache directory and how deep its entries live below it.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Root {
     /// Directory to sweep.
     pub path: PathBuf,
@@ -77,7 +77,7 @@ pub struct Root {
 }
 
 /// One component's caches and the budget they must collectively stay within.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Budget {
     /// Component name, for a debug log line.
     pub label: &'static str,

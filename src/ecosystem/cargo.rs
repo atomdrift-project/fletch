@@ -125,15 +125,12 @@ fn cargo_download_url(
 
 fn cargo_registry_prefix(name: &str) -> Option<String> {
     let characters: Vec<char> = name.chars().collect();
-    Some(match characters.len() {
-        0 => return None,
-        1 => "1".to_string(),
-        2 => "2".to_string(),
-        3 => format!("3/{}", characters[0]),
-        _ => format!(
-            "{}{}/{}{}",
-            characters[0], characters[1], characters[2], characters[3]
-        ),
+    Some(match characters.as_slice() {
+        [] => return None,
+        [_] => "1".to_string(),
+        [_, _] => "2".to_string(),
+        [first, _, _] => format!("3/{first}"),
+        [a, b, c, d, ..] => format!("{a}{b}/{c}{d}"),
     })
 }
 

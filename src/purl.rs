@@ -295,7 +295,7 @@ fn starts_with_digit(s: &str) -> bool {
 }
 
 /// A decoded, validated package URL with one canonical spelling.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Purl {
     #[serde(rename = "type")]
     typ: String,
@@ -314,7 +314,7 @@ pub struct Purl {
 ///
 /// This deliberately has public data fields; [`Purl::from_components`]
 /// validates them before producing the invariant-carrying type used by fetchers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PurlComponents {
     /// Registered or custom package type.
     #[serde(rename = "type")]
@@ -336,7 +336,8 @@ pub struct PurlComponents {
 }
 
 /// Why a PURL could not be constructed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
 pub enum PurlError {
     /// The generic ECMA-427 structure is malformed.
     #[error("invalid package URL syntax")]

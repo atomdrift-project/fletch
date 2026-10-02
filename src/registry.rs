@@ -53,7 +53,8 @@ use crate::purl::{Purl, PurlError};
 use filefacts::{RefLocator, Registry};
 
 /// Why a registry lookup produced no record.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
 pub enum RegistryError {
     /// The locator is a URL or a path, not a package URL.
     #[error("not a package URL")]
@@ -349,8 +350,11 @@ pub fn registry_with_sources(
 
 /// Split a PURL into `(type, name-path, version?)`: the normalized type and
 /// the percent-encoded coordinates (a scope is `%40`) the registry lookup keys
-/// on. Public so a consumer (the CLI's `purl` probe, cross-tool consistency
-/// checks against hopper's generator) can see exactly those coordinates.
+/// on.
+#[deprecated(
+    note = "use `Purl::parse`, whose `typ`, `encoded_path` and `encoded_version` name these \
+            coordinates and whose qualifiers this tuple drops"
+)]
 #[must_use]
 pub fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
     let purl = Purl::parse(purl).ok()?;
@@ -703,6 +707,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(deprecated, reason = "the deprecated helper keeps its own test")]
     fn parse_purl_tolerates_misplaced_version() {
         // Spec order: `@version` before `?qualifiers`.
         assert_eq!(
@@ -723,6 +728,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(deprecated, reason = "the deprecated helper keeps its own test")]
     fn parse_purl_canonicalizes_a_versionless_literal_npm_scope() {
         assert_eq!(
             parse_purl("pkg:npm/@scope/name"),
@@ -731,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(deprecated, reason = "the deprecated helper keeps its own test")]
     fn registry_parser_rejects_type_prohibited_namespaces() {
         for invalid in [
             "pkg:pypi/namespace/name@1",

@@ -27,6 +27,7 @@ use base64::Engine as _;
 use serde::Serialize;
 
 use fletch::fetch::{BlobCache, HttpFetch, RecordedSource};
+use fletch::purl::Purl;
 use fletch::{RefKind, RefLocator, Reference, Registry};
 
 /// The CLI envelope: the normalized record scan consumes, alongside the raw
@@ -95,7 +96,7 @@ fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("usage: fletch purl <purl> | fletch purl -"))?;
             if purl == "-" {
                 run_purl_batch()
-            } else if fletch::registry::parse_purl(&purl).is_none() {
+            } else if Purl::parse(&purl).is_err() {
                 // Exit `2` (empty stdout) for a string that isn't a PURL at
                 // all, so a caller can tell "not a purl" from a usage error.
                 std::process::exit(2);
@@ -185,7 +186,9 @@ fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
 /// absent when the corresponding read fails, so batch callers see one probe
 /// per input no matter how malformed the input is.
 fn probe_purl(purl: &str) -> PurlProbe {
-    let (typ, path, version) = fletch::registry::parse_purl(purl).unwrap_or_default();
+    let (typ, path, version) = Purl::parse(purl)
+        .map(|p| (p.typ().to_string(), p.encoded_path(), p.encoded_version()))
+        .unwrap_or_default();
     let cache = BlobCache::disabled();
     let locator = RefLocator::Purl(purl.to_string());
 

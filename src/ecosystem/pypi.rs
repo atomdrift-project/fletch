@@ -168,16 +168,16 @@ fn wheel_attributes(file_name: &str, name: &str, version: &str) -> BTreeMap<Stri
         .filter(|actual| actual.eq_ignore_ascii_case(&prefix))
         .and_then(|_| stem.get(prefix.len()..))
         .unwrap_or(stem);
+    // `[build-]python-abi-platform`.
     let parts: Vec<&str> = suffix.split('-').collect();
-    if parts.len() < 3 {
+    let [.., python, abi, platform] = parts.as_slice() else {
         return attributes;
-    }
-    let tag = parts.len() - 3;
-    attributes.insert("python".into(), parts[tag].to_string());
-    attributes.insert("abi".into(), parts[tag + 1].to_string());
-    attributes.insert("platform".into(), parts[tag + 2].to_string());
-    if parts.len() == 4 {
-        attributes.insert("build".into(), parts[0].to_string());
+    };
+    attributes.insert("python".into(), (*python).to_string());
+    attributes.insert("abi".into(), (*abi).to_string());
+    attributes.insert("platform".into(), (*platform).to_string());
+    if let [build, _, _, _] = parts.as_slice() {
+        attributes.insert("build".into(), (*build).to_string());
     }
     attributes
 }

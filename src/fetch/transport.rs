@@ -33,7 +33,8 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(600);
 /// What a [`Request`] does: a GET, which follows redirects, or a POST of a
 /// body, which does not (a redirected query endpoint is an error, not a silent
 /// re-POST to another host).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Method<'a> {
     /// Retrieve the resource.
     Get,
@@ -45,6 +46,7 @@ pub enum Method<'a> {
 /// One request to a [`Fetch`] backend: everything about it travels together,
 /// so a wrapping backend that forwards [`send`](Fetch::send) forwards it all.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Request<'a> {
     /// The URL to ask.
     pub url: &'a str,
@@ -133,7 +135,7 @@ pub trait Fetch {
 }
 
 /// A successful fetch with the provenance the transport observed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetched {
     /// The retrieved bytes.
     pub bytes: Vec<u8>,
@@ -148,8 +150,11 @@ pub struct Fetched {
 }
 
 /// Why a fetch produced no bytes.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, thiserror::Error, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FetchError {
     /// Refused before/at connect — SSRF guard, disallowed scheme, private
     /// host, too many redirects.
@@ -586,9 +591,10 @@ fn response_headers(resp: &reqwest::blocking::Response) -> Vec<(String, String)>
         .collect()
 }
 
-// Used as `map_err(map_send_err)`, so it must take the error by value even
-// though it only inspects it.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used as `map_err(map_send_err)`, which hands over the error by value"
+)]
 fn map_send_err(e: reqwest::Error) -> FetchError {
     // reqwest's own message stops at "error sending request for url (…)"; the
     // cause (the resolver's refusal, a DNS or TLS failure) is in the chain.

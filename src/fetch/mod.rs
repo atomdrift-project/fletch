@@ -63,7 +63,7 @@ use select::{
 use verify::{Digests, verify_pin, verify_purl_checksum};
 
 /// The terminal result of trying to fetch one reference.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     /// Fetched (or served from cache) and, if pinned, verified.
@@ -85,8 +85,9 @@ pub enum Outcome {
 }
 
 /// Why a reference resolved to no URL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Unresolved {
     /// The package URL does not parse.
     InvalidPurl,
@@ -103,7 +104,7 @@ pub enum Unresolved {
 }
 
 /// Where a record's bytes came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Served {
     /// Fetched over the network just now.
@@ -206,8 +207,22 @@ impl FetchRecord {
     /// Whether the bytes came from the blob cache, fresh or stale, rather than
     /// the network.
     #[must_use]
-    pub fn cached(&self) -> bool {
+    pub fn is_cached(&self) -> bool {
         matches!(self.served, Some(Served::Cache | Served::StaleCache))
+    }
+
+    /// Whether this record represents a live network fetch — so it counts
+    /// against the [`FetchBudget::max_count`] ceiling. A cache hit (fresh or
+    /// stale-served), an unresolved locator, a non-target, and a
+    /// budget-skipped edge do not count, so a re-run over a warm cache is never
+    /// throttled.
+    #[must_use]
+    pub fn counts_against_budget(&self) -> bool {
+        !self.is_cached()
+            && matches!(
+                self.outcome,
+                Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin | Outcome::Failed(_)
+            )
     }
 }
 
@@ -222,7 +237,10 @@ fn undefined_kind() -> RefKind {
 }
 
 /// `skip_serializing_if` helper: an unclassified kind carries no information.
-#[allow(clippy::trivially_copy_pass_by_ref)] // signature dictated by serde
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's `skip_serializing_if` passes a reference"
+)]
 fn kind_is_undefined(k: &RefKind) -> bool {
     *k == RefKind::Undefined
 }
@@ -234,19 +252,6 @@ pub fn fetch_ref(r: &Reference, net: &dyn Fetch, cache: &BlobCache) -> FetchReco
     let mut rec = fetch_ref_inner(r, net, cache, || true);
     rec.kind = r.kind;
     rec
-}
-
-/// Whether a record represents a live network fetch — so it counts against the
-/// [`FetchBudget::max_count`] ceiling. A cache hit (fresh or stale-served), an
-/// unresolved locator, a non-target, and a budget-skipped edge do not count, so
-/// a re-run over a warm cache is never throttled.
-#[must_use]
-pub fn counts_against_budget(rec: &FetchRecord) -> bool {
-    !rec.cached()
-        && matches!(
-            rec.outcome,
-            Outcome::Ok | Outcome::PinMismatch | Outcome::UnverifiablePin | Outcome::Failed(_)
-        )
 }
 
 /// [`fetch_ref`], with a `claim_fetch` gate consulted **only on a cache miss**,
@@ -322,15 +327,13 @@ fn fetch_and_record(
     let spool = cache.spool(&key);
     let fetched = if let Some(oci_ref) = url.strip_prefix("oci://") {
         if net.allows_oci() {
-            crate::oci::export(oci_ref)
-                .map(|(bytes, digest)| Fetched {
-                    bytes,
-                    final_url: url.clone(),
-                    status: 200,
-                    headers: vec![("docker-content-digest".to_string(), digest)],
-                    redirects: Vec::new(),
-                })
-                .map_err(FetchError::Transport)
+            crate::oci::export(oci_ref).map(|(bytes, digest)| Fetched {
+                bytes,
+                final_url: url.clone(),
+                status: 200,
+                headers: vec![("docker-content-digest".to_string(), digest)],
+                redirects: Vec::new(),
+            })
         } else {
             Err(FetchError::Refused(
                 "oci pull not permitted by this fetch backend".into(),
@@ -383,7 +386,7 @@ fn fetch_and_record(
 /// Per-run ceiling on fetching, so one analysis can't turn into a fetch
 /// storm. A manifest with thousands of deps fetches up to the cap; the rest
 /// are recorded as [`Outcome::BudgetExceeded`], never silently dropped.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FetchBudget {
     /// Maximum number of references to fetch.
     pub max_count: usize,
@@ -400,18 +403,29 @@ impl Default for FetchBudget {
             max_count: 512,
             // 5 GiB retrieved per whole run (every hop, every file) — the safety
             // ceiling against a crafted reference chain, not a per-fetch limit
-            // (that is `MAX_FETCH_BYTES`).
+            // (that is `HttpFetch::with_max_bytes`).
             max_bytes: 5 * 1024 * 1024 * 1024,
         }
     }
 }
 
+/// Whether a batch also fetches the URLs a script merely reaches for — a `curl`
+/// or `wget` target ([`RefKind::UrlFetch`]). Packages, and dependencies or
+/// commanded packages a manifest gives as a raw URL, are fetched either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UrlFetches {
+    /// Leave them unfetched.
+    Skip,
+    /// Fetch them too.
+    Include,
+}
+
 /// Fetch every selectable reference, in declaration order, under `budget`,
 /// returning one [`FetchRecord`] edge per attempt (including budget-skipped
 /// ones), each stamped with `source_sha256` (the file that declared the
-/// references) so it is a self-contained hash→hash edge. `fetch_urls` enables
-/// raw-URL targets; without it only registry packages (PURLs) are fetched.
-/// Identity references (a repository) are never fetched.
+/// references) so it is a self-contained hash→hash edge. `url_fetches` says
+/// whether a script's own URL fetches are among them. Identity references (a
+/// repository) are never fetched.
 ///
 /// Fetches run concurrently across a bounded pool of scoped threads; the
 /// returned order is always declaration order regardless of completion order.
@@ -427,7 +441,7 @@ impl Default for FetchBudget {
 pub fn fetch_references(
     refs: &[Reference],
     source_sha256: &str,
-    fetch_urls: bool,
+    url_fetches: UrlFetches,
     net: &(dyn Fetch + Sync),
     cache: &BlobCache,
     budget: FetchBudget,
@@ -435,7 +449,7 @@ pub fn fetch_references(
     fetch_references_with(
         refs,
         source_sha256,
-        fetch_urls,
+        url_fetches,
         net,
         cache,
         budget,
@@ -454,7 +468,7 @@ pub fn fetch_references(
 pub fn fetch_references_with(
     refs: &[Reference],
     source_sha256: &str,
-    fetch_urls: bool,
+    url_fetches: UrlFetches,
     net: &(dyn Fetch + Sync),
     cache: &BlobCache,
     budget: FetchBudget,
@@ -463,7 +477,7 @@ pub fn fetch_references_with(
     // Selectable references, in declaration order. Every target is visited; the
     // caps are enforced live below — the byte cap stops the sweep, the count cap
     // gates only *network* fetches (cache hits are always served, never counted).
-    let targets: Vec<&Reference> = refs.iter().filter(|r| selected(r, fetch_urls)).collect();
+    let targets: Vec<&Reference> = refs.iter().filter(|r| selected(r, url_fetches)).collect();
     let fetch_n = if budget.max_bytes == 0 {
         0
     } else {
@@ -588,14 +602,15 @@ pub fn fetch_references_with(
 /// dependencies that merely lack a package coordinate, so they follow the
 /// deps/packages policy the caller already applied by [`RefKind`]. Only an
 /// opportunistic [`RefKind::UrlFetch`] (a script's `curl`/`wget`) is gated
-/// behind `fetch_urls`. An intra-artifact path is resolved against sibling
+/// behind `url_fetches`. An intra-artifact path is resolved against sibling
 /// files, not fetched.
-fn selected(r: &Reference, fetch_urls: bool) -> bool {
+fn selected(r: &Reference, url_fetches: UrlFetches) -> bool {
     r.is_fetch_target()
         && match r.locator {
             RefLocator::Purl(_) => true,
             RefLocator::Url(_) => {
-                matches!(r.kind, RefKind::Dependency | RefKind::Command) || fetch_urls
+                matches!(r.kind, RefKind::Dependency | RefKind::Command)
+                    || url_fetches == UrlFetches::Include
             }
             RefLocator::Path(_) => false,
         }
@@ -1039,13 +1054,13 @@ pub fn prefer_lock_pin(reference: &Reference, lock: &[Reference]) -> Reference {
             }
         })
         .collect();
-    if matches.len() != 1 {
+    let [only] = matches.as_slice() else {
         return reference.clone();
-    }
+    };
     let mut resolved = reference.clone();
-    resolved.locator = matches[0].locator.clone();
-    resolved.pinned_hash = matches[0].pinned_hash.clone();
-    resolved.content_sha256 = matches[0].content_sha256.clone();
+    resolved.locator = only.locator.clone();
+    resolved.pinned_hash = only.pinned_hash.clone();
+    resolved.content_sha256 = only.content_sha256.clone();
     resolved
 }
 
@@ -2499,18 +2514,36 @@ mod tests {
 
         // A declared dependency or a commanded package expressed as a raw URL (a
         // PKGBUILD `source=()`, a lockfile URL entry) is a genuine fetch target
-        // regardless of `fetch_urls` — it follows the deps/packages policy.
-        assert!(selected(&with_kind(url(), RefKind::Dependency), false));
-        assert!(selected(&with_kind(url(), RefKind::Command), false));
+        // regardless of `url_fetches` — it follows the deps/packages policy.
+        assert!(selected(
+            &with_kind(url(), RefKind::Dependency),
+            UrlFetches::Skip
+        ));
+        assert!(selected(
+            &with_kind(url(), RefKind::Command),
+            UrlFetches::Skip
+        ));
 
         // An opportunistic URL fetch (a script's curl/wget) stays behind the flag.
-        assert!(!selected(&with_kind(url(), RefKind::UrlFetch), false));
-        assert!(selected(&with_kind(url(), RefKind::UrlFetch), true));
+        assert!(!selected(
+            &with_kind(url(), RefKind::UrlFetch),
+            UrlFetches::Skip
+        ));
+        assert!(selected(
+            &with_kind(url(), RefKind::UrlFetch),
+            UrlFetches::Include
+        ));
 
         // A package coordinate is always fetched; a repository is identity — its
         // non-fetch-target kind short-circuits `selected` before the locator.
-        assert!(selected(&with_kind(purl(), RefKind::Dependency), false));
-        assert!(!selected(&with_kind(url(), RefKind::Repository), true));
+        assert!(selected(
+            &with_kind(purl(), RefKind::Dependency),
+            UrlFetches::Skip
+        ));
+        assert!(!selected(
+            &with_kind(url(), RefKind::Repository),
+            UrlFetches::Include
+        ));
     }
 
     #[test]
@@ -2542,7 +2575,7 @@ mod tests {
         let rec = fetch_ref(&r, &net, &cache);
         assert_eq!(rec.outcome, Outcome::Ok);
         assert_eq!(rec.resolved_url.as_deref(), Some(url));
-        assert!(!rec.cached());
+        assert!(!rec.is_cached());
         assert_eq!(rec.size, Some(7));
         assert_eq!(
             rec.content_sha256.as_deref(),
@@ -2556,7 +2589,7 @@ mod tests {
 
         // Cache hit reconstructs headers + timestamp from the sidecar.
         let rec2 = fetch_ref(&r, &Fixtures::default(), &cache);
-        assert!(rec2.cached());
+        assert!(rec2.is_cached());
         assert_eq!(rec2.outcome, Outcome::Ok);
         assert_eq!(rec2.headers, rec.headers);
         assert_eq!(rec2.fetched_at, rec.fetched_at);
@@ -2643,7 +2676,7 @@ mod tests {
         let recs = fetch_references(
             &refs,
             "src",
-            true,
+            UrlFetches::Include,
             &net,
             &BlobCache::disabled(),
             FetchBudget::default(),
@@ -2666,7 +2699,7 @@ mod tests {
             fetch_references_with(
                 &refs,
                 "src",
-                true,
+                UrlFetches::Include,
                 &net,
                 &BlobCache::disabled(),
                 FetchBudget::default(),
@@ -2698,11 +2731,11 @@ mod tests {
             },
         ];
 
-        // Without fetch_urls: only the package (raw URL + repo excluded).
+        // Without URL fetches: only the package (raw URL + repo excluded).
         let recs = fetch_references(
             &refs,
             "trigsha",
-            false,
+            UrlFetches::Skip,
             &net,
             &cache,
             FetchBudget::default(),
@@ -2714,7 +2747,14 @@ mod tests {
         assert_eq!(recs[0].kind, RefKind::Dependency);
 
         // With fetch_urls: package + raw URL; the repository is never fetched.
-        let recs = fetch_references(&refs, "trigsha", true, &net, &cache, FetchBudget::default());
+        let recs = fetch_references(
+            &refs,
+            "trigsha",
+            UrlFetches::Include,
+            &net,
+            &cache,
+            FetchBudget::default(),
+        );
         assert_eq!(recs.len(), 2);
         // The raw URL's edge carries its own binding class, and it serializes
         // (`kind` is how a consumer distinguishes a pinned lockfile entry from
@@ -2738,7 +2778,7 @@ mod tests {
         let recs = fetch_references(
             &refs,
             "trigsha",
-            true,
+            UrlFetches::Include,
             &net,
             &cold_cache,
             FetchBudget {
@@ -2783,10 +2823,18 @@ mod tests {
         ];
 
         // Warm the cache with a generous budget: both are live fetches.
-        let warm = fetch_references(&refs, "s", true, &net, &cache, FetchBudget::default());
+        let warm = fetch_references(
+            &refs,
+            "s",
+            UrlFetches::Include,
+            &net,
+            &cache,
+            FetchBudget::default(),
+        );
         assert_eq!(warm.len(), 2);
         assert!(
-            warm.iter().all(|r| r.outcome == Outcome::Ok && !r.cached()),
+            warm.iter()
+                .all(|r| r.outcome == Outcome::Ok && !r.is_cached()),
             "cold run should fetch both live"
         );
 
@@ -2795,7 +2843,7 @@ mod tests {
         let warm = fetch_references(
             &refs,
             "s",
-            true,
+            UrlFetches::Include,
             &net,
             &cache,
             FetchBudget {
@@ -2805,7 +2853,7 @@ mod tests {
         );
         assert_eq!(
             warm.iter()
-                .filter(|r| r.cached() && r.outcome == Outcome::Ok)
+                .filter(|r| r.is_cached() && r.outcome == Outcome::Ok)
                 .count(),
             2,
             "a warm re-run is never throttled by the count budget"
@@ -2860,7 +2908,7 @@ mod tests {
             let recs = fetch_references(
                 &refs,
                 "sha",
-                false,
+                UrlFetches::Skip,
                 &net,
                 &cache,
                 FetchBudget {
@@ -2902,11 +2950,18 @@ mod tests {
             let (fx, refs) = numbered_npm_refs(n);
             // Warm the even-indexed refs into the cache with an unmetered run.
             let warm: Vec<Reference> = refs.iter().step_by(2).cloned().collect();
-            let warmed = fetch_references(&warm, "sha", false, &fx, &cache, FetchBudget::default());
+            let warmed = fetch_references(
+                &warm,
+                "sha",
+                UrlFetches::Skip,
+                &fx,
+                &cache,
+                FetchBudget::default(),
+            );
             assert!(
                 warmed
                     .iter()
-                    .all(|r| r.outcome == Outcome::Ok && !r.cached())
+                    .all(|r| r.outcome == Outcome::Ok && !r.is_cached())
             );
 
             let net = CountingFetch {
@@ -2916,7 +2971,7 @@ mod tests {
             let recs = fetch_references(
                 &refs,
                 "sha",
-                false,
+                UrlFetches::Skip,
                 &net,
                 &cache,
                 FetchBudget {
@@ -2929,7 +2984,7 @@ mod tests {
             // Every pre-cached (even) ref is served from cache, regardless of budget.
             for even in (0..n).step_by(2) {
                 assert!(
-                    recs[even].cached() && recs[even].outcome == Outcome::Ok,
+                    recs[even].is_cached() && recs[even].outcome == Outcome::Ok,
                     "attempt {attempt}: cached ref {even} should be served free"
                 );
             }
@@ -2956,7 +3011,14 @@ mod tests {
             net = net.with(&url, format!("PKG{i}").as_bytes());
             refs.push(dep(RefLocator::Purl(format!("pkg:npm/p{i}@1.0.0")), None));
         }
-        let recs = fetch_references(&refs, "sha", false, &net, &cache, FetchBudget::default());
+        let recs = fetch_references(
+            &refs,
+            "sha",
+            UrlFetches::Skip,
+            &net,
+            &cache,
+            FetchBudget::default(),
+        );
         assert_eq!(recs.len(), n);
         for (i, rec) in recs.iter().enumerate() {
             assert_eq!(rec.locator, format!("pkg:npm/p{i}@1.0.0"));
@@ -2985,7 +3047,7 @@ mod tests {
 
         // Populate the cache with a working fetch.
         let ok = Fixtures::default().with(url, b"CACHED");
-        assert!(!fetch_ref(&r, &ok, &cache).cached());
+        assert!(!fetch_ref(&r, &ok, &cache).is_cached());
 
         // Age the entry past the 12h unpinned TTL by backdating the recorded
         // fetch time — freshness is measured from `fetched_at`, not the file
@@ -3000,7 +3062,7 @@ mod tests {
         // The source is now unreachable (no fixture): serve the stale copy.
         let rec = fetch_ref(&r, &Fixtures::default(), &cache);
         assert_eq!(rec.outcome, Outcome::Ok);
-        assert!(rec.cached());
+        assert!(rec.is_cached());
         assert_eq!(rec.served, Some(Served::StaleCache));
         assert_eq!(rec.content_sha256.as_deref(), Some(&*sha256_hex(b"CACHED")));
 

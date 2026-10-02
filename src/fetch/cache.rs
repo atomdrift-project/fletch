@@ -95,7 +95,7 @@ impl CachedMeta {
 /// [`BlobCache`] — the verbatim bytes plus the transport facts (`status`,
 /// `content_type`) observed when they were first fetched. The re-parsing backup a
 /// consumer archives alongside the normalized record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedSource {
     /// The URL the document was fetched from.
     pub url: String,
@@ -163,9 +163,9 @@ impl BlobCache {
 
     /// Open a cache rooted at an explicit directory (created on first write).
     #[must_use]
-    pub fn with_dir(dir: PathBuf) -> Self {
+    pub fn with_dir(dir: impl Into<PathBuf>) -> Self {
         Self {
-            dir,
+            dir: dir.into(),
             enabled: true,
             meta_ttl: TTL_PINNED,
             recorder: None,

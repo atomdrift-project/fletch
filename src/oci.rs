@@ -18,6 +18,7 @@
 //!   the same reason a layer naming foreign `urls` is refused: oci-client
 //!   falls back to fetching those from any host when the registry fails.
 
+use crate::fetch::FetchError;
 use std::collections::HashSet;
 use std::io::{Cursor, Read, Write};
 use std::pin::Pin;
@@ -85,7 +86,7 @@ const PULL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// `resolve_purl`'s `oci://` pseudo-URL) and export the flattened rootfs as an
 /// xz-compressed tar. Returns the bytes and the image's manifest digest — the
 /// content-addressed identity that is stable across implementations.
-pub(crate) fn export(reference: &str) -> Result<(Vec<u8>, String), String> {
+pub(crate) fn export(reference: &str) -> Result<(Vec<u8>, String), FetchError> {
     let (layers, digest) = pull(reference)?;
     let layers = decompress_all(layers, MAX_EXPORT_BYTES)?;
     let tar_xz = flatten_to_tar_xz(&layers)?;
@@ -102,14 +103,14 @@ pub(crate) fn export(reference: &str) -> Result<(Vec<u8>, String), String> {
 /// per layer, so a small download becomes an arbitrarily large allocation. The
 /// running total is checked as each layer lands, so an oversized image is
 /// refused partway through rather than after it is all in memory.
-fn decompress_all(layers: Vec<ImageLayer>, cap: u64) -> Result<Vec<Vec<u8>>, String> {
+fn decompress_all(layers: Vec<ImageLayer>, cap: u64) -> Result<Vec<Vec<u8>>, FetchError> {
     let mut total: u64 = 0;
     let mut out = Vec::with_capacity(layers.len());
     for layer in layers {
         let bytes = decompress(layer, cap)?;
         total = total.saturating_add(bytes.len() as u64);
         if total > cap {
-            return Err("image layers exceed the export size cap".into());
+            return Err(FetchError::TooLarge);
         }
         out.push(bytes);
     }
@@ -120,13 +121,15 @@ fn decompress_all(layers: Vec<ImageLayer>, cap: u64) -> Result<Vec<Vec<u8>>, Str
 /// go-containerregistry's crane resolves, so both exporters flatten the same
 /// per-platform manifest of a multi-arch index. Returns the layers in manifest
 /// (base → top) order, which the flatten depends on, and the manifest digest.
-fn pull(reference: &str) -> Result<(Vec<ImageLayer>, String), String> {
+fn pull(reference: &str) -> Result<(Vec<ImageLayer>, String), FetchError> {
     let re: Reference = reference
         .parse()
-        .map_err(|e| format!("bad OCI reference {reference:?}: {e}"))?;
+        .map_err(|e| FetchError::Refused(format!("bad OCI reference {reference:?}: {e}")))?;
     let registry = re.resolve_registry();
     if !ALLOWED_REGISTRIES.contains(&registry) {
-        return Err(format!("registry {registry:?} not in the public allowlist"));
+        return Err(FetchError::Refused(format!(
+            "registry {registry:?} not in the public allowlist"
+        )));
     }
     // Built inside the runtime: the deadline's timer registers on creation.
     block_on_isolated(|| async {
@@ -138,15 +141,14 @@ fn pull(reference: &str) -> Result<(Vec<ImageLayer>, String), String> {
         });
         tokio::time::timeout(PULL_DEADLINE, pull_layers(&client, &re)).await
     })?
-    .map_err(|e| format!("pull {reference}: {e}"))?
-    .map_err(|e| format!("pull {reference}: {e}"))
+    .map_err(|_elapsed| FetchError::Timeout)?
 }
 
 /// Run the future `make` builds on a fresh current-thread runtime, in a thread
 /// of its own. [`export`] is reached through the sync, public fetch API, so its
 /// caller may already be driving a tokio runtime on this thread, where
 /// `block_on` (and dropping a runtime) panics; a dedicated thread never is.
-fn block_on_isolated<F: Future>(make: impl FnOnce() -> F + Send) -> Result<F::Output, String>
+fn block_on_isolated<F: Future>(make: impl FnOnce() -> F + Send) -> Result<F::Output, FetchError>
 where
     F::Output: Send,
 {
@@ -156,7 +158,7 @@ where
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| format!("tokio runtime: {e}"))?;
+                    .map_err(|e| FetchError::Transport(format!("tokio runtime: {e}")))?;
                 Ok(rt.block_on(make()))
             })
             .join()
@@ -171,11 +173,14 @@ where
 /// size or count check could run; it falls back to a descriptor's foreign
 /// `urls`, outside the registry allowlist; and it collects layers in
 /// completion order, where the flatten needs manifest order.
-async fn pull_layers(client: &Client, re: &Reference) -> Result<(Vec<ImageLayer>, String), String> {
+async fn pull_layers(
+    client: &Client,
+    re: &Reference,
+) -> Result<(Vec<ImageLayer>, String), FetchError> {
     let (manifest, digest) = client
         .pull_image_manifest(re, &RegistryAuth::Anonymous)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| FetchError::Transport(format!("pull {re}: {e}")))?;
     vet_layers(&manifest.layers, MAX_EXPORT_BYTES)?;
     let layers = futures_util::stream::iter(&manifest.layers)
         .map(|desc| async move {
@@ -183,11 +188,10 @@ async fn pull_layers(client: &Client, re: &Reference) -> Result<(Vec<ImageLayer>
                 buf: Vec::new(),
                 limit: u64::try_from(desc.size).unwrap_or(0),
             };
-            client
-                .pull_blob(re, desc, &mut sink)
-                .await
-                .map_err(|e| format!("layer {}: {e}", desc.digest))?;
-            Ok::<_, String>(ImageLayer::new(
+            client.pull_blob(re, desc, &mut sink).await.map_err(|e| {
+                FetchError::Transport(format!("pull {re} layer {}: {e}", desc.digest))
+            })?;
+            Ok::<_, FetchError>(ImageLayer::new(
                 sink.buf,
                 desc.media_type.clone(),
                 desc.annotations.clone(),
@@ -203,35 +207,34 @@ async fn pull_layers(client: &Client, re: &Reference) -> Result<(Vec<ImageLayer>
 /// [`MAX_LAYERS`], a media type [`decompress`] can't handle, a foreign `urls`
 /// fallback, or declared sizes that are negative or sum past `cap`. The sizes
 /// are then enforced on the bytes actually received by [`LayerSink`].
-fn vet_layers(layers: &[OciDescriptor], cap: u64) -> Result<(), String> {
+fn vet_layers(layers: &[OciDescriptor], cap: u64) -> Result<(), FetchError> {
     if layers.is_empty() {
-        return Err("image has no layers".into());
+        return Err(FetchError::Refused("image has no layers".into()));
     }
     if layers.len() > MAX_LAYERS {
-        return Err(format!(
-            "image declares {} layers, over the {MAX_LAYERS} ceiling",
-            layers.len()
-        ));
+        return Err(FetchError::TooLarge);
     }
     let mut total: u64 = 0;
     for layer in layers {
         if !ACCEPTED_LAYER_TYPES.contains(&layer.media_type.as_str()) {
-            return Err(format!(
+            return Err(FetchError::Refused(format!(
                 "unsupported layer media type {:?}",
                 layer.media_type
-            ));
+            )));
         }
         if layer.urls.as_ref().is_some_and(|urls| !urls.is_empty()) {
-            return Err(format!("layer {} names foreign urls", layer.digest));
+            return Err(FetchError::Refused(format!(
+                "layer {} names foreign urls",
+                layer.digest
+            )));
         }
-        let size = u64::try_from(layer.size)
-            .map_err(|e| format!("layer {} size {}: {e}", layer.digest, layer.size))?;
+        let size = u64::try_from(layer.size).map_err(|e| {
+            FetchError::Refused(format!("layer {} size {}: {e}", layer.digest, layer.size))
+        })?;
         total = total.saturating_add(size);
     }
     if total > cap {
-        return Err(format!(
-            "image layers declare {total} bytes, over the {cap}-byte pull cap"
-        ));
+        return Err(FetchError::TooLarge);
     }
     Ok(())
 }
@@ -271,24 +274,24 @@ impl tokio::io::AsyncWrite for LayerSink {
 /// Decode one layer blob to its plain tar bytes, by media-type suffix, reading
 /// one byte past `cap` so an over-cap layer is rejected rather than truncated
 /// into a tar that would parse as something else.
-fn decompress(layer: ImageLayer, cap: u64) -> Result<Vec<u8>, String> {
+fn decompress(layer: ImageLayer, cap: u64) -> Result<Vec<u8>, FetchError> {
     let mut out = Vec::new();
     if layer.media_type.ends_with("gzip") {
         flate2::read::MultiGzDecoder::new(Cursor::new(&layer.data))
-            .take(cap + 1)
+            .take(cap.saturating_add(1))
             .read_to_end(&mut out)
     } else if layer.media_type.ends_with("zstd") {
         zstd::stream::read::Decoder::new(Cursor::new(&layer.data))
-            .map_err(|e| format!("zstd: {e}"))?
-            .take(cap + 1)
+            .map_err(|e| FetchError::Transport(format!("zstd: {e}")))?
+            .take(cap.saturating_add(1))
             .read_to_end(&mut out)
     } else {
         // Already a plain tar: hand the buffer on rather than copying it.
         return Ok(layer.data.into());
     }
-    .map_err(|e| format!("decompress layer ({}): {e}", layer.media_type))?;
+    .map_err(|e| FetchError::Transport(format!("decompress layer ({}): {e}", layer.media_type)))?;
     if out.len() as u64 > cap {
-        return Err("layer exceeds the export size cap".into());
+        return Err(FetchError::TooLarge);
     }
     Ok(out)
 }
@@ -303,7 +306,7 @@ fn decompress(layer: ImageLayer, cap: u64) -> Result<Vec<u8>, String> {
 /// (`.wh..wh..opq`, hiding a directory's lower-layer *contents* while keeping
 /// the directory) is honored per spec, which crane's Extract famously is not —
 /// spec correctness wins over bug parity, and identity is digest-based anyway.
-fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, FetchError> {
     let xz = xz2::write::XzEncoder::new(Vec::new(), 6);
     let mut builder = tar::Builder::new(LimitWriter {
         w: xz,
@@ -330,8 +333,11 @@ fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, String> {
         let mut layer_opaque: HashSet<Vec<u8>> = HashSet::new();
         let mut archive = tar::Archive::new(Cursor::new(layer.as_slice()));
         archive.set_ignore_zeros(true);
-        for entry in archive.entries().map_err(|e| format!("layer tar: {e}"))? {
-            let entry = entry.map_err(|e| format!("layer tar: {e}"))?;
+        for entry in archive
+            .entries()
+            .map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?
+        {
+            let entry = entry.map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?;
             let path = clean_path(&entry.path_bytes());
             let (dir, base) = split_dir_base(&path);
             if base == b".wh..wh..opq" {
@@ -344,8 +350,11 @@ fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, String> {
         // Pass 2: emit entries not shadowed by HIGHER layers.
         let mut archive = tar::Archive::new(Cursor::new(layer.as_slice()));
         archive.set_ignore_zeros(true);
-        for entry in archive.entries().map_err(|e| format!("layer tar: {e}"))? {
-            let mut entry = entry.map_err(|e| format!("layer tar: {e}"))?;
+        for entry in archive
+            .entries()
+            .map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?
+        {
+            let mut entry = entry.map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?;
             let path = clean_path(&entry.path_bytes());
             // An entry that cleans away to nothing names the archive root
             // itself (`./`, `.`, `/`, `..`). It carries no content, and
@@ -373,8 +382,11 @@ fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, String> {
 
     let limit = builder
         .into_inner()
-        .map_err(|e| format!("finish tar: {e}"))?;
-    limit.w.finish().map_err(|e| format!("finish xz: {e}"))
+        .map_err(|e| FetchError::Transport(format!("finish tar: {e}")))?;
+    limit
+        .w
+        .finish()
+        .map_err(|e| FetchError::Transport(format!("finish xz: {e}")))
 }
 
 /// Copy one tar entry (header, path, link target, body) into the output,
@@ -393,13 +405,13 @@ fn append_entry<W: Write>(
     builder: &mut tar::Builder<W>,
     entry: &mut tar::Entry<'_, Cursor<&[u8]>>,
     path: &[u8],
-) -> Result<(), String> {
+) -> Result<(), FetchError> {
     let mut header = entry.header().clone();
     let kind = header.entry_type();
     if kind.is_symlink() || kind.is_hard_link() {
         let mut target = entry
             .link_name_bytes()
-            .ok_or_else(|| "link entry without target".to_string())?
+            .ok_or_else(|| FetchError::Refused("link entry without target".into()))?
             .into_owned();
         if kind.is_hard_link() {
             target = clean_path(&target);
@@ -409,11 +421,11 @@ fn append_entry<W: Write>(
         }
         builder
             .append_link(&mut header, bytes_path(path), bytes_path(&target))
-            .map_err(|e| format!("append link: {e}"))
+            .map_err(|e| FetchError::Transport(format!("append link: {e}")))
     } else {
         builder
             .append_data(&mut header, bytes_path(path), entry)
-            .map_err(|e| format!("append entry: {e}"))
+            .map_err(|e| FetchError::Transport(format!("append entry: {e}")))
     }
 }
 
@@ -667,7 +679,7 @@ mod tests {
 
         let over = decompress_all(vec![raw_layer(40), raw_layer(40), raw_layer(40)], 100);
         assert!(
-            over.is_err_and(|e| e.contains("exceed the export size cap")),
+            matches!(over, Err(FetchError::TooLarge)),
             "120 bytes must not pass a 100-byte cap"
         );
     }
@@ -694,7 +706,10 @@ mod tests {
         // never catch this — only the count can, and before any blob request.
         let many: Vec<OciDescriptor> = (0..=MAX_LAYERS).map(|_| desc(0)).collect();
         assert!(
-            vet_layers(&many, MAX_EXPORT_BYTES).is_err_and(|e| e.contains("layers")),
+            matches!(
+                vet_layers(&many, MAX_EXPORT_BYTES),
+                Err(FetchError::TooLarge)
+            ),
             "a manifest over the layer ceiling must be refused"
         );
         assert!(vet_layers(&many[..MAX_LAYERS], MAX_EXPORT_BYTES).is_ok());
@@ -713,13 +728,17 @@ mod tests {
             urls: Some(vec!["https://169.254.169.254/latest".into()]),
             ..desc(1)
         };
-        assert!(vet_layers(&[foreign], 100).is_err_and(|e| e.contains("foreign")));
+        assert!(
+            matches!(vet_layers(&[foreign], 100), Err(FetchError::Refused(why)) if why.contains("foreign"))
+        );
         // As are the layer types that exist to use that fallback.
         let nondistributable = OciDescriptor {
             media_type: oci_client::manifest::IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE.into(),
             ..desc(1)
         };
-        assert!(vet_layers(&[nondistributable], 100).is_err_and(|e| e.contains("media type")));
+        assert!(
+            matches!(vet_layers(&[nondistributable], 100), Err(FetchError::Refused(why)) if why.contains("media type"))
+        );
     }
 
     #[test]
@@ -922,6 +941,9 @@ mod tests {
         let Err(err) = pull("internal.corp:5000/secret/image:latest") else {
             panic!("pull of a non-allowlisted registry must fail");
         };
-        assert!(err.contains("not in the public allowlist"), "{err}");
+        assert!(
+            matches!(&err, FetchError::Refused(why) if why.contains("not in the public allowlist")),
+            "{err}"
+        );
     }
 }
