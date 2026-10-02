@@ -103,8 +103,9 @@ mod metadata_tests {
     #[test]
     fn checksum_metadata_and_conflicts_survive_discovery() {
         let bytes = b"example.test/m v1.0.0/go.mod h1:METADATA\nexample.test/m v1.0.0 h1:ONE\nexample.test/m v1.0.0 h1:TWO\n";
-        let parsed = filefacts::open_with_path(std::path::Path::new("go.sum"), bytes)
-            .unwrap_or_else(|error| panic!("test input must parse: {error}"));
+        let parsed = filefacts::OpenOptions::new()
+            .path(std::path::Path::new("go.sum"))
+            .open(bytes);
         for refs in [
             super::references(&parsed),
             super::references_from_facts(parsed.values().as_json(), parsed.references()),
@@ -117,14 +118,14 @@ mod metadata_tests {
 
 /// Discover references in raw bytes: open them with filefacts and run
 /// [`references`]. For callers that hold bytes rather than a parsed file (e.g.
-/// a root sample on disk). Returns an empty list when filefacts can't parse the
-/// input — discovery is best-effort, never an error.
+/// a root sample on disk).
 #[must_use]
 pub fn references_in_bytes(data: &[u8], filename: &str) -> Vec<Reference> {
-    match filefacts::open_with_path(std::path::Path::new(filename), data) {
-        Ok(parsed) => references(&parsed),
-        Err(_) => Vec::new(),
-    }
+    references(
+        &filefacts::OpenOptions::new()
+            .path(std::path::Path::new(filename))
+            .open(data),
+    )
 }
 
 /// Module-load calls recovered from a file's retained AST call symbols — the
