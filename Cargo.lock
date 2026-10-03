@@ -816,7 +816,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#028a20d62ab69ce46147b0240a8a178a76fdffff"
+source = "git+https://github.com/atomdrift-project/filefacts.git#167b3eb372f4c9246ef84600bb5f57232ba9261c"
 dependencies = [
  "aho-corasick",
  "cab",
@@ -3394,7 +3394,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#028a20d62ab69ce46147b0240a8a178a76fdffff"
+source = "git+https://github.com/atomdrift-project/filefacts.git#167b3eb372f4c9246ef84600bb5f57232ba9261c"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -3685,9 +3685,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.26.1"
+version = "1.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
+checksum = "97277d36b9c3ace13e58fa6e753f8b0bbbf302a18dd193240d70f9e29681059a"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
