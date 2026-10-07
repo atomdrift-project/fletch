@@ -178,6 +178,49 @@ pub enum FetchError {
     Internal(String),
 }
 
+impl FetchError {
+    /// Whether a later fetch pass may succeed without changing the reference.
+    /// Policy refusals, ordinary HTTP errors and integrity failures are not
+    /// transient. Transport failures remain visible after retries are spent.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout | Self::Transport(_) | Self::Status(408 | 429 | 500 | 502 | 503 | 504)
+        )
+    }
+}
+
+/// Retry connection establishment for GET only, before any body or spool file
+/// exists. The caller classifies reqwest errors, retaining SSRF refusals.
+fn retry_get_send<T>(
+    deadline: Instant,
+    mut send: impl FnMut() -> Result<T, (FetchError, bool)>,
+    mut pause: impl FnMut(Duration),
+) -> Result<T, FetchError> {
+    for attempt in 0..=2 {
+        if Instant::now() >= deadline {
+            return Err(FetchError::Timeout);
+        }
+        match send() {
+            Ok(value) => return Ok(value),
+            Err((error, retry)) => {
+                if !retry || !error.is_retryable() || attempt == 2 {
+                    return Err(error);
+                }
+                let delay = Duration::from_millis(250 << attempt);
+                if deadline.saturating_duration_since(Instant::now()) <= delay {
+                    return Err(FetchError::Timeout);
+                }
+                pause(delay);
+            }
+        }
+    }
+    Err(FetchError::Internal(
+        "retry loop exhausted without an outcome".into(),
+    ))
+}
+
 /// The real network backend: an HTTPS client whose DNS resolver enforces the
 /// SSRF floor. Redirects are followed manually so every hop is re-checked
 /// for scheme and the chain is recorded; the response is size-capped.
@@ -356,10 +399,32 @@ impl HttpFetch {
             if let Some(token) = self.token_for(&host, headers) {
                 req = req.bearer_auth(token);
             }
-            let resp = req.send().map_err(map_send_err)?;
+            let resp = retry_get_send(
+                deadline,
+                || {
+                    let request = req.try_clone().ok_or_else(|| {
+                        (
+                            FetchError::Internal("GET request cannot be cloned".into()),
+                            false,
+                        )
+                    })?;
+                    request
+                        .timeout(
+                            deadline
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_secs(30)),
+                        )
+                        .send()
+                        .map_err(|error| {
+                            let retry = error.is_connect() || error.is_timeout();
+                            (map_send_err(error), retry)
+                        })
+                },
+                std::thread::sleep,
+            )?;
             let status = resp.status();
 
-            if let Some(delay) = back_off_delay(status, resp.headers(), waits) {
+            if let Some(delay) = get_back_off_delay(status, resp.headers(), waits) {
                 self.backoff.hold(&host, delay, status.as_u16());
                 if waits < BACKOFF_RETRIES && delay <= MAX_BACKOFF_WAIT {
                     waits += 1;
@@ -546,6 +611,17 @@ impl Backoff {
 /// throttled (a `403` with `x-ratelimit-remaining: 0`, reset at
 /// `x-ratelimit-reset`, or with `Retry-After`). A `429` that names no time
 /// backs off 1 s, 2 s, 4 s.
+fn get_back_off_delay(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    waits: u32,
+) -> Option<Duration> {
+    back_off_delay(status, headers, waits).or_else(|| {
+        matches!(status.as_u16(), 408 | 500 | 502 | 503 | 504)
+            .then(|| Duration::from_secs(1 << waits.min(5)))
+    })
+}
+
 fn back_off_delay(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
@@ -607,10 +683,10 @@ fn map_send_err(e: reqwest::Error) -> FetchError {
         message.push_str(&cause.to_string());
         source = cause.source();
     }
-    if e.is_timeout() {
-        FetchError::Timeout
-    } else if refused {
+    if refused {
         FetchError::Refused(message)
+    } else if e.is_timeout() {
+        FetchError::Timeout
     } else {
         FetchError::Transport(message)
     }
@@ -848,6 +924,103 @@ mod tests {
             assert!(
                 forward_header(name, false),
                 "{name} must survive a redirect"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    #[test]
+    fn transient_get_succeeds_after_bounded_backoff() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let result = retry_get_send(
+            Instant::now() + Duration::from_secs(10),
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err((FetchError::Transport("DNS unavailable".into()), true))
+                } else {
+                    Ok(42)
+                }
+            },
+            |delay| delays.push(delay),
+        );
+        assert_eq!(result, Ok(42));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            delays,
+            vec![Duration::from_millis(250), Duration::from_millis(500)]
+        );
+    }
+    #[test]
+    fn persistent_failure_is_returned_after_three_attempts() {
+        let mut attempts = 0;
+        let error = FetchError::Timeout;
+        let result: Result<(), _> = retry_get_send(
+            Instant::now() + Duration::from_secs(10),
+            || {
+                attempts += 1;
+                Err((error.clone(), true))
+            },
+            |_| {},
+        );
+        assert_eq!(result, Err(error));
+        assert_eq!(attempts, 3);
+    }
+    #[test]
+    fn policy_refusal_and_nonconnection_errors_are_never_retried() {
+        for (error, retry) in [
+            (FetchError::Refused("private address".into()), true),
+            (FetchError::TooLarge, true),
+            (FetchError::Status(404), true),
+            (FetchError::Internal("parser".into()), true),
+            (FetchError::Transport("invalid header".into()), false),
+        ] {
+            let mut attempts = 0;
+            let result: Result<(), _> = retry_get_send(
+                Instant::now() + Duration::from_secs(10),
+                || {
+                    attempts += 1;
+                    Err((error.clone(), retry))
+                },
+                |_| panic!("must not sleep"),
+            );
+            assert_eq!(result, Err(error));
+            assert_eq!(attempts, 1);
+        }
+    }
+    #[test]
+    fn retry_wait_cannot_exceed_deadline() {
+        let result: Result<(), _> = retry_get_send(
+            Instant::now() + Duration::from_millis(20),
+            || Err((FetchError::Timeout, true)),
+            |_| panic!("must not sleep"),
+        );
+        assert_eq!(result, Err(FetchError::Timeout));
+        let result: Result<(), _> =
+            retry_get_send(Instant::now(), || panic!("must not send"), |_| {});
+        assert_eq!(result, Err(FetchError::Timeout));
+    }
+    #[test]
+    fn extra_server_retries_are_get_only_and_honor_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for code in [408, 500, 502, 503, 504] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert!(get_back_off_delay(status, &headers, 0).is_some());
+            assert!(back_off_delay(status, &headers, 0).is_none());
+        }
+        headers.insert("retry-after", "5".parse().unwrap());
+        assert_eq!(
+            get_back_off_delay(reqwest::StatusCode::SERVICE_UNAVAILABLE, &headers, 0),
+            Some(Duration::from_secs(5))
+        );
+        for code in [400, 401, 404] {
+            assert!(
+                get_back_off_delay(reqwest::StatusCode::from_u16(code).unwrap(), &headers, 0)
+                    .is_none()
             );
         }
     }

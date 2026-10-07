@@ -33,9 +33,9 @@ pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
         FileType::Shell => scan_shell(found.text, "shell", &mut found),
         FileType::Dockerfile => scan_shell(found.text, "dockerfile", &mut found),
         FileType::JavaScript | FileType::TypeScript => {
-            scan_source(found.text, "javascript", &mut found);
+            scan_source(parsed, "javascript", &mut found);
         }
-        FileType::Python => scan_source(found.text, "python", &mut found),
+        FileType::Python => scan_source(parsed, "python", &mut found),
         FileType::PowerShell => scan_powershell(found.text, "powershell", &mut found),
         _ => {}
     }
@@ -92,7 +92,11 @@ fn dedup(refs: &mut Vec<Reference>) {
         if r.kind == RefKind::Undefined {
             return true;
         }
-        seen.insert(crate::fetch::locator_str(&r.locator).to_owned())
+        seen.insert((
+            crate::fetch::locator_str(&r.locator).to_owned(),
+            r.pinned_hash.clone(),
+            r.context.clone(),
+        ))
     });
 }
 
@@ -343,32 +347,279 @@ fn npm_scripts(values: &serde_json::Value, out: &mut Found<'_>) {
                 cmd,
             );
         }
+        let start = out.refs.len();
         commands(cmd, None, &source, out);
+        for reference in &mut out.refs[start..] {
+            reference.context = Some(filefacts::DependencyContext {
+                scope: filefacts::DependencyScope::Build,
+                optional: false,
+                has_install_script: true,
+                installed_path: None,
+            });
+        }
     }
 }
 
-/// Scan a JavaScript/TypeScript/Python source body for package-manager
-/// invocations expressed in *code* rather than on a shell line: a programmatic
-/// install API (`npm().install("pkg", …)`), a list-form subprocess install
-/// (`subprocess.run(["pip", "install", "pkg"])`), or a command embedded in a
-/// string. Replacing source punctuation *outside string literals* with spaces
-/// collapses all of these to the same `<pm> install <pkg>` token stream the
-/// shell recognizer consumes — so `npm().install("pkg")` and
-/// `["pip","install","pkg"]` both fall out. Punctuation inside a literal is
-/// package data and stays intact (`github.com/mod@v1.2.3`, for example).
-///
-/// A bare `obj.install(plugin)` (a DI/plugin call) stays invisible: with no
-/// package-manager keyword as the leading token, `match_pm` never fires. This
-/// is what turns a covert installer's own `npm`-aliasing disguise into the
-/// detection hook, and lets the caller diff the hunted package against the
-/// manifest's declared dependencies to surface an undeclared runtime install.
-fn scan_source(text: Option<&str>, source: &str, out: &mut Found<'_>) {
-    let Some(text) = text else {
+/// Hunt commands only inside actual process or package installation calls.
+/// A comment, documentation string, or unrelated string is never a call node.
+fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
+    let Some(ast) = parsed.source_ast() else {
+        if let Some(text) = out.text {
+            git_refs(text, source, out);
+            urls(text, source, out);
+        }
         return;
     };
+    let text = ast.source;
+    let bindings = js_import_bindings(parsed);
+    let mut stack = vec![ast.tree.root_node()];
+    let mut remaining = 100_000usize;
+    let mut calls = Vec::new();
+    let mut comments = Vec::new();
+    while let Some(node) = stack.pop() {
+        if remaining == 0 {
+            break;
+        }
+        remaining -= 1;
+        if node.kind() == "comment" {
+            comments.push(node.byte_range());
+        }
+        if matches!(node.kind(), "call" | "call_expression")
+            && let Some(function) = node.child_by_field_name("function")
+            && let Some(arguments) = node.child_by_field_name("arguments")
+            && let Some(callee) = text.get(function.byte_range())
+        {
+            let compact: String = callee.chars().filter(|c| !c.is_whitespace()).collect();
+            let original = compact.clone();
+            let (head, tail) = compact.split_once('.').unwrap_or((&compact, ""));
+            let compact = if let Some(binding) = bindings.get(head) {
+                if tail.is_empty() { binding.clone() } else { format!("{binding}.{tail}") }
+            } else { resolve_import_alias(&compact, parsed.symbols().as_slice()) };
+            let eco = match (source, compact.as_str()) {
+                ("javascript" | "typescript", "import" | "require") => Some("npm"),
+                ("python", "__import__" | "import_module" | "importlib.import_module") => {
+                    Some("pypi")
+                }
+                _ => None,
+            };
+            let mut cursor = arguments.walk();
+            if let Some(eco) = eco
+                && let Some(argument) = arguments
+                    .named_children(&mut cursor)
+                    .find(|arg| arg.kind() != "comment")
+                && matches!(argument.kind(), "string" | "template_string")
+                && let Some(raw) = text.get(argument.byte_range())
+                && let Some(spec) = literal_specifier(raw)
+                && let Some((locator, kind)) = import_locator(eco, spec)
+            {
+                out.push_at(
+                    locator,
+                    kind,
+                    "ast-call",
+                    spec.to_owned(),
+                    Some(node.start_byte() as u64),
+                );
+            }
+            let process = execution_call(source, &compact);
+            let installer = installation_call(source, &compact);
+            if process || installer {
+                // Only the executable/argv arguments belong to a process
+                // command. Environment, cwd, callbacks and later source text
+                // must not become packages. Installer options are bounded by
+                // this call's argument list and the existing object boundary.
+                let count = if process
+                    && matches!(
+                        compact.rsplit('.').next(),
+                        Some(
+                            "spawn"
+                                | "spawnSync"
+                                | "execFile"
+                                | "execFileSync"
+                                | "execa"
+                                | "execaSync"
+                        )
+                    ) {
+                    2
+                } else {
+                    1
+                };
+                let mut end = arguments.start_byte();
+                let mut cursor = arguments.walk();
+                for arg in arguments
+                    .named_children(&mut cursor)
+                    .filter(|a| a.kind() != "comment")
+                    .take(count)
+                {
+                    end = arg.end_byte();
+                }
+                if end > arguments.start_byte()
+                    && let Some(span) = text.get(node.start_byte()..end)
+                {
+                    let prefix = (installer && !installation_call(source, &original))
+                        .then(|| (compact.clone(), arguments.start_byte() - node.start_byte()));
+                    calls.push((span, node.start_byte(), prefix));
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor).take(remaining));
+    }
+    comments.sort_by_key(|range| range.start);
+    for (span, base, prefix) in calls {
+        let mut masked = span.as_bytes().to_vec();
+        let first = comments.partition_point(|range| range.end <= base);
+        for range in comments[first..]
+            .iter()
+            .take_while(|range| range.start < base + span.len())
+        {
+            let start = range.start.saturating_sub(base);
+            let end = (range.end - base).min(span.len());
+            masked[start..end].fill(b' ');
+        }
+        let Ok(masked) = String::from_utf8(masked) else {
+            continue;
+        };
+        let (normalized, remap) = if let Some((callee, arguments)) = prefix {
+            let (arguments_text, arguments_remap) = normalize_call(&masked[arguments..], base + arguments);
+            let prefix = callee.replace(['.', '(', ')'], " ");
+            let prefix = format!("{prefix} ");
+            let mut remap = vec![(0, base)];
+            remap.extend(arguments_remap.into_iter().map(|(copy, source)| (copy + prefix.len(), source)));
+            (format!("{prefix}{arguments_text}"), remap)
+        } else { normalize_call(&masked, base) };
+        commands(&normalized, Some(&remap), source, out);
+    }
+    // Retain URL hunting, including encoded URLs recovered by extracted_refs.
+    git_refs(text, source, out);
+    urls(text, source, out);
+    out.refs
+        .extend(import_calls(source, parsed.symbols().as_slice()));
+}
+
+fn literal_specifier(raw: &str) -> Option<&str> {
+    let delimiter = raw.chars().next()?;
+    if !matches!(delimiter, '\'' | '"' | '`') || raw.len() < 2 || !raw.ends_with(delimiter) {
+        return None;
+    }
+    let value = &raw[1..raw.len() - 1];
+    (!value.is_empty() && !value.contains(['$', ' ', '\n', '\t'])).then_some(value)
+}
+
+/// JavaScript import and require bindings aren't member-level import symbols
+/// in filefacts. Recover only literal bindings from syntax, never source text
+/// that merely resembles an import inside a comment or string.
+fn js_import_bindings(parsed: &ParsedFile<'_>) -> std::collections::HashMap<String, String> {
+    let mut bindings = std::collections::HashMap::new();
+    let Some(ast) = parsed.source_ast() else { return bindings; };
+    let text = ast.source;
+    let mut stack = vec![ast.tree.root_node()];
+    let mut remaining = 100_000usize;
+    while let Some(node) = stack.pop() {
+        if remaining == 0 { break; } remaining -= 1;
+        let module = if node.kind() == "import_statement" {
+            node.child_by_field_name("source").and_then(|source| text.get(source.byte_range())).and_then(literal_specifier)
+        } else if node.kind() == "variable_declarator" {
+            node.child_by_field_name("value").filter(|value| value.kind() == "call_expression")
+                .filter(|value| value.child_by_field_name("function").and_then(|function| text.get(function.byte_range())) == Some("require"))
+                .and_then(|value| value.child_by_field_name("arguments"))
+                .and_then(|args| args.named_child(0))
+                .and_then(|arg| text.get(arg.byte_range())).and_then(literal_specifier)
+        } else { None };
+        if let Some(module) = module {
+            let mut children = vec![node];
+            let mut budget = 1_000usize;
+            while let Some(binding) = children.pop() {
+                if budget == 0 { break; } budget -= 1;
+                let pair = match binding.kind() {
+                    "import_specifier" => binding.child_by_field_name("name").map(|name| (binding.child_by_field_name("alias").unwrap_or(name), Some(name))),
+                    "pair_pattern" => binding.child_by_field_name("key").zip(binding.child_by_field_name("value")).map(|(name, local)| (local, Some(name))),
+                    "shorthand_property_identifier_pattern" => Some((binding, Some(binding))),
+                    "identifier" if binding.parent().is_some_and(|p| matches!(p.kind(), "import_clause" | "namespace_import")) => Some((binding, None)),
+                    "variable_declarator" => binding.child_by_field_name("name").filter(|name| name.kind() == "identifier").map(|name| (name, None)),
+                    _ => None,
+                };
+                if let Some((local, member)) = pair
+                    && let Some(local) = text.get(local.byte_range()) {
+                    let target = member.and_then(|member| text.get(member.byte_range()))
+                        .map_or_else(|| module.to_owned(), |member| format!("{module}.{member}"));
+                    bindings.insert(local.to_owned(), target);
+                }
+                let mut cursor = binding.walk();
+                children.extend(binding.named_children(&mut cursor).take(budget));
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor).take(remaining));
+    }
+    bindings
+}
+
+fn resolve_import_alias(callee: &str, symbols: &[Symbol]) -> String {
+    let (head, tail) = callee.split_once('.').unwrap_or((callee, ""));
+    for symbol in symbols {
+        if let Symbol::Import {
+            name,
+            alias,
+            library,
+            ..
+        } = symbol
+            && alias.as_deref().unwrap_or(name) == head
+        {
+            let canonical = if let Some(library) = library {
+                format!("{library}.{name}")
+            } else {
+                name.clone()
+            };
+            return if tail.is_empty() {
+                canonical
+            } else {
+                format!("{canonical}.{tail}")
+            };
+        }
+    }
+    callee.to_owned()
+}
+
+fn execution_call(source: &str, callee: &str) -> bool {
+    let method = callee.rsplit('.').next().unwrap_or(callee);
+    match source {
+        "python" => {
+            (callee.starts_with("subprocess.")
+                && matches!(
+                    method,
+                    "run" | "call" | "check_call" | "check_output" | "Popen"
+                ))
+                || (callee.starts_with("os.")
+                    && (matches!(method, "system" | "popen")
+                        || method.starts_with("exec")
+                        || method.starts_with("spawn")))
+        }
+        "javascript" | "typescript" => {
+            let known_module = ["child_process.", "node:child_process.", "shelljs.", "execa."].iter().any(|prefix| callee.starts_with(prefix))
+                || ["child_process", "node:child_process", "shelljs", "execa"].iter().any(|module|
+                    ["'", "\""].iter().any(|quote| callee.starts_with(&format!("require({quote}{module}{quote})."))));
+            (known_module || matches!(callee, "execa" | "execaSync" | "execCommand" | "execCommandSync"))
+                && matches!(method, "exec" | "execSync" | "execFile" | "execFileSync" | "spawn" | "spawnSync" | "execa" | "execaSync" | "execCommand" | "execCommandSync")
+        }
+        _ => false,
+    }
+}
+
+fn installation_call(source: &str, callee: &str) -> bool {
+    match source {
+        "python" => matches!(callee, "pip.main" | "pip._internal.main"),
+        "javascript" | "typescript" => matches!(
+            callee,
+            "npm.install" | "npm().install" | "bun.add" | "yarn.add" | "pnpm.add"
+        ),
+        _ => false,
+    }
+}
+
+/// Normalize a single call span and retain its exact byte-to-source mapping.
+fn normalize_call(text: &str, base: usize) -> (String, Vec<(usize, usize)>) {
     let mut normalized = String::with_capacity(text.len());
-    // Braces widen to ` { `, so record where the copy and the file realign.
-    let mut remap: Vec<(usize, usize)> = Vec::new();
+    let mut remap = vec![(0, base)];
     let mut quote = None;
     let mut escaped = false;
     for (at, c) in text.char_indices() {
@@ -392,76 +643,16 @@ fn scan_source(text: Option<&str>, source: &str, out: &mut Found<'_>) {
                 normalized.push(' ');
                 quote = Some(c);
             }
-            // Keep braces as their own tokens: they bound an options object
-            // (`{ "no-save": true }`), and `commands` stops collecting package
-            // args at a `{`, so option keys/values are not read as packages.
             '{' | '}' => {
-                remap.push((normalized.len() + 1, at));
+                remap.push((normalized.len() + 1, base + at));
                 normalized.extend([' ', c, ' ']);
-                remap.push((normalized.len(), at + 1));
+                remap.push((normalized.len(), base + at + 1));
             }
-            '.' | '(' | ')' | '[' | ']' | ',' | ':' => normalized.push(' '),
+            '.' | '(' | ')' | '[' | ']' | ',' | ':' | '\n' | '\r' | '\t' => normalized.push(' '),
             other => normalized.push(other),
         }
     }
-    commands(&normalized, Some(&remap), source, out);
-    // git_refs before urls so a `git+https://…` repo is classed Repository, not
-    // a plain UrlFetch (dedup keeps whichever recognizer emits the URL first).
-    git_refs(text, source, out);
-    urls(text, source, out);
-    // Dynamic module loads: `import("spec")` (JS/TS), `__import__`/`import_module`
-    // (Python). Markers are language-specific; the install scan above is not.
-    let (markers, eco): (&[&str], &str) = match source {
-        "python" => (&["__import__(", "import_module("], "pypi"),
-        _ => (&["import("], "npm"),
-    };
-    for marker in markers {
-        dynamic_imports(text, marker, eco, source, out);
-    }
-}
-
-/// Recognize *dynamic* module loads — `import("spec")`, `__import__("spec")`,
-/// `import_module("spec")` — and emit the loaded package (a bare specifier) or
-/// URL (a remote `import()`). These resolve a module name at runtime, so a
-/// static dependency resolver never sees them; diffing the hunted name against
-/// the manifest's declared deps surfaces a load of an *undeclared* package — a
-/// covertly-installed companion or a dependency-confusion target. A static
-/// `import x` / literal `require("x")` is declared-intent and handled by the
-/// manifest extractor; only the runtime-resolved call forms are hunted here.
-///
-/// The package is emitted as [`RefKind::Command`] (the fetchable "imperative
-/// package" kind) rather than a new kind: the locator is what the caller diffs
-/// and fetches, and a runtime import is the same imperative acquisition an
-/// `npm install` is. Relative paths and language builtins are skipped — they
-/// are never undeclared external dependencies.
-fn dynamic_imports(text: &str, marker: &str, eco: &str, source: &str, out: &mut Found<'_>) {
-    let mut start = 0;
-    while let Some(rel) = text[start..].find(marker) {
-        let at = start + rel + marker.len();
-        start = at; // always past the marker → terminates
-        let Some(spec) = leading_string_literal(&text[at..]) else {
-            continue;
-        };
-        if let Some((locator, kind)) = import_locator(eco, spec) {
-            out.push(locator, kind, source, spec);
-        }
-    }
-}
-
-/// The string literal at the start of `s` (after optional whitespace), or
-/// `None` if `s` does not begin with a `'`, `"`, or backtick quote — i.e. the
-/// argument is a computed expression whose module name is not statically known.
-fn leading_string_literal(s: &str) -> Option<&str> {
-    let s = s.trim_start();
-    let quote = s.chars().next()?;
-    if quote != '"' && quote != '\'' && quote != '`' {
-        return None;
-    }
-    let rest = &s[quote.len_utf8()..];
-    let end = rest.find(quote)?;
-    let spec = &rest[..end];
-    // A real specifier has no whitespace and is not a template interpolation.
-    (!spec.is_empty() && !spec.contains(['$', ' ', '\n', '\t'])).then_some(spec)
+    (normalized, remap)
 }
 
 /// Classify a dynamic-import specifier into a fetchable reference, or `None` for
@@ -1131,7 +1322,7 @@ fn commands(scan: &str, remap: Option<&[(usize, usize)]>, source: &str, out: &mu
     let mut distro: Option<&'static str> = None;
     for seg in joined.split([';', '&', '|', '\n', '\r']) {
         let seg = seg.trim();
-        if seg.is_empty() {
+        if seg.is_empty() || seg.starts_with('#') {
             continue;
         }
         let offset = remap.zip(position_in(&joined, seg)).map(|(remap, at)| {
@@ -1165,15 +1356,31 @@ fn commands(scan: &str, remap: Option<&[(usize, usize)]>, source: &str, out: &mu
         // their unrestricted command behavior.
         let Some((family, args)) = (0..toks.len()).find_map(|i| {
             let (family, consumed) = match_pm(&toks[i..])?;
-            source_command_allowed(source, family, seg).then(|| (family, &toks[i + consumed..]))
+            if !matches!(source, "javascript" | "typescript" | "python")
+                && toks[..i]
+                    .iter()
+                    .any(|token| matches!(*token, "echo" | "printf"))
+            {
+                return None;
+            }
+            Some((family, &toks[i + consumed..]))
         }) else {
             continue;
         };
         let eco = distro_eco(family, distro);
         // A redirect, or an options-object `{`, ends the list.
+        let mut skip_value = false;
         let packages = args
             .iter()
-            .take_while(|arg| !arg.starts_with('>') && !arg.starts_with('<') && **arg != "{");
+            .take_while(|arg| !arg.starts_with(['>', '<', '#']) && **arg != "{")
+            .filter(|arg| {
+                if skip_value {
+                    skip_value = false;
+                    return false;
+                }
+                skip_value = package_option_takes_value(eco, arg);
+                !skip_value
+            });
         for locator in packages.filter_map(|arg| pm_token_locator(eco, arg)) {
             match offset {
                 Some(offset) => out.push_at(
@@ -1189,42 +1396,41 @@ fn commands(scan: &str, remap: Option<&[(usize, usize)]>, source: &str, out: &mu
     }
 }
 
-/// Foreign package-manager commands in source text need an execution context.
-/// Without this gate, prose such as a Python docstring containing
-/// `go install example.invalid/tool@v1.0.0` is flattened into the same token
-/// stream as `subprocess.run(["go", "install", ...])` and becomes a dependency.
-/// Native Python/JavaScript managers remain handled by their existing
-/// programmatic-install recognizers.
-fn source_command_allowed(source: &str, family: &str, segment: &str) -> bool {
-    if family != "golang" {
-        return true;
-    }
-    let tokens: Vec<&str> = segment.split_whitespace().collect();
-    match source {
-        "python" => tokens.windows(2).any(|pair| match pair {
-            ["subprocess", call] => {
-                matches!(
-                    *call,
-                    "run" | "call" | "check_call" | "check_output" | "Popen"
-                )
-            }
-            ["os", call] => {
-                matches!(*call, "system" | "popen")
-                    || call.starts_with("exec")
-                    || call.starts_with("spawn")
-            }
-            _ => false,
-        }),
-        "javascript" | "typescript" => tokens.windows(2).any(|pair| {
-            matches!(
-                pair,
-                [
-                    "child_process",
-                    "exec" | "execSync" | "spawn" | "spawnSync" | "fork"
-                ] | ["shelljs", "exec"]
-            )
-        }),
-        _ => true,
+fn package_option_takes_value(ecosystem: &str, option: &str) -> bool {
+    match ecosystem {
+        "npm" => matches!(
+            option,
+            "--registry"
+                | "--prefix"
+                | "--cache"
+                | "--cwd"
+                | "--userconfig"
+                | "--loglevel"
+                | "--platform"
+                | "--arch"
+                | "--target"
+        ),
+        "pypi" => matches!(
+            option,
+            "-r" | "--requirement"
+                | "-c"
+                | "--constraint"
+                | "-i"
+                | "--index-url"
+                | "--extra-index-url"
+                | "-f"
+                | "--find-links"
+                | "--trusted-host"
+                | "--target"
+                | "--prefix"
+                | "--root"
+                | "--python"
+                | "--platform"
+                | "--python-version"
+                | "--implementation"
+                | "--abi"
+        ),
+        _ => false,
     }
 }
 
@@ -1739,9 +1945,9 @@ mod tests {
                     r#"Purl("pkg:debian/curl")"#.to_string(),
                     "apt-get".to_string()
                 ),
-                (r#"Purl("pkg:npm/left-pad")"#.to_string(), "#".to_string()),
+                (r#"Purl("pkg:npm/left-pad")"#.to_string(), "npm".to_string()),
             ],
-            "the comment line names left-pad first, and dedup keeps it"
+            "the executable command supplies the package and its citation"
         );
         let js = "const opts = { quiet: true };\n\
                   require('child_process').execSync('npm install left-pad');\n";
@@ -2757,5 +2963,198 @@ mod tests {
             })
             .collect();
         assert_eq!(purls, ["pkg:pypi/realpkg"]);
+    }
+}
+
+#[cfg(test)]
+mod source_boundary_tests {
+    use super::*;
+    fn packages(text: &str, name: &str) -> Vec<String> {
+        references_in_bytes(text.as_bytes(), name)
+            .into_iter()
+            .filter_map(|r| match r.locator {
+                RefLocator::Purl(p) if r.kind == RefKind::Command => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+    #[test]
+    fn prose_comments_and_examples_do_not_become_install_commands() {
+        for (name, source) in [
+            (
+                "x.js",
+                "// npm install executes Many\n/* npm install needed failed. */\nconst help = 'npm install lanceur auquel manque';",
+            ),
+            (
+                "x.py",
+                "# pip install needed failed\n\"\"\"pip install examples extra\"\"\"\nmessage = 'npm install executes Many'",
+            ),
+            (
+                "x.ts",
+                "const help: string = `npm install example`; // npm install another",
+            ),
+        ] {
+            assert!(
+                packages(source, name).is_empty(),
+                "{name}: {:?}",
+                packages(source, name)
+            );
+        }
+    }
+    #[test]
+    fn argument_boundary_stops_prose_and_options_spillover() {
+        let source = "child_process.exec('npm install real-pkg', { cwd: 'needed' }); const help = 'failed Many';";
+        assert_eq!(packages(source, "x.js"), vec!["pkg:npm/real-pkg"]);
+        let source =
+            "subprocess.run(['pip', 'install', 'real-pkg'], cwd='needed')\nmessage = 'failed Many'";
+        assert_eq!(packages(source, "x.py"), vec!["pkg:pypi/real-pkg"]);
+    }
+    #[test]
+    fn multiline_argv_and_multiple_calls_remain_visible() {
+        let source = "subprocess.run([\n 'pip',\n 'install',\n 'first-pkg'\n])\nsubprocess.run(['pip', 'install', 'second-pkg'])";
+        let mut found = packages(source, "x.py");
+        found.sort();
+        assert_eq!(found, vec!["pkg:pypi/first-pkg", "pkg:pypi/second-pkg"]);
+        assert_eq!(
+            packages(
+                "child_process.spawn('npm', ['install', 'real-pkg'], {env: {NAME:'noise'}})",
+                "x.js"
+            ),
+            vec!["pkg:npm/real-pkg"]
+        );
+    }
+    #[test]
+    fn dynamic_import_examples_are_not_actual_loads() {
+        assert!(
+            packages(
+                "// import('example')\nconst help = \"import('other')\"",
+                "x.js"
+            )
+            .is_empty()
+        );
+        assert!(
+            packages(
+                "# __import__('example')\nhelp = \"import_module('other')\"",
+                "x.py"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            packages("import('actual-pkg')", "x.js"),
+            vec!["pkg:npm/actual-pkg"]
+        );
+    }
+    #[test]
+    fn unicode_prefix_does_not_shift_command_offsets() {
+        let source = "const label = 'é'; child_process.exec('npm install real-pkg');";
+        let refs = references_in_bytes(source.as_bytes(), "x.js");
+        let reference = refs
+            .iter()
+            .find(|r| r.locator == RefLocator::Purl("pkg:npm/real-pkg".into()))
+            .unwrap();
+        assert_eq!(
+            reference.offset,
+            Some(source.find("child_process").unwrap() as u64)
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_discovery_tests {
+    use super::*;
+    #[test]
+    fn argv_comments_do_not_create_packages_and_python_aliases_work() {
+        let source = "import subprocess as sp\nsp.run(['pip', # npm install bogus prose\n'install', 'real-pkg'])";
+        let refs = references_in_bytes(source.as_bytes(), "x.py");
+        let packages: Vec<_> = refs
+            .iter()
+            .filter_map(|r| match &r.locator {
+                RefLocator::Purl(p) if r.kind == RefKind::Command => Some(p.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(packages, vec!["pkg:pypi/real-pkg"]);
+    }
+    #[test]
+    fn dedup_preserves_scope_and_integrity_constraints() {
+        let mut a = Reference::new(
+            RefLocator::Purl("pkg:npm/a@1.0.0".into()),
+            RefKind::Dependency,
+            "lock",
+            "a",
+        );
+        a.context = Some(filefacts::DependencyContext {
+            scope: filefacts::DependencyScope::Development,
+            optional: false,
+            has_install_script: false,
+            installed_path: None,
+        });
+        let mut runtime = a.clone();
+        runtime.context.as_mut().unwrap().scope = filefacts::DependencyScope::Runtime;
+        let mut pinned = runtime.clone();
+        pinned.pinned_hash = Some(filefacts::PinnedHash {
+            algo: filefacts::HashAlgo::Sha512,
+            value: "PIN".into(),
+        });
+        let mut refs = vec![a.clone(), a, runtime, pinned];
+        dedup(&mut refs);
+        assert_eq!(refs.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod command_argument_tests {
+    use super::*;
+    #[test]
+    fn shell_comments_echo_and_option_values_are_not_packages() {
+        for (name, text, expected) in [
+            (
+                "x.sh",
+                "# npm install documented\nnpm install --prefix directory --loglevel silent real-pkg # explanatory words",
+                "pkg:npm/real-pkg",
+            ),
+            (
+                "x.sh",
+                "pip install --index-url https://registry.example.test/simple --trusted-host registry.example.test real-pkg",
+                "pkg:pypi/real-pkg",
+            ),
+            (
+                "Dockerfile",
+                "FROM alpine\n# npm install example\nRUN echo npm install documented\nRUN npm install real-pkg",
+                "pkg:npm/real-pkg",
+            ),
+        ] {
+            let refs = references_in_bytes(text.as_bytes(), name);
+            let packages: Vec<_> = refs
+                .iter()
+                .filter_map(|r| match &r.locator {
+                    RefLocator::Purl(p) if r.kind == RefKind::Command => Some(p.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(packages, vec![expected], "{name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_binding_tests {
+    use super::*;
+    #[test]
+    fn regular_expression_exec_is_not_a_process_execution() {
+        let refs = references_in_bytes(b"const regex = /npm/; regex.exec('npm install needed'); /pip/.exec('pip install example');", "x.js");
+        assert!(!refs.iter().any(|r| r.kind == RefKind::Command));
+    }
+}
+
+#[cfg(test)]
+mod process_alias_tests {
+    use super::*;
+    #[test]
+    fn imported_process_aliases_and_require_bindings_remain_discoverable() {
+        for source in ["import { exec as run } from 'node:child_process'; run('npm install real-pkg');", "const cp = require('child_process'); cp.exec('npm install real-pkg');"] {
+            let refs = references_in_bytes(source.as_bytes(), "x.js");
+            assert!(refs.iter().any(|r| r.locator == RefLocator::Purl("pkg:npm/real-pkg".into())), "{source}: {refs:?}");
+        }
     }
 }

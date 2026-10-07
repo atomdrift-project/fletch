@@ -180,11 +180,18 @@ pub struct FetchRecord {
     pub pin_verified: Option<bool>,
     /// The terminal outcome.
     pub outcome: Outcome,
+    /// Declaring dependency scope and installation metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<filefacts::DependencyContext>,
+    /// Explanation of an orchestration limit or local coverage decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_note: Option<String>,
 }
 
 impl FetchRecord {
     /// A record that never reached the network (skipped / unresolved).
-    fn terminal(locator: String, outcome: Outcome) -> Self {
+    #[must_use]
+    pub fn terminal(locator: String, outcome: Outcome) -> Self {
         Self {
             source_sha256: None,
             source_offset: None,
@@ -201,6 +208,8 @@ impl FetchRecord {
             served: None,
             pin_verified: None,
             outcome,
+            context: None,
+            coverage_note: None,
         }
     }
 
@@ -251,6 +260,7 @@ fn kind_is_undefined(k: &RefKind) -> bool {
 pub fn fetch_ref(r: &Reference, net: &dyn Fetch, cache: &BlobCache) -> FetchRecord {
     let mut rec = fetch_ref_inner(r, net, cache, || true);
     rec.kind = r.kind;
+    rec.context = r.context.clone();
     rec
 }
 
@@ -590,6 +600,7 @@ pub fn fetch_references_with(
         rec.source_sha256 = Some(source_sha256.to_string()).filter(|s| !s.is_empty());
         rec.source_offset = r.offset;
         rec.kind = r.kind;
+        rec.context = r.context.clone();
         records.push(rec);
     }
     records
@@ -741,6 +752,8 @@ fn record(
         served: Some(served),
         pin_verified,
         outcome,
+        context: None,
+        coverage_note: None,
     }
 }
 
