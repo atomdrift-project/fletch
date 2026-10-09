@@ -393,8 +393,14 @@ fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
             let original = compact.clone();
             let (head, tail) = compact.split_once('.').unwrap_or((&compact, ""));
             let compact = if let Some(binding) = bindings.get(head) {
-                if tail.is_empty() { binding.clone() } else { format!("{binding}.{tail}") }
-            } else { resolve_import_alias(&compact, parsed.symbols().as_slice()) };
+                if tail.is_empty() {
+                    binding.clone()
+                } else {
+                    format!("{binding}.{tail}")
+                }
+            } else {
+                resolve_import_alias(&compact, parsed.symbols().as_slice())
+            };
             let eco = match (source, compact.as_str()) {
                 ("javascript" | "typescript", "import" | "require") => Some("npm"),
                 ("python", "__import__" | "import_module" | "importlib.import_module") => {
@@ -480,13 +486,20 @@ fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
             continue;
         };
         let (normalized, remap) = if let Some((callee, arguments)) = prefix {
-            let (arguments_text, arguments_remap) = normalize_call(&masked[arguments..], base + arguments);
+            let (arguments_text, arguments_remap) =
+                normalize_call(&masked[arguments..], base + arguments);
             let prefix = callee.replace(['.', '(', ')'], " ");
             let prefix = format!("{prefix} ");
             let mut remap = vec![(0, base)];
-            remap.extend(arguments_remap.into_iter().map(|(copy, source)| (copy + prefix.len(), source)));
+            remap.extend(
+                arguments_remap
+                    .into_iter()
+                    .map(|(copy, source)| (copy + prefix.len(), source)),
+            );
             (format!("{prefix}{arguments_text}"), remap)
-        } else { normalize_call(&masked, base) };
+        } else {
+            normalize_call(&masked, base)
+        };
         commands(&normalized, Some(&remap), source, out);
     }
     // Retain URL hunting, including encoded URLs recovered by extracted_refs.
@@ -510,37 +523,75 @@ fn literal_specifier(raw: &str) -> Option<&str> {
 /// that merely resembles an import inside a comment or string.
 fn js_import_bindings(parsed: &ParsedFile<'_>) -> std::collections::HashMap<String, String> {
     let mut bindings = std::collections::HashMap::new();
-    let Some(ast) = parsed.source_ast() else { return bindings; };
+    let Some(ast) = parsed.source_ast() else {
+        return bindings;
+    };
     let text = ast.source;
     let mut stack = vec![ast.tree.root_node()];
     let mut remaining = 100_000usize;
     while let Some(node) = stack.pop() {
-        if remaining == 0 { break; } remaining -= 1;
+        if remaining == 0 {
+            break;
+        }
+        remaining -= 1;
         let module = if node.kind() == "import_statement" {
-            node.child_by_field_name("source").and_then(|source| text.get(source.byte_range())).and_then(literal_specifier)
+            node.child_by_field_name("source")
+                .and_then(|source| text.get(source.byte_range()))
+                .and_then(literal_specifier)
         } else if node.kind() == "variable_declarator" {
-            node.child_by_field_name("value").filter(|value| value.kind() == "call_expression")
-                .filter(|value| value.child_by_field_name("function").and_then(|function| text.get(function.byte_range())) == Some("require"))
+            node.child_by_field_name("value")
+                .filter(|value| value.kind() == "call_expression")
+                .filter(|value| {
+                    value
+                        .child_by_field_name("function")
+                        .and_then(|function| text.get(function.byte_range()))
+                        == Some("require")
+                })
                 .and_then(|value| value.child_by_field_name("arguments"))
                 .and_then(|args| args.named_child(0))
-                .and_then(|arg| text.get(arg.byte_range())).and_then(literal_specifier)
-        } else { None };
+                .and_then(|arg| text.get(arg.byte_range()))
+                .and_then(literal_specifier)
+        } else {
+            None
+        };
         if let Some(module) = module {
             let mut children = vec![node];
             let mut budget = 1_000usize;
             while let Some(binding) = children.pop() {
-                if budget == 0 { break; } budget -= 1;
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
                 let pair = match binding.kind() {
-                    "import_specifier" => binding.child_by_field_name("name").map(|name| (binding.child_by_field_name("alias").unwrap_or(name), Some(name))),
-                    "pair_pattern" => binding.child_by_field_name("key").zip(binding.child_by_field_name("value")).map(|(name, local)| (local, Some(name))),
+                    "import_specifier" => binding.child_by_field_name("name").map(|name| {
+                        (
+                            binding.child_by_field_name("alias").unwrap_or(name),
+                            Some(name),
+                        )
+                    }),
+                    "pair_pattern" => binding
+                        .child_by_field_name("key")
+                        .zip(binding.child_by_field_name("value"))
+                        .map(|(name, local)| (local, Some(name))),
                     "shorthand_property_identifier_pattern" => Some((binding, Some(binding))),
-                    "identifier" if binding.parent().is_some_and(|p| matches!(p.kind(), "import_clause" | "namespace_import")) => Some((binding, None)),
-                    "variable_declarator" => binding.child_by_field_name("name").filter(|name| name.kind() == "identifier").map(|name| (name, None)),
+                    "identifier"
+                        if binding.parent().is_some_and(|p| {
+                            matches!(p.kind(), "import_clause" | "namespace_import")
+                        }) =>
+                    {
+                        Some((binding, None))
+                    }
+                    "variable_declarator" => binding
+                        .child_by_field_name("name")
+                        .filter(|name| name.kind() == "identifier")
+                        .map(|name| (name, None)),
                     _ => None,
                 };
                 if let Some((local, member)) = pair
-                    && let Some(local) = text.get(local.byte_range()) {
-                    let target = member.and_then(|member| text.get(member.byte_range()))
+                    && let Some(local) = text.get(local.byte_range())
+                {
+                    let target = member
+                        .and_then(|member| text.get(member.byte_range()))
                         .map_or_else(|| module.to_owned(), |member| format!("{module}.{member}"));
                     bindings.insert(local.to_owned(), target);
                 }
@@ -595,11 +646,39 @@ fn execution_call(source: &str, callee: &str) -> bool {
                         || method.starts_with("spawn")))
         }
         "javascript" | "typescript" => {
-            let known_module = ["child_process.", "node:child_process.", "shelljs.", "execa."].iter().any(|prefix| callee.starts_with(prefix))
-                || ["child_process", "node:child_process", "shelljs", "execa"].iter().any(|module|
-                    ["'", "\""].iter().any(|quote| callee.starts_with(&format!("require({quote}{module}{quote})."))));
-            (known_module || matches!(callee, "execa" | "execaSync" | "execCommand" | "execCommandSync"))
-                && matches!(method, "exec" | "execSync" | "execFile" | "execFileSync" | "spawn" | "spawnSync" | "execa" | "execaSync" | "execCommand" | "execCommandSync")
+            let known_module = [
+                "child_process.",
+                "node:child_process.",
+                "shelljs.",
+                "execa.",
+            ]
+            .iter()
+            .any(|prefix| callee.starts_with(prefix))
+                || ["child_process", "node:child_process", "shelljs", "execa"]
+                    .iter()
+                    .any(|module| {
+                        ["'", "\""].iter().any(|quote| {
+                            callee.starts_with(&format!("require({quote}{module}{quote})."))
+                        })
+                    });
+            (known_module
+                || matches!(
+                    callee,
+                    "execa" | "execaSync" | "execCommand" | "execCommandSync"
+                ))
+                && matches!(
+                    method,
+                    "exec"
+                        | "execSync"
+                        | "execFile"
+                        | "execFileSync"
+                        | "spawn"
+                        | "spawnSync"
+                        | "execa"
+                        | "execaSync"
+                        | "execCommand"
+                        | "execCommandSync"
+                )
         }
         _ => false,
     }
@@ -3152,9 +3231,16 @@ mod process_alias_tests {
     use super::*;
     #[test]
     fn imported_process_aliases_and_require_bindings_remain_discoverable() {
-        for source in ["import { exec as run } from 'node:child_process'; run('npm install real-pkg');", "const cp = require('child_process'); cp.exec('npm install real-pkg');"] {
+        for source in [
+            "import { exec as run } from 'node:child_process'; run('npm install real-pkg');",
+            "const cp = require('child_process'); cp.exec('npm install real-pkg');",
+        ] {
             let refs = references_in_bytes(source.as_bytes(), "x.js");
-            assert!(refs.iter().any(|r| r.locator == RefLocator::Purl("pkg:npm/real-pkg".into())), "{source}: {refs:?}");
+            assert!(
+                refs.iter()
+                    .any(|r| r.locator == RefLocator::Purl("pkg:npm/real-pkg".into())),
+                "{source}: {refs:?}"
+            );
         }
     }
 }

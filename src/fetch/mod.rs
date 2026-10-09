@@ -542,7 +542,7 @@ pub fn fetch_references_with(
                             let rec = std::panic::catch_unwind(AssertUnwindSafe(|| {
                                 fetch_ref_inner(targets[i], net, cache, || {
                                     net_used
-                                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                                             (n < budget.max_count).then_some(n + 1)
                                         })
                                         .is_ok()

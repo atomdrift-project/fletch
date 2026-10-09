@@ -816,7 +816,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#548fbd410e27d8edc594510c13f5b079f2e87b28"
+source = "git+https://github.com/atomdrift-project/filefacts.git#b0687aa93e08b687b330321c6c366e17a31896e3"
 dependencies = [
  "aho-corasick",
  "cab",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "fletch"
-version = "1.3.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2901,8 +2901,8 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stng"
-version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/stng.git?rev=60c96257262bfeb9bcc0c399a529631e354f6681#60c96257262bfeb9bcc0c399a529631e354f6681"
+version = "2.1.0"
+source = "git+https://github.com/atomdrift-project/stng.git#3ed38f251ba169a27e6f943e06d19100f05517f4"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2919,6 +2919,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+ "tree-sitter",
+ "tree-sitter-lua",
 ]
 
 [[package]]
@@ -3341,7 +3343,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter"
 version = "0.28.0"
-source = "git+https://github.com/tstromberg/tree-sitter?rev=a88e37f7c2202fa9dd2869ccf9c40d022460e73b#a88e37f7c2202fa9dd2869ccf9c40d022460e73b"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#3c432e1a6ec5d0c1e792bb7efa1fe53ed45d631a"
 dependencies = [
  "cc",
  "regex",
@@ -3393,7 +3395,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#548fbd410e27d8edc594510c13f5b079f2e87b28"
+source = "git+https://github.com/atomdrift-project/filefacts.git#b0687aa93e08b687b330321c6c366e17a31896e3"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -3463,7 +3465,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
-source = "git+https://github.com/tstromberg/tree-sitter?rev=a88e37f7c2202fa9dd2869ccf9c40d022460e73b#a88e37f7c2202fa9dd2869ccf9c40d022460e73b"
+source = "git+https://github.com/tstromberg/tree-sitter?branch=master#3c432e1a6ec5d0c1e792bb7efa1fe53ed45d631a"
 
 [[package]]
 name = "tree-sitter-lua"
