@@ -2,12 +2,9 @@
 
 use filefacts::Registry;
 use serde::Deserialize;
-use std::time::Duration;
 
-use crate::ecosystem::{Localized, fetch_json, parse_ts};
-use crate::fetch::{
-    BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata, percent_decode, safe_coordinate,
-};
+use crate::ecosystem::{Localized, fetch_json, immutable_or_fresh, parse_ts};
+use crate::fetch::{BlobCache, Fetch, cached_metadata, percent_decode, safe_coordinate};
 use crate::registry::RegistryError;
 
 /// Resolve a Dify Marketplace plugin (`<org>/<name>`) to `(version, .difypkg
@@ -31,8 +28,8 @@ pub(crate) fn resolve_dify(
         return None;
     }
     let base = format!("https://marketplace.dify.ai/api/v1/plugins/{org}/{name}");
-    let json = |url: &str, ttl: Duration| {
-        cached_metadata(url, net, &cache.with_meta_ttl(ttl))
+    let json = |url: &str, cache: &BlobCache| {
+        cached_metadata(url, net, cache)
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
     };
     let text = |doc: &serde_json::Value, pointer: &str| {
@@ -40,31 +37,34 @@ pub(crate) fn resolve_dify(
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     };
+    // Held to its documented shape, so a surprising response can't point the
+    // download at another plugin's (or another release's) package.
+    let vetted = |resolved: String, identifier: String| {
+        if version.is_some_and(|want| percent_decode(want) != resolved) {
+            return None;
+        }
+        let checksum = identifier.strip_prefix(&format!("{}:{resolved}@", percent_decode(path)))?;
+        if checksum.is_empty() || !checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some((resolved, identifier))
+    };
     let (resolved, identifier) = match version {
-        Some(v) => {
-            let doc = json(&format!("{base}/{v}"), META_TTL_IMMUTABLE)?;
-            (
+        Some(v) => immutable_or_fresh(cache, |cache| {
+            let doc = json(&format!("{base}/{v}"), cache)?;
+            vetted(
                 text(&doc, "/data/version/version")?,
                 text(&doc, "/data/version/unique_identifier")?,
             )
-        }
+        })?,
         None => {
-            let doc = json(&base, cache.meta_ttl_unpinned())?;
-            (
+            let doc = json(&base, &cache.with_meta_ttl(cache.meta_ttl_unpinned()))?;
+            vetted(
                 text(&doc, "/data/plugin/latest_version")?,
                 text(&doc, "/data/plugin/latest_package_identifier")?,
-            )
+            )?
         }
     };
-    if version.is_some_and(|want| percent_decode(want) != resolved) {
-        return None;
-    }
-    // Held to its documented shape, so a surprising response can't point the
-    // download at another plugin's (or another release's) package.
-    let checksum = identifier.strip_prefix(&format!("{}:{resolved}@", percent_decode(path)))?;
-    if checksum.is_empty() || !checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
     Some((
         resolved,
         format!(

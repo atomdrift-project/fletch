@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
@@ -65,6 +66,8 @@ const MARKER: &str = ".last-sweep";
 const MARK_STARTED: &[u8] = b"s";
 /// Marker contents: the sweep that wrote it ran to completion.
 const MARK_DONE: &[u8] = b"d";
+/// The most of the marker ever read: one byte past the longest state.
+const MAX_MARKER_BYTES: u64 = 2;
 
 /// A cache directory and how deep its entries live below it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -249,6 +252,14 @@ static WRITES: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn note_write(dir: &Path) {
     if WRITES.fetch_add(1, Ordering::Relaxed) + 1 >= blob_cache_max_entries() {
         WRITES.store(0, Ordering::Relaxed);
+        if !is_blob_cache(dir) {
+            tracing::warn!(
+                target: "cache_sweep",
+                root = %dir.display(),
+                "not sweeping a cache directory that holds other files"
+            );
+            return;
+        }
         spawn_inner(vec![blob_cache_budget(Some(dir.to_path_buf()))], true);
     }
 }
@@ -280,10 +291,10 @@ fn run(b: &Budget, force: bool) {
     // skips. Best-effort; if the directory doesn't exist yet, there's nothing
     // to sweep anyway.
     let marker = primary.path.join(MARKER);
-    let _ = fs::write(&marker, MARK_STARTED);
+    mark(&marker, MARK_STARTED);
 
     let mut entries = Vec::new();
-    for r in &b.roots {
+    for r in b.roots.iter().filter(|r| sweepable(&r.path, &marker)) {
         collect(&r.path, r.depth, &mut entries);
     }
 
@@ -294,7 +305,7 @@ fn run(b: &Budget, force: bool) {
     // Age pass: drop anything past the retention window outright.
     entries.retain(|e| {
         if now.duration_since(e.modified).unwrap_or_default() > b.max_age && remove(e) {
-            freed += e.bytes;
+            freed = freed.saturating_add(e.bytes);
             removed += 1;
             false
         } else {
@@ -308,7 +319,9 @@ fn run(b: &Budget, force: bool) {
     // Divide before multiplying so a caller's `u64::MAX`/`usize::MAX` ceiling
     // can't overflow the target.
     let mut count = entries.len();
-    let mut total: u64 = entries.iter().map(|e| e.bytes).sum();
+    let mut total = entries
+        .iter()
+        .fold(0, |sum: u64, e| sum.saturating_add(e.bytes));
     if total > b.max_bytes || count > b.max_entries {
         entries.sort_by_key(|e| e.modified); // oldest first
         let byte_target = b.max_bytes / 10 * 9;
@@ -320,7 +333,7 @@ fn run(b: &Budget, force: bool) {
             if remove(e) {
                 total = total.saturating_sub(e.bytes);
                 count -= 1;
-                freed += e.bytes;
+                freed = freed.saturating_add(e.bytes);
                 removed += 1;
             }
         }
@@ -328,7 +341,7 @@ fn run(b: &Budget, force: bool) {
 
     // Record completion, so the next run waits a full interval rather than
     // retrying. Not reached if this thread dies with its process mid-sweep.
-    let _ = fs::write(&marker, MARK_DONE);
+    mark(&marker, MARK_DONE);
 
     if removed > 0 {
         tracing::debug!(
@@ -353,11 +366,101 @@ fn due(root: &Path) -> bool {
     let Ok(elapsed) = started.elapsed() else {
         return true; // marker dated in the future (clock skew): sweep now
     };
-    let interval = match fs::read(&marker).as_deref() {
-        Ok(MARK_DONE) => SWEEP_INTERVAL,
+    let interval = match read_marker(&marker).as_deref() {
+        Some(MARK_DONE) => SWEEP_INTERVAL,
         _ => RETRY_INTERVAL,
     };
     elapsed >= interval
+}
+
+/// The marker's state, read only from a regular file and only as far as a
+/// state is long: a marker swapped for a symlink to `/dev/zero` must not
+/// exhaust memory, nor a FIFO stall the sweep.
+fn read_marker(marker: &Path) -> Option<Vec<u8>> {
+    if !fs::symlink_metadata(marker).ok()?.is_file() {
+        return None;
+    }
+    let mut state = Vec::new();
+    fs::File::open(marker)
+        .ok()?
+        .take(MAX_MARKER_BYTES)
+        .read_to_end(&mut state)
+        .ok()?;
+    Some(state)
+}
+
+/// Record `state` in the marker, replacing whatever is there rather than
+/// writing through it: a symlink planted in its place would otherwise aim the
+/// write at any file this user can reach. Best-effort.
+fn mark(marker: &Path, state: &[u8]) {
+    let _ = fs::remove_file(marker);
+    if let Ok(mut file) = fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        let _ = file.write_all(state);
+    }
+}
+
+/// Whether `root` is safe to sweep: a directory this user owns and others
+/// cannot write. In one they can, an entry swapped for a symlink between
+/// listing and deleting would aim the deletions anywhere this user can reach.
+/// `marker` is the file this sweep just created, so its owner is this user —
+/// which std has no other way to name. An owned root that others can read or
+/// enter is made private on the way: the cache records what was scanned.
+fn sweepable(root: &Path, marker: &Path) -> bool {
+    let Ok(meta) = fs::metadata(root) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let refuse = |why: &str| {
+            tracing::warn!(target: "cache_sweep", root = %root.display(), why, "not sweeping");
+            false
+        };
+        let Ok(ours) = fs::symlink_metadata(marker) else {
+            return refuse("no marker to establish ownership");
+        };
+        if meta.uid() != ours.uid() {
+            return refuse("owned by another user");
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o002 != 0 {
+            return refuse("world-writable");
+        }
+        // Only fletch's own cache: a root another tool registered may be
+        // shared with a group on purpose.
+        if mode & 0o077 != 0 && meta.is_dir() && is_blob_cache(root) {
+            let _ = fs::set_permissions(root, fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = marker;
+    meta.is_dir()
+}
+
+/// Whether `dir` holds nothing but a blob cache's own names — shard
+/// directories (`ab`), entries left by the flatter layout before them
+/// (`<64 hex>.…`), and the sweep marker — so a write-triggered sweep can't
+/// reach files that happen to share a directory a caller passed to
+/// [`BlobCache::with_dir`](crate::fetch::BlobCache::with_dir).
+fn is_blob_cache(dir: &Path) -> bool {
+    let hex = |s: &str| s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().all(|e| {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        // Finder drops a `.DS_Store` into any directory it has shown.
+        matches!(name, MARKER | ".DS_Store")
+            || (name.len() == 2 && hex(name))
+            || name.get(..64).is_some_and(hex)
+    })
 }
 
 /// Gather the cache entries at `depth` below `root` into `out`. At `depth <= 1`
@@ -393,12 +496,16 @@ fn collect(root: &Path, depth: u8, out: &mut Vec<Entry>) {
                 .entry(path.with_extension(""))
                 .and_modify(|pair| {
                     pair.paths.push(path.clone());
-                    pair.bytes += entry.bytes;
+                    pair.bytes = pair.bytes.saturating_add(entry.bytes);
                     pair.modified = pair.modified.max(entry.modified);
                 })
                 .or_insert(entry);
         } else if ft.is_dir() {
-            collect(&path, depth - 1, out);
+            // Re-checked just before descending, narrowing the window for a
+            // directory swapped for a symlink since it was listed.
+            if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                collect(&path, depth - 1, out);
+            }
         } else if path.file_name().is_some_and(|n| n != MARKER)
             && let Some(entry) = stat_entry(path, false)
         {
@@ -427,16 +534,19 @@ fn dir_size(dir: &Path) -> u64 {
     let Ok(rd) = fs::read_dir(dir) else {
         return 0;
     };
-    let mut total = 0;
+    let mut total: u64 = 0;
     for e in rd.flatten() {
         let Ok(ft) = e.file_type() else {
             continue;
         };
-        if ft.is_dir() {
-            total += dir_size(&e.path());
+        let bytes = if ft.is_dir() {
+            dir_size(&e.path())
         } else if ft.is_file() {
-            total += e.metadata().map(|m| m.len()).unwrap_or(0);
-        }
+            e.metadata().map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
+        total = total.saturating_add(bytes);
     }
     total
 }
@@ -457,7 +567,6 @@ fn remove(e: &Entry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -490,6 +599,77 @@ mod tests {
             10,
             "the symlink is neither followed nor counted"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn single_root(path: &Path) -> Budget {
+        Budget {
+            label: "test",
+            roots: vec![Root {
+                path: path.to_path_buf(),
+                depth: 1,
+            }],
+            max_age: day(30),
+            max_bytes: u64::MAX,
+            max_entries: usize::MAX,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_marker_symlink_is_replaced_not_written_through() {
+        let dir = scratch("marker-link");
+        let elsewhere = scratch("marker-victim");
+        let victim = elsewhere.join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join(MARKER)).unwrap();
+        run(&single_root(&dir), true);
+        assert_eq!(fs::read(&victim).unwrap(), b"keep", "victim untouched");
+        let marker = fs::symlink_metadata(dir.join(MARKER)).unwrap();
+        assert!(marker.is_file(), "the symlink was replaced by a marker");
+        assert_eq!(read_marker(&dir.join(MARKER)).as_deref(), Some(MARK_DONE));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn only_a_directory_of_cache_names_is_a_blob_cache() {
+        let dir = scratch("blob-cache-shape");
+        fs::create_dir_all(dir.join("ab")).unwrap();
+        fs::write(dir.join(MARKER), MARK_DONE).unwrap();
+        fs::write(dir.join(format!("{}.zst", "a".repeat(64))), b"x").unwrap();
+        assert!(is_blob_cache(&dir));
+        fs::write(dir.join(".DS_Store"), b"x").unwrap();
+        assert!(
+            is_blob_cache(&dir),
+            "Finder's droppings don't disqualify it"
+        );
+        fs::write(dir.join("thesis.tex"), b"x").unwrap();
+        assert!(!is_blob_cache(&dir), "a stranger's file disqualifies it");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_owned_root_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("made-private");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        run(&single_root(&dir), true);
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_world_writable_root_is_never_swept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("world-writable");
+        write_aged(&dir.join("old.zst"), 10, day(40));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        run(&single_root(&dir), true);
+        assert!(dir.join("old.zst").exists(), "nothing deleted");
         let _ = fs::remove_dir_all(&dir);
     }
 

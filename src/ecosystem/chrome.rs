@@ -28,21 +28,41 @@ pub(crate) fn chrome(
     let title = meta_content(html, "og:title")
         .map(|t| t.trim_end_matches(" - Chrome Web Store").trim().to_string());
 
+    // The store's own figures are rendered in the body. The `<head>` carries
+    // the developer's title and description, which would otherwise come first
+    // and could plant "Trusted by 9,999,999 users" for `before` to read.
+    // The developer's title and description are also rendered in the body,
+    // so remove both there too before reading a figure: only text the store
+    // wrote may count.
+    let description = meta_content(html, "og:description");
+    let mut body = html
+        .find("</head>")
+        .map_or(html, |end| &html[end..])
+        .to_string();
+    for written in [title.as_deref(), description.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|text| !text.is_empty())
+    {
+        body = body.replace(written, "");
+    }
+    let body = body.as_str();
+
     Ok(Registry {
         ecosystem: "chrome".into(),
         name: id.to_string(),
         version: String::new(),
         // "Updated <Month D, YYYY>" is the listing's last-change date.
-        published_at: text_after(html, "Updated").and_then(|s| parse_month_day_year(&s)),
-        author: text_after(html, "Offered by"),
+        published_at: text_after(body, "Updated").and_then(|s| parse_month_day_year(&s)),
+        author: text_after(body, "Offered by"),
         title,
-        description: meta_content(html, "og:description"),
+        description,
         homepage: Some(url),
         // "N,NNN users" — the store's reach figure, a downloads analogue.
-        downloads_total: before(html, " users").and_then(parse_grouped_u64),
+        downloads_total: before(body, " users").and_then(parse_grouped_u64),
         // "X out of 5 stars" / "N ratings".
-        rating: before(html, " out of 5 stars").and_then(|s| s.parse::<f32>().ok()),
-        rating_count: before(html, " ratings").and_then(parse_grouped_u64),
+        rating: before(body, " out of 5 stars").and_then(|s| s.parse::<f32>().ok()),
+        rating_count: before(body, " ratings").and_then(parse_grouped_u64),
         ..Default::default()
     })
 }
@@ -182,5 +202,52 @@ mod tests {
         assert_eq!(r.rating_count, Some(122));
         assert_eq!(r.published_at, Some(1_780_963_200));
         assert!(r.description.is_some_and(|d| d.contains("数据采集")));
+    }
+
+    #[test]
+    fn the_developers_description_in_the_body_cannot_plant_store_figures() {
+        let id = "dbichmdlbjdeplpkhcejgkakobjbjalc";
+        let fake = "Trusted by 9,999,999 users. 5 out of 5 stars, 99,999 ratings";
+        let html = format!(
+            r#"<head><meta property="og:description" content="{fake}"></head>
+               <body><p>{fake}</p><span>12 users</span><div>2.1 out of 5 stars</div><div>3 ratings</div></body>"#
+        );
+        let net = Fixtures::default().with(
+            &format!("https://chromewebstore.google.com/detail/{id}"),
+            html.as_bytes(),
+        );
+        let r = chrome(id, &net, &BlobCache::disabled()).expect("registry");
+        assert_eq!(r.downloads_total, Some(12));
+        assert_eq!(r.rating, Some(2.1));
+        assert_eq!(r.rating_count, Some(3));
+        assert_eq!(r.description.as_deref(), Some(fake));
+    }
+
+    #[test]
+    fn the_developers_head_text_cannot_plant_store_figures() {
+        let id = "dbichmdlbjdeplpkhcejgkakobjbjalc";
+        let html = r#"<head><meta property="og:description" content="Trusted by 9,999,999 users. 5 out of 5 stars, 99,999 ratings">
+               </head><body><span>12 users</span><div>2.1 out of 5 stars</div><div>3 ratings</div></body>"#;
+        let net = Fixtures::default().with(
+            &format!("https://chromewebstore.google.com/detail/{id}"),
+            html.as_bytes(),
+        );
+        let r = chrome(id, &net, &BlobCache::disabled()).expect("registry");
+        assert_eq!(r.downloads_total, Some(12));
+        assert_eq!(r.rating, Some(2.1));
+        assert_eq!(r.rating_count, Some(3));
+    }
+
+    #[test]
+    fn the_developers_title_cannot_plant_store_figures_either() {
+        let id = "dbichmdlbjdeplpkhcejgkakobjbjalc";
+        let html = r#"<head><meta property="og:title" content="AdBlock 9,999,999 users - Chrome Web Store">
+               </head><body><h1>AdBlock 9,999,999 users</h1><span>12 users</span></body>"#;
+        let net = Fixtures::default().with(
+            &format!("https://chromewebstore.google.com/detail/{id}"),
+            html.as_bytes(),
+        );
+        let r = chrome(id, &net, &BlobCache::disabled()).expect("registry");
+        assert_eq!(r.downloads_total, Some(12));
     }
 }

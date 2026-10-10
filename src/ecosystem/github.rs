@@ -3,8 +3,8 @@
 use filefacts::Registry;
 use serde::Deserialize;
 
-use crate::ecosystem::{fetch_json, parse_rfc3339_secs};
-use crate::fetch::{BlobCache, Fetch};
+use crate::ecosystem::{decode, parse_rfc3339_secs};
+use crate::fetch::{BlobCache, Fetch, cached_github_api};
 use crate::registry::RegistryError;
 
 /// GitHub: a `pkg:github/<owner>/<repo>` reference has no package registry — the
@@ -18,7 +18,17 @@ pub(crate) fn github(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let doc: Repo = fetch_json(&format!("https://api.github.com/repos/{path}"), net, cache)?;
+    // Exactly `owner/repo`: the request carries the GitHub token, so a longer
+    // path (`victim/private/contents/.env`) must never reach another endpoint.
+    if !path
+        .split_once('/')
+        .is_some_and(|(owner, repo)| !owner.is_empty() && !repo.is_empty() && !repo.contains('/'))
+    {
+        return Err(RegistryError::NoRecord);
+    }
+    // fletch names this URL itself, so it alone may carry the GitHub token.
+    let url = format!("https://api.github.com/repos/{path}");
+    let doc: Repo = decode(&url, &cached_github_api(&url, net, cache)?)?;
 
     Ok(Registry {
         ecosystem: "github".into(),

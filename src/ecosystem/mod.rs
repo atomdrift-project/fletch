@@ -40,7 +40,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use crate::fetch::{BlobCache, Fetch, cached_metadata_status};
+use crate::fetch::{BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata_status};
 use crate::registry::RegistryError;
 
 /// The domain half of an email address (`a@b.com` → `b.com`), lowercased.
@@ -131,6 +131,20 @@ impl Localized {
 /// A boolean flag the registry sets → its `label` when set, else `None`.
 fn flag(set: Option<bool>, label: &str) -> Option<String> {
     set.and_then(|f| f.then(|| label.to_string()))
+}
+
+/// Resolve through a per-version document that, once published, never
+/// changes: `resolve` reads it trusting a cached copy of any age, and if what
+/// it reads does not check out, once more straight from the network. Without
+/// the second read, a wrong answer cached before the release existed (a `200`
+/// placeholder for a version not yet published) would be served forever —
+/// and the real release, published later under that version, never resolved.
+pub(crate) fn immutable_or_fresh<T>(
+    cache: &BlobCache,
+    resolve: impl Fn(&BlobCache) -> Option<T>,
+) -> Option<T> {
+    resolve(&cache.with_meta_ttl(META_TTL_IMMUTABLE))
+        .or_else(|| resolve(&cache.with_meta_ttl(std::time::Duration::ZERO)))
 }
 
 /// The final path segment — the bare package name, dropping any vendor/namespace

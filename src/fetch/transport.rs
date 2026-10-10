@@ -13,6 +13,67 @@ use crate::fetch::ssrf::{NonPublicHost, SafeResolver, guard_host};
 /// unless [`HttpFetch::with_max_bytes`] sets another.
 pub const DEFAULT_MAX_FETCH_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The in-memory body ceiling for a host fletch did not choose (see
+/// [`HttpFetch::body_limit`]). Far above any registry document such a host
+/// legitimately serves.
+const MAX_FOREIGN_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The registry hosts fletch names itself, whose documents keep the full
+/// per-fetch ceiling: npm's and PyPI's package documents legitimately run to
+/// tens of megabytes, and distro indexes further. A host missing here only
+/// gets the smaller [`MAX_FOREIGN_DOCUMENT_BYTES`].
+const REGISTRY_HOSTS: &[&str] = &[
+    "addons.mozilla.org",
+    "api.anaconda.org",
+    "api.comfy.org",
+    "api.github.com",
+    "api.jsr.io",
+    "api.npmjs.org",
+    "api.nuget.org",
+    "api.snapcraft.io",
+    "api.wordpress.org",
+    "archive.ubuntu.com",
+    "archlinux.org",
+    "aur.archlinux.org",
+    "azuresearch-usnc.nuget.org",
+    "cdn.netbsd.org",
+    "cdn.openbsd.org",
+    "chromewebstore.google.com",
+    "clawhub.ai",
+    "clojars.org",
+    "crandb.r-pkg.org",
+    "crates.io",
+    "deb.debian.org",
+    "dl-cdn.alpinelinux.org",
+    "download.opensuse.org",
+    "download1.rpmfusion.org",
+    "fastapi.metacpan.org",
+    "formulae.brew.sh",
+    "hex.pm",
+    "hub.docker.com",
+    "huggingface.co",
+    "index.crates.io",
+    "marketplace.dify.ai",
+    "marketplace.visualstudio.com",
+    "mdapi.fedoraproject.org",
+    "open-vsx.org",
+    "packagist.org",
+    "packages.wolfi.dev",
+    "pkg.freebsd.org",
+    "plugins.jetbrains.com",
+    "proxy.golang.org",
+    "pub.dev",
+    "pypi.org",
+    "quay.io",
+    "registry.npmjs.org",
+    "registry.terraform.io",
+    "repo.packagist.org",
+    "repo1.maven.org",
+    "rubygems.org",
+    "search.maven.org",
+    "snapcraft.io",
+];
+
 /// Redirect-chain cap.
 const MAX_REDIRECTS: u32 = 10;
 
@@ -20,6 +81,11 @@ const MAX_REDIRECTS: u32 = 10;
 /// one fails the request instead — and every request to that host until the
 /// time is up, without asking it again.
 const MAX_BACKOFF_WAIT: Duration = Duration::from_secs(30);
+
+/// The longest a host is left alone, however long it asks for: a day outlasts
+/// any honest rate-limit window, and the bound keeps `Instant` arithmetic on a
+/// server-chosen number from overflowing.
+const MAX_HOLD: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How many back-offs one request waits out before failing.
 const BACKOFF_RETRIES: u32 = 3;
@@ -66,6 +132,16 @@ pub struct Request<'a> {
     /// be held in memory whole. A backend that cannot may return the bytes
     /// instead; the caller writes them out itself.
     pub spool: Option<&'a Path>,
+    /// Send the backend's GitHub token, if it has one, to `api.github.com`.
+    /// Set only where fletch itself names the GitHub URL, never for one a
+    /// scanned file or a registry response chose: the token can read every
+    /// private repository its owner can, so an attacker-named API URL
+    /// (`/repos/victim/private/zipball/main`) must go anonymously.
+    pub github_auth: bool,
+    /// This request's response-size ceiling, in place of the backend's own —
+    /// for a caller that has vetted a larger declared size (a container
+    /// layer). `None` keeps the backend's.
+    pub max_bytes: Option<u64>,
 }
 
 impl<'a> Request<'a> {
@@ -78,6 +154,8 @@ impl<'a> Request<'a> {
             headers: &[],
             any_status: false,
             spool: None,
+            github_auth: false,
+            max_bytes: None,
         }
     }
 
@@ -114,21 +192,44 @@ impl<'a> Request<'a> {
             ..self
         }
     }
+
+    /// This request, authenticated to the GitHub API (see
+    /// [`github_auth`](Self::github_auth)).
+    #[must_use]
+    pub fn github_auth(self) -> Self {
+        Self {
+            github_auth: true,
+            ..self
+        }
+    }
+
+    /// This request, abandoned past `limit` response bytes (see
+    /// [`max_bytes`](Self::max_bytes)).
+    #[must_use]
+    pub fn max_bytes(self, limit: u64) -> Self {
+        Self {
+            max_bytes: Some(limit),
+            ..self
+        }
+    }
 }
 
 /// The one network operation. Backends: [`HttpFetch`] (real, SSRF-guarded)
 /// and [`Fixtures`] (offline tests).
-pub trait Fetch {
+///
+/// `Sync`, so one backend serves a batch's workers and a container pull's
+/// concurrent blob reads alike.
+pub trait Fetch: Sync {
     /// Carry out `request`.
     fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError>;
 
     /// Whether an `oci://` target may be pulled. The OCI distribution protocol
-    /// (token + manifest + blob rounds) runs on the puller's own HTTP stack,
-    /// not through this backend — so a backend that exists to refuse or replay
-    /// traffic (the `purl` probe, test fixtures) must not have containers
-    /// pulled behind its back. Default `false`: only the backend that owns
-    /// real network policy ([`HttpFetch`]) opts in, and the puller's
-    /// public-registry allowlist stands in for its SSRF guard.
+    /// (token + manifest + blob rounds) runs through this backend like any
+    /// other request, but a pull is many requests to a few public registries,
+    /// so a backend that exists to refuse or replay traffic (the `purl` probe,
+    /// test fixtures) opts out of it wholesale. Default `false`: only the
+    /// backend that owns real network policy ([`HttpFetch`]) opts in, and the
+    /// puller's public-registry allowlist applies on top of its SSRF guard.
     fn allows_oci(&self) -> bool {
         false
     }
@@ -264,7 +365,10 @@ impl HttpFetch {
     /// the API allows 60 requests an hour per address, and both GitHub repo
     /// lookups and Composer downloads (Packagist's dist URLs are API zipballs)
     /// go through it. The token is sent to `api.github.com` alone — not to the
-    /// host its downloads redirect to.
+    /// host its downloads redirect to — and only for a request that opts in
+    /// with [`Request::github_auth`], so a URL a scanned file names never
+    /// carries it. Prefer a token without private-repository scope: it is
+    /// only here for the rate limit.
     #[must_use]
     pub fn with_github_token(self, token: Option<String>) -> Self {
         Self {
@@ -308,11 +412,7 @@ fn read_body_capped(
         return Ok(bytes);
     };
     let spool_error = |e: std::io::Error| FetchError::Transport(format!("spool: {e}"));
-    let file = std::fs::File::options()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(spool_error)?;
+    let file = crate::fetch::cache::create_private(path).map_err(spool_error)?;
     let mut out = std::io::BufWriter::new(file);
     copy_bounded(resp, &mut out, limit, deadline)?;
     out.flush().map_err(spool_error)?;
@@ -367,16 +467,19 @@ impl HttpFetch {
     /// security floor is defined exactly once. `any_status` returns a
     /// non-success response as a [`Fetched`] rather than a
     /// [`FetchError::Status`]; redirects and the host guard apply either way.
-    fn get(
-        &self,
-        url: &str,
-        headers: &[(&str, &str)],
-        any_status: bool,
-        spool: Option<&Path>,
-    ) -> Result<Fetched, FetchError> {
+    fn get(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+        let Request {
+            url,
+            headers,
+            any_status,
+            spool,
+            github_auth,
+            ..
+        } = *request;
         let deadline = Instant::now() + REQUEST_DEADLINE;
         let mut current =
             reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
+        let limit = self.body_limit(request, &current);
         let origin = current.origin();
         let mut redirects = Vec::new();
         let (mut hops, mut waits) = (0, 0);
@@ -396,7 +499,12 @@ impl HttpFetch {
                     req = req.header(*name, *value);
                 }
             }
-            if let Some(token) = self.token_for(&host, headers) {
+            // Only along a chain that began at a GitHub URL fletch named, so a
+            // redirect from elsewhere can't borrow the token either.
+            if github_auth
+                && same_origin
+                && let Some(token) = self.token_for(&host, headers)
+            {
                 req = req.bearer_auth(token);
             }
             let resp = retry_get_send(
@@ -462,7 +570,7 @@ impl HttpFetch {
             }
 
             let headers = response_headers(&resp);
-            let bytes = read_body_capped(resp, self.max_bytes, deadline, spool)?;
+            let bytes = read_body_capped(resp, limit, deadline, spool)?;
             return Ok(Fetched {
                 bytes,
                 final_url: current.to_string(),
@@ -470,6 +578,28 @@ impl HttpFetch {
                 headers,
                 redirects,
             });
+        }
+    }
+
+    /// The response-size ceiling for `request`, which starts at `url`: the
+    /// request's own when it names one, else the backend's — lowered to
+    /// [`MAX_FOREIGN_DOCUMENT_BYTES`] for a body held in memory from a host
+    /// fletch did not choose. That host came from a `repository_url` in a
+    /// scanned file, and a document it serves is parsed whole into a JSON tree
+    /// several times its size, so the artifact-sized cap would let one hostile
+    /// reply cost gigabytes. Decided by the first hop: a redirect is the chosen
+    /// host's to make (openSUSE's mirror network).
+    fn body_limit(&self, request: &Request<'_>, url: &reqwest::Url) -> u64 {
+        if let Some(limit) = request.max_bytes {
+            return limit;
+        }
+        let chosen = url
+            .host_str()
+            .is_some_and(|host| REGISTRY_HOSTS.contains(&host));
+        if request.spool.is_some() || chosen {
+            self.max_bytes
+        } else {
+            self.max_bytes.min(MAX_FOREIGN_DOCUMENT_BYTES)
         }
     }
 
@@ -486,41 +616,32 @@ impl HttpFetch {
 impl Fetch for HttpFetch {
     fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
         match request.method {
-            Method::Get => self.get(
-                request.url,
-                request.headers,
-                request.any_status,
-                request.spool,
-            ),
-            Method::Post(body) => self.post(
-                request.url,
-                body,
-                request.headers,
-                request.any_status,
-                request.spool,
-            ),
+            Method::Get => self.get(request),
+            Method::Post(body) => self.post(request, body),
         }
     }
 
     // The real-network backend is the one place container pulls are welcome:
-    // the puller's public-registry allowlist covers the SSRF posture that
-    // guard_host provides for plain URL fetches.
+    // every pull request still passes guard_host and SafeResolver here, and
+    // the puller's public-registry allowlist narrows it further.
     fn allows_oci(&self) -> bool {
         true
     }
 }
 
 impl HttpFetch {
-    fn post(
-        &self,
-        url: &str,
-        body: &[u8],
-        headers: &[(&str, &str)],
-        any_status: bool,
-        spool: Option<&Path>,
-    ) -> Result<Fetched, FetchError> {
+    fn post(&self, request: &Request<'_>, body: &[u8]) -> Result<Fetched, FetchError> {
+        let Request {
+            url,
+            headers,
+            any_status,
+            spool,
+            github_auth,
+            ..
+        } = *request;
         let deadline = Instant::now() + REQUEST_DEADLINE;
         let target = reqwest::Url::parse(url).map_err(|e| FetchError::Transport(e.to_string()))?;
+        let limit = self.body_limit(request, &target);
         guard_host(&target)?;
         let host = target.host_str().unwrap_or_default().to_string();
         let mut waits = 0;
@@ -530,7 +651,7 @@ impl HttpFetch {
             for (name, value) in headers {
                 req = req.header(*name, *value);
             }
-            if let Some(token) = self.token_for(&host, headers) {
+            if github_auth && let Some(token) = self.token_for(&host, headers) {
                 req = req.bearer_auth(token);
             }
             let resp = req.send().map_err(map_send_err)?;
@@ -550,7 +671,7 @@ impl HttpFetch {
             return Err(FetchError::Status(status.as_u16()));
         }
         let headers = response_headers(&resp);
-        let bytes = read_body_capped(resp, self.max_bytes, deadline, spool)?;
+        let bytes = read_body_capped(resp, limit, deadline, spool)?;
         Ok(Fetched {
             bytes,
             final_url: target.to_string(),
@@ -595,7 +716,9 @@ impl Backoff {
     fn hold(&self, host: &str, delay: Duration, status: u16) {
         crate::metrics::backoff(host, status, delay);
         let now = Instant::now();
-        let until = now + delay;
+        // A hostile `Retry-After: 18446744073709551615` must not panic the
+        // addition; past `MAX_BACKOFF_WAIT` any hold already means "fail now".
+        let until = now + delay.min(MAX_HOLD);
         let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         held.retain(|_, (when, _)| *when > now);
         let entry = held.entry(host.to_string()).or_insert((until, status));
@@ -861,6 +984,27 @@ mod tests {
             None
         );
         assert!(!format!("{net:?}").contains("ghp_secret"));
+    }
+
+    #[test]
+    fn the_github_token_is_opt_in_per_request() {
+        assert!(!Request::get("https://api.github.com/repos/o/r").github_auth);
+        assert!(
+            Request::get("https://api.github.com/repos/o/r")
+                .github_auth()
+                .github_auth
+        );
+    }
+
+    #[test]
+    fn a_hostile_retry_after_cannot_overflow_the_hold() {
+        let backoff = Backoff::default();
+        backoff.hold("hostile.test", Duration::MAX, 429);
+        let deadline = Instant::now() + REQUEST_DEADLINE;
+        assert_eq!(
+            backoff.wait("hostile.test", deadline),
+            Err(FetchError::Status(429))
+        );
     }
 
     /// [`copy_bounded`] into memory.

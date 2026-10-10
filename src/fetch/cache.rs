@@ -62,6 +62,11 @@ const META_TTL_PINNED_DEFAULT: Duration = Duration::from_secs(90 * 86_400);
 
 const META_TTL_UNPINNED_DEFAULT: Duration = Duration::from_secs(3600);
 
+/// The largest sidecar read back. Ours hold a status, a few URLs, and the
+/// response headers (which the HTTP client already bounds), so this is ample;
+/// it stops a sidecar swapped for `/dev/zero` from exhausting memory.
+const MAX_SIDECAR_BYTES: u64 = 4 << 20;
+
 /// Cached provenance stored next to the bytes, so a cache hit reconstructs
 /// the full [`FetchRecord`](crate::fetch::FetchRecord) (headers, timestamp, redirects) without a fetch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -354,8 +359,12 @@ impl BlobCache {
         }
         let blob = std::fs::File::open(self.blob_path(key)).ok()?;
         let blob_mtime = blob.metadata().ok()?.modified().ok()?;
-        let meta: CachedMeta =
-            serde_json::from_slice(&std::fs::read(self.meta_path(key)).ok()?).ok()?;
+        let meta: CachedMeta = serde_json::from_reader(
+            std::fs::File::open(self.meta_path(key))
+                .ok()?
+                .take(MAX_SIDECAR_BYTES),
+        )
+        .ok()?;
         let age = Duration::from_secs(now().saturating_sub(meta.fetched_at));
         if max_age.is_some_and(|max_age| age > max_age) {
             return None;
@@ -385,11 +394,7 @@ impl BlobCache {
     ) -> Option<(Spool, CachedMeta)> {
         let spool = self.spool(key);
         let ((), meta) = self.read_with(key, max_age, |body| {
-            let mut out = std::fs::File::options()
-                .write(true)
-                .create_new(true)
-                .open(spool.path())?;
-            std::io::copy(body, &mut out).map(drop)
+            std::io::copy(body, &mut create_private(spool.path())?).map(drop)
         })?;
         Some((spool, meta))
     }
@@ -399,15 +404,23 @@ impl BlobCache {
     /// cache's own disk — a system temp directory is often memory-backed,
     /// which is what spooling exists to avoid — or, for a disabled cache, in
     /// the system temp directory.
+    ///
+    /// The name ends in a random tag. The key is the attacker-chosen locator's
+    /// hash and the pid is public, so without it anyone sharing the temp
+    /// directory could plant the path first: a symlink to write through, a
+    /// file of their own bytes to be judged, or just a name that fails every
+    /// fetch of that locator.
     pub(crate) fn spool(&self, key: &str) -> Spool {
+        use std::hash::{BuildHasher, RandomState};
         static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let name = format!(
-            "{key}.part.{}.{}",
+            "{key}.part.{}.{seq}.{:016x}",
             std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
+            RandomState::new().hash_one(seq)
         );
         let shard = self.shard(key);
-        let dir = if self.enabled && std::fs::create_dir_all(&shard).is_ok() {
+        let dir = if self.enabled && create_private_dir(&shard).is_ok() {
             shard
         } else {
             std::env::temp_dir()
@@ -457,7 +470,7 @@ impl BlobCache {
     /// Store the `size`-byte `body` and `meta` for `key`, compressing it as it
     /// streams. Best-effort, as [`put`](Self::put).
     pub(crate) fn store(&self, key: &str, body: impl Read, size: u64, meta: &CachedMeta) {
-        if !self.enabled || std::fs::create_dir_all(self.shard(key)).is_err() {
+        if !self.enabled || create_private_dir(&self.shard(key)).is_err() {
             return;
         }
         if !write_replacing(&self.blob_path(key), |out| {
@@ -537,16 +550,45 @@ fn write_replacing(
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let written = std::fs::File::options()
-        .create_new(true)
-        .write(true)
-        .open(&tmp)
-        .and_then(|mut f| write(&mut f));
+    let written = create_private(&tmp).and_then(|mut f| write(&mut f));
     if written.is_ok() && std::fs::rename(&tmp, path).is_ok() {
         return true;
     }
     let _ = std::fs::remove_file(&tmp);
     false
+}
+
+/// Create `dir` and any missing parents, readable by this user alone: the
+/// cache records what was scanned and holds documents fetched with the user's
+/// GitHub token.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
+/// Create the new file `path` for writing, readable by this user alone.
+/// `create_new` fails on any existing path, a symlink included, rather than
+/// writing through it.
+pub(crate) fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
+/// Whether `error` is the source's answer about the document at `url` rather
+/// than a failure to get one. A 403 means that only from proxy.golang.org; from
+/// anywhere else it is as likely a rate limit (GitHub's) as a refusal.
+fn is_verdict(url: &str, error: &FetchError) -> bool {
+    match error {
+        FetchError::Status(404 | 410 | 451) => true,
+        FetchError::Status(403) => url.starts_with("https://proxy.golang.org/"),
+        _ => false,
+    }
 }
 
 /// The `Content-Type` header value (case-insensitive), if any.
@@ -567,6 +609,21 @@ fn content_type_of(headers: &[(String, String)]) -> Option<&str> {
 /// copy yields `None`; the caller treats that as "unknown".
 pub(crate) fn cached_metadata(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<Vec<u8>> {
     cached_metadata_status(url, &[], net, cache).ok()
+}
+
+/// The cache key for a read of `url` sent with `headers`: [`metadata_cache_key`]
+/// without any, else one with each part length-prefixed, so no URL can spell
+/// another URL's headers — with a plain `{url}:{k}:{v}` join, a header-less
+/// read of `…/x:k:v` keyed the same entry as `…/x` sent with `k: v`.
+fn headed_cache_key(url: &str, headers: &[(&str, &str)]) -> String {
+    if headers.is_empty() {
+        return metadata_cache_key(url);
+    }
+    let mut joined = format!("meta:{}:{url}", url.len());
+    for (k, v) in headers {
+        joined.push_str(&format!("|{}:{k}{}:{v}", k.len(), v.len()));
+    }
+    sha256_hex(joined.as_bytes())
 }
 
 /// The cache key [`cached_metadata`] files a header-less read of `url` under.
@@ -612,18 +669,20 @@ pub(crate) fn cached_metadata_status(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Vec<u8>, FetchError> {
-    let key = if headers.is_empty() {
-        metadata_cache_key(url)
-    } else {
-        let joined = headers
-            .iter()
-            .map(|(k, v)| format!("{k}:{v}"))
-            .collect::<Vec<_>>()
-            .join(";");
-        sha256_hex(format!("meta:{url}:{joined}").as_bytes())
-    };
-    cached_document(&key, url, cache, || {
+    cached_document(&headed_cache_key(url, headers), url, cache, || {
         net.send(&Request::get(url).with_headers(headers))
+    })
+}
+
+/// [`cached_metadata_status`] for a GitHub API URL fletch named itself, sent
+/// with the backend's GitHub token (see [`Request::github_auth`]).
+pub(crate) fn cached_github_api(
+    url: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Vec<u8>, FetchError> {
+    cached_document(&metadata_cache_key(url), url, cache, || {
+        net.send(&Request::get(url).github_auth())
     })
 }
 
@@ -645,7 +704,8 @@ pub(crate) fn cached_post(
 
 /// The metadata cache flow every registry read shares: serve a fresh entry,
 /// else `send` the request and store what comes back, else fall back to any
-/// cached copy however old — an unreachable source still beats no answer.
+/// cached copy however old — an unreachable source still beats no answer, but
+/// a source that answered "gone" ([`is_verdict`]) is never overruled by one.
 /// Whatever is served is handed to the cache's recorder, so a caller archiving
 /// provenance sees the document exactly once per read.
 ///
@@ -666,9 +726,13 @@ fn cached_document(
     let f = match send() {
         Ok(f) => f,
         Err(e) => {
-            // A stale copy still beats no answer, and outranks the refusal:
-            // the document was true once, where the status is only true now.
-            if let Some((bytes, meta)) = cache.any(key) {
+            // A stale copy stands in for a source that could not be reached,
+            // never for one that answered: a package removed (404, 410 — how
+            // registries pull malware) or withheld (451, the Go proxy's 403
+            // takedown) is the news, and an old copy would hide it.
+            if !is_verdict(url, &e)
+                && let Some((bytes, meta)) = cache.any(key)
+            {
                 crate::metrics::metadata(url, "stale_cache", Some(bytes.len()));
                 cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
                 return Ok(bytes);
@@ -780,6 +844,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn private_files_are_owner_only_and_never_written_through() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let link = dir.path().join("planted");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(
+            create_private(&link).is_err(),
+            "a planted symlink is refused"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+
+        let fresh = dir.path().join("fresh");
+        create_private(&fresh).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let shard = dir.path().join("a/b");
+        create_private_dir(&shard).unwrap();
+        let mode = std::fs::metadata(&shard).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn spool_names_are_unguessable() {
+        let cache = BlobCache::disabled();
+        let (a, b) = (cache.spool("k"), cache.spool("k"));
+        assert_ne!(a.path(), b.path());
+        let tag = |s: &Spool| {
+            s.path()
+                .to_string_lossy()
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(tag(&a).len(), 16, "a 64-bit random tag ends the name");
+        assert_ne!(tag(&a), tag(&b));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_planted_symlink_cache_entry_is_replaced_not_followed() {
         // Pre-create the entry a fetch is about to write as a symlink pointing
         // at a file outside the cache. The store must unlink the symlink, not
@@ -810,6 +917,62 @@ mod tests {
         assert_eq!(
             cache.load("some-locator").as_deref(),
             Some(&b"fetched bytes"[..])
+        );
+    }
+
+    #[test]
+    fn a_removal_outranks_a_stale_copy_but_an_outage_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlobCache::with_dir(dir.path()).with_meta_ttl(Duration::from_secs(60));
+        // Cache `url`'s document, then age it past fresh so the network is asked.
+        let warm = |url: &str| {
+            assert!(cached_metadata(url, &Fixtures::default().with(url, b"{}"), &cache).is_some());
+            let path = cache.meta_path(&metadata_cache_key(url));
+            let mut meta: CachedMeta =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            meta.fetched_at -= 3600;
+            std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        };
+        let url = "https://registry.npmjs.org/evil";
+        warm(url);
+
+        // Unreachable: the stale copy stands in.
+        assert_eq!(
+            cached_metadata_status(url, &[], &Fixtures::default(), &cache),
+            Ok(b"{}".to_vec())
+        );
+        // Removed: the registry's answer is the news.
+        let removed = Fixtures::default().refusing(url, 404);
+        assert_eq!(
+            cached_metadata_status(url, &[], &removed, &cache),
+            Err(FetchError::Status(404))
+        );
+        // A 403 is a takedown only from the Go proxy; elsewhere, a rate limit.
+        let limited = Fixtures::default().refusing(url, 403);
+        assert!(cached_metadata_status(url, &[], &limited, &cache).is_ok());
+        let go = "https://proxy.golang.org/example.com/evil/@v/v1.0.0.info";
+        warm(go);
+        let withheld = Fixtures::default().refusing(go, 403);
+        assert_eq!(
+            cached_metadata_status(go, &[], &withheld, &cache),
+            Err(FetchError::Status(403))
+        );
+    }
+
+    #[test]
+    fn header_keys_are_unambiguous() {
+        let key = headed_cache_key;
+        assert_ne!(
+            key("https://x.test/a:k:v", &[]),
+            key("https://x.test/a", &[("k", "v")])
+        );
+        assert_ne!(
+            key("https://x.test/a", &[("k", "v|1:j1:w")]),
+            key("https://x.test/a", &[("k", "v"), ("j", "w")])
+        );
+        assert_eq!(
+            key("https://x.test/a", &[]),
+            metadata_cache_key("https://x.test/a")
         );
     }
 

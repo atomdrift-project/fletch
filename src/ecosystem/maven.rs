@@ -4,7 +4,7 @@ use filefacts::Registry;
 use serde::Deserialize;
 
 use crate::ecosystem::fetch_json;
-use crate::fetch::{BlobCache, Fetch};
+use crate::fetch::{BlobCache, Fetch, percent_decode};
 use crate::registry::RegistryError;
 
 /// Maven Central: the solrsearch `gav` core returns one document per release
@@ -28,8 +28,14 @@ pub(crate) fn maven(
         net,
         cache,
     )?;
-    // An empty result is Maven Central saying it has no such artifact or version.
-    let Some(d) = doc.response.docs.first() else {
+    // An empty result is Maven Central saying it has no such artifact or
+    // version. Only a document for exactly these coordinates counts: search
+    // ranks, and another artifact's release must not stand in for this one.
+    let (want_group, want_artifact) = (percent_decode(group), percent_decode(artifact));
+    let Some(d) = doc.response.docs.iter().find(|d| {
+        d.g.as_deref() == Some(want_group.as_str())
+            && d.a.as_deref() == Some(want_artifact.as_str())
+    }) else {
         return Err(RegistryError::NotFound);
     };
 
@@ -61,6 +67,8 @@ struct SolrResponse {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct SolrDoc {
+    g: Option<String>,
+    a: Option<String>,
     v: Option<String>,
     timestamp: Option<u64>,
 }
@@ -71,6 +79,29 @@ mod tests {
     use crate::ecosystem::test_cache;
 
     use crate::fetch::Fixtures;
+
+    #[test]
+    fn only_the_requested_coordinates_answer() {
+        let url = "https://search.maven.org/solrsearch/select?q=g:%22com.google.guava%22+AND+a:%22guava%22&core=gav&rows=20&wt=json";
+        let doc = serde_json::json!({"response": {"docs": [
+            {"g": "com.evil", "a": "guava", "v": "99.0", "timestamp": 1u64},
+            {"g": "com.google.guava", "a": "guava", "v": "33.4.8-jre", "timestamp": 1_619_172_000_000u64}
+        ]}})
+        .to_string();
+        let net = Fixtures::default().with(url, doc.as_bytes());
+        let r = maven("com.google.guava/guava", None, &net, &test_cache("m")).expect("registry");
+        assert_eq!(r.version, "33.4.8-jre");
+
+        let only_other = serde_json::json!({"response": {"docs": [
+            {"g": "com.evil", "a": "guava", "v": "99.0"}
+        ]}})
+        .to_string();
+        let net = Fixtures::default().with(url, only_other.as_bytes());
+        assert_eq!(
+            maven("com.google.guava/guava", None, &net, &test_cache("m")).err(),
+            Some(RegistryError::NotFound)
+        );
+    }
 
     #[test]
     fn maven_solrsearch_normalizes() {

@@ -96,12 +96,9 @@ thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
 dirs = "6"
-oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
-# `net` and `time` back the runtime oci.rs builds with `enable_all()`: the
-# registry client needs the IO driver, and the pull deadline the timer.
-tokio = { version = "1.53.2", features = ["rt", "net", "time"] }
-# Ordered, bounded-concurrency layer downloads in oci.rs.
-futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# `rt` backs `spawn_blocking` in the SSRF resolver: getaddrinfo blocks, so
+# it runs off reqwest's runtime thread.
+tokio = { version = "1.53.2", features = ["rt"] }
 tar = "0.4.46"
 xz2 = "0.1.7"
 pep440_rs = "0.7.3"

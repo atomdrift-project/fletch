@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 
 use crate::ecosystem::{fetch_json, null_default, parse_ts};
-use crate::fetch::{BlobCache, Fetch, cached_metadata};
+use crate::fetch::{BlobCache, Fetch, cached_metadata, safe_coordinate};
 use crate::registry::RegistryError;
 
 /// The AUR snapshot URL for `name`: ask the (cached) RPC for the package's
@@ -19,10 +19,11 @@ pub(crate) fn resolve_aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Str
     cached_metadata(&api, net, cache)
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|doc| {
-            Some(format!(
-                "https://aur.archlinux.org{}",
-                doc.pointer("/results/0/URLPath")?.as_str()?
-            ))
+            // Concatenated onto the host, so anything but a snapshot path
+            // (`@evil.test/x`, `.evil.test/x`) would move the host itself.
+            let path = doc.pointer("/results/0/URLPath")?.as_str()?;
+            let snapshot = path.strip_prefix("/cgit/aur.git/snapshot/")?;
+            safe_coordinate(snapshot).then(|| format!("https://aur.archlinux.org{path}"))
         })
         .unwrap_or_else(|| format!("https://aur.archlinux.org/cgit/aur.git/snapshot/{name}.tar.gz"))
 }

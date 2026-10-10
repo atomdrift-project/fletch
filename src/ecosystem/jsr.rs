@@ -8,6 +8,14 @@ use crate::fetch::{BlobCache, Fetch, percent_decode};
 use crate::purl::encode_component;
 use crate::registry::RegistryError;
 
+/// Whether `s` is a JSR scope or package name: non-empty lowercase ASCII
+/// letters, digits and hyphens.
+fn jsr_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// JSR: the native API's package record (description, score, repo, latest) plus
 /// the release's own version document (its `createdAt` publish time). `path` is the
 /// `@scope/name` the locator carries, percent-encoded (`%40` is `@`).
@@ -18,9 +26,13 @@ pub(crate) fn jsr(
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
     let decoded = path.replace("%40", "@");
+    // Exactly `@scope/name`: a lenient `@@@std/path` must not borrow
+    // `@std/path`'s record. JSR scopes and names are `[a-z0-9-]`.
     let (scope, pkg) = decoded
-        .trim_start_matches('@')
+        .strip_prefix('@')
+        .unwrap_or(&decoded)
         .split_once('/')
+        .filter(|(scope, pkg)| [scope, pkg].iter().all(|s| jsr_segment(s)))
         .ok_or(RegistryError::NoRecord)?;
     let doc: Package = fetch_json(
         &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}"),

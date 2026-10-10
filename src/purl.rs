@@ -1255,7 +1255,11 @@ fn normalize_legacy(raw: &str) -> Option<String> {
 /// filename parser deliberately drops the architecture), so an arch-qualified
 /// spelling must collide with the bare one or every SBOM-derived lookup
 /// misses. `repository_url` and `vcs_url` survive because they select the
-/// package's registry or source location — that *is* release identity.
+/// package's registry or source location — that *is* release identity. So
+/// does `download_url`, which names the bytes outright: dropped, a scanned
+/// file's `pkg:npm/lodash@4.17.21?download_url=https://evil.test/x.tgz` keyed
+/// as lodash itself and its bytes passed as a known package. No pool key
+/// carries one, so such a PURL simply misses and is scanned.
 ///
 /// Fetching keeps the full [`normalize`]d form, where `kind=sdist` and friends
 /// legitimately steer artifact selection; only key derivation flattens.
@@ -1265,13 +1269,15 @@ pub fn identity(raw: &str) -> Option<String> {
     parsed.subpath.clear();
     parsed
         .qualifiers
-        .retain(|key, _| matches!(key.as_str(), "repository_url" | "vcs_url"));
+        .retain(|key, _| matches!(key.as_str(), "repository_url" | "vcs_url" | "download_url"));
     Some(parsed.canonical())
 }
 
 /// The identity of one concrete package release, retaining qualifiers that
 /// distinguish releases while dropping only qualifiers that select bytes
-/// within that release. This is intentionally narrower than [`identity`],
+/// within that release. A `download_url` is kept: it replaces the release's
+/// bytes with another host's, so it is not the same release (see
+/// [`identity`]). This is intentionally narrower than [`identity`],
 /// which remains the broad lookup key used by existing bloom filters.
 #[must_use]
 pub fn release_identity(raw: &str) -> Option<String> {
@@ -1290,7 +1296,7 @@ pub(crate) fn release_identity_at(raw: &str, version: Option<&str>) -> Option<St
     }
     let typ = parsed.typ.as_str();
     parsed.qualifiers.retain(|key, _| {
-        !matches!(key.as_str(), "checksum" | "download_url" | "file_name")
+        !matches!(key.as_str(), "checksum" | "file_name")
             && !matches!(
                 (typ, key.as_str()),
                 ("pypi", "kind")
@@ -1819,6 +1825,16 @@ mod normalize_tests {
         let purl = "pkg:golang/github.com/gofrs/uuid@v4.4.0%2Bincompatible";
         assert_eq!(norm(purl), purl);
         assert_eq!(identity(purl).as_deref(), Some(purl));
+    }
+
+    #[test]
+    fn a_download_url_never_shares_the_genuine_releases_identity() {
+        let off = "pkg:npm/lodash@4.17.21?download_url=https://evil.test/x.tgz";
+        assert_ne!(identity(off), identity("pkg:npm/lodash@4.17.21"));
+        assert_ne!(
+            release_identity(off),
+            release_identity("pkg:npm/lodash@4.17.21")
+        );
     }
 
     #[test]

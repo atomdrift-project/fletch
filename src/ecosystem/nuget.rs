@@ -41,8 +41,14 @@ pub(crate) fn nuget(
         cache,
     )?;
     // An exact `packageid:` query with no hit is NuGet saying there is no such
-    // package.
-    let Some(d) = doc.data.first() else {
+    // package. Only the hit that *is* that package counts: search is a
+    // ranking, and another package's record must not stand in for this one.
+    let want = percent_decode(&id);
+    let Some(d) = doc.data.iter().find(|hit| {
+        hit.id
+            .as_deref()
+            .is_some_and(|found| found.eq_ignore_ascii_case(&want))
+    }) else {
         return Err(RegistryError::NotFound);
     };
     let latest = d.version.as_deref();
@@ -368,6 +374,29 @@ mod tests {
     use crate::ecosystem::parse_rfc3339_secs;
 
     use crate::fetch::Fixtures;
+
+    #[test]
+    fn only_the_requested_package_answers_a_search() {
+        let url = "https://azuresearch-usnc.nuget.org/query?q=packageid:newtonsoft.json&prerelease=true&semVerLevel=2.0.0";
+        let doc = serde_json::json!({"data": [
+            {"id": "Newtonsoft.Json.Evil", "version": "99.0.0", "totalDownloads": 1u64},
+            {"id": "Newtonsoft.Json", "version": "13.0.3", "totalDownloads": 7u64}
+        ]})
+        .to_string();
+        let net = Fixtures::default().with(url, doc.as_bytes());
+        let r = nuget("Newtonsoft.Json", None, &net, &test_cache("nuget")).expect("registry");
+        assert_eq!(r.version, "13.0.3");
+        assert_eq!(r.downloads_total, Some(7));
+
+        let other =
+            serde_json::json!({"data": [{"id": "Newtonsoft.Json.Evil", "version": "99.0.0"}]})
+                .to_string();
+        let net = Fixtures::default().with(url, other.as_bytes());
+        assert_eq!(
+            nuget("Newtonsoft.Json", None, &net, &test_cache("nuget")).err(),
+            Some(RegistryError::NotFound)
+        );
+    }
 
     #[test]
     fn nuget_search_normalizes() {

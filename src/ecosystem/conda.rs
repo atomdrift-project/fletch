@@ -12,12 +12,14 @@ use crate::registry::RegistryError;
 /// the earliest upload of the matching version is its publish time.
 pub(crate) fn conda(
     name: &str,
+    channel: Option<&str>,
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
+    let owner = anaconda_owner(channel)?;
     let doc: Package = fetch_json(
-        &format!("https://api.anaconda.org/package/conda-forge/{name}"),
+        &format!("https://api.anaconda.org/package/{owner}/{name}"),
         net,
         cache,
     )?;
@@ -73,6 +75,28 @@ struct PackageFile {
     upload_time: Option<String>,
 }
 
+/// The anaconda.org account that publishes a PURL's `channel`: conda-forge
+/// when none is named, Anaconda's own for its default channel, else the named
+/// channel — every other channel is some user's account, and conda-forge's
+/// record for a same-named package says nothing about that user's build. A
+/// channel given as a URL or path is not one anaconda.org can answer for.
+fn anaconda_owner(channel: Option<&str>) -> Result<&str, RegistryError> {
+    match channel {
+        None | Some("conda-forge") => Ok("conda-forge"),
+        Some("main" | "defaults" | "anaconda" | "pkgs/main") => Ok("anaconda"),
+        Some(owner)
+            if !owner.is_empty()
+                && owner
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                && !owner.starts_with('.') =>
+        {
+            Ok(owner)
+        }
+        Some(_) => Err(RegistryError::OffRegistry),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,7 +118,7 @@ mod tests {
             "https://api.anaconda.org/package/conda-forge/numpy",
             doc.as_bytes(),
         );
-        let r = conda("numpy", None, &net, &test_cache("conda")).expect("registry");
+        let r = conda("numpy", None, None, &net, &test_cache("conda")).expect("registry");
         assert_eq!(r.ecosystem, "conda");
         assert_eq!(r.version, "1.9.3");
         assert_eq!(r.published_at, Some(1_619_172_000));
@@ -103,5 +127,19 @@ mod tests {
             Some("https://github.com/numpy/numpy")
         );
         assert_eq!(r.downloads_total, Some(138_106_777));
+    }
+
+    #[test]
+    fn a_channel_reads_its_own_owners_record() {
+        assert_eq!(anaconda_owner(None), Ok("conda-forge"));
+        assert_eq!(anaconda_owner(Some("main")), Ok("anaconda"));
+        assert_eq!(anaconda_owner(Some("some-user")), Ok("some-user"));
+        for hostile in ["https://evil.test/c", "../x", "a/b", ".hidden", ""] {
+            assert_eq!(
+                anaconda_owner(Some(hostile)),
+                Err(RegistryError::OffRegistry),
+                "{hostile}"
+            );
+        }
     }
 }

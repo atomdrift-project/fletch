@@ -34,8 +34,16 @@ Three modules, deliberately walled apart so the dangerous half stays auditable:
 Retrieval is the dangerous part, so it is the narrow, guarded one:
 
 - **SSRF-guarded by construction.** A custom DNS resolver refuses any host that
-  resolves to a private, loopback, link-local, or cloud-metadata address —
-  re-checked on **every redirect hop**, not just the first.
+  resolves to a private, loopback, link-local, or cloud-metadata address (IPv6
+  must be global unicast) — re-checked on **every redirect hop**, not just the
+  first, and connecting only to the addresses it vetted, so DNS rebinding has
+  nothing to swap. HTTPS only, never through an environment proxy, and never to
+  a port browsers refuse (SMTP, SSH, IRC, …). Container pulls go through the
+  same client.
+- **Bounded.** Every response is size-capped (tighter for a document from a host
+  a scanned file chose), every request and every batch has a deadline, and a
+  batch's registry metadata traffic counts against its budget alongside the
+  artifacts.
 - **Pins are verified.** A reference that carries a hash is checked against the
   bytes retrieved; immutable/pinned artifacts are cached long, mutable
   `@latest` tags briefly, so a cache hit is never a stale-but-wrong hit.
@@ -108,8 +116,10 @@ exact artifact identities instead; they are not falsely presented as bijective.
 
 ## Caching
 
-Fetched blobs are cached on disk and reclaimed in the background — best-effort,
-self-gated to once a day, non-blocking. Entries past a TTL or beyond the size
+Fetched blobs are cached on disk, readable by the owning user alone, and
+reclaimed in the background — best-effort, self-gated to once a day,
+non-blocking. A cache directory owned by another user, or writable by others,
+is never swept. Entries past a TTL or beyond the size
 ceiling (10 GiB default) are swept oldest-first. Any process that links fletch
 can perform the reclamation.
 
@@ -123,7 +133,10 @@ can perform the reclamation.
 
 `fletch registry` sends `GITHUB_TOKEN`, when set, to the GitHub API (and only
 there), lifting its anonymous limit of 60 requests an hour; library callers pass
-a token with `HttpFetch::with_github_token`. A registry that answers `429`, or
+a token with `HttpFetch::with_github_token`. It is sent only on requests fletch
+itself addressed — `pkg:github` repository lookups and Packagist-resolved
+Composer downloads — never to a GitHub URL a scanned file named. Prefer a token
+without private-repository scope; it exists for the rate limit. A registry that answers `429`, or
 `503` with `Retry-After`, or reports its rate limit exhausted, is waited out for
 up to 30 s; a longer pause fails the request, and every request to that host
 until it ends, without asking the host again.

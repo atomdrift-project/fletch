@@ -27,12 +27,14 @@ pub(crate) fn repository_base(purl: &Purl, default: &str) -> Option<String> {
 
 /// Whether a decoded PURL qualifier can safely be embedded as one artifact
 /// filename component. Reject separators and URL delimiters instead of letting
-/// a crafted classifier/type change the Maven repository path.
+/// a crafted classifier/type change the Maven repository path — `%` too, as the
+/// value is already decoded and interpolated raw, so a doubly-encoded
+/// `%252F..%252F` would otherwise arrive as an encoded traversal.
 pub(crate) fn safe_filename_part(value: &str) -> bool {
     !value.is_empty()
         && !value
             .bytes()
-            .any(|b| matches!(b, b'/' | b'\\' | b'?' | b'#'))
+            .any(|b| matches!(b, b'/' | b'\\' | b'?' | b'#' | b'%'))
 }
 
 /// Whether a PURL's coordinate path or version may be interpolated into a

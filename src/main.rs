@@ -230,7 +230,12 @@ fn run_registry(purl: &str) -> anyhow::Result<()> {
     let record = match record {
         Ok(record) => record,
         Err(why) => {
-            eprintln!("fletch: no registry record for {purl}: {why}");
+            // Escaped: the PURL is often feed data, and may carry terminal
+            // control sequences.
+            eprintln!(
+                "fletch: no registry record for {}: {why}",
+                purl.escape_debug()
+            );
             std::process::exit(2);
         }
     };

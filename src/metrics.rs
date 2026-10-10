@@ -91,6 +91,7 @@ pub(crate) fn registry(locator: &str, result: &Result<Registry, RegistryError>, 
         Err(RegistryError::Unavailable(_)) => ("unavailable", None),
         Err(RegistryError::Malformed { .. }) => ("malformed", None),
         Err(RegistryError::NoRecord) => ("no_record", None),
+        Err(RegistryError::OffRegistry) => ("off_registry", None),
     };
     tracing::debug!(
         target: TARGET,

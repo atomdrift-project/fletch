@@ -3,8 +3,9 @@
 use filefacts::Registry;
 use serde::Deserialize;
 
+use crate::ecosystem::immutable_or_fresh;
 use crate::ecosystem::{Localized, fetch_json, flag, null_default, parse_ts};
-use crate::fetch::{BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata};
+use crate::fetch::{BlobCache, Fetch, cached_metadata};
 use crate::registry::RegistryError;
 
 /// Resolve a Firefox Add-ons slug to the XPI AMO serves. A requested version
@@ -21,31 +22,31 @@ pub(crate) fn resolve_firefox(
     if slug.is_empty() {
         return None;
     }
-    let (api, ttl) = match version {
-        Some(v) => (
-            format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/versions/{v}/"),
-            META_TTL_IMMUTABLE,
-        ),
-        None => (
-            format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/"),
-            cache.meta_ttl_unpinned(),
-        ),
+    let api = match version {
+        Some(v) => format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/versions/{v}/"),
+        None => format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/"),
     };
-    let bytes = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let release = if version.is_some() {
-        &json
-    } else {
-        json.get("current_version")?
+    let resolve = |cache: &BlobCache| {
+        let bytes = cached_metadata(&api, net, cache)?;
+        let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let release = if version.is_some() {
+            &json
+        } else {
+            json.get("current_version")?
+        };
+        let resolved_version = release.get("version")?.as_str()?.to_string();
+        // Defensive equality check: a malformed or surprising API response must
+        // not substitute another release for an explicitly requested version.
+        if version.is_some_and(|want| want != resolved_version) {
+            return None;
+        }
+        let url = release.pointer("/file/url")?.as_str()?.to_string();
+        Some((resolved_version, url))
     };
-    let resolved_version = release.get("version")?.as_str()?.to_string();
-    // Defensive equality check: a malformed or surprising API response must
-    // not substitute another release for an explicitly requested version.
-    if version.is_some_and(|want| want != resolved_version) {
-        return None;
+    match version {
+        Some(_) => immutable_or_fresh(cache, resolve),
+        None => resolve(&cache.with_meta_ttl(cache.meta_ttl_unpinned())),
     }
-    let url = release.pointer("/file/url")?.as_str()?.to_string();
-    Some((resolved_version, url))
 }
 
 /// Firefox Add-ons (addons.mozilla.org v5): the same marketplace shape as the

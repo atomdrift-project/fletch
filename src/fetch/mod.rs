@@ -26,8 +26,8 @@ mod verify;
 
 pub use cache::{BlobCache, RawSink, RecordedSource, refs_dir};
 pub(crate) use cache::{
-    CachedMeta, META_TTL_IMMUTABLE, Spool, cached_metadata, cached_metadata_status, cached_post,
-    store_metadata,
+    CachedMeta, META_TTL_IMMUTABLE, Spool, cached_github_api, cached_metadata,
+    cached_metadata_status, cached_post, store_metadata,
 };
 pub(crate) use coordinate::{
     is_web_scheme, percent_decode, repository_base, safe_coordinate, safe_filename_part,
@@ -303,6 +303,15 @@ fn fetch_and_record(
         Ok(target) => target,
         Err(why) => return FetchRecord::terminal(locator, Outcome::Unresolved(why)),
     };
+    // Registry JSON (an npm `dist.tarball`, a PyPI `url`) is as attacker-
+    // publishable as a scanned file, so like a URL locator it may name a
+    // destination but never pick the container puller's transport: only a
+    // container coordinate resolves to `oci://`.
+    if url.starts_with("oci://")
+        && !Purl::parse(&locator).is_ok_and(|p| matches!(p.typ(), "oci" | "docker"))
+    {
+        return FetchRecord::terminal(locator, Outcome::Unresolved(Unresolved::Unsupported));
+    }
 
     let key = sha256_hex(locator.as_bytes());
     let max_age = if r.pinned_hash.is_some() {
@@ -337,7 +346,7 @@ fn fetch_and_record(
     let spool = cache.spool(&key);
     let fetched = if let Some(oci_ref) = url.strip_prefix("oci://") {
         if net.allows_oci() {
-            crate::oci::export(oci_ref).map(|(bytes, digest)| Fetched {
+            crate::oci::export(oci_ref, net).map(|(bytes, digest)| Fetched {
                 bytes,
                 final_url: url.clone(),
                 status: 200,
@@ -350,7 +359,17 @@ fn fetch_and_record(
             ))
         }
     } else {
-        net.send(&Request::get(&url).spool_to(spool.path()))
+        let request = Request::get(&url).spool_to(spool.path());
+        // Packagist's dist URLs are GitHub API zipballs, and Packagist (not
+        // the scanned file) chose this one, so it may use the GitHub token —
+        // unless a `download_url` qualifier, which the file chose, named it.
+        if Purl::parse(&locator)
+            .is_ok_and(|p| p.typ() == "composer" && p.qualifier("download_url").is_none())
+        {
+            net.send(&request.github_auth())
+        } else {
+            net.send(&request)
+        }
     };
     let landed = fetched.and_then(|f| {
         let meta = CachedMeta {
@@ -504,6 +523,15 @@ pub fn fetch_references_with(
         // Live fetches issued so far. A cache hit never bumps this, so a warm
         // re-run serves every reference regardless of `max_count`.
         let net_used = AtomicUsize::new(0);
+        // Every request the batch makes, registry metadata included, is
+        // charged to the run: resolution traffic is otherwise free.
+        let net = Metered {
+            inner: net,
+            budget,
+            bytes: &bytes_used,
+            requests: AtomicUsize::new(0),
+            started: Instant::now(),
+        };
         // Fetching is network-bound, so the pool scales with the host but is
         // independent of the CPU pool: clamped so a long reference list can't
         // open an unbounded number of sockets while a small host still
@@ -520,7 +548,7 @@ pub fn fetch_references_with(
                     scope.spawn(|| {
                         let mut local = Vec::new();
                         loop {
-                            if bytes_used.load(Ordering::Relaxed) >= budget.max_bytes {
+                            if net.spent() {
                                 break;
                             }
                             let i = cursor.fetch_add(1, Ordering::Relaxed);
@@ -540,7 +568,7 @@ pub fn fetch_references_with(
                             // the batch's: caught here, the worker's other
                             // results survive and the rest of the sweep runs.
                             let rec = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                fetch_ref_inner(targets[i], net, cache, || {
+                                fetch_ref_inner(targets[i], &net, cache, || {
                                     net_used
                                         .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                                             (n < budget.max_count).then_some(n + 1)
@@ -560,6 +588,18 @@ pub fn fetch_references_with(
                                     Outcome::Failed(FetchError::Internal(message.to_string())),
                                 )
                             });
+                            // A reference that failed once the run's budget was
+                            // spent was cut off by it, mid-resolution or
+                            // mid-pull: over budget, not broken. The budget only
+                            // ever runs down, so this cannot misfire early.
+                            let rec = if rec.outcome != Outcome::Ok && net.spent() {
+                                FetchRecord::terminal(
+                                    locator_string(&targets[i].locator),
+                                    Outcome::BudgetExceeded,
+                                )
+                            } else {
+                                rec
+                            };
                             bytes_used.fetch_add(rec.size.unwrap_or(0), Ordering::Relaxed);
                             // Signal completion before the record is buffered, so
                             // a live progress view advances as each fetch lands
@@ -604,6 +644,79 @@ pub fn fetch_references_with(
         records.push(rec);
     }
     records
+}
+
+/// Network requests a batch may make per reference its count budget allows:
+/// room for every resolution round (a dist-tag, a package document, a Go
+/// proxy's case probe, a container's token and manifests) plus the artifact.
+const REQUESTS_PER_FETCH: usize = 8;
+
+/// Wall-clock ceiling on one batch's network use. Each request has its own
+/// deadline, but a run of them against a tarpit (a host trickling every
+/// response out to that deadline) would otherwise hold the batch for days. An
+/// hour covers a full dependency closure, container pulls included.
+const RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The batch's view of its backend: every request charged against the run.
+///
+/// Without it only artifacts counted. Resolution was free, so a file of PURLs
+/// each pointing `repository_url` at a tarpit or a maximal document cost
+/// unbounded wall time and transfer before the first artifact was counted —
+/// and a reference past the count cap still did all of its metadata reads
+/// before being recorded as over budget. Cache hits never reach the backend,
+/// so a warm re-run is still never throttled.
+struct Metered<'a> {
+    inner: &'a (dyn Fetch + Sync),
+    budget: FetchBudget,
+    /// Bytes retrieved so far in the run, shared with the batch's byte cap.
+    /// A spooled artifact arrives here empty and is counted from its record.
+    bytes: &'a AtomicU64,
+    requests: AtomicUsize,
+    started: Instant,
+}
+
+impl Metered<'_> {
+    fn max_requests(&self) -> usize {
+        self.budget
+            .max_count
+            .saturating_add(1)
+            .saturating_mul(REQUESTS_PER_FETCH)
+    }
+
+    /// Whether the run's bytes, requests or time are used up.
+    fn spent(&self) -> bool {
+        self.bytes.load(Ordering::Relaxed) >= self.budget.max_bytes
+            || self.requests.load(Ordering::Relaxed) >= self.max_requests()
+            || self.started.elapsed() >= RUN_DEADLINE
+    }
+}
+
+impl Fetch for Metered<'_> {
+    fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+        // A request that names its own ceiling is a container pull's vetted,
+        // size-declared read from an allowlisted registry — a pull is one fetch
+        // slot however many layers it has — so it is charged by its bytes, not
+        // counted against the request cap.
+        let counted = request.max_bytes.is_none();
+        if self.bytes.load(Ordering::Relaxed) >= self.budget.max_bytes
+            || self.started.elapsed() >= RUN_DEADLINE
+            || (counted && self.requests.fetch_add(1, Ordering::Relaxed) >= self.max_requests())
+        {
+            tracing::debug!(url = request.url, "run budget spent; request refused");
+            return Err(FetchError::Refused("run budget spent".into()));
+        }
+        let fetched = self.inner.send(request)?;
+        // A pull's blobs are charged once, as the export its record sizes.
+        if counted {
+            self.bytes
+                .fetch_add(fetched.bytes.len() as u64, Ordering::Relaxed);
+        }
+        Ok(fetched)
+    }
+
+    fn allows_oci(&self) -> bool {
+        self.inner.allows_oci()
+    }
 }
 
 /// Whether a reference should be fetched: a fetch target whose locator resolves
@@ -696,8 +809,12 @@ fn land(
     meta: &CachedMeta,
     cache: &BlobCache,
 ) -> std::io::Result<Examined> {
-    if !spool.path().exists() {
-        std::fs::write(spool.path(), bytes)?;
+    // Never write through whatever is already at the spool path: an existing
+    // file is the transport's own spool only when it handed back no bytes.
+    match cache::create_private(spool.path()) {
+        Ok(mut file) => std::io::Write::write_all(&mut file, bytes)?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && bytes.is_empty() => {}
+        Err(e) => return Err(e),
     }
     let examined = examine(
         r,
@@ -1322,12 +1439,14 @@ fn resolved_target(
             .as_ref()
             .and_then(ArtifactMatrix::preferred)
     {
-        let exact = candidate
-            .artifact_purl
-            .as_ref()
-            .or(candidate.release_purl.as_ref())
-            .cloned()
-            .unwrap_or(p);
+        let exact = match &candidate.artifact_purl {
+            Some(artifact) => artifact.clone(),
+            // The release form drops `checksum`, so a registry answer that
+            // spoils the artifact identity (a malformed digest) must not
+            // trade a pinned PURL for an unpinned one and pass unverified.
+            None if purl.qualifier("checksum").is_some() => p,
+            None => candidate.release_purl.clone().unwrap_or(p),
+        };
         return Ok((exact, candidate.url.clone()));
     }
     // A versionless (or tag-versioned) npm dependency is refined through
@@ -2884,6 +3003,53 @@ mod tests {
             self.gets.fetch_add(1, Ordering::SeqCst);
             self.inner.send(request)
         }
+    }
+
+    #[test]
+    fn metadata_requests_are_charged_to_the_run_budget() {
+        // Versionless npm refs each need a dist-tag read before any artifact
+        // fetch; with no fixtures every read fails, so none ever claims a
+        // count slot. Unmetered, all 200 reads went out.
+        let refs: Vec<Reference> = (0..200)
+            .map(|i| dep(RefLocator::Purl(format!("pkg:npm/p{i}")), None))
+            .collect();
+        let net = CountingFetch {
+            inner: Fixtures::default(),
+            gets: AtomicUsize::new(0),
+        };
+        let budget = FetchBudget {
+            max_count: 1,
+            max_bytes: u64::MAX,
+        };
+        let records = fetch_references(
+            &refs,
+            "s",
+            UrlFetches::Include,
+            &net,
+            &BlobCache::disabled(),
+            budget,
+        );
+        let ceiling = (budget.max_count + 1) * REQUESTS_PER_FETCH;
+        assert!(
+            net.gets.load(Ordering::SeqCst) <= ceiling,
+            "{} requests for a ceiling of {ceiling}",
+            net.gets.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            records.len(),
+            refs.len(),
+            "every reference is still recorded"
+        );
+        let over = records
+            .iter()
+            .filter(|r| r.outcome == Outcome::BudgetExceeded)
+            .count();
+        let attempted = records.len() - over;
+        assert!(
+            attempted <= ceiling,
+            "{attempted} references reached the network for a ceiling of {ceiling}: \
+             one cut off mid-resolution is over budget, not failed"
+        );
     }
 
     // Build `n` distinct versioned-npm refs (resolved offline, so each fetch is

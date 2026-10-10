@@ -6,35 +6,21 @@
 //! encoder details differ); cross-implementation identity comes from the
 //! manifest digest, which [`export`] returns and the fetch layer records.
 //!
-//! Transport caveat: the OCI distribution protocol is a token handshake plus
-//! manifest and blob rounds, not a single URL, so pulls go through
-//! oci-client's own HTTP stack rather than the [`crate::fetch::Fetch`]
-//! backend. Two consequences, both deliberate:
-//! - hermetic tests must never fetch a `pkg:oci` reference (the flatten stage
-//!   is pure and tested against fixture layers instead);
-//! - the fetch backend's SSRF guard does not see these requests, so pulls are
-//!   restricted to an allowlist of public registries — `repository_url` is
-//!   feed-supplied data and must not steer requests at internal hosts. For
-//!   the same reason a layer naming foreign `urls` is refused: oci-client
-//!   falls back to fetching those from any host when the registry fails.
+//! The distribution protocol is spoken here over the caller's
+//! [`Fetch`] backend — a token handshake, then manifest and blob GETs — so
+//! every request, the token realm and the blob CDN a registry redirects to
+//! included, passes the same per-hop https and SSRF floor as any other fetch.
+//! Pulls are additionally restricted to an allowlist of public registries:
+//! `repository_url` is feed-supplied data, and an image is a large, costly
+//! artifact to let a scanned file aim anywhere. For the same reason a layer
+//! naming foreign `urls` is refused.
 
-use crate::fetch::FetchError;
-use std::collections::HashSet;
+use crate::fetch::{Fetch, FetchError, Fetched, Request};
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::Duration;
-
-use futures_util::{StreamExt as _, TryStreamExt as _};
-use oci_client::client::{
-    ClientConfig, DEFAULT_MAX_CONCURRENT_DOWNLOAD, ImageLayer, linux_amd64_resolver,
-};
-use oci_client::manifest::{
-    IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
-    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, OciDescriptor,
-};
-use oci_client::secrets::RegistryAuth;
-use oci_client::{Client, Reference};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Uncompressed-tar size cap, matching forager's `maxContainerBytes` guard:
 /// a generous runaway stop for pathological images, not a package-size cap.
@@ -49,12 +35,12 @@ pub(crate) const MAX_EXPORT_BYTES: u64 = 2 << 30; // 2 GiB
 const MAX_LAYERS: usize = 256;
 
 /// Registries an `oci://` pull may talk to. The reference host comes from a
-/// purl's `repository_url` qualifier — feed-supplied data — and these pulls
-/// bypass the fetch backend's SSRF guard, so only well-known public registries
-/// are reachable. Extend deliberately, never dynamically.
+/// purl's `repository_url` qualifier — feed-supplied data — so only
+/// well-known public registries are reachable. Extend deliberately, never
+/// dynamically.
 const ALLOWED_REGISTRIES: &[&str] = &[
     "docker.io",
-    "index.docker.io", // oci-client's canonical spelling of docker.io
+    "index.docker.io",
     "registry-1.docker.io",
     "ghcr.io",
     "quay.io",
@@ -63,34 +49,77 @@ const ALLOWED_REGISTRIES: &[&str] = &[
     "public.ecr.aws",
 ];
 
-/// The layer encodings we can flatten. zstd variants are handled by suffix in
-/// [`decompress`], but the pull-time accept list uses the ratified constants.
-/// The deprecated non-distributable types are deliberately absent: their whole
-/// purpose is a blob served from foreign `urls`, which [`vet_layers`] refuses.
+/// Docker Hub's API host, which its other spellings stand for.
+const DOCKER_HUB: &str = "registry-1.docker.io";
+
+const OCI_LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
+const OCI_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+const OCI_LAYER_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+const DOCKER_LAYER: &str = "application/vnd.docker.image.rootfs.diff.tar";
+const DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+
+/// The layer encodings we can flatten. The deprecated non-distributable types
+/// are deliberately absent: their whole purpose is a blob served from foreign
+/// `urls`, which [`vet_layers`] refuses.
 const ACCEPTED_LAYER_TYPES: &[&str] = &[
-    IMAGE_LAYER_MEDIA_TYPE,
-    IMAGE_LAYER_GZIP_MEDIA_TYPE,
-    "application/vnd.oci.image.layer.v1.tar+zstd",
-    IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
-    IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
+    OCI_LAYER,
+    OCI_LAYER_GZIP,
+    OCI_LAYER_ZSTD,
+    DOCKER_LAYER,
+    DOCKER_LAYER_GZIP,
 ];
 
-/// Registry request timeouts. oci-client sets none by default, so a registry
-/// that stalls mid-blob would otherwise hold the fetch worker forever. The
-/// read timeout is per read; [`PULL_DEADLINE`] bounds the whole pull.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// The manifest shapes asked for: an image manifest, or an index (manifest
+/// list) to pick the platform's manifest from — OCI and Docker spellings.
+const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
+     application/vnd.docker.distribution.manifest.list.v2+json, \
+     application/vnd.oci.image.manifest.v1+json, \
+     application/vnd.docker.distribution.manifest.v2+json";
+
+/// The largest manifest or index read. Real ones are a few KiB; a manifest at
+/// the layer ceiling is well under this.
+const MAX_MANIFEST_BYTES: u64 = 4 << 20;
+
+/// The largest token-realm reply read: a JSON object around one bearer token.
+const MAX_TOKEN_REPLY_BYTES: u64 = 1 << 20;
+
+/// The longest bearer token accepted. Registry JWTs run to a few KiB.
+const MAX_TOKEN_BYTES: usize = 16 << 10;
+
+/// Blobs one pull reads at once: enough to overlap round trips to a
+/// registry's CDN without opening a socket per layer.
+const BLOB_WORKERS: usize = 4;
+
+/// Wall-clock bound on the whole pull. Each request carries the backend's own
+/// deadline as well, so this can be overrun by at most one request.
 const PULL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
+/// Bound on flattening and recompressing the layers: the CPU-bound half of an
+/// export, which [`PULL_DEADLINE`] does not cover. Checked per tar entry.
+const FLATTEN_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// Longest entry or link name a layer may carry: Linux's `PATH_MAX`. Names are
+/// attacker-sized (a GNU or PAX long name is bounded only by the layer), and
+/// shadowing hashes every ancestor of a name, so an unbounded name costs time
+/// quadratic in its length.
+const MAX_PATH: usize = 4096;
+
 /// Pull `reference` (`host/path:tag` or `host/path@sha256:…`, as produced by
-/// `resolve_purl`'s `oci://` pseudo-URL) and export the flattened rootfs as an
-/// xz-compressed tar. Returns the bytes and the image's manifest digest — the
-/// content-addressed identity that is stable across implementations.
-pub(crate) fn export(reference: &str) -> Result<(Vec<u8>, String), FetchError> {
-    let (layers, digest) = pull(reference)?;
+/// `resolve_purl`'s `oci://` pseudo-URL) through `net` and export the
+/// flattened rootfs as an xz-compressed tar. Returns the bytes and the image's
+/// manifest digest — the content-addressed identity that is stable across
+/// implementations.
+pub(crate) fn export(reference: &str, net: &dyn Fetch) -> Result<(Vec<u8>, String), FetchError> {
+    let (layers, digest) = pull(reference, net)?;
     let layers = decompress_all(layers, MAX_EXPORT_BYTES)?;
     let tar_xz = flatten_to_tar_xz(&layers)?;
     Ok((tar_xz, digest))
+}
+
+/// One downloaded layer blob, still in its transfer encoding.
+struct Layer {
+    data: Vec<u8>,
+    media_type: String,
 }
 
 /// Decompress every layer, refusing an image whose layers together exceed
@@ -103,11 +132,13 @@ pub(crate) fn export(reference: &str) -> Result<(Vec<u8>, String), FetchError> {
 /// per layer, so a small download becomes an arbitrarily large allocation. The
 /// running total is checked as each layer lands, so an oversized image is
 /// refused partway through rather than after it is all in memory.
-fn decompress_all(layers: Vec<ImageLayer>, cap: u64) -> Result<Vec<Vec<u8>>, FetchError> {
+fn decompress_all(layers: Vec<Layer>, cap: u64) -> Result<Vec<Vec<u8>>, FetchError> {
     let mut total: u64 = 0;
     let mut out = Vec::with_capacity(layers.len());
     for layer in layers {
-        let bytes = decompress(layer, cap)?;
+        // Only what is left of the budget: a full `cap` per layer would let
+        // the last one inflate to `cap` again on top of everything resident.
+        let bytes = decompress(layer, cap.saturating_sub(total))?;
         total = total.saturating_add(bytes.len() as u64);
         if total > cap {
             return Err(FetchError::TooLarge);
@@ -117,97 +148,493 @@ fn decompress_all(layers: Vec<ImageLayer>, cap: u64) -> Result<Vec<Vec<u8>>, Fet
     Ok(out)
 }
 
-/// Anonymous pull of the linux/amd64 image — the same default platform
-/// go-containerregistry's crane resolves, so both exporters flatten the same
-/// per-platform manifest of a multi-arch index. Returns the layers in manifest
-/// (base → top) order, which the flatten depends on, and the manifest digest.
-fn pull(reference: &str) -> Result<(Vec<ImageLayer>, String), FetchError> {
-    let re: Reference = reference
-        .parse()
-        .map_err(|e| FetchError::Refused(format!("bad OCI reference {reference:?}: {e}")))?;
-    let registry = re.resolve_registry();
-    if !ALLOWED_REGISTRIES.contains(&registry) {
-        return Err(FetchError::Refused(format!(
-            "registry {registry:?} not in the public allowlist"
-        )));
-    }
-    // Built inside the runtime: the deadline's timer registers on creation.
-    block_on_isolated(|| async {
-        let client = Client::new(ClientConfig {
-            platform_resolver: Some(Box::new(linux_amd64_resolver)),
-            connect_timeout: Some(CONNECT_TIMEOUT),
-            read_timeout: Some(READ_TIMEOUT),
-            ..ClientConfig::default()
-        });
-        tokio::time::timeout(PULL_DEADLINE, pull_layers(&client, &re)).await
-    })?
-    .map_err(|_elapsed| FetchError::Timeout)?
+/// A parsed `oci://` reference: the registry's API host, the repository, and
+/// what to ask the manifest endpoint for (a digest when pinned, else a tag).
+#[derive(Debug, PartialEq, Eq)]
+struct ImageRef {
+    host: String,
+    repository: String,
+    reference: String,
 }
 
-/// Run the future `make` builds on a fresh current-thread runtime, in a thread
-/// of its own. [`export`] is reached through the sync, public fetch API, so its
-/// caller may already be driving a tokio runtime on this thread, where
-/// `block_on` (and dropping a runtime) panics; a dedicated thread never is.
-fn block_on_isolated<F: Future>(make: impl FnOnce() -> F + Send) -> Result<F::Output, FetchError>
-where
-    F::Output: Send,
-{
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| FetchError::Transport(format!("tokio runtime: {e}")))?;
-                Ok(rt.block_on(make()))
+impl ImageRef {
+    /// Parse `[host/]repository[:tag][@digest]` strictly — every part is
+    /// interpolated into a registry URL, so anything outside the distribution
+    /// spec's grammar is refused rather than escaped. A host-less name is on
+    /// Docker Hub, and a single-segment one under `library/`. The registry
+    /// must be on [`ALLOWED_REGISTRIES`].
+    fn parse(reference: &str) -> Result<Self, FetchError> {
+        let bad = || FetchError::Refused(format!("bad OCI reference {reference:?}"));
+        let (rest, digest) = match reference.split_once('@') {
+            Some((rest, digest)) => (rest, Some(digest)),
+            None => (reference, None),
+        };
+        // The tag follows the last ':' after the last '/' — an earlier ':' is
+        // a registry port.
+        let last = rest.rfind('/').map_or(0, |i| i + 1);
+        let (name, tag) = match rest[last..].rfind(':') {
+            Some(i) => (&rest[..last + i], Some(&rest[last + i + 1..])),
+            None => (rest, None),
+        };
+        let (host, repository) = match name.split_once('/') {
+            Some((first, path)) if first.contains(['.', ':']) || first == "localhost" => {
+                (first, path)
+            }
+            _ => ("docker.io", name),
+        };
+        // Host names are case-insensitive and 443 is https's own port, so
+        // `GHCR.IO:443` is ghcr.io; anything else must match exactly.
+        let host = host.to_ascii_lowercase();
+        let host = host.strip_suffix(":443").unwrap_or(&host);
+        if !ALLOWED_REGISTRIES.contains(&host) {
+            return Err(FetchError::Refused(format!(
+                "registry {host:?} not in the public allowlist"
+            )));
+        }
+        let docker_hub = matches!(host, "docker.io" | "index.docker.io" | DOCKER_HUB);
+        let repository = if docker_hub && !repository.contains('/') {
+            format!("library/{repository}")
+        } else {
+            repository.to_string()
+        };
+        if !valid_repository(&repository)
+            || tag.is_some_and(|t| !valid_tag(t))
+            || digest.is_some_and(|d| !valid_digest(d))
+        {
+            return Err(bad());
+        }
+        Ok(Self {
+            host: if docker_hub { DOCKER_HUB } else { host }.to_string(),
+            repository,
+            reference: digest.or(tag).unwrap_or("latest").to_string(),
+        })
+    }
+}
+
+/// A repository path: `/`-separated lowercase components, each starting and
+/// ending with an alphanumeric and otherwise `[a-z0-9._-]`.
+fn valid_repository(repository: &str) -> bool {
+    repository.len() <= 255
+        && repository.split('/').all(|part| {
+            let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+            part.bytes().next().is_some_and(alnum)
+                && part.bytes().last().is_some_and(alnum)
+                && part
+                    .bytes()
+                    .all(|b| alnum(b) || matches!(b, b'.' | b'_' | b'-'))
+        })
+}
+
+/// A tag: `[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`.
+fn valid_tag(tag: &str) -> bool {
+    tag.len() <= 128
+        && tag
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// A digest this module can verify: `sha256:` or `sha512:` and the full
+/// lowercase hex of that hash.
+fn valid_digest(digest: &str) -> bool {
+    let hex = |h: &str, len: usize| {
+        h.len() == len && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    digest.strip_prefix("sha256:").is_some_and(|h| hex(h, 64))
+        || digest.strip_prefix("sha512:").is_some_and(|h| hex(h, 128))
+}
+
+/// The digest of `bytes` under `digest`'s algorithm, spelled like it.
+fn digest_of(digest: &str, bytes: &[u8]) -> Option<String> {
+    use sha2::Digest as _;
+    if digest.starts_with("sha256:") {
+        Some(format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(bytes))
+        ))
+    } else if digest.starts_with("sha512:") {
+        Some(format!(
+            "sha512:{}",
+            hex::encode(sha2::Sha512::digest(bytes))
+        ))
+    } else {
+        None
+    }
+}
+
+/// A content descriptor: what a manifest says about a layer, or an index
+/// about a platform's manifest.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Descriptor {
+    media_type: String,
+    digest: String,
+    size: i64,
+    urls: Option<Vec<String>>,
+    platform: Option<Platform>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Platform {
+    os: String,
+    architecture: String,
+}
+
+/// An image manifest (`layers`) or an index (`manifests`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Manifest {
+    schema_version: u32,
+    manifests: Option<Vec<Descriptor>>,
+    layers: Option<Vec<Descriptor>>,
+}
+
+/// One registry, spoken to anonymously through `net`: the bearer token its
+/// challenge led to, once one has been needed, and the pull's deadline.
+struct Session<'a> {
+    net: &'a dyn Fetch,
+    image: &'a ImageRef,
+    token: Option<String>,
+    deadline: Instant,
+}
+
+impl Session<'_> {
+    /// GET `url` from the registry, answering a `401` challenge once with an
+    /// anonymous pull token. Any other non-success status is an error.
+    fn get(&mut self, url: &str, accept: Option<&str>, limit: u64) -> Result<Fetched, FetchError> {
+        let mut resp = self.send(url, accept, limit)?;
+        if resp.status == 401 && self.token.is_none() {
+            let challenge = header(&resp, "www-authenticate")
+                .ok_or_else(|| FetchError::Refused("401 without a challenge".into()))?;
+            self.token = Some(self.pull_token(challenge)?);
+            resp = self.send(url, accept, limit)?;
+        }
+        if !(200..300).contains(&resp.status) {
+            return Err(FetchError::Status(resp.status));
+        }
+        Ok(resp)
+    }
+
+    fn send(&self, url: &str, accept: Option<&str>, limit: u64) -> Result<Fetched, FetchError> {
+        if Instant::now() >= self.deadline {
+            return Err(FetchError::Timeout);
+        }
+        let bearer = self.token.as_ref().map(|token| format!("Bearer {token}"));
+        let mut headers = Vec::new();
+        if let Some(accept) = accept {
+            headers.push(("Accept", accept));
+        }
+        // Dropped by the transport on any hop that leaves the registry's
+        // origin, so a blob's CDN redirect never sees it.
+        if let Some(bearer) = &bearer {
+            headers.push(("Authorization", bearer.as_str()));
+        }
+        self.net.send(
+            &Request::get(url)
+                .with_headers(&headers)
+                .any_status()
+                .max_bytes(limit),
+        )
+    }
+
+    /// An anonymous pull token from the realm a `Bearer` challenge names. The
+    /// realm is registry-supplied, so it is held to https here and to the
+    /// transport's SSRF floor like every other request, and the scope asked
+    /// for is this repository's pull — not whatever the challenge proposes.
+    /// The token goes into a header, so anything but visible ASCII is refused.
+    fn pull_token(&self, challenge: &str) -> Result<String, FetchError> {
+        let params = bearer_challenge(challenge)
+            .ok_or_else(|| FetchError::Refused("unsupported auth challenge".into()))?;
+        let mut realm = params
+            .get("realm")
+            .and_then(|realm| url::Url::parse(realm).ok())
+            .filter(|realm| realm.scheme() == "https")
+            .ok_or_else(|| FetchError::Refused("auth realm is not an https URL".into()))?;
+        {
+            let mut query = realm.query_pairs_mut();
+            if let Some(service) = params.get("service") {
+                query.append_pair("service", service);
+            }
+            query.append_pair(
+                "scope",
+                &format!("repository:{}:pull", self.image.repository),
+            );
+        }
+        if Instant::now() >= self.deadline {
+            return Err(FetchError::Timeout);
+        }
+        let resp = self.net.send(
+            &Request::get(realm.as_str())
+                .with_headers(&[("Accept", "application/json")])
+                .max_bytes(MAX_TOKEN_REPLY_BYTES),
+        )?;
+        #[derive(Deserialize)]
+        struct Reply {
+            token: Option<String>,
+            access_token: Option<String>,
+        }
+        let reply: Reply = serde_json::from_slice(&resp.bytes)
+            .map_err(|e| FetchError::Transport(format!("auth token reply: {e}")))?;
+        reply
+            .token
+            .or(reply.access_token)
+            .filter(|token| {
+                !token.is_empty()
+                    && token.len() <= MAX_TOKEN_BYTES
+                    && token.bytes().all(|b| b.is_ascii_graphic())
             })
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            .ok_or_else(|| FetchError::Refused("auth token missing or malformed".into()))
+    }
+
+    /// The manifest `reference` names, and its digest. The body is checked
+    /// against the digest a pinned `reference` names and against the
+    /// registry's own `Docker-Content-Digest`, so a registry (or anything
+    /// between) cannot substitute another image under a pinned name.
+    fn manifest(&mut self, reference: &str) -> Result<(Manifest, String), FetchError> {
+        let url = format!(
+            "https://{}/v2/{}/manifests/{reference}",
+            self.image.host, self.image.repository
+        );
+        let resp = self.get(&url, Some(MANIFEST_ACCEPT), MAX_MANIFEST_BYTES)?;
+        let pinned = valid_digest(reference).then_some(reference);
+        let expect = pinned.unwrap_or("sha256:");
+        let digest = digest_of(expect, &resp.bytes)
+            .ok_or_else(|| FetchError::Refused(format!("unsupported digest {expect:?}")))?;
+        let mismatch = |claimed: &str| {
+            FetchError::Refused(format!("manifest digest {digest} does not match {claimed}"))
+        };
+        if let Some(pinned) = pinned
+            && pinned != digest
+        {
+            return Err(mismatch(pinned));
+        }
+        if let Some(claimed) = header(&resp, "docker-content-digest")
+            && digest_of(claimed, &resp.bytes).is_some_and(|actual| actual != claimed)
+        {
+            return Err(mismatch(claimed));
+        }
+        let manifest: Manifest = serde_json::from_slice(&resp.bytes)
+            .map_err(|e| FetchError::Transport(format!("manifest: {e}")))?;
+        if manifest.schema_version != 2 {
+            return Err(FetchError::Refused(format!(
+                "unsupported manifest schema {}",
+                manifest.schema_version
+            )));
+        }
+        Ok((manifest, digest))
+    }
+
+    /// Every blob `descs` name, in order, each held to its declared size and
+    /// digest. The first is read alone, so a registry that wants a token only
+    /// for blobs has its challenge answered once; the rest are read
+    /// [`BLOB_WORKERS`] at a time with that token, and the first failure stops
+    /// the others taking new work.
+    fn blobs(&mut self, descs: &[Descriptor]) -> Result<Vec<Layer>, FetchError> {
+        let Some((first, rest)) = descs.split_first() else {
+            return Ok(Vec::new());
+        };
+        let (url, limit) = self.blob_url(first)?;
+        let first = layer(first, self.get(&url, None, limit)?)?;
+        let this = &*self;
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let mut done: Vec<(usize, Result<Layer, FetchError>)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..BLOB_WORKERS.min(rest.len()))
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut got = Vec::new();
+                        while !failed.load(Ordering::Relaxed) {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(desc) = rest.get(i) else {
+                                break;
+                            };
+                            let read = this
+                                .blob_url(desc)
+                                .and_then(|(url, limit)| this.get_shared(&url, limit))
+                                .and_then(|resp| layer(desc, resp));
+                            failed.fetch_or(read.is_err(), Ordering::Relaxed);
+                            got.push((i, read));
+                        }
+                        got
+                    })
+                })
+                .collect();
+            // A worker that panicked loses its reads; the count check below
+            // turns that into an error rather than a shorter image.
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap_or_default())
+                .collect()
+        });
+        done.sort_by_key(|(i, _)| *i);
+        let mut layers = vec![first];
+        for (_, read) in done {
+            layers.push(read?);
+        }
+        if layers.len() != descs.len() {
+            return Err(FetchError::Internal("a blob read was lost".into()));
+        }
+        Ok(layers)
+    }
+
+    /// GET a blob with the token already in hand: a fresh challenge mid-pull
+    /// is an error rather than a race between workers to fetch another token.
+    fn get_shared(&self, url: &str, limit: u64) -> Result<Fetched, FetchError> {
+        let resp = self.send(url, None, limit)?;
+        if !(200..300).contains(&resp.status) {
+            return Err(FetchError::Status(resp.status));
+        }
+        Ok(resp)
+    }
+
+    /// The registry URL of the blob `desc` names, and the most of a response
+    /// to read for it: its declared size, but never less than room for a
+    /// `401` challenge or error body — a 32-byte empty layer's limit would
+    /// otherwise refuse the challenge itself. [`layer`] holds the body to the
+    /// exact declared size.
+    fn blob_url(&self, desc: &Descriptor) -> Result<(String, u64), FetchError> {
+        let size = u64::try_from(desc.size)
+            .map_err(|e| FetchError::Refused(format!("layer {} size: {e}", desc.digest)))?;
+        let url = format!(
+            "https://{}/v2/{}/blobs/{}",
+            self.image.host, self.image.repository, desc.digest
+        );
+        Ok((url, size.max(64 << 10)))
+    }
+}
+
+/// The layer `resp` carries, held to the size and digest `desc` declares.
+fn layer(desc: &Descriptor, resp: Fetched) -> Result<Layer, FetchError> {
+    let size = u64::try_from(desc.size)
+        .map_err(|e| FetchError::Refused(format!("layer {} size: {e}", desc.digest)))?;
+    if resp.bytes.len() as u64 != size {
+        return Err(FetchError::Refused(format!(
+            "layer {} is {} bytes, not the {size} its manifest declares",
+            desc.digest,
+            resp.bytes.len()
+        )));
+    }
+    if digest_of(&desc.digest, &resp.bytes).as_deref() != Some(desc.digest.as_str()) {
+        return Err(FetchError::Refused(format!(
+            "layer {} does not match its digest",
+            desc.digest
+        )));
+    }
+    Ok(Layer {
+        data: resp.bytes,
+        media_type: desc.media_type.clone(),
     })
 }
 
-/// Fetch the manifest, vet it with [`vet_layers`], then download each layer
-/// into a buffer capped at its declared size.
-///
-/// Not `Client::pull`, for three reasons: it downloads every layer before any
-/// size or count check could run; it falls back to a descriptor's foreign
-/// `urls`, outside the registry allowlist; and it collects layers in
-/// completion order, where the flatten needs manifest order.
-async fn pull_layers(
-    client: &Client,
-    re: &Reference,
-) -> Result<(Vec<ImageLayer>, String), FetchError> {
-    let (manifest, digest) = client
-        .pull_image_manifest(re, &RegistryAuth::Anonymous)
-        .await
-        .map_err(|e| FetchError::Transport(format!("pull {re}: {e}")))?;
-    vet_layers(&manifest.layers, MAX_EXPORT_BYTES)?;
-    let layers = futures_util::stream::iter(&manifest.layers)
-        .map(|desc| async move {
-            let mut sink = LayerSink {
-                buf: Vec::new(),
-                limit: u64::try_from(desc.size).unwrap_or(0),
+/// A response header's value, by case-insensitive name.
+fn header<'a>(resp: &'a Fetched, name: &str) -> Option<&'a str> {
+    resp.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// The parameters of a `Bearer` `WWW-Authenticate` challenge
+/// (`Bearer realm="…",service="…",scope="…"`), keys lowercased. Values may be
+/// quoted strings (with `\` escapes) or bare tokens; `None` for any other
+/// scheme or a challenge that does not parse.
+fn bearer_challenge(challenge: &str) -> Option<HashMap<String, String>> {
+    let (scheme, mut rest) = challenge.trim().split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let mut params = HashMap::new();
+    loop {
+        rest = rest.trim_start_matches([' ', '\t', ',']);
+        if rest.is_empty() {
+            return Some(params);
+        }
+        let (key, after) = rest.split_once('=')?;
+        let key = key.trim();
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        let after = after.trim_start();
+        let value = if let Some(quoted) = after.strip_prefix('"') {
+            let mut value = String::new();
+            let mut chars = quoted.char_indices();
+            let end = loop {
+                match chars.next()? {
+                    (i, '"') => break i,
+                    (_, '\\') => value.push(chars.next()?.1),
+                    (_, c) => value.push(c),
+                }
             };
-            client.pull_blob(re, desc, &mut sink).await.map_err(|e| {
-                FetchError::Transport(format!("pull {re} layer {}: {e}", desc.digest))
-            })?;
-            Ok::<_, FetchError>(ImageLayer::new(
-                sink.buf,
-                desc.media_type.clone(),
-                desc.annotations.clone(),
-            ))
-        })
-        .buffered(DEFAULT_MAX_CONCURRENT_DOWNLOAD)
-        .try_collect()
-        .await?;
+            rest = &quoted[end + 1..];
+            value
+        } else {
+            let end = after.find(',').unwrap_or(after.len());
+            rest = &after[end..];
+            after[..end].trim().to_string()
+        };
+        params.insert(key.to_ascii_lowercase(), value);
+    }
+}
+
+/// Anonymous pull of the linux/amd64 image — the same default platform
+/// go-containerregistry's crane resolves, so both exporters flatten the same
+/// per-platform manifest of a multi-arch index. Returns the layers in manifest
+/// (base → top) order, which the flatten depends on, and the manifest digest
+/// (the platform manifest's, for an index).
+///
+/// Every layer is vetted with [`vet_layers`] before the first blob request,
+/// and none is fetched from anywhere but the registry.
+fn pull(reference: &str, net: &dyn Fetch) -> Result<(Vec<Layer>, String), FetchError> {
+    let image = ImageRef::parse(reference)?;
+    let mut session = Session {
+        net,
+        image: &image,
+        token: None,
+        deadline: Instant::now() + PULL_DEADLINE,
+    };
+    let (mut manifest, mut digest) = session.manifest(&image.reference)?;
+    if let Some(entries) = &manifest.manifests {
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == "linux" && p.architecture == "amd64")
+            })
+            .ok_or_else(|| FetchError::Refused("no linux/amd64 image in the index".into()))?;
+        if !valid_digest(&entry.digest) {
+            return Err(FetchError::Refused(format!(
+                "index entry digest {:?} is malformed",
+                entry.digest
+            )));
+        }
+        digest = entry.digest.clone();
+        (manifest, _) = session.manifest(&digest)?;
+        if manifest.manifests.is_some() {
+            return Err(FetchError::Refused(
+                "index entry is another index, not an image".into(),
+            ));
+        }
+    }
+    let layers = manifest
+        .layers
+        .ok_or_else(|| FetchError::Refused("manifest lists no layers".into()))?;
+    vet_layers(&layers, MAX_EXPORT_BYTES)?;
+    let layers = session.blobs(&layers)?;
     Ok((layers, digest))
 }
 
 /// Refuse a manifest before any blob is requested: no layers, more than
 /// [`MAX_LAYERS`], a media type [`decompress`] can't handle, a foreign `urls`
-/// fallback, or declared sizes that are negative or sum past `cap`. The sizes
-/// are then enforced on the bytes actually received by [`LayerSink`].
-fn vet_layers(layers: &[OciDescriptor], cap: u64) -> Result<(), FetchError> {
+/// fallback, a digest that is not plain `algorithm:hex` (it is interpolated
+/// into the blob URL), or declared sizes that are negative or sum past `cap`.
+/// Each size and digest is then enforced on the bytes actually received.
+fn vet_layers(layers: &[Descriptor], cap: u64) -> Result<(), FetchError> {
     if layers.is_empty() {
         return Err(FetchError::Refused("image has no layers".into()));
     }
@@ -220,6 +647,18 @@ fn vet_layers(layers: &[OciDescriptor], cap: u64) -> Result<(), FetchError> {
             return Err(FetchError::Refused(format!(
                 "unsupported layer media type {:?}",
                 layer.media_type
+            )));
+        }
+        let hex = layer
+            .digest
+            .strip_prefix("sha256:")
+            .or_else(|| layer.digest.strip_prefix("sha512:"));
+        if !hex.is_some_and(|h| {
+            !h.is_empty() && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        }) {
+            return Err(FetchError::Refused(format!(
+                "layer digest {:?} is malformed",
+                layer.digest
             )));
         }
         if layer.urls.as_ref().is_some_and(|urls| !urls.is_empty()) {
@@ -239,42 +678,10 @@ fn vet_layers(layers: &[OciDescriptor], cap: u64) -> Result<(), FetchError> {
     Ok(())
 }
 
-/// A layer buffer that refuses bytes past the descriptor's declared size.
-/// oci-client checks the digest only once the whole blob has arrived, so
-/// without this a registry could stream far more than the manifest promised.
-struct LayerSink {
-    buf: Vec<u8>,
-    limit: u64,
-}
-
-impl tokio::io::AsyncWrite for LayerSink {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        if (self.buf.len() + data.len()) as u64 > self.limit {
-            return Poll::Ready(Err(std::io::Error::other(
-                "layer is larger than its manifest size",
-            )));
-        }
-        self.buf.extend_from_slice(data);
-        Poll::Ready(Ok(data.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
 /// Decode one layer blob to its plain tar bytes, by media-type suffix, reading
 /// one byte past `cap` so an over-cap layer is rejected rather than truncated
 /// into a tar that would parse as something else.
-fn decompress(layer: ImageLayer, cap: u64) -> Result<Vec<u8>, FetchError> {
+fn decompress(layer: Layer, cap: u64) -> Result<Vec<u8>, FetchError> {
     let mut out = Vec::new();
     if layer.media_type.ends_with("gzip") {
         flate2::read::MultiGzDecoder::new(Cursor::new(&layer.data))
@@ -287,7 +694,8 @@ fn decompress(layer: ImageLayer, cap: u64) -> Result<Vec<u8>, FetchError> {
             .read_to_end(&mut out)
     } else {
         // Already a plain tar: hand the buffer on rather than copying it.
-        return Ok(layer.data.into());
+        out = layer.data;
+        Ok(0)
     }
     .map_err(|e| FetchError::Transport(format!("decompress layer ({}): {e}", layer.media_type)))?;
     if out.len() as u64 > cap {
@@ -300,13 +708,19 @@ fn decompress(layer: ImageLayer, cap: u64) -> Result<Vec<u8>, FetchError> {
 /// them) into one xz-compressed rootfs tar.
 ///
 /// Semantics follow `crane.Export` / `mutate.Extract`: walk layers *top-down*,
-/// the first occurrence of a path wins, and a `.wh.<name>` whiteout tombstones
-/// that path (and, for a directory, everything under it) in the layers below.
+/// the highest layer's copy of a path wins, and a `.wh.<name>` whiteout
+/// tombstones that path (and, for a directory, everything under it) in the
+/// layers below. Within one layer the *last* copy of a path wins, as it does
+/// when containerd or Docker extract the layer; crane keeps the first, which
+/// would let a layer show this scanner a benign file while the runtime
+/// installs the one after it. Entries that tar readers parse differently are
+/// refused outright (see [`vet_entry`]).
 /// One deliberate divergence: the OCI image-spec's opaque-whiteout marker
 /// (`.wh..wh..opq`, hiding a directory's lower-layer *contents* while keeping
 /// the directory) is honored per spec, which crane's Extract famously is not —
 /// spec correctness wins over bug parity, and identity is digest-based anyway.
 fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, FetchError> {
+    let deadline = Instant::now() + FLATTEN_DEADLINE;
     let xz = xz2::write::XzEncoder::new(Vec::new(), 6);
     let mut builder = tar::Builder::new(LimitWriter {
         w: xz,
@@ -317,43 +731,63 @@ fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, FetchError> {
     // Paths already emitted (exact-match dedup: a higher layer's file shadows
     // the same path below, never its siblings).
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    // Paths tombstoned by a higher layer's `.wh.` marker: the path itself and,
-    // when it names a directory, its whole subtree are hidden below.
-    let mut tombstones: HashSet<Vec<u8>> = HashSet::new();
-    // Directories opaqued by a higher layer's `.wh..wh..opq`: all lower-layer
-    // entries strictly under them are hidden.
-    let mut opaque: HashSet<Vec<u8>> = HashSet::new();
+    // What higher layers hide from lower ones.
+    let mut shadows = Shadows::default();
 
     for layer in layers.iter().rev() {
         // Pass 1: collect this layer's markers. They constrain the layers
         // BELOW this one, not this layer's own entries, so they are staged
         // and merged in only after pass 2. (Tar reading is forward-only, so
         // each pass opens a fresh Archive over the in-memory bytes.)
-        let mut layer_tombstones: HashSet<Vec<u8>> = HashSet::new();
-        let mut layer_opaque: HashSet<Vec<u8>> = HashSet::new();
+        let mut layer_tombstones: Vec<Vec<u8>> = Vec::new();
+        let mut layer_opaque: Vec<Vec<u8>> = Vec::new();
+        // Each path's last entry in this layer — the one that is emitted —
+        // and whether it is something other than a directory.
+        let mut last: HashMap<Vec<u8>, (usize, bool)> = HashMap::new();
         let mut archive = tar::Archive::new(Cursor::new(layer.as_slice()));
         archive.set_ignore_zeros(true);
-        for entry in archive
+        for (i, entry) in archive
             .entries()
             .map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?
+            .enumerate()
         {
-            let entry = entry.map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?;
+            if Instant::now() >= deadline {
+                return Err(FetchError::Timeout);
+            }
+            let mut entry = entry.map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?;
+            vet_entry(&mut entry)?;
             let path = clean_path(&entry.path_bytes());
             let (dir, base) = split_dir_base(&path);
             if base == b".wh..wh..opq" {
-                layer_opaque.insert(dir.to_vec());
+                layer_opaque.push(dir.to_vec());
             } else if let Some(target) = base.strip_prefix(b".wh.") {
-                layer_tombstones.insert(join_dir(dir, target));
+                layer_tombstones.push(join_dir(dir, target));
             }
+            let replaces =
+                !base.starts_with(b".wh.") && replaces_directory(entry.header().entry_type());
+            last.insert(path, (i, replaces));
         }
+        // A file, link or device where a lower layer had a directory replaces
+        // that directory outright when a runtime applies the layer, so
+        // everything beneath it below is gone — as if the directory were
+        // opaque. (The path itself is deduplicated by `seen`.)
+        layer_opaque.extend(
+            last.iter()
+                .filter(|(path, (_, replaces))| *replaces && !path.is_empty())
+                .map(|(path, _)| path.clone()),
+        );
 
         // Pass 2: emit entries not shadowed by HIGHER layers.
         let mut archive = tar::Archive::new(Cursor::new(layer.as_slice()));
         archive.set_ignore_zeros(true);
-        for entry in archive
+        for (i, entry) in archive
             .entries()
             .map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?
+            .enumerate()
         {
+            if Instant::now() >= deadline {
+                return Err(FetchError::Timeout);
+            }
             let mut entry = entry.map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?;
             let path = clean_path(&entry.path_bytes());
             // An entry that cleans away to nothing names the archive root
@@ -369,15 +803,22 @@ fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, FetchError> {
             if base.starts_with(b".wh.") {
                 continue; // marker, never emitted
             }
-            if seen.contains(&path) || shadowed(&path, &tombstones, &opaque) {
+            if last.get(&path).map(|&(last, _)| last) != Some(i)
+                || seen.contains(&path)
+                || shadows.hides(&path)
+            {
                 continue;
             }
             append_entry(&mut builder, &mut entry, &path)?;
             seen.insert(path);
         }
 
-        tombstones.extend(layer_tombstones);
-        opaque.extend(layer_opaque);
+        for path in layer_tombstones {
+            shadows.tombstone(path);
+        }
+        for path in layer_opaque {
+            shadows.opaque(path);
+        }
     }
 
     let limit = builder
@@ -389,9 +830,59 @@ fn flatten_to_tar_xz(layers: &[Vec<u8>]) -> Result<Vec<u8>, FetchError> {
         .map_err(|e| FetchError::Transport(format!("finish xz: {e}")))
 }
 
-/// Copy one tar entry (header, path, link target, body) into the output,
-/// regenerating long-name/long-link extensions so paths the source encoded
-/// via PAX/GNU records survive the transplant.
+/// Refuse an entry that tar readers disagree on, so the rootfs analyzed is the
+/// one a container runtime extracts. tar-rs takes the *first* of a repeated PAX
+/// `path`/`linkpath`/`size` record where Go (containerd) takes the last, and
+/// treats an empty one as set where Go ignores it; a GNU long name with an
+/// embedded NUL is cut at the NUL by Go but not by tar-rs. Each lets one layer
+/// read as two different file sets. Names past [`MAX_PATH`] are refused too.
+fn vet_entry(entry: &mut tar::Entry<'_, Cursor<&[u8]>>) -> Result<(), FetchError> {
+    let refuse = |why: &str| {
+        Err(FetchError::Refused(format!(
+            "ambiguous layer tar entry: {why}"
+        )))
+    };
+    for name in [Some(entry.path_bytes()), entry.link_name_bytes()]
+        .into_iter()
+        .flatten()
+    {
+        if name.len() > MAX_PATH {
+            return refuse("name longer than PATH_MAX");
+        }
+        if name.contains(&0) {
+            return refuse("NUL in name");
+        }
+    }
+    let Some(pax) = entry
+        .pax_extensions()
+        .map_err(|e| FetchError::Transport(format!("layer tar: {e}")))?
+    else {
+        return Ok(());
+    };
+    let mut keys: HashSet<&[u8]> = HashSet::new();
+    for ext in pax {
+        let ext = ext.map_err(|e| FetchError::Transport(format!("layer tar pax: {e}")))?;
+        let key = ext.key_bytes();
+        if matches!(key, b"path" | b"linkpath" | b"size")
+            && (ext.value_bytes().is_empty() || !keys.insert(key))
+        {
+            return refuse("empty or repeated PAX record");
+        }
+    }
+    Ok(())
+}
+
+/// Copy one tar entry (path, link target, body) into the output under a
+/// header built afresh, regenerating long-name/long-link extensions so paths
+/// the source encoded via PAX/GNU records survive the transplant.
+///
+/// Never the source header itself: its size field need not frame the body
+/// tar-rs yields (a PAX `size`, a GNU sparse map, a link with a nonzero size),
+/// and copying it would let a layer's bytes parse as forged entries of the
+/// output. So only the file types a rootfs holds are kept, sparse and
+/// contiguous files become regular ones of their real size, and metadata
+/// records (PAX globals, GNU volume and multivolume headers) and unknown types
+/// are dropped.
 ///
 /// The entry *name* is the cleaned path. A symlink's *target* is copied
 /// verbatim, deliberately: absolute and `..`-relative targets are how a real
@@ -406,8 +897,32 @@ fn append_entry<W: Write>(
     entry: &mut tar::Entry<'_, Cursor<&[u8]>>,
     path: &[u8],
 ) -> Result<(), FetchError> {
-    let mut header = entry.header().clone();
-    let kind = header.entry_type();
+    use tar::EntryType as T;
+    let src = entry.header();
+    let kind = match src.entry_type() {
+        T::Regular | T::Continuous | T::GNUSparse => T::Regular,
+        kind @ (T::Directory | T::Symlink | T::Link | T::Char | T::Block | T::Fifo) => kind,
+        _ => return Ok(()),
+    };
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(kind);
+    header.set_size(0);
+    header.set_mode(src.mode().unwrap_or(0o644) & 0o7777);
+    header.set_uid(src.uid().unwrap_or(0));
+    header.set_gid(src.gid().unwrap_or(0));
+    header.set_mtime(src.mtime().unwrap_or(0));
+    if let Ok(Some(name)) = src.username() {
+        let _ = header.set_username(name);
+    }
+    if let Ok(Some(name)) = src.groupname() {
+        let _ = header.set_groupname(name);
+    }
+    if matches!(kind, T::Char | T::Block)
+        && let (Ok(Some(major)), Ok(Some(minor))) = (src.device_major(), src.device_minor())
+    {
+        let _ = header.set_device_major(major);
+        let _ = header.set_device_minor(minor);
+    }
     if kind.is_symlink() || kind.is_hard_link() {
         let mut target = entry
             .link_name_bytes()
@@ -422,9 +937,14 @@ fn append_entry<W: Write>(
         builder
             .append_link(&mut header, bytes_path(path), bytes_path(&target))
             .map_err(|e| FetchError::Transport(format!("append link: {e}")))
-    } else {
+    } else if kind == T::Regular {
+        header.set_size(entry.size());
         builder
             .append_data(&mut header, bytes_path(path), entry)
+            .map_err(|e| FetchError::Transport(format!("append entry: {e}")))
+    } else {
+        builder
+            .append_data(&mut header, bytes_path(path), std::io::empty())
             .map_err(|e| FetchError::Transport(format!("append entry: {e}")))
     }
 }
@@ -488,21 +1008,83 @@ fn join_dir(dir: &[u8], base: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Whether a path is hidden by higher-layer markers: the path or any ancestor
-/// is tombstoned, or any ancestor directory is opaque.
-fn shadowed(path: &[u8], tombstones: &HashSet<Vec<u8>>, opaque: &HashSet<Vec<u8>>) -> bool {
-    if tombstones.contains(path) {
-        return true;
+/// Whether an entry kind is something [`append_entry`] emits other than a
+/// directory — what replaces a lower layer's directory at the same path.
+fn replaces_directory(kind: tar::EntryType) -> bool {
+    use tar::EntryType as T;
+    matches!(
+        kind,
+        T::Regular
+            | T::Continuous
+            | T::GNUSparse
+            | T::Symlink
+            | T::Link
+            | T::Char
+            | T::Block
+            | T::Fifo
+    )
+}
+
+/// What higher layers hide from lower ones: paths tombstoned by a `.wh.`
+/// marker (the path and its subtree) and directories made opaque (everything
+/// strictly beneath them — the root included, as `""`).
+///
+/// Each path is kept beside its keyed hash, so [`hides`](Self::hides) can test
+/// every ancestor of a name in one pass over it: the prefix hashes are built
+/// incrementally, and only a hash hit is confirmed against the path itself.
+/// Looking each prefix up afresh would rehash it, which is quadratic in the
+/// name's length.
+#[derive(Default)]
+struct Shadows {
+    state: std::hash::RandomState,
+    tombstones: HashSet<Vec<u8>>,
+    tombstone_hashes: HashSet<u64>,
+    opaque: HashSet<Vec<u8>>,
+    opaque_hashes: HashSet<u64>,
+}
+
+impl Shadows {
+    fn hash(&self, path: &[u8]) -> u64 {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        let mut hasher = self.state.build_hasher();
+        hasher.write(path);
+        hasher.finish()
     }
-    let mut end = path.len();
-    while let Some(i) = path[..end].iter().rposition(|&b| b == b'/') {
-        let ancestor = &path[..i];
-        if tombstones.contains(ancestor) || opaque.contains(ancestor) {
+
+    fn tombstone(&mut self, path: Vec<u8>) {
+        self.tombstone_hashes.insert(self.hash(&path));
+        self.tombstones.insert(path);
+    }
+
+    fn opaque(&mut self, path: Vec<u8>) {
+        self.opaque_hashes.insert(self.hash(&path));
+        self.opaque.insert(path);
+    }
+
+    /// Whether `path` is hidden: it or an ancestor is tombstoned, or an
+    /// ancestor directory is opaque.
+    fn hides(&self, path: &[u8]) -> bool {
+        use std::hash::{BuildHasher as _, Hasher as _};
+        if self.tombstones.contains(path) || self.opaque.contains(b"".as_slice()) {
             return true;
         }
-        end = i;
+        // `Hasher::write` streams, so feeding the name chunk by chunk and
+        // finishing a clone at each '/' yields each ancestor's hash.
+        let mut hasher = self.state.build_hasher();
+        let mut start = 0;
+        for (i, _) in path.iter().enumerate().filter(|&(_, &b)| b == b'/') {
+            hasher.write(&path[start..i]);
+            start = i;
+            let hash = hasher.clone().finish();
+            let ancestor = &path[..i];
+            if (self.tombstone_hashes.contains(&hash) && self.tombstones.contains(ancestor))
+                || (self.opaque_hashes.contains(&hash) && self.opaque.contains(ancestor))
+            {
+                return true;
+            }
+        }
+        false
     }
-    false
 }
 
 /// Borrow a raw tar entry name as a `Path`.
@@ -665,8 +1247,11 @@ mod tests {
     }
 
     /// A plain (uncompressed) layer of `n` bytes.
-    fn raw_layer(n: usize) -> ImageLayer {
-        ImageLayer::new(vec![0u8; n], IMAGE_LAYER_MEDIA_TYPE.to_string(), None)
+    fn raw_layer(n: usize) -> Layer {
+        Layer {
+            data: vec![0u8; n],
+            media_type: OCI_LAYER.to_string(),
+        }
     }
 
     #[test]
@@ -691,12 +1276,12 @@ mod tests {
     }
 
     /// A manifest descriptor for a plain layer declaring `size` bytes.
-    fn desc(size: i64) -> OciDescriptor {
-        OciDescriptor {
-            media_type: IMAGE_LAYER_MEDIA_TYPE.to_string(),
+    fn desc(size: i64) -> Descriptor {
+        Descriptor {
+            media_type: OCI_LAYER.to_string(),
             digest: "sha256:00".into(),
             size,
-            ..OciDescriptor::default()
+            ..Descriptor::default()
         }
     }
 
@@ -704,7 +1289,7 @@ mod tests {
     fn absurd_layer_counts_are_refused() {
         // Near-empty layers cost almost nothing in bytes, so the byte cap can
         // never catch this — only the count can, and before any blob request.
-        let many: Vec<OciDescriptor> = (0..=MAX_LAYERS).map(|_| desc(0)).collect();
+        let many: Vec<Descriptor> = (0..=MAX_LAYERS).map(|_| desc(0)).collect();
         assert!(
             matches!(
                 vet_layers(&many, MAX_EXPORT_BYTES),
@@ -722,9 +1307,9 @@ mod tests {
         assert!(vet_layers(&[desc(40), desc(40), desc(40)], 100).is_err());
         assert!(vet_layers(&[desc(-1)], 100).is_err());
         assert!(vet_layers(&[], 100).is_err());
-        // oci-client would fetch a foreign url from any host, outside the
-        // registry allowlist.
-        let foreign = OciDescriptor {
+        // A foreign url is a fetch from any host, outside the registry
+        // allowlist.
+        let foreign = Descriptor {
             urls: Some(vec!["https://169.254.169.254/latest".into()]),
             ..desc(1)
         };
@@ -732,8 +1317,8 @@ mod tests {
             matches!(vet_layers(&[foreign], 100), Err(FetchError::Refused(why)) if why.contains("foreign"))
         );
         // As are the layer types that exist to use that fallback.
-        let nondistributable = OciDescriptor {
-            media_type: oci_client::manifest::IMAGE_LAYER_NONDISTRIBUTABLE_GZIP_MEDIA_TYPE.into(),
+        let nondistributable = Descriptor {
+            media_type: "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip".into(),
             ..desc(1)
         };
         assert!(
@@ -744,34 +1329,29 @@ mod tests {
     #[test]
     fn a_pull_from_inside_an_async_caller_does_not_panic() {
         // `fetch_ref` is sync but public, so an async caller can reach the
-        // puller from a thread already driving a runtime, where a nested
-        // `block_on` panics.
+        // puller from a thread already driving a runtime. The puller owns no
+        // runtime of its own, so there is no nested `block_on` to panic.
+        let image = TestImage::new();
         let outer = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
             .build()
             .unwrap();
-        let got = outer.block_on(async {
-            block_on_isolated(|| async {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                7
-            })
-        });
-        assert_eq!(got, Ok(7));
+        let got = outer.block_on(async { export("docker.io/hello:latest", &image.registry) });
+        assert!(got.is_ok(), "{got:?}");
     }
 
     #[test]
     fn a_layer_cannot_outgrow_its_declared_size() {
-        use tokio::io::AsyncWrite as _;
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        let mut sink = LayerSink {
-            buf: Vec::new(),
-            limit: 5,
-        };
-        let mut write = |data: &[u8]| Pin::new(&mut sink).poll_write(&mut cx, data);
-        assert!(matches!(write(b"1234"), Poll::Ready(Ok(4))));
-        assert!(matches!(write(b"5"), Poll::Ready(Ok(1))));
-        assert!(matches!(write(b"6"), Poll::Ready(Err(_))));
-        assert_eq!(sink.buf, b"12345");
+        // A backend that ignores the request's byte cap is still held to the
+        // manifest's size, so a registry can't stream more than it promised.
+        let image = TestImage::new();
+        let mut bigger = image.layer.clone();
+        bigger.extend_from_slice(&[0; 512]);
+        image.registry.serve(&image.blob_url(), &bigger, &[]);
+        let got = export("docker.io/hello:latest", &image.registry);
+        assert!(
+            matches!(&got, Err(FetchError::Refused(why)) if why.contains("declares")),
+            "{got:?}"
+        );
     }
 
     #[test]
@@ -889,13 +1469,178 @@ mod tests {
         assert_eq!(got, vec![("app/a".into(), "new".into())]);
     }
 
+    /// A raw 512-byte header block: `name`, `kind`, and a declared `size`.
+    fn raw_header(name: &str, kind: tar::EntryType, size: u64) -> Vec<u8> {
+        let mut h = tar::Header::new_ustar();
+        h.set_size(size);
+        h.set_mode(0o644);
+        h.set_entry_type(kind);
+        h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_cksum();
+        h.as_bytes().to_vec()
+    }
+
+    /// A layer of one PAX extension block carrying `records`, then the entry
+    /// `name` whose ustar header declares size 0 and whose body is `body`.
+    fn pax_layer(records: &str, name: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = raw_header("pax", tar::EntryType::XHeader, records.len() as u64);
+        out.extend_from_slice(records.as_bytes());
+        out.resize(out.len().div_ceil(512) * 512, 0);
+        out.extend_from_slice(&raw_header(name, tar::EntryType::Regular, 0));
+        out.extend_from_slice(body);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+        out.extend_from_slice(&[0u8; 1024]);
+        out
+    }
+
+    #[test]
+    fn a_pax_size_cannot_forge_entries_in_the_output() {
+        // The body tar-rs reads (PAX `size=512`) is itself a header block. A
+        // copied header would still say 0 bytes, so a reader of the output
+        // would parse the body as an entry that never existed in the image.
+        let forged = raw_header("etc/forged", tar::EntryType::Regular, 0);
+        let layer = pax_layer("12 size=512\n", "f", &forged);
+        let got = entries_of(&flatten_to_tar_xz(&[layer]).unwrap());
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "f");
+        assert_eq!(got[0].1.len(), 512);
+    }
+
+    #[test]
+    fn ambiguous_pax_records_are_refused() {
+        // Go keeps the last `path`, tar-rs the first: two readings of one layer.
+        for records in ["12 path=abc\n12 path=xyz\n", "8 path=\n"] {
+            let layer = pax_layer(records, "f", b"");
+            assert!(
+                matches!(flatten_to_tar_xz(&[layer]), Err(FetchError::Refused(_))),
+                "{records:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn overlong_names_are_refused() {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(0);
+        h.set_mode(0o644);
+        b.append_data(&mut h, "a/".repeat(MAX_PATH / 2 + 1), std::io::empty())
+            .unwrap();
+        let layer = b.into_inner().unwrap();
+        assert!(matches!(
+            flatten_to_tar_xz(&[layer]),
+            Err(FetchError::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn the_last_copy_of_a_path_in_a_layer_wins() {
+        // containerd and Docker extract a layer in order, so the later copy is
+        // the one that runs; showing the first would hide it.
+        let layer = layer(&[("usr/bin/sshd", "benign"), ("usr/bin/sshd", "evil")]);
+        let got = entries_of(&flatten_to_tar_xz(&[layer]).unwrap());
+        assert_eq!(got, vec![("usr/bin/sshd".into(), "evil".into())]);
+    }
+
+    /// A layer holding one symlink `path` → `target`.
+    fn symlink_layer(path: &str, target: &str) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        b.append_link(&mut h, path, target).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    #[test]
+    fn a_directory_replaced_by_a_file_hides_what_was_beneath_it() {
+        // A runtime applying the top layer removes the `etc` directory to put
+        // a file there, so `etc/cron.d/evil` from below never reaches the
+        // container — and must not reach the analysis as if it did.
+        let base = layer(&[("etc/cron.d/evil", "x"), ("etcetera", "kept")]);
+        let top = layer(&[("etc", "now a file")]);
+        let got = entries_of(&flatten_to_tar_xz(&[base, top]).unwrap());
+        assert_eq!(
+            got,
+            vec![
+                ("etc".into(), "now a file".into()),
+                ("etcetera".into(), "kept".into())
+            ]
+        );
+
+        // Likewise a symlink in the directory's place.
+        let base = layer(&[("opt/app/bin", "x")]);
+        let top = symlink_layer("opt", "/srv");
+        let got = entries_of(&flatten_to_tar_xz(&[base, top]).unwrap());
+        assert_eq!(got, vec![("opt".into(), String::new())]);
+    }
+
+    #[test]
+    fn a_directory_over_a_directory_still_merges() {
+        let base = layer(&[("etc/passwd", "base")]);
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_size(0);
+        h.set_mode(0o755);
+        b.append_data(&mut h, "etc", std::io::empty()).unwrap();
+        let top = b.into_inner().unwrap();
+        let got = entries_of(&flatten_to_tar_xz(&[base, top]).unwrap());
+        assert!(
+            got.contains(&("etc/passwd".into(), "base".into())),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn shadows_test_each_ancestor_exactly() {
+        let mut shadows = Shadows::default();
+        shadows.tombstone(b"a/b".to_vec());
+        shadows.opaque(b"x".to_vec());
+        assert!(shadows.hides(b"a/b"), "the tombstoned path");
+        assert!(shadows.hides(b"a/b/c/d"), "beneath it");
+        assert!(!shadows.hides(b"a/bc"), "a sibling sharing its prefix");
+        assert!(!shadows.hides(b"a"), "its parent");
+        assert!(!shadows.hides(b"x"), "an opaque directory itself survives");
+        assert!(shadows.hides(b"x/y"), "what is beneath it does not");
+        let deep = "d/".repeat(2000) + "f";
+        assert!(!shadows.hides(deep.as_bytes()));
+        shadows.opaque(Vec::new());
+        assert!(shadows.hides(b"anything"), "a root opaque hides everything");
+    }
+
+    #[test]
+    fn a_root_opaque_marker_hides_every_lower_layer() {
+        let base = layer(&[("etc/passwd", "base")]);
+        let top = layer(&[(".wh..wh..opq", ""), ("new", "n")]);
+        let got = entries_of(&flatten_to_tar_xz(&[base, top]).unwrap());
+        assert_eq!(got, vec![("new".into(), "n".into())]);
+    }
+
+    #[test]
+    fn a_malformed_layer_digest_is_refused() {
+        for digest in ["sha256:../../x", "sha256:", "md5:00", "sha256:AB"] {
+            let bad = Descriptor {
+                digest: digest.into(),
+                ..desc(1)
+            };
+            assert!(
+                matches!(vet_layers(&[bad], 100), Err(FetchError::Refused(_))),
+                "{digest:?} must be refused"
+            );
+        }
+    }
+
     /// Opt-in live check (`cargo test -- --ignored oci`): pulls the tiny
     /// hello-world image and flattens it. Everything else in this module is
     /// hermetic; this is the one place the real protocol gets exercised.
     #[test]
     #[ignore = "live network: pulls docker.io/library/hello-world"]
     fn live_export_hello_world() {
-        let (tar_xz, digest) = export("docker.io/library/hello-world:latest").expect("export");
+        let net = crate::fetch::HttpFetch::new().expect("client");
+        let (tar_xz, digest) =
+            export("docker.io/library/hello-world:latest", &net).expect("export");
         assert!(
             digest.starts_with("sha256:"),
             "manifest digest must be recorded"
@@ -920,7 +1665,9 @@ mod tests {
     #[test]
     #[ignore = "live network: pulls docker.io/library/debian"]
     fn live_export_debian_rootfs() {
-        let (tar_xz, digest) = export("docker.io/library/debian:stable-slim").expect("export");
+        let net = crate::fetch::HttpFetch::new().expect("client");
+        let (tar_xz, digest) =
+            export("docker.io/library/debian:stable-slim", &net).expect("export");
         assert!(digest.starts_with("sha256:"));
         let entries = entries_of(&tar_xz);
         assert!(
@@ -938,12 +1685,391 @@ mod tests {
 
     #[test]
     fn disallowed_registry_is_refused() {
-        let Err(err) = pull("internal.corp:5000/secret/image:latest") else {
+        let registry = FakeRegistry::default();
+        let Err(err) = pull("internal.corp:5000/secret/image:latest", &registry) else {
             panic!("pull of a non-allowlisted registry must fail");
         };
         assert!(
             matches!(&err, FetchError::Refused(why) if why.contains("not in the public allowlist")),
             "{err}"
         );
+        assert!(registry.requests().is_empty(), "refused before any request");
+    }
+
+    #[test]
+    fn references_parse_strictly() {
+        let parse = |r: &str| ImageRef::parse(r).map(|i| (i.host, i.repository, i.reference));
+        let hub = |repo: &str, reference: &str| {
+            Ok((
+                DOCKER_HUB.to_string(),
+                repo.to_string(),
+                reference.to_string(),
+            ))
+        };
+        assert_eq!(parse("nginx"), hub("library/nginx", "latest"));
+        assert_eq!(
+            parse("docker.io/library/nginx:1.25"),
+            hub("library/nginx", "1.25")
+        );
+        assert_eq!(
+            parse("index.docker.io/myorg/app"),
+            hub("myorg/app", "latest")
+        );
+        assert_eq!(
+            parse("GHCR.IO:443/owner/img"),
+            Ok(("ghcr.io".into(), "owner/img".into(), "latest".into())),
+            "a registry's case and https's own port are spelling, not identity"
+        );
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            parse(&format!("ghcr.io/owner/img:v1@{digest}")),
+            Ok(("ghcr.io".into(), "owner/img".into(), digest.clone()))
+        );
+        for bad in [
+            "ghcr.io/owner/img@sha256:244fd47e07d10", // short digest
+            "ghcr.io/Owner/img",                      // uppercase
+            "ghcr.io/owner/../img",
+            "ghcr.io/owner/img:bad?tag",
+            "ghcr.io/owner/img:",
+            "ghcr.io/owner//img",
+            "ghcr.io/owner/img#x",
+            "ghcr.io/owner/img%2F..",
+            "ghcr.io/owner/img@md5:00",
+            "ghcr.io:444/owner/img", // another port is another server
+        ] {
+            assert!(ImageRef::parse(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn bearer_challenges_parse_robustly() {
+        let got = bearer_challenge(
+            r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io", scope="repository:a/b:pull",error="x\"y""#,
+        )
+        .unwrap();
+        assert_eq!(got["realm"], "https://auth.docker.io/token");
+        assert_eq!(got["service"], "registry.docker.io");
+        assert_eq!(got["error"], "x\"y");
+        assert_eq!(
+            bearer_challenge(r#"bearer realm=https://r.test/t"#).unwrap()["realm"],
+            "https://r.test/t"
+        );
+        assert!(bearer_challenge(r#"Basic realm="x""#).is_none());
+        assert!(bearer_challenge(r#"Bearer realm="unterminated"#).is_none());
+        assert!(bearer_challenge("Bearer =x").is_none());
+    }
+
+    #[test]
+    fn a_pull_follows_the_token_flow_and_picks_linux_amd64() {
+        let image = TestImage::new();
+        let (tar_xz, digest) = export("docker.io/hello:latest", &image.registry).unwrap();
+        assert_eq!(digest, image.amd64_digest, "the platform manifest's digest");
+        assert_eq!(entries_of(&tar_xz), vec![("hello".into(), "hi".into())]);
+
+        let requests = image.registry.requests();
+        let realm: Vec<_> = requests
+            .iter()
+            .filter(|(url, _)| url.starts_with(REALM))
+            .collect();
+        assert_eq!(realm.len(), 1, "one token for the whole pull: {requests:?}");
+        assert_eq!(realm[0].1, None, "the realm is asked anonymously");
+        assert!(
+            realm[0]
+                .0
+                .contains("scope=repository%3Alibrary%2Fhello%3Apull"),
+            "the scope is this repository's pull, not the challenge's: {}",
+            realm[0].0
+        );
+        let blob = requests
+            .iter()
+            .find(|(url, _)| url.contains("/blobs/"))
+            .expect("blob request");
+        assert_eq!(blob.1.as_deref(), Some("Bearer t0ken"));
+    }
+
+    #[test]
+    fn a_blob_that_does_not_match_its_digest_is_refused() {
+        let image = TestImage::new();
+        let mut forged = image.layer.clone();
+        forged[0] ^= 1; // same size, different bytes
+        image.registry.serve(&image.blob_url(), &forged, &[]);
+        let got = export("docker.io/hello:latest", &image.registry);
+        assert!(
+            matches!(&got, Err(FetchError::Refused(why)) if why.contains("digest")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_match_its_digest_is_refused() {
+        // The index names the amd64 manifest by digest; another body served
+        // under that digest is a substitution.
+        let image = TestImage::new();
+        let other = manifest_json(&image.layer, 1);
+        image
+            .registry
+            .serve(&image.amd64_url(), other.as_bytes(), &[]);
+        let got = export("docker.io/hello:latest", &image.registry);
+        assert!(
+            matches!(&got, Err(FetchError::Refused(why)) if why.contains("manifest digest")),
+            "{got:?}"
+        );
+
+        // So is a tag response whose body is not what the registry's own
+        // Docker-Content-Digest says it is.
+        let image = TestImage::new();
+        let lie = format!("sha256:{}", "0".repeat(64));
+        image.registry.serve(
+            &image.tag_url(),
+            image.index.as_bytes(),
+            &[("Docker-Content-Digest", &lie)],
+        );
+        let got = export("docker.io/hello:latest", &image.registry);
+        assert!(
+            matches!(&got, Err(FetchError::Refused(why)) if why.contains("manifest digest")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_http_realm_is_refused_unasked() {
+        let image = TestImage::new();
+        image
+            .registry
+            .challenge("Bearer realm=\"http://auth.docker.io/token\",service=\"x\"");
+        let got = export("docker.io/hello:latest", &image.registry);
+        assert!(
+            matches!(&got, Err(FetchError::Refused(why)) if why.contains("https")),
+            "{got:?}"
+        );
+        assert!(
+            image
+                .registry
+                .requests()
+                .iter()
+                .all(|(url, _)| !url.starts_with("http://")),
+            "the realm was never asked"
+        );
+    }
+
+    #[test]
+    fn a_token_that_could_inject_headers_is_refused() {
+        for token in ["t0ken\r\nX-Evil: 1", "has space", ""] {
+            let image = TestImage::new();
+            let reply = serde_json::json!({ "token": token }).to_string();
+            image.registry.serve(REALM, reply.as_bytes(), &[]);
+            let got = export("docker.io/hello:latest", &image.registry);
+            assert!(
+                matches!(&got, Err(FetchError::Refused(why)) if why.contains("token")),
+                "{token:?}: {got:?}"
+            );
+        }
+    }
+
+    const REALM: &str = "https://auth.docker.io/token";
+
+    /// A registry that demands a bearer token for everything under `/v2/`,
+    /// issues `t0ken` from [`REALM`], and records each request with the
+    /// `Authorization` it carried.
+    #[derive(Default)]
+    struct FakeRegistry {
+        responses: std::sync::Mutex<HashMap<String, Fetched>>,
+        challenge: std::sync::Mutex<String>,
+        log: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl FakeRegistry {
+        fn serve(&self, url: &str, bytes: &[u8], headers: &[(&str, &str)]) {
+            let fetched = Fetched {
+                bytes: bytes.to_vec(),
+                final_url: url.to_string(),
+                status: 200,
+                headers: headers
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                redirects: Vec::new(),
+            };
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), fetched);
+        }
+
+        fn challenge(&self, challenge: &str) {
+            *self.challenge.lock().unwrap() = challenge.to_string();
+        }
+
+        fn requests(&self) -> Vec<(String, Option<String>)> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl Fetch for FakeRegistry {
+        fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+            let auth = request
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| (*v).to_string());
+            self.log
+                .lock()
+                .unwrap()
+                .push((request.url.to_string(), auth.clone()));
+            let key = request.url.split('?').next().unwrap_or_default();
+            if request.url.contains("/v2/") && auth.as_deref() != Some("Bearer t0ken") {
+                return Ok(Fetched {
+                    bytes: Vec::new(),
+                    final_url: request.url.to_string(),
+                    status: 401,
+                    headers: vec![(
+                        "www-authenticate".into(),
+                        self.challenge.lock().unwrap().clone(),
+                    )],
+                    redirects: Vec::new(),
+                });
+            }
+            self.responses
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or(FetchError::Status(404))
+        }
+
+        fn allows_oci(&self) -> bool {
+            true
+        }
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("sha256:{}", crate::fetch::sha256_hex(bytes))
+    }
+
+    #[test]
+    fn concurrently_read_layers_flatten_in_manifest_order() {
+        let registry = FakeRegistry::default();
+        registry.challenge(&format!(
+            "Bearer realm=\"{REALM}\",service=\"registry.docker.io\""
+        ));
+        registry.serve(REALM, br#"{"token":"t0ken"}"#, &[]);
+        // Ten layers each rewrite `f`; the top one's must win.
+        let layers: Vec<Vec<u8>> = (0..10)
+            .map(|n| layer(&[("f", &n.to_string()), (&format!("only{n}"), "x")]))
+            .collect();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "layers": layers.iter().map(|l| serde_json::json!(
+                {"mediaType": OCI_LAYER, "digest": sha256(l), "size": l.len()}
+            )).collect::<Vec<_>>()
+        })
+        .to_string();
+        registry.serve(
+            &format!("https://{DOCKER_HUB}/v2/library/stack/manifests/latest"),
+            manifest.as_bytes(),
+            &[],
+        );
+        for l in &layers {
+            registry.serve(
+                &format!("https://{DOCKER_HUB}/v2/library/stack/blobs/{}", sha256(l)),
+                l,
+                &[],
+            );
+        }
+        let (export, _) = export("docker.io/library/stack:latest", &registry).expect("export");
+        let entries = entries_of(&export);
+        let f: Vec<_> = entries.iter().filter(|(p, _)| p == "f").collect();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].1, "9", "the top layer's copy wins");
+        for n in 0..10 {
+            assert!(
+                entries.iter().any(|(p, _)| *p == format!("only{n}")),
+                "layer {n} kept"
+            );
+        }
+    }
+
+    /// An image manifest of the one plain layer `layer`; `salt` varies the
+    /// body without changing what it describes.
+    fn manifest_json(layer: &[u8], salt: u32) -> String {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": sha256(b"{}"), "size": 2},
+            "layers": [{"mediaType": OCI_LAYER, "digest": sha256(layer), "size": layer.len()}],
+            "annotations": {"salt": salt.to_string()}
+        })
+        .to_string()
+    }
+
+    /// `docker.io/library/hello`: a two-platform index whose linux/amd64
+    /// manifest has one layer holding `hello`, served by a [`FakeRegistry`].
+    struct TestImage {
+        registry: FakeRegistry,
+        layer: Vec<u8>,
+        index: String,
+        amd64_digest: String,
+    }
+
+    impl TestImage {
+        fn new() -> Self {
+            let layer = layer(&[("hello", "hi")]);
+            let amd64 = manifest_json(&layer, 0);
+            let arm64 = manifest_json(&layer, 1);
+            let amd64_digest = sha256(amd64.as_bytes());
+            let index = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [
+                    {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                     "digest": sha256(arm64.as_bytes()), "size": arm64.len(),
+                     "platform": {"os": "linux", "architecture": "arm64"}},
+                    {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+                     "digest": amd64_digest, "size": amd64.len(),
+                     "platform": {"os": "linux", "architecture": "amd64"}}
+                ]
+            })
+            .to_string();
+            let image = Self {
+                registry: FakeRegistry::default(),
+                layer,
+                index,
+                amd64_digest,
+            };
+            image.registry.challenge(&format!(
+                "Bearer realm=\"{REALM}\",service=\"registry.docker.io\",scope=\"repository:other/repo:push\""
+            ));
+            image.registry.serve(REALM, br#"{"token":"t0ken"}"#, &[]);
+            image.registry.serve(
+                &image.tag_url(),
+                image.index.as_bytes(),
+                &[("Docker-Content-Digest", &sha256(image.index.as_bytes()))],
+            );
+            image
+                .registry
+                .serve(&image.amd64_url(), amd64.as_bytes(), &[]);
+            image.registry.serve(&image.blob_url(), &image.layer, &[]);
+            image
+        }
+
+        fn tag_url(&self) -> String {
+            format!("https://{DOCKER_HUB}/v2/library/hello/manifests/latest")
+        }
+
+        fn amd64_url(&self) -> String {
+            format!(
+                "https://{DOCKER_HUB}/v2/library/hello/manifests/{}",
+                self.amd64_digest
+            )
+        }
+
+        fn blob_url(&self) -> String {
+            format!(
+                "https://{DOCKER_HUB}/v2/library/hello/blobs/{}",
+                sha256(&self.layer)
+            )
+        }
     }
 }

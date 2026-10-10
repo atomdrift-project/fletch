@@ -36,7 +36,6 @@ use crate::ecosystem::homebrew::homebrew;
 use crate::ecosystem::huggingface::huggingface;
 use crate::ecosystem::jetbrains::jetbrains;
 use crate::ecosystem::jsr::jsr;
-use crate::ecosystem::last_seg;
 use crate::ecosystem::maven::maven;
 use crate::ecosystem::npm::npm;
 use crate::ecosystem::nuget::nuget;
@@ -87,6 +86,11 @@ pub enum RegistryError {
     /// The registry answered, but with nothing fletch could read as a record.
     #[error("no usable record in the registry's answer")]
     NoRecord,
+    /// The PURL's bytes come from somewhere other than the registry the lookup
+    /// reads (a `download_url`, or a `repository_url` the backend cannot
+    /// follow), so that registry's record would describe another artifact.
+    #[error("package is not served by the registry fletch reads")]
+    OffRegistry,
 }
 
 impl From<FetchError> for RegistryError {
@@ -139,6 +143,12 @@ fn look_up(
     if !safe_coordinate(&path) || version.as_deref().is_some_and(|v| !safe_coordinate(v)) {
         return Err(RegistryError::UnsafeCoordinate);
     }
+    // The fetcher honours these qualifiers, so without this a file could name
+    // `pkg:npm/lodash@4.17.21?repository_url=https://evil.test` and have
+    // evil.test's bytes judged by lodash's age and popularity.
+    if off_registry(&purl) {
+        return Err(RegistryError::OffRegistry);
+    }
     let version = version.as_deref();
     // Package documents are mutable, but what they say about a published
     // version is not (see the metadata TTL notes in `fetch`), so a versioned
@@ -182,6 +192,69 @@ const DATES_EVERY_VERSION: &[&str] = &[
     "npm", "cargo", "pypi", "composer", "gem", "hex", "pub", "conda", "jsr", "cran",
 ];
 
+/// Whether `purl` names bytes the registry lookup does not read: any
+/// `download_url`, or a `repository_url` other than the public registry for a
+/// backend that only ever reads that registry.
+fn off_registry(purl: &Purl) -> bool {
+    if purl.qualifier("download_url").is_some() {
+        return true;
+    }
+    let Some(repository) = purl.qualifier("repository_url") else {
+        return false;
+    };
+    let host = url::Url::parse(repository)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    match purl.typ() {
+        "npm" => host != "registry.npmjs.org",
+        "pypi" => !matches!(host.as_str(), "pypi.org" | "files.pythonhosted.org"),
+        "cargo" => !matches!(host.as_str(), "crates.io" | "index.crates.io"),
+        "gem" => host != "rubygems.org",
+        "golang" => host != "proxy.golang.org",
+        _ => false,
+    }
+}
+
+/// The Arch Linux repositories `archlinux.org` answers for, as an `alpm`
+/// namespace: the vendor itself, and its official repos.
+const ARCH_REPOSITORIES: &[&str] = &[
+    "arch",
+    "core",
+    "extra",
+    "multilib",
+    "community",
+    "testing",
+    "core-testing",
+    "extra-testing",
+    "multilib-testing",
+    "community-testing",
+    "staging",
+    "core-staging",
+    "extra-staging",
+    "gnome-unstable",
+    "kde-unstable",
+];
+
+/// The namespaces naming Homebrew's own formula repository, the one
+/// `formulae.brew.sh` describes.
+const HOMEBREW_CORE: &[&str] = &["homebrew", "homebrew-core", "homebrew/core", "core"];
+
+/// The bare package name for a backend that reads one repository: `path`
+/// itself, or its name under a namespace in `own`, that repository's own
+/// spellings. Any other namespace — a third-party tap, PPA, or vendor —
+/// names a package elsewhere, and the backend's record of the same name would
+/// lend it a reputation it never earned.
+fn bare<'a>(path: &'a str, own: &[&str]) -> Result<&'a str, RegistryError> {
+    match path.rsplit_once('/') {
+        None => Ok(path),
+        Some((namespace, name)) if own.iter().any(|o| o.eq_ignore_ascii_case(namespace)) => {
+            Ok(name)
+        }
+        Some(_) => Err(RegistryError::OffRegistry),
+    }
+}
+
 /// One registry lookup: dispatch on the PURL type to its backend.
 fn lookup(
     purl: &Purl,
@@ -209,10 +282,28 @@ fn lookup(
         // the attacker-reachable half of the ML supply chain forager mirrors.
         "huggingface" => huggingface(path, version, net, cache),
         "hex" => hex_pm(path, version, net, cache),
-        "cran" => cran(last_seg(path), version, net, cache),
-        "cpan" => cpan(last_seg(path), net, cache),
-        "pub" => pub_dev(last_seg(path), version, net, cache),
-        "conda" => conda(last_seg(path), version, net, cache),
+        "cran" => cran(bare(path, &[])?, version, net, cache),
+        // The namespace is the PAUSE id that released the distribution; another
+        // author's upload of the same name is not the one CPAN indexes.
+        "cpan" => match path.split_once('/') {
+            Some((author, dist)) => cpan(bare(dist, &[])?, net, cache).and_then(|record| {
+                record
+                    .author
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(author))
+                    .then_some(record)
+                    .ok_or(RegistryError::OffRegistry)
+            }),
+            None => cpan(path, net, cache),
+        },
+        "pub" => pub_dev(bare(path, &[])?, version, net, cache),
+        "conda" => conda(
+            bare(path, &[])?,
+            purl.qualifier("channel"),
+            version,
+            net,
+            cache,
+        ),
         "clojars" => clojars(path, net, cache),
         // JSR ships through npm-compatible mirrors, but its own API carries the
         // richer record (score, repo, per-version dates).
@@ -223,8 +314,8 @@ fn lookup(
         // OS package registries each get their own PURL type so a scan can name
         // `pkg:fedora/curl` vs `pkg:arch/pacman` directly. The package name is
         // the last path segment (any vendor namespace is dropped).
-        "arch" => arch(last_seg(path), net, cache),
-        "fedora" => fedora(last_seg(path), net, cache),
+        "arch" => arch(bare(path, &[])?, net, cache),
+        "fedora" => fedora(bare(path, &[])?, net, cache),
         // The AUR is the user-contributed, attacker-reachable half of Arch. Three
         // spellings reach it: the bare `pkg:aur/<name>` legacy type; the
         // spec-compliant `pkg:alpm/arch/<name>?repository_url=https://aur.archlinux.org`,
@@ -234,30 +325,33 @@ fn lookup(
         // alpm namespace is an official repo. Normalization folds the spec form
         // into the `aur` namespace; a repository URL it doesn't fold is read
         // from the qualifier.
-        "aur" => aur(last_seg(path), net, cache),
+        "aur" => aur(bare(path, &[])?, net, cache),
         "alpm" if repository_url.is_some_and(|url| url.contains("aur.archlinux.org")) => {
-            aur(last_seg(path), net, cache)
+            aur(bare(path, &["arch", "aur"])?, net, cache)
         }
         "alpm" => match path.split_once('/') {
-            Some(("aur", name)) => aur(name, net, cache),
-            Some((_, name)) => arch(name, net, cache),
+            Some(("aur", name)) => aur(bare(name, &[])?, net, cache),
+            Some((repo, name)) if ARCH_REPOSITORIES.contains(&repo) => {
+                arch(bare(name, &[])?, net, cache)
+            }
+            Some(_) => Err(RegistryError::OffRegistry),
             None => arch(path, net, cache),
         },
         // Distro registries with no JSON API: each metadata lookup fetches a
         // compressed index/catalog and scans it. See [`crate::distro`].
-        "alpine" => distro::alpine(last_seg(path), net, cache),
-        "wolfi" => distro::wolfi(last_seg(path), net, cache),
-        "debian" => distro::debian(last_seg(path), net, cache),
-        "ubuntu" => distro::ubuntu(last_seg(path), net, cache),
-        "opensuse" => distro::opensuse(last_seg(path), net, cache),
-        "rpmfusion" => distro::rpmfusion(last_seg(path), net, cache),
-        "netbsd" => distro::netbsd(last_seg(path), net, cache),
-        "freebsd" => distro::freebsd(last_seg(path), net, cache),
-        "openbsd" => distro::openbsd(last_seg(path), net, cache),
+        "alpine" => distro::alpine(bare(path, &[])?, net, cache),
+        "wolfi" => distro::wolfi(bare(path, &[])?, net, cache),
+        "debian" => distro::debian(bare(path, &[])?, net, cache),
+        "ubuntu" => distro::ubuntu(bare(path, &[])?, net, cache),
+        "opensuse" => distro::opensuse(bare(path, &[])?, net, cache),
+        "rpmfusion" => distro::rpmfusion(bare(path, &[])?, net, cache),
+        "netbsd" => distro::netbsd(bare(path, &[])?, net, cache),
+        "freebsd" => distro::freebsd(bare(path, &[])?, net, cache),
+        "openbsd" => distro::openbsd(bare(path, &[])?, net, cache),
         // Package managers and app stores.
-        "homebrew" => homebrew(last_seg(path), net, cache),
-        "snap" => snap(last_seg(path), net, cache),
-        "wordpress" => wordpress(last_seg(path), net, cache),
+        "homebrew" => homebrew(bare(path, HOMEBREW_CORE)?, net, cache),
+        "snap" => snap(bare(path, &[])?, net, cache),
+        "wordpress" => wordpress(bare(path, &[])?, net, cache),
         // Agent-skill registry: `pkg:clawhub/[owner/]slug`.
         "clawhub" => clawhub(path, net, cache),
         // Plugin registries of ML apps: a ComfyUI custom node
@@ -272,13 +366,13 @@ fn lookup(
         "oci" | "docker" => oci_meta(repository_url, path, net, cache),
         // Browser-extension / plugin marketplaces — the same listing shape as
         // the Chrome and VS Code stores (rating, downloads, recency).
-        "firefox" => firefox(last_seg(path), net, cache),
-        "jetbrains" => jetbrains(last_seg(path), net, cache),
+        "firefox" => firefox(bare(path, &[])?, net, cache),
+        "jetbrains" => jetbrains(bare(path, &[])?, net, cache),
         // Browser extensions: `pkg:chrome/<extension-id>`. The store's risk
         // signals (reach, rating, recency, the developer's own description of
         // what it harvests) live on the listing, not in a manifest.
         // `chrome-extension` is the ratified purl-spec spelling of the same type.
-        "chrome" | "chrome-extension" => chrome(last_seg(path), net, cache),
+        "chrome" | "chrome-extension" => chrome(bare(path, &[])?, net, cache),
         // VS Code / editor extensions: `pkg:openvsx/<namespace>/<name>`. Open
         // VSX exposes a clean JSON API, so no scraping — the same marketplace
         // shape (rating, downloads, publisher, recency) as the Chrome store.
@@ -297,20 +391,25 @@ fn lookup(
         // Spec-form aliases (purl-spec / common practice) for the same registries,
         // so a PURL generated per spec fetches identically to our legacy spelling.
         // The OS types carry the distro in the namespace (`pkg:deb/debian/curl`).
+        // Any other vendor (a PPA, a derivative) names its own repository,
+        // whose package of the same name the official record does not describe.
         "deb" => match path.split_once('/') {
-            Some(("ubuntu", name)) => distro::ubuntu(last_seg(name), net, cache),
-            Some((_, name)) => distro::debian(last_seg(name), net, cache),
+            Some(("ubuntu", name)) => distro::ubuntu(bare(name, &[])?, net, cache),
+            Some(("debian", name)) => distro::debian(bare(name, &[])?, net, cache),
+            Some(_) => Err(RegistryError::OffRegistry),
             None => distro::debian(path, net, cache),
         },
         "rpm" => match path.split_once('/') {
-            Some(("opensuse", name)) => distro::opensuse(last_seg(name), net, cache),
-            Some(("rpmfusion", name)) => distro::rpmfusion(last_seg(name), net, cache),
-            Some((_, name)) => fedora(last_seg(name), net, cache),
+            Some(("opensuse", name)) => distro::opensuse(bare(name, &[])?, net, cache),
+            Some(("rpmfusion", name)) => distro::rpmfusion(bare(name, &[])?, net, cache),
+            Some(("fedora", name)) => fedora(bare(name, &[])?, net, cache),
+            Some(_) => Err(RegistryError::OffRegistry),
             None => fedora(path, net, cache),
         },
         "apk" => match path.split_once('/') {
-            Some(("wolfi", name)) => distro::wolfi(last_seg(name), net, cache),
-            Some((_, name)) => distro::alpine(last_seg(name), net, cache),
+            Some(("wolfi", name)) => distro::wolfi(bare(name, &[])?, net, cache),
+            Some(("alpine", name)) => distro::alpine(bare(name, &[])?, net, cache),
+            Some(_) => Err(RegistryError::OffRegistry),
             None => distro::alpine(path, net, cache),
         },
         other => Err(RegistryError::Unsupported(other.to_string())),
@@ -658,6 +757,73 @@ mod tests {
         assert_eq!(r.downloads_recent, Some(1_234_567));
         assert_eq!(r.rating_count, Some(89));
         assert_eq!(r.first_published_at, Some(1_647_424_800)); // createdAt
+    }
+
+    #[test]
+    fn off_registry_bytes_never_borrow_the_public_record() {
+        // No fixtures: an off-registry PURL must be refused before any read.
+        let (net, cache) = (Fixtures::default(), BlobCache::disabled());
+        let look = |purl: &str| try_registry(&RefLocator::Purl(purl.into()), &net, &cache);
+        for purl in [
+            "pkg:npm/lodash@4.17.21?repository_url=https://evil.test",
+            "pkg:npm/lodash@4.17.21?download_url=https://evil.test/x.tgz",
+            "pkg:pypi/requests@2.31.0?repository_url=https://evil.test/simple",
+            "pkg:cargo/serde@1.0.0?repository_url=https://evil.test",
+            "pkg:gem/rails@7.0.0?repository_url=https://evil.test",
+            "pkg:golang/github.com/a/b@v1.0.0?repository_url=https://evil.test",
+        ] {
+            assert_eq!(look(purl), Err(RegistryError::OffRegistry), "{purl}");
+        }
+        assert_ne!(
+            look("pkg:npm/lodash@4.17.21?repository_url=https://registry.npmjs.org"),
+            Err(RegistryError::OffRegistry),
+            "the public registry named explicitly is still the public registry"
+        );
+    }
+
+    #[test]
+    fn a_foreign_vendor_never_borrows_the_official_record() {
+        // No fixtures: each must be refused before any read.
+        let (net, cache) = (Fixtures::default(), BlobCache::disabled());
+        let look = |purl: &str| try_registry(&RefLocator::Purl(purl.into()), &net, &cache);
+        for purl in [
+            "pkg:deb/attacker-ppa/curl",
+            "pkg:rpm/evilrepo/openssl",
+            "pkg:apk/evil/musl",
+            "pkg:alpm/evil/pacman",
+            "pkg:homebrew/evil-tap/wget",
+            "pkg:snap/evil/firefox",
+            "pkg:deb/debian/nested/curl",
+        ] {
+            assert_eq!(look(purl), Err(RegistryError::OffRegistry), "{purl}");
+        }
+        assert_eq!(
+            look("pkg:jsr/%40%40%40std/path"),
+            Err(RegistryError::NoRecord)
+        );
+    }
+
+    #[test]
+    fn a_cpan_author_namespace_must_be_the_releasing_author() {
+        let doc = br#"{"distribution":"URI-PackageURL","author":"GDT","version":"2.0"}"#;
+        let net = Fixtures::default().with(
+            "https://fastapi.metacpan.org/v1/release/URI-PackageURL",
+            doc,
+        );
+        let cache = BlobCache::disabled();
+        let look = |purl: &str| try_registry(&RefLocator::Purl(purl.into()), &net, &cache);
+        assert_eq!(
+            look("pkg:cpan/GDT/URI-PackageURL").map(|r| r.author),
+            Ok(Some("GDT".to_string()))
+        );
+        assert_eq!(
+            look("pkg:cpan/EVIL/URI-PackageURL"),
+            Err(RegistryError::OffRegistry)
+        );
+        assert!(
+            look("pkg:cpan/URI-PackageURL").is_ok(),
+            "no namespace, no claim"
+        );
     }
 
     #[test]

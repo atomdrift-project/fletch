@@ -27,11 +27,21 @@ use crate::ecosystem::{parse_ts, strip_email};
 use crate::fetch::{BlobCache, Fetch, cached_metadata_status, sha256_hex};
 use crate::registry::RegistryError;
 
-/// Ceiling on a single index's *decompressed* size. The 64 MiB download cap
+/// Ceiling on a single index's *decompressed* size. The per-fetch download cap
 /// already bounds the compressed input; this backstops a decompression bomb
 /// (a tiny input inflating without limit) and the streaming scanners never hold
-/// more than one stanza regardless.
+/// more than one stanza regardless. Exceeding it is an error, never a silent
+/// truncation that would report a package past the cut as absent.
 const DECOMP_CAP: u64 = 512 * 1024 * 1024;
+
+/// Ceiling on one line, stanza, or `<package>` element of an index. Real ones
+/// are kilobytes; without a bound, one endless element would be buffered
+/// whole.
+const MAX_ELEMENT: usize = 16 * 1024 * 1024;
+
+/// The xz decoder's memory ceiling: well above the 65 MiB `xz -9` needs, far
+/// below what a crafted header could otherwise ask for.
+const XZ_MEMLIMIT: u64 = 256 * 1024 * 1024;
 
 /// Read size for the streaming XML scanner.
 const XML_CHUNK: usize = 64 * 1024;
@@ -260,16 +270,18 @@ fn lookup(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    listings(url, url, parse, net, cache)?
+    listings(url, url, None, parse, net, cache)?
         .get(name)
         .map(|listing| listing.record(ecosystem, name))
         .ok_or(RegistryError::NotFound)
 }
 
-/// The listings of the index at `url`, kept as [`PARSED`]`[slot]`.
+/// The listings of the index at `url`, kept as [`PARSED`]`[slot]` — refused
+/// when its SHA-256 is not the `expected` one its repository published.
 fn listings(
     slot: &str,
     url: &str,
+    expected: Option<&str>,
     parse: Parser,
     net: &dyn Fetch,
     cache: &BlobCache,
@@ -278,6 +290,9 @@ fn listings(
     // the index fresh and records it as a source.
     let bytes = index(url, net, cache)?;
     let digest = sha256_hex(&bytes);
+    if expected.is_some_and(|want| want != digest) {
+        return Err(unreadable(url, "checksum differs from repomd.xml"));
+    }
     let slot = Arc::clone(
         PARSED
             .lock()
@@ -320,8 +335,7 @@ fn stanza_listings<R: BufRead>(
 /// back to back, whose `APKINDEX` member holds `K:value` stanzas.
 fn parse_apkindex(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
     let mut out = Vec::new();
-    flate2::read::MultiGzDecoder::new(Cursor::new(bytes))
-        .take(DECOMP_CAP)
+    capped(flate2::read::MultiGzDecoder::new(Cursor::new(bytes)))
         .read_to_end(&mut out)
         .map_err(|e| unreadable(url, e))?;
     let apkindex = tar_find(&out, "APKINDEX").ok_or_else(|| unreadable(url, "no APKINDEX"))?;
@@ -385,14 +399,23 @@ fn rpm_repo_lookup(
 ) -> Result<Registry, RegistryError> {
     let repomd_url = format!("{base}/repodata/repomd.xml");
     let repomd = index(&repomd_url, net, cache)?;
-    let href = std::str::from_utf8(&repomd)
-        .ok()
-        .and_then(primary_href)
-        .ok_or_else(|| unreadable(&repomd_url, "no primary index"))?;
-    listings(base, &format!("{base}/{href}"), parse_primary, net, cache)?
-        .get(name)
-        .map(|listing| listing.record(ecosystem, name))
-        .ok_or(RegistryError::NotFound)
+    let repomd = std::str::from_utf8(&repomd).unwrap_or_default();
+    let href = primary_href(repomd).ok_or_else(|| unreadable(&repomd_url, "no primary index"))?;
+    // `primary.xml` is served from third-party mirrors (openSUSE's
+    // MirrorCache redirects), `repomd.xml` from the origin: hold the mirror to
+    // the digest the origin published.
+    let expected = primary_sha256(repomd);
+    listings(
+        base,
+        &format!("{base}/{href}"),
+        expected.as_deref(),
+        parse_primary,
+        net,
+        cache,
+    )?
+    .get(name)
+    .map(|listing| listing.record(ecosystem, name))
+    .ok_or(RegistryError::NotFound)
 }
 
 /// A `primary.xml`, compressed as its `.zst`/`.gz`/`.xz` suffix says.
@@ -402,11 +425,15 @@ fn parse_primary(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
             zstd::stream::read::Decoder::new(Cursor::new(bytes)).map_err(|e| unreadable(url, e))?,
         ),
         Some("gz") => Box::new(gunzip(bytes)),
-        Some("xz") => Box::new(xz2::read::XzDecoder::new_multi_decoder(Cursor::new(bytes))),
+        Some("xz") => Box::new(xz2::read::XzDecoder::new_stream(
+            Cursor::new(bytes),
+            xz2::stream::Stream::new_stream_decoder(XZ_MEMLIMIT, xz2::stream::CONCATENATED)
+                .map_err(|e| unreadable(url, e))?,
+        )),
         _ => return Err(unreadable(url, "unknown compression")),
     };
     let mut listings = Listings::new();
-    xml_packages(reader.take(DECOMP_CAP), |pkg| {
+    xml_packages(capped(reader), |pkg| {
         if let Some((name, found)) = rpm_listing(pkg) {
             listings.entry(name).or_insert(found);
         }
@@ -415,11 +442,28 @@ fn parse_primary(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
     Ok(listings)
 }
 
-/// The `<location href="…primary.xml.*"/>` from `repomd.xml`.
-fn primary_href(xml: &str) -> Option<String> {
+/// The `<data type="primary">` element of `repomd.xml`.
+fn primary_data(xml: &str) -> Option<&str> {
     let data = xml
         .split("<data ")
         .find(|d| d.starts_with("type=\"primary\""))?;
+    Some(data.split("</data>").next().unwrap_or(data))
+}
+
+/// The SHA-256 `repomd.xml` publishes for the compressed `primary.xml`, if it
+/// publishes one (`<checksum>`, not the decompressed `<open-checksum>`).
+fn primary_sha256(xml: &str) -> Option<String> {
+    let anchor = "<checksum type=\"sha256\">";
+    let data = primary_data(xml)?;
+    let rest = &data[data.find(anchor)? + anchor.len()..];
+    let hex = rest[..rest.find('<')?].trim();
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| hex.to_ascii_lowercase())
+}
+
+/// The `<location href="…primary.xml.*"/>` from `repomd.xml`.
+fn primary_href(xml: &str) -> Option<String> {
+    let data = primary_data(xml)?;
     let anchor = "href=\"";
     let start = data.find(anchor)? + anchor.len();
     let rest = &data[start..];
@@ -482,7 +526,7 @@ fn pkg_summary_listing(stanza: &str) -> Option<(Box<str>, Listing)> {
 fn parse_packagesite(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
     let decoder =
         zstd::stream::read::Decoder::new(Cursor::new(bytes)).map_err(|e| unreadable(url, e))?;
-    let mut archive = tar::Archive::new(decoder.take(DECOMP_CAP));
+    let mut archive = tar::Archive::new(capped(decoder));
     for entry in archive.entries().map_err(|e| unreadable(url, e))? {
         let entry = entry.map_err(|e| unreadable(url, e))?;
         if !entry.path_bytes().ends_with(b"packagesite.yaml") {
@@ -491,11 +535,7 @@ fn parse_packagesite(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryErro
         let mut listings = Listings::new();
         let mut yaml = BufReader::new(entry);
         let mut line = Vec::new();
-        while yaml
-            .read_until(b'\n', &mut line)
-            .map_err(|e| unreadable(url, e))?
-            > 0
-        {
+        while read_line(&mut yaml, &mut line).map_err(|e| unreadable(url, e))? > 0 {
             if let Some((name, found)) = serde_json::from_slice::<Packagesite>(&line)
                 .ok()
                 .and_then(packagesite_listing)
@@ -558,7 +598,38 @@ fn openbsd_version(listing: &str, name: &str) -> Option<String> {
 /// A streaming gzip reader over owned compressed `bytes`, capped against a bomb.
 /// A non-gzip body surfaces as a read error when the scanner pulls from it.
 fn gunzip(bytes: Vec<u8>) -> impl Read {
-    flate2::read::MultiGzDecoder::new(Cursor::new(bytes)).take(DECOMP_CAP)
+    capped(flate2::read::MultiGzDecoder::new(Cursor::new(bytes)))
+}
+
+/// `r`, failing once more than [`DECOMP_CAP`] bytes have come out of it.
+fn capped<R: Read>(r: R) -> Capped<R> {
+    Capped(r.take(DECOMP_CAP + 1))
+}
+
+/// A decompressed stream that errors past [`DECOMP_CAP`] rather than ending
+/// there: one byte over is read, so the cap itself is still allowed.
+struct Capped<R>(std::io::Take<R>);
+
+impl<R: Read> Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        if n > 0 && self.0.limit() == 0 {
+            return Err(std::io::Error::other("index exceeds the decompression cap"));
+        }
+        Ok(n)
+    }
+}
+
+/// [`BufRead::read_until`] a newline, refusing a line past [`MAX_ELEMENT`].
+fn read_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<usize> {
+    line.clear();
+    let n = reader
+        .take(MAX_ELEMENT as u64 + 1)
+        .read_until(b'\n', line)?;
+    if line.len() > MAX_ELEMENT {
+        return Err(std::io::Error::other("index line too long"));
+    }
+    Ok(n)
 }
 
 /// Find a member by exact name (or `…/name`) in an uncompressed POSIX/ustar tar,
@@ -633,8 +704,7 @@ fn stanzas<R: BufRead>(mut reader: R, mut f: impl FnMut(&str)) -> std::io::Resul
     let mut stanza = String::new();
     let mut line = Vec::new();
     loop {
-        line.clear();
-        let at_end = reader.read_until(b'\n', &mut line)? == 0;
+        let at_end = read_line(&mut reader, &mut line)? == 0;
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end_matches(['\n', '\r']);
         if text.is_empty() {
@@ -646,6 +716,9 @@ fn stanzas<R: BufRead>(mut reader: R, mut f: impl FnMut(&str)) -> std::io::Resul
                 return Ok(());
             }
         } else {
+            if stanza.len() + text.len() > MAX_ELEMENT {
+                return Err(std::io::Error::other("index stanza too long"));
+            }
             stanza.push_str(text);
             stanza.push('\n');
         }
@@ -653,13 +726,18 @@ fn stanzas<R: BufRead>(mut reader: R, mut f: impl FnMut(&str)) -> std::io::Resul
 }
 
 /// Stream `reader`, isolating each `<package …>…</package>` element and handing
-/// its text to `f`. Buffers at most one element plus a read chunk, so a
-/// multi-hundred-MiB `primary.xml` is read without holding it whole.
+/// its text to `f`. Buffers at most one element (up to [`MAX_ELEMENT`]) plus a
+/// read chunk, so a multi-hundred-MiB `primary.xml` is read without holding it
+/// whole. An element still open after a read resumes its close-tag search
+/// where the last one stopped, so one long element costs linear time, not a
+/// rescan per chunk.
 fn xml_packages<R: Read>(mut reader: R, mut f: impl FnMut(&str)) -> std::io::Result<()> {
     const OPEN: &[u8] = b"<package";
     const CLOSE: &[u8] = b"</package>";
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; XML_CHUNK];
+    // How much of the open element at the front of `buf` was already searched.
+    let mut searched: usize = 0;
     loop {
         let n = reader.read(&mut chunk)?;
         if n == 0 {
@@ -675,7 +753,13 @@ fn xml_packages<R: Read>(mut reader: R, mut f: impl FnMut(&str)) -> std::io::Res
                 done = done.max(buf.len().saturating_sub(OPEN.len() - 1));
                 break;
             };
-            let Some(end) = find_sub(&buf[start..], CLOSE).map(|i| start + i + CLOSE.len()) else {
+            // A close tag may straddle the previous read, so step back over it.
+            let from = start + std::mem::take(&mut searched).saturating_sub(CLOSE.len() - 1);
+            let Some(end) = find_sub(&buf[from..], CLOSE).map(|i| from + i + CLOSE.len()) else {
+                if buf.len() - start > MAX_ELEMENT {
+                    return Err(std::io::Error::other("index element too long"));
+                }
+                searched = buf.len() - start;
                 done = start; // incomplete: read more
                 break;
             };
@@ -1007,5 +1091,70 @@ mod tests {
         )
         .expect("record");
         assert_eq!(r.version, "8.5.0-1.2");
+    }
+
+    #[test]
+    fn a_mirrored_primary_index_must_match_repomd() {
+        let primary = br#"<metadata><package type="rpm"><name>curl</name>
+            <version epoch="0" ver="8.5.0" rel="1.2"/></package></metadata>"#;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(primary).unwrap();
+        let gz = gz.finish().unwrap();
+        let repomd = |sum: &str| {
+            format!(
+                r#"<repomd><data type="primary"><checksum type="sha256">{sum}</checksum>
+                <open-checksum type="sha256">{zero}</open-checksum>
+                <location href="repodata/p-primary.xml.gz"/></data></repomd>"#,
+                zero = "0".repeat(64)
+            )
+        };
+        let lookup = |base: &str, sum: &str| {
+            let net = crate::fetch::Fixtures::default()
+                .with(
+                    &format!("{base}/repodata/repomd.xml"),
+                    repomd(sum).as_bytes(),
+                )
+                .with(&format!("{base}/repodata/p-primary.xml.gz"), &gz);
+            rpm_repo_lookup(base, "curl", "opensuse", &net, &BlobCache::disabled())
+        };
+        let good = lookup("https://repo-sum-ok.test", &sha256_hex(&gz).to_uppercase());
+        assert_eq!(good.map(|r| r.version), Ok("8.5.0-1.2".into()));
+        let bad = lookup("https://repo-sum-bad.test", &"a".repeat(64));
+        assert!(
+            matches!(bad, Err(RegistryError::Malformed { .. })),
+            "{bad:?}"
+        );
+    }
+
+    #[test]
+    fn a_decompressed_index_past_the_cap_is_an_error_not_a_prefix() {
+        let read = |limit: u64| {
+            let mut out = Vec::new();
+            Capped(Cursor::new([0u8; 10]).take(limit + 1)).read_to_end(&mut out)
+        };
+        assert_eq!(read(10).ok(), Some(10));
+        assert!(read(9).is_err());
+    }
+
+    #[test]
+    fn an_endless_index_element_is_refused() {
+        let mut xml = b"<metadata><package><name>a</name>".to_vec();
+        xml.resize(MAX_ELEMENT + XML_CHUNK * 2, b'x');
+        let got = xml_packages(Cursor::new(xml), |_| {});
+        assert!(got.is_err());
+
+        let line = vec![b'x'; MAX_ELEMENT + 1];
+        assert!(stanzas(Cursor::new(line), |_| {}).is_err());
+    }
+
+    #[test]
+    fn a_close_tag_split_across_reads_is_still_found() {
+        // Elements far longer than one read, closed across a read boundary.
+        let mut xml = b"<metadata><package><name>a</name>".to_vec();
+        xml.resize(XML_CHUNK * 3 - 4, b' ');
+        xml.extend_from_slice(b"</package><package><name>b</name></package>");
+        let mut names = Vec::new();
+        xml_packages(Cursor::new(xml), |p| names.push(tag_text(p, "name"))).expect("read");
+        assert_eq!(names, [Some("a".into()), Some("b".into())]);
     }
 }
