@@ -650,7 +650,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#ed1f6d0721dd71324a1e6913709231390996ce8c"
+source = "git+https://github.com/atomdrift-project/filefacts.git#73a261b03add6b6c5b363f76cf4dcb27fc46797c"
 dependencies = [
  "aho-corasick",
  "cab",
@@ -2175,9 +2175,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.152"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "1741ab7a6cc54a03a89b5d563ed60075c277d9e3cfa73ad0c1f23f23974703c6"
 dependencies = [
  "indexmap",
  "itoa",
@@ -2376,7 +2376,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "2.1.1"
-source = "git+https://github.com/atomdrift-project/stng.git#b4f71d2fc189f20270c3e5f5afb51038f9871665"
+source = "git+https://github.com/atomdrift-project/stng.git#1c2738561a2ed2651122e6d4a9cdf30b69f0ffbb"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2819,7 +2819,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#ed1f6d0721dd71324a1e6913709231390996ce8c"
+source = "git+https://github.com/atomdrift-project/filefacts.git#73a261b03add6b6c5b363f76cf4dcb27fc46797c"
 dependencies = [
  "cc",
  "tree-sitter",
