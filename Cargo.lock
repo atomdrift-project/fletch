@@ -650,7 +650,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#070ffde65593cd4ec7959185a8e3c9041a4c4171"
+source = "git+https://github.com/atomdrift-project/filefacts.git#6cd021949cdc4d87b64b73942d4b78bfa5e4f5b5"
 dependencies = [
  "aho-corasick",
  "cab",
@@ -2826,7 +2826,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#070ffde65593cd4ec7959185a8e3c9041a4c4171"
+source = "git+https://github.com/atomdrift-project/filefacts.git#6cd021949cdc4d87b64b73942d4b78bfa5e4f5b5"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -3472,9 +3472,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "2.4.2"
+version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+checksum = "1dcb24d0152526ae49b9b96c1dcf71850ca1e0b882e4e28ed898a93c41334744"
 dependencies = [
  "aes",
  "arbitrary",
@@ -3483,7 +3483,6 @@ dependencies = [
  "crc32fast",
  "crossbeam-utils",
  "deflate64",
- "displaydoc",
  "flate2",
  "getrandom 0.3.4",
  "hmac",
@@ -3492,7 +3491,6 @@ dependencies = [
  "memchr",
  "pbkdf2",
  "sha1 0.10.7",
- "thiserror 2.0.21",
  "time",
  "xz2",
  "zeroize",
@@ -3544,9 +3542,9 @@ dependencies = [
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.1+zstd.1.5.7"
+version = "2.1.2+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aeec9eaf2dffbbd09201e23bd0ffcbaa33bb8e9266a10734fd7ed90a85eca078"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
 dependencies = [
  "cc",
  "pkg-config",
