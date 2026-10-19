@@ -98,7 +98,7 @@ anyhow = "1"
 dirs = "6"
 # `rt` backs `spawn_blocking` in the SSRF resolver: getaddrinfo blocks, so
 # it runs off reqwest's runtime thread.
-tokio = { version = "1.53.3", features = ["rt"] }
+tokio = { version = "1.54.0", features = ["rt"] }
 tar = "0.4.46"
 xz2 = "0.1.7"
 pep440_rs = "0.7.3"
