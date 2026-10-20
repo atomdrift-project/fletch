@@ -123,5 +123,7 @@ tempfile = "3"
 # scan. Track the fork's master as the siblings do, so `cargo update` moves
 # every root together. Remove from all five once a release carries the fix.
 [patch.crates-io]
+# Inherited from a sibling by update-deps: [patch] applies only in the root.
+tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
