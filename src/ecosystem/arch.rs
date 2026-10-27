@@ -28,6 +28,24 @@ pub(crate) fn resolve_aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Str
         .unwrap_or_else(|| format!("https://aur.archlinux.org/cgit/aur.git/snapshot/{name}.tar.gz"))
 }
 
+/// Resolve the current official-repository package, not an installed version.
+/// The package API supplies repository and architecture; only known official
+/// repository labels and Arch's x86_64/any artifacts are accepted.
+pub(crate) fn resolve_arch_current(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<String> {
+    if !safe_coordinate(name) { return None; }
+    let url = format!("https://archlinux.org/packages/search/json/?name={name}");
+    let bytes = cached_metadata(&url, net, cache)?;
+    let doc: ArchSearch = serde_json::from_slice(&bytes).ok()?;
+    let package = doc.results.iter().filter(|p| p.pkgname.as_deref() == Some(name))
+        .filter_map(|p| {
+            let repo = p.repo.as_deref()?;
+            let arch = p.arch.as_deref()?;
+            if !matches!(repo, "Core" | "Extra" | "Multilib") || !matches!(arch, "x86_64" | "any") { return None; }
+            Some((arch != "x86_64", repo, arch))
+        }).min_by_key(|p| p.0)?;
+    Some(format!("https://archlinux.org/packages/{}/os/{}/{name}/download/", package.1.to_ascii_lowercase(), package.2))
+}
+
 /// AUR: the RPC `info` endpoint. The AUR has no downloads; its custody signal
 /// is the maintainer plus vote count and popularity score, and `LastModified`
 /// (when the PKGBUILD last changed) is the supply-chain-relevant "age". Official
@@ -149,6 +167,8 @@ struct ArchSearch {
 #[serde(default)]
 struct ArchPackage {
     pkgname: Option<String>,
+    repo: Option<String>,
+    arch: Option<String>,
     pkgver: Option<String>,
     pkgrel: Option<String>,
     last_update: Option<String>,
@@ -250,5 +270,18 @@ mod tests {
         assert_eq!(r.author.as_deref(), Some("eworm"));
         assert_eq!(r.maintainers, Some(2));
         assert_eq!(r.deprecated, None);
+    }
+
+    #[test]
+    fn official_download_uses_matching_name_and_safe_repository() {
+        let doc = serde_json::json!({"results": [
+            {"pkgname":"bash-extra", "repo":"Core", "arch":"x86_64"},
+            {"pkgname":"bash", "repo":"../../evil", "arch":"x86_64"},
+            {"pkgname":"bash", "repo":"Core", "arch":"x86_64"}
+        ]}).to_string();
+        let net = Fixtures::default().with("https://archlinux.org/packages/search/json/?name=bash", doc.as_bytes());
+        assert_eq!(resolve_arch_current("bash", &net, &BlobCache::disabled()).as_deref(),
+            Some("https://archlinux.org/packages/core/os/x86_64/bash/download/"));
+        assert!(resolve_arch_current("../bash", &net, &BlobCache::disabled()).is_none());
     }
 }
