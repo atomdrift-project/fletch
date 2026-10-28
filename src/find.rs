@@ -21,6 +21,9 @@ mod js_commands;
 #[path = "find_ruby_fetch.rs"]
 mod ruby_fetch;
 
+#[path = "find_glib_stylesheet.rs"]
+mod glib_stylesheet;
+
 /// All external references a file points at: filefacts' declared dependencies,
 /// plus the imperative ones recognized here.
 #[must_use]
@@ -297,7 +300,7 @@ pub fn python_imports(file_type: &str, symbols: &[Symbol]) -> Vec<Reference> {
     refs
 }
 
-/// Literal HTTP(S) targets of parsed shell curl/wget calls. Unlike a raw-text
+/// Literal HTTP(S) retrieval targets of parsed source calls. Unlike a raw-text
 /// hunt, this also works after an archive member's bytes have been discarded.
 /// Option values are not targets; computed arguments are not resolved here.
 #[must_use]
@@ -327,6 +330,9 @@ pub struct UnresolvedFetchCall {
 /// Discover literal fetch targets and explicit coverage gaps from call facts.
 #[must_use]
 pub fn discover_fetch_calls(file_type: &str, symbols: &[Symbol]) -> FetchCallDiscovery {
+    if matches!(file_type, "javascript" | "typescript") {
+        return glib_stylesheet::discover(symbols);
+    }
     if file_type == "ruby" { return ruby_fetch::discover(symbols); }
     if file_type != "shell" {
         return FetchCallDiscovery::default();
