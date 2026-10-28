@@ -36,7 +36,7 @@ checksum = "b2a5b0a5ab8561c603f16c3b78c24a386b1f70e7fc1b1b1e8c15738828e4a176"
 dependencies = [
  "anstyle",
  "memchr",
- "unicode-width 0.2.2",
+ "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -650,6 +650,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.1"
+source = "git+https://github.com/atomdrift-project/filefacts.git#0316f009a8d288f6482be4b48daa60189acb53ab"
 dependencies = [
  "aho-corasick",
  "cab",
@@ -1598,7 +1599,7 @@ checksum = "31095ca1f396e3de32745f42b20deef7bc09077f918b085307e8eab6ddd8fb9c"
 dependencies = [
  "once_cell",
  "serde",
- "unicode-width 0.2.2",
+ "unicode-width 0.2.3",
  "unscanny",
 ]
 
@@ -2384,7 +2385,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "2.1.1"
-source = "git+https://github.com/atomdrift-project/stng.git#dafb7d17ffea1021e1f457e24e7c26eaef28d2f5"
+source = "git+https://github.com/atomdrift-project/stng.git#06ee8e4d17df7c9cde230485239fea2fda4238a5"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2409,7 +2410,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#dafb7d17ffea1021e1f457e24e7c26eaef28d2f5"
+source = "git+https://github.com/atomdrift-project/stng.git#06ee8e4d17df7c9cde230485239fea2fda4238a5"
 dependencies = [
  "libc",
 ]
@@ -2835,6 +2836,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
+source = "git+https://github.com/atomdrift-project/filefacts.git#0316f009a8d288f6482be4b48daa60189acb53ab"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -3072,9 +3074,9 @@ checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "unscanny"
