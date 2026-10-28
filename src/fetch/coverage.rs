@@ -79,6 +79,30 @@ pub enum CandidateSource {
     PythonImport,
 }
 
+impl Coverage {
+    /// Whether this fact leaves something about the reference unresolved:
+    /// its analysis, or which provider is actually installed. A policy
+    /// choice, or code another record already answers for, is not a gap.
+    ///
+    /// Every kind is listed, so a new one cannot compile without a decision.
+    #[must_use]
+    pub const fn is_gap(&self) -> bool {
+        match self {
+            Self::Unavailable { .. }
+            | Self::Incomplete
+            | Self::Pending { .. }
+            | Self::Candidate { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::BacklogUnsaved => true,
+            Self::Supplied { .. }
+            | Self::DevelopmentExcluded
+            | Self::TransitiveNotFollowed
+            | Self::CoveredByDeclaration
+            | Self::CandidateFlagged { .. } => false,
+        }
+    }
+}
+
 impl fmt::Display for Coverage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -163,6 +187,28 @@ mod tests {
         );
         let back: Vec<Coverage> = serde_json::from_value(json).unwrap();
         assert_eq!(back, facts);
+    }
+
+    #[test]
+    fn every_candidate_is_a_gap_and_no_policy_choice_is() {
+        for source in [
+            CandidateSource::PeerDependency,
+            CandidateSource::ArchRepository,
+            CandidateSource::PythonImport,
+        ] {
+            assert!(Coverage::Candidate { source }.is_gap(), "{source:?}");
+        }
+        for chosen in [
+            Coverage::DevelopmentExcluded,
+            Coverage::TransitiveNotFollowed,
+            Coverage::CoveredByDeclaration,
+            Coverage::Supplied {
+                path: "vendor/x".into(),
+                pin_verified: Some(true),
+            },
+        ] {
+            assert!(!chosen.is_gap(), "{chosen:?}");
+        }
     }
 
     #[test]
