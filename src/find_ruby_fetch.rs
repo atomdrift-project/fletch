@@ -2,7 +2,7 @@
 //! No Ruby, shell command, or fetched program is evaluated or executed.
 
 use super::{
-    discover_fetch_calls, tool_name, Arg, FetchCallDiscovery, Symbol, UnresolvedFetchCall,
+    Arg, FetchCallDiscovery, Symbol, UnresolvedFetchCall, discover_fetch_calls, tool_name,
 };
 
 pub(super) fn discover(symbols: &[Symbol]) -> FetchCallDiscovery {
@@ -192,7 +192,10 @@ exec('wget', '-O', 'https://output.fixturetests.net/name.sh', 'https://ruby.fixt
             "Kernel = Logger\nKernel.system('curl https://ruby.fixturetests.net/rebound.sh')\n",
         ] {
             let found = parse(source);
-            assert!(found.references.is_empty() && found.unresolved.is_empty(), "{source}: {found:?}");
+            assert!(
+                found.references.is_empty() && found.unresolved.is_empty(),
+                "{source}: {found:?}"
+            );
         }
     }
 
@@ -207,10 +210,12 @@ exec('wget', '-O', 'https://output.fixturetests.net/name.sh', 'https://ruby.fixt
             let found = parse(source);
             assert_eq!(found.unresolved.len(), 1, "{source}: {found:?}");
             assert_eq!(found.unresolved[0].command, "curl");
-            assert!(found
-                .references
-                .iter()
-                .all(|reference| !format!("{:?}", reference.locator).contains("after-unknown")));
+            assert!(
+                found
+                    .references
+                    .iter()
+                    .all(|reference| !format!("{:?}", reference.locator).contains("after-unknown"))
+            );
         }
     }
 }

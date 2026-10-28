@@ -1543,7 +1543,9 @@ fn resolved_target(
         return Ok((p, resolve_aur(name, net, cache)));
     }
     if ty == "alpm" && coordinate_path.starts_with("arch/") && coordinate_version.is_none() {
-        let name = coordinate_path.strip_prefix("arch/").ok_or(Unresolved::UnsafeCoordinate)?;
+        let name = coordinate_path
+            .strip_prefix("arch/")
+            .ok_or(Unresolved::UnsafeCoordinate)?;
         return resolve_arch_current(name, net, cache)
             .map(|url| (p, url))
             .ok_or(Unresolved::NoRelease);
@@ -3355,15 +3357,30 @@ mod tests {
     #[test]
     fn official_arch_fetches_current_candidate_but_does_not_guess_pins() {
         let net = Fixtures::default()
-            .with("https://archlinux.org/packages/search/json/?name=bash", br#"{"results":[{"pkgname":"bash","repo":"Core","arch":"x86_64"}]}"#)
-            .with("https://archlinux.org/packages/core/os/x86_64/bash/download/", b"PACKAGE");
+            .with(
+                "https://archlinux.org/packages/search/json/?name=bash",
+                br#"{"results":[{"pkgname":"bash","repo":"Core","arch":"x86_64"}]}"#,
+            )
+            .with(
+                "https://archlinux.org/packages/core/os/x86_64/bash/download/",
+                b"PACKAGE",
+            );
         let cache = BlobCache::disabled();
         let current = dep(RefLocator::Purl("pkg:alpm/arch/bash".into()), None);
         assert_eq!(fetch_ref(&current, &net, &cache).outcome, Outcome::Ok);
         let pinned = dep(RefLocator::Purl("pkg:alpm/arch/bash@5.0-1".into()), None);
-        assert_eq!(fetch_ref(&pinned, &net, &cache).outcome, Outcome::Unresolved(Unresolved::Unsupported));
-        let constrained = dep(RefLocator::Purl("pkg:alpm/arch/bash?version_requirement=%3E%3D5".into()), None);
-        assert_eq!(fetch_ref(&constrained, &net, &cache).outcome, Outcome::Unresolved(Unresolved::NoRelease));
+        assert_eq!(
+            fetch_ref(&pinned, &net, &cache).outcome,
+            Outcome::Unresolved(Unresolved::Unsupported)
+        );
+        let constrained = dep(
+            RefLocator::Purl("pkg:alpm/arch/bash?version_requirement=%3E%3D5".into()),
+            None,
+        );
+        assert_eq!(
+            fetch_ref(&constrained, &net, &cache).outcome,
+            Outcome::Unresolved(Unresolved::NoRelease)
+        );
     }
 
     #[test]

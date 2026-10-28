@@ -31,19 +31,35 @@ pub(crate) fn resolve_aur(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Str
 /// Resolve the current official-repository package, not an installed version.
 /// The package API supplies repository and architecture; only known official
 /// repository labels and Arch's x86_64/any artifacts are accepted.
-pub(crate) fn resolve_arch_current(name: &str, net: &dyn Fetch, cache: &BlobCache) -> Option<String> {
-    if !safe_coordinate(name) { return None; }
+pub(crate) fn resolve_arch_current(
+    name: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Option<String> {
+    if !safe_coordinate(name) {
+        return None;
+    }
     let url = format!("https://archlinux.org/packages/search/json/?name={name}");
     let bytes = cached_metadata(&url, net, cache)?;
     let doc: ArchSearch = serde_json::from_slice(&bytes).ok()?;
-    let package = doc.results.iter().filter(|p| p.pkgname.as_deref() == Some(name))
+    let package = doc
+        .results
+        .iter()
+        .filter(|p| p.pkgname.as_deref() == Some(name))
         .filter_map(|p| {
             let repo = p.repo.as_deref()?;
             let arch = p.arch.as_deref()?;
-            if !matches!(repo, "Core" | "Extra" | "Multilib") || !matches!(arch, "x86_64" | "any") { return None; }
+            if !matches!(repo, "Core" | "Extra" | "Multilib") || !matches!(arch, "x86_64" | "any") {
+                return None;
+            }
             Some((arch != "x86_64", repo, arch))
-        }).min_by_key(|p| p.0)?;
-    Some(format!("https://archlinux.org/packages/{}/os/{}/{name}/download/", package.1.to_ascii_lowercase(), package.2))
+        })
+        .min_by_key(|p| p.0)?;
+    Some(format!(
+        "https://archlinux.org/packages/{}/os/{}/{name}/download/",
+        package.1.to_ascii_lowercase(),
+        package.2
+    ))
 }
 
 /// AUR: the RPC `info` endpoint. The AUR has no downloads; its custody signal
@@ -278,10 +294,16 @@ mod tests {
             {"pkgname":"bash-extra", "repo":"Core", "arch":"x86_64"},
             {"pkgname":"bash", "repo":"../../evil", "arch":"x86_64"},
             {"pkgname":"bash", "repo":"Core", "arch":"x86_64"}
-        ]}).to_string();
-        let net = Fixtures::default().with("https://archlinux.org/packages/search/json/?name=bash", doc.as_bytes());
-        assert_eq!(resolve_arch_current("bash", &net, &BlobCache::disabled()).as_deref(),
-            Some("https://archlinux.org/packages/core/os/x86_64/bash/download/"));
+        ]})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://archlinux.org/packages/search/json/?name=bash",
+            doc.as_bytes(),
+        );
+        assert_eq!(
+            resolve_arch_current("bash", &net, &BlobCache::disabled()).as_deref(),
+            Some("https://archlinux.org/packages/core/os/x86_64/bash/download/")
+        );
         assert!(resolve_arch_current("../bash", &net, &BlobCache::disabled()).is_none());
     }
 }
