@@ -18,6 +18,7 @@ use crate::purl::Purl;
 
 mod cache;
 mod coordinate;
+mod coverage;
 mod go_hash;
 mod select;
 mod ssrf;
@@ -32,6 +33,7 @@ pub(crate) use cache::{
 pub(crate) use coordinate::{
     is_web_scheme, percent_decode, repository_base, safe_coordinate, safe_filename_part,
 };
+pub use coverage::{CandidateSource, Coverage};
 pub use select::{ArtifactCandidate, ArtifactMatrix, ArtifactTarget, SelectionPolicy};
 pub(crate) use select::{
     artifact_candidate, file_name_from_url, file_name_matches, purl_checksums,
@@ -183,9 +185,9 @@ pub struct FetchRecord {
     /// Declaring dependency scope and installation metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<filefacts::DependencyContext>,
-    /// Explanation of an orchestration limit or local coverage decision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coverage_note: Option<String>,
+    /// What limited, or decided, how much of the reference was analyzed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage: Vec<Coverage>,
 }
 
 impl FetchRecord {
@@ -209,7 +211,7 @@ impl FetchRecord {
             pin_verified: None,
             outcome,
             context: None,
-            coverage_note: None,
+            coverage: Vec::new(),
         }
     }
 
@@ -870,7 +872,7 @@ fn record(
         pin_verified,
         outcome,
         context: None,
-        coverage_note: None,
+        coverage: Vec::new(),
     }
 }
 
