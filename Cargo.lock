@@ -525,7 +525,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#144150b23722c7feb58ec4916fa79f5edb958370"
+source = "git+https://github.com/atomdrift-project/filefacts.git#4afced3e2ef2247f42d777c8d4f4815a7450407a"
 dependencies = [
  "aho-corasick",
  "cab",
@@ -556,6 +556,7 @@ dependencies = [
  "sha1 0.10.7",
  "sha2 0.10.9",
  "stng",
+ "stng-process",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -2145,8 +2146,8 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stng"
-version = "2.1.1"
-source = "git+https://github.com/atomdrift-project/stng.git#eb3b2d0cd6a10bb551143c35bfbb6526b5362632"
+version = "3.0.0"
+source = "git+https://github.com/atomdrift-project/stng.git#855d5f1132a67d9d9497d868f9880968aee3d59a"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2171,7 +2172,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#eb3b2d0cd6a10bb551143c35bfbb6526b5362632"
+source = "git+https://github.com/atomdrift-project/stng.git#855d5f1132a67d9d9497d868f9880968aee3d59a"
 dependencies = [
  "libc",
 ]
@@ -2573,7 +2574,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#144150b23722c7feb58ec4916fa79f5edb958370"
+source = "git+https://github.com/atomdrift-project/filefacts.git#4afced3e2ef2247f42d777c8d4f4815a7450407a"
 dependencies = [
  "cc",
  "tree-sitter",
