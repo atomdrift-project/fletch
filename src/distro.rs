@@ -103,7 +103,7 @@ pub(crate) fn wolfi(
         "https://packages.wolfi.dev/os/x86_64/APKINDEX.tar.gz",
         parse_apkindex,
         name,
-        Ecosystem::Wolfi,
+        Ecosystem::from_label("wolfi"),
         net,
         cache,
     )
@@ -168,7 +168,7 @@ pub(crate) fn rpmfusion(
     rpm_repo_lookup(
         "https://download1.rpmfusion.org/free/fedora/development/rawhide/Everything/x86_64/os",
         name,
-        Ecosystem::Rpmfusion,
+        Ecosystem::from_label("rpmfusion"),
         net,
         cache,
     )
