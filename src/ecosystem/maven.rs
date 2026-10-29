@@ -1,6 +1,6 @@
 //! Maven Central: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, secs_from_millis};
@@ -43,20 +43,17 @@ pub(crate) fn lookup(
         return Err(RegistryError::NotFound);
     };
 
-    Ok(Registry {
-        ecosystem: "maven".into(),
-        name: format!("{want_group}:{}", c.name()),
-        version: c.target(d.v.as_deref()).to_string(),
-        published_at: d.timestamp.and_then(secs_from_millis),
-        // With a version filter the result set is that one version, so "latest"
-        // is only meaningful for an unversioned query.
-        latest_version: if c.version().is_none() {
-            d.v.clone()
-        } else {
-            None
-        },
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Maven, format!("{want_group}:{}", c.name()));
+    registry.version = c.target(d.v.as_deref()).to_string();
+    registry.published_at = d.timestamp.and_then(secs_from_millis);
+    // With a version filter the result set is that one version, so "latest"
+    // is only meaningful for an unversioned query.
+    registry.latest_version = if c.version().is_none() {
+        d.v.clone()
+    } else {
+        None
+    };
+    Ok(registry)
 }
 
 /// A Maven Central solrsearch answer.
@@ -85,7 +82,7 @@ struct SolrDoc {
 mod tests {
     use crate::fetch::{BlobCache, Fixtures};
     use crate::registry::{RegistryError, lookup};
-    use filefacts::{RefLocator, Registry};
+    use filefacts::{Ecosystem, RefLocator, Registry};
 
     const GUAVA: &str = "https://search.maven.org/solrsearch/select?q=g:%22com.google.guava%22+AND+a:%22guava%22&core=gav&rows=20&wt=json";
 
@@ -123,7 +120,7 @@ mod tests {
         .to_string();
         let net = Fixtures::default().with(GUAVA, doc.as_bytes());
         let r = look(&net, "pkg:maven/com.google.guava/guava").expect("registry");
-        assert_eq!(r.ecosystem, "maven");
+        assert_eq!(r.ecosystem, Ecosystem::Maven);
         assert_eq!(r.name, "com.google.guava:guava");
         assert_eq!(r.version, "33.4.8-jre");
         assert_eq!(r.published_at, Some(1_619_172_000));

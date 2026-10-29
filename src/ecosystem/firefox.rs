@@ -1,6 +1,6 @@
 //! Firefox Add-ons (AMO): registry metadata and artifact resolution.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
@@ -98,43 +98,42 @@ pub(crate) fn lookup(
     };
     let ratings = doc.ratings.unwrap_or_default();
 
-    let mut record = Registry {
-        ecosystem: "firefox".into(),
-        name: doc.slug.unwrap_or_else(|| c.name().to_string()),
-        version,
-        published_at,
-        // `created` is the add-on's first listing.
-        first_published_at: doc.created.as_deref().and_then(unix_secs),
-        author: doc.authors.first().and_then(|author| author.name.clone()),
-        maintainers: u32::try_from(doc.authors.len()).ok(),
-        title: doc.name.as_ref().and_then(Localized::text),
-        description: doc.summary.as_ref().and_then(Localized::text),
-        homepage: doc
-            .homepage
-            .and_then(|h| h.url)
-            .as_ref()
-            .and_then(Localized::text),
-        license: release
-            .license
-            .and_then(|l| l.name)
-            .as_ref()
-            .and_then(Localized::text),
-        // `average_daily_users` is the install base, the reach a lifetime
-        // download count stands for elsewhere; `weekly_downloads` is recent.
-        downloads_total: doc.average_daily_users,
-        downloads_recent: doc.weekly_downloads,
-        rating: ratings.average.and_then(|r| five_star(r, 5.0)),
-        rating_count: ratings.count,
-        // Mozilla disables an add-on it has taken down; a developer disables
-        // one to withdraw it.
-        security_hold: match doc.status.as_deref() {
-            Some("disabled") => Some(true),
-            Some("public") => Some(false),
-            _ => None,
-        },
-        version_removed: doc.is_disabled,
-        ..Default::default()
+    let mut record = Registry::new(
+        Ecosystem::Firefox,
+        doc.slug.unwrap_or_else(|| c.name().to_string()),
+    );
+    record.version = version;
+    record.published_at = published_at;
+    // `created` is the add-on's first listing.
+    record.first_published_at = doc.created.as_deref().and_then(unix_secs);
+    record.author = doc.authors.first().and_then(|author| author.name.clone());
+    record.maintainers = u32::try_from(doc.authors.len()).ok();
+    record.title = doc.name.as_ref().and_then(Localized::text);
+    record.description = doc.summary.as_ref().and_then(Localized::text);
+    record.homepage = doc
+        .homepage
+        .and_then(|h| h.url)
+        .as_ref()
+        .and_then(Localized::text);
+    record.license = release
+        .license
+        .and_then(|l| l.name)
+        .as_ref()
+        .and_then(Localized::text);
+    // `average_daily_users` is the install base, the reach a lifetime
+    // download count stands for elsewhere; `weekly_downloads` is recent.
+    record.downloads_total = doc.average_daily_users;
+    record.downloads_recent = doc.weekly_downloads;
+    record.rating = ratings.average.and_then(|r| five_star(r, 5.0));
+    record.rating_count = ratings.count;
+    // Mozilla disables an add-on it has taken down; a developer disables
+    // one to withdraw it.
+    record.security_hold = match doc.status.as_deref() {
+        Some("disabled") => Some(true),
+        Some("public") => Some(false),
+        _ => None,
     };
+    record.version_removed = doc.is_disabled;
 
     // The newest page of releases gives the timeline; `count` is how many
     // AMO lists in all.
@@ -287,7 +286,7 @@ mod tests {
     #[test]
     fn firefox_amo_normalizes() {
         let r = lookup("pkg:firefox/ublock-origin", &net()).expect("registry");
-        assert_eq!(r.ecosystem, "firefox");
+        assert_eq!(r.ecosystem, Ecosystem::Firefox);
         assert_eq!(r.title.as_deref(), Some("uBlock Origin"));
         assert_eq!(r.version, "1.66.4");
         assert_eq!(r.published_at, Some(1_619_172_000));

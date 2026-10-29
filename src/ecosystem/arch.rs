@@ -1,7 +1,7 @@
 //! Arch Linux's official repositories and the AUR: registry metadata and
 //! artifact resolution.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
@@ -162,26 +162,23 @@ pub(crate) fn official(
         _ => String::new(),
     };
 
-    Ok(Registry {
-        ecosystem: "arch".into(),
-        name: c.name().to_string(),
-        version,
-        published_at: r
-            .last_update
-            .as_deref()
-            .or(r.build_date.as_deref())
-            .and_then(unix_secs),
-        author: r.packager.clone(),
-        description: r.pkgdesc.clone(),
-        homepage: r.url.clone(),
-        license: r.licenses.first().cloned(),
-        maintainers: r
-            .maintainers
-            .as_ref()
-            .and_then(|m| u32::try_from(m.len()).ok()),
-        deprecated: flag(Some(r.flag_date.is_some()), "flagged out-of-date"),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Arch, c.name().to_string());
+    registry.version = version;
+    registry.published_at = r
+        .last_update
+        .as_deref()
+        .or(r.build_date.as_deref())
+        .and_then(unix_secs);
+    registry.author = r.packager.clone();
+    registry.description = r.pkgdesc.clone();
+    registry.homepage = r.url.clone();
+    registry.license = r.licenses.first().cloned();
+    registry.maintainers = r
+        .maintainers
+        .as_ref()
+        .and_then(|m| u32::try_from(m.len()).ok());
+    registry.deprecated = flag(Some(r.flag_date.is_some()), "flagged out-of-date");
+    Ok(registry)
 }
 
 /// Look up the package `c` names in the AUR through the RPC `info` endpoint.
@@ -201,36 +198,36 @@ pub(crate) fn user(
         .next()
         .ok_or(RegistryError::NotFound)?;
 
-    Ok(Registry {
-        ecosystem: "aur".into(),
-        name: r.name.clone().unwrap_or_else(|| c.name().to_string()),
-        version: r.version.unwrap_or_default(),
-        // LastModified is a Unix-seconds integer already.
-        published_at: r.last_modified,
-        // FirstSubmitted is the package's birth; the gap to LastModified is the
-        // dormancy a revived abandoned package would show.
-        first_published_at: r.first_submitted,
-        // The primary maintainer plus any co-maintainers — the custody set.
-        maintainers: Some(
-            u32::try_from(r.co_maintainers.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(u32::from(r.maintainer.is_some())),
-        ),
-        author: r.maintainer.clone(),
-        publisher: r.maintainer,
-        title: r.name,
-        description: r.description,
-        homepage: r.url,
-        deprecated: flag(r.out_of_date.map(|t| t > 0), "flagged out-of-date"),
-        // The AUR's popularity score (votes decayed by age) and the votes
-        // behind it: the AUR case `Registry::rating` names.
-        rating: r
-            .popularity
-            .filter(|p| p.is_finite() && *p >= 0.0)
-            .map(|p| p as f32),
-        rating_count: r.num_votes,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Aur,
+        r.name.clone().unwrap_or_else(|| c.name().to_string()),
+    );
+    registry.version = r.version.unwrap_or_default();
+    // LastModified is a Unix-seconds integer already.
+    registry.published_at = r.last_modified;
+    // FirstSubmitted is the package's birth; the gap to LastModified is the
+    // dormancy a revived abandoned package would show.
+    registry.first_published_at = r.first_submitted;
+    // The primary maintainer plus any co-maintainers — the custody set.
+    registry.maintainers = Some(
+        u32::try_from(r.co_maintainers.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(u32::from(r.maintainer.is_some())),
+    );
+    registry.author = r.maintainer.clone();
+    registry.publisher = r.maintainer;
+    registry.title = r.name;
+    registry.description = r.description;
+    registry.homepage = r.url;
+    registry.deprecated = flag(r.out_of_date.map(|t| t > 0), "flagged out-of-date");
+    // The AUR's popularity score (votes decayed by age) and the votes
+    // behind it: the AUR case `Registry::rating` names.
+    registry.rating = r
+        .popularity
+        .filter(|p| p.is_finite() && *p >= 0.0)
+        .map(|p| p as f32);
+    registry.rating_count = r.num_votes;
+    Ok(registry)
 }
 
 /// An AUR RPC `info` response.
@@ -316,7 +313,7 @@ mod tests {
             rpc.as_bytes(),
         );
         let p = look("pkg:alpm/aur/yay", &net).expect("provenance");
-        assert_eq!(p.ecosystem, "aur");
+        assert_eq!(p.ecosystem, Ecosystem::Aur);
         assert_eq!(p.published_at, Some(1_619_172_000));
         assert_eq!(p.first_published_at, Some(1_600_000_000));
         // Primary maintainer + two co-maintainers = a custody set of three.
@@ -352,7 +349,7 @@ mod tests {
             doc.as_bytes(),
         );
         let r = look("pkg:alpm/arch/pacman", &net).expect("registry");
-        assert_eq!(r.ecosystem, "arch");
+        assert_eq!(r.ecosystem, Ecosystem::Arch);
         assert_eq!(r.version, "7.1.0-2");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.author.as_deref(), Some("eworm"));

@@ -3,7 +3,7 @@
 //! and lists each platform's build, which is what the artifact resolver
 //! reads.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 
@@ -159,21 +159,17 @@ pub(crate) fn lookup(
             .or_insert(at);
     }
 
-    let mut p = Registry {
-        ecosystem: "gem".into(),
-        name: c.name().to_string(),
-        version: version.to_string(),
-        // A version the list lacks gets no date rather than the newest's.
-        published_at: released.get(version).copied(),
-        latest_version: doc.version.clone(),
-        author: doc.authors,
-        description: doc.info,
-        homepage: doc.homepage_uri,
-        repository: doc.source_code_uri,
-        license: doc.licenses.into_iter().next(),
-        downloads_total: doc.downloads,
-        ..Default::default()
-    };
+    let mut p = Registry::new(Ecosystem::Gem, c.name().to_string());
+    p.version = version.to_string();
+    // A version the list lacks gets no date rather than the newest's.
+    p.published_at = released.get(version).copied();
+    p.latest_version = doc.version.clone();
+    p.author = doc.authors;
+    p.description = doc.info;
+    p.homepage = doc.homepage_uri;
+    p.repository = doc.source_code_uri;
+    p.license = doc.licenses.into_iter().next();
+    p.downloads_total = doc.downloads;
     set_timeline(&mut p, released.into_values());
     Ok(p)
 }
@@ -258,7 +254,7 @@ mod tests {
             &BlobCache::disabled(),
         )
         .expect("registry");
-        assert_eq!(r.ecosystem, "gem");
+        assert_eq!(r.ecosystem, Ecosystem::Gem);
         assert_eq!(r.version, "8.1.3");
         assert_eq!(r.latest_version.as_deref(), Some("8.1.3"));
         assert_eq!(r.published_at, Some(1_619_172_000));

@@ -1,6 +1,6 @@
 //! CRAN: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -42,27 +42,27 @@ pub(crate) fn lookup(
         .or_else(|| doc.latest.as_deref().and_then(|v| versions.remove(v)))
         .unwrap_or_default();
 
-    Ok(Registry {
-        ecosystem: "cran".into(),
-        name: desc.package.unwrap_or_else(|| c.name().to_string()),
-        version: target.to_string(),
-        published_at,
-        latest_version: doc.latest.clone(),
-        author: desc.maintainer.as_deref().map(strip_email),
-        description: desc.title,
-        // CRAN crowds several URLs into one field, separated by commas or
-        // whitespace; keep the first.
-        homepage: desc
-            .url
-            .as_deref()
-            .and_then(|urls| {
-                urls.split(|c: char| c == ',' || c.is_whitespace())
-                    .find(|u| !u.is_empty())
-            })
-            .map(str::to_string),
-        license: desc.license,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Cran,
+        desc.package.unwrap_or_else(|| c.name().to_string()),
+    );
+    registry.version = target.to_string();
+    registry.published_at = published_at;
+    registry.latest_version = doc.latest.clone();
+    registry.author = desc.maintainer.as_deref().map(strip_email);
+    registry.description = desc.title;
+    // CRAN crowds several URLs into one field, separated by commas or
+    // whitespace; keep the first.
+    registry.homepage = desc
+        .url
+        .as_deref()
+        .and_then(|urls| {
+            urls.split(|c: char| c == ',' || c.is_whitespace())
+                .find(|u| !u.is_empty())
+        })
+        .map(str::to_string);
+    registry.license = desc.license;
+    Ok(registry)
 }
 
 /// crandb's all-versions document for a package.
@@ -98,7 +98,7 @@ struct DescriptionFile {
 mod tests {
     use crate::fetch::{BlobCache, Fixtures};
     use crate::registry::{RegistryError, lookup};
-    use filefacts::{RefLocator, Registry};
+    use filefacts::{Ecosystem, RefLocator, Registry};
 
     #[test]
     fn cran_crandb_normalizes() {
@@ -123,7 +123,7 @@ mod tests {
             lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled())
         };
         let r = look("pkg:cran/jsonlite").expect("registry");
-        assert_eq!(r.ecosystem, "cran");
+        assert_eq!(r.ecosystem, Ecosystem::Cran);
         assert_eq!(r.version, "2.0.0");
         assert_eq!(r.latest_version.as_deref(), Some("2.0.0"));
         assert_eq!(r.published_at, Some(1_619_172_000));

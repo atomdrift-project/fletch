@@ -1,7 +1,7 @@
 //! npm: registry metadata and artifact resolution, both read from the one
 //! packument document.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use std::collections::{BTreeMap, HashMap};
@@ -179,53 +179,49 @@ pub(crate) fn lookup(
     let release = doc.versions.get(version);
     let published = |key: &str| doc.time.get(key).and_then(TimeEntry::secs);
 
-    let mut p = Registry {
-        ecosystem: "npm".into(),
-        name: c.full_name(),
-        version: version.to_string(),
-        published_at: published(version),
-        // `created` dates the package itself, before any version's entry.
-        first_published_at: published("created"),
-        latest_version: latest.map(str::to_string),
-        // The version's own manifest field, else the package root's: npm
-        // packuments carry both, and the version's copy is authoritative.
-        author: release
-            .and_then(|r| r.author.as_ref())
-            .or(doc.author.as_ref())
-            .and_then(Person::name)
-            .or_else(|| doc.maintainers.as_deref()?.first()?.name())
-            .map(str::to_string),
-        description: release
-            .and_then(|r| r.description.clone())
-            .or_else(|| doc.description.clone()),
-        homepage: release
-            .and_then(|r| r.homepage.clone())
-            .or_else(|| doc.homepage.clone()),
-        repository: release
-            .and_then(|r| r.repository.as_ref())
-            .or(doc.repository.as_ref())
-            .and_then(|r| r.url.clone()),
-        license: release
-            .and_then(|r| r.license.clone())
-            .or_else(|| doc.license.clone()),
-        deprecated: release
-            .and_then(|r| r.deprecated.as_ref())
-            .and_then(Deprecated::reason),
-        // A live package always lists at least one maintainer, so a missing,
-        // null, or empty list is itself the anomaly: zero, not unknown.
-        maintainers: Some(
-            doc.maintainers
-                .as_ref()
-                .map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX)),
-        ),
-        // npm replaces a taken-down malicious package with a stub whose
-        // description is exactly this: the registry's own verdict.
-        security_hold: Some(doc.description.as_deref() == Some("security holding package")),
-        // An unpublished version keeps its `time` entry but leaves `versions`;
-        // a live version is in both.
-        version_removed: Some(release.is_none() && doc.time.contains_key(version)),
-        ..Default::default()
-    };
+    let mut p = Registry::new(Ecosystem::Npm, c.full_name());
+    p.version = version.to_string();
+    p.published_at = published(version);
+    // `created` dates the package itself, before any version's entry.
+    p.first_published_at = published("created");
+    p.latest_version = latest.map(str::to_string);
+    // The version's own manifest field, else the package root's: npm
+    // packuments carry both, and the version's copy is authoritative.
+    p.author = release
+        .and_then(|r| r.author.as_ref())
+        .or(doc.author.as_ref())
+        .and_then(Person::name)
+        .or_else(|| doc.maintainers.as_deref()?.first()?.name())
+        .map(str::to_string);
+    p.description = release
+        .and_then(|r| r.description.clone())
+        .or_else(|| doc.description.clone());
+    p.homepage = release
+        .and_then(|r| r.homepage.clone())
+        .or_else(|| doc.homepage.clone());
+    p.repository = release
+        .and_then(|r| r.repository.as_ref())
+        .or(doc.repository.as_ref())
+        .and_then(|r| r.url.clone());
+    p.license = release
+        .and_then(|r| r.license.clone())
+        .or_else(|| doc.license.clone());
+    p.deprecated = release
+        .and_then(|r| r.deprecated.as_ref())
+        .and_then(Deprecated::reason);
+    // A live package always lists at least one maintainer, so a missing,
+    // null, or empty list is itself the anomaly: zero, not unknown.
+    p.maintainers = Some(
+        doc.maintainers
+            .as_ref()
+            .map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX)),
+    );
+    // npm replaces a taken-down malicious package with a stub whose
+    // description is exactly this: the registry's own verdict.
+    p.security_hold = Some(doc.description.as_deref() == Some("security holding package"));
+    // An unpublished version keeps its `time` entry but leaves `versions`;
+    // a live version is in both.
+    p.version_removed = Some(release.is_none() && doc.time.contains_key(version));
     // Every `time` entry but the `created`/`modified` bookkeeping is a
     // version's publish time.
     set_timeline(
@@ -497,7 +493,7 @@ mod tests {
                 br#"{"downloads": 1234}"#,
             );
         let p = look("pkg:npm/left-pad@1.3.0", &net).expect("provenance");
-        assert_eq!(p.ecosystem, "npm");
+        assert_eq!(p.ecosystem, Ecosystem::Npm);
         assert_eq!(p.name, "left-pad");
         assert_eq!(p.published_at, Some(1_619_172_000));
         assert_eq!(p.latest_version.as_deref(), Some("1.3.0"));

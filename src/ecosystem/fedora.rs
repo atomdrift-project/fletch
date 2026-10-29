@@ -1,6 +1,6 @@
 //! Fedora packages: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, non_empty};
@@ -27,16 +27,16 @@ pub(crate) fn lookup(
         Some(release) => format!("{v}-{release}"),
         None => v,
     });
-    Ok(Registry {
-        ecosystem: "fedora".into(),
-        name: doc.basename.unwrap_or_else(|| c.name().to_string()),
-        version: c.target(latest.as_deref()).to_string(),
-        latest_version: latest,
-        description: doc.summary.or(doc.description),
-        homepage: doc.url,
-        license: doc.license,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Fedora,
+        doc.basename.unwrap_or_else(|| c.name().to_string()),
+    );
+    registry.version = c.target(latest.as_deref()).to_string();
+    registry.latest_version = latest;
+    registry.description = doc.summary.or(doc.description);
+    registry.homepage = doc.url;
+    registry.license = doc.license;
+    Ok(registry)
 }
 
 /// The parts of an mdapi package record the registry record reads.
@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn fedora_mdapi_normalizes() {
         let r = look("pkg:rpm/fedora/curl");
-        assert_eq!(r.ecosystem, "fedora");
+        assert_eq!(r.ecosystem, Ecosystem::Fedora);
         assert_eq!(r.version, "8.21.0-3.fc45");
         assert_eq!(r.latest_version.as_deref(), Some("8.21.0-3.fc45"));
         assert_eq!(r.homepage.as_deref(), Some("https://curl.se/"));

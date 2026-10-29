@@ -1,6 +1,6 @@
 //! The JetBrains Marketplace: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
@@ -55,29 +55,29 @@ pub(crate) fn lookup(
     let update = update.unwrap_or_default();
     let urls = doc.urls.unwrap_or_default();
 
-    Ok(Registry {
-        ecosystem: "jetbrains".into(),
-        name: doc.xml_id.unwrap_or_else(|| c.name().to_string()),
-        version: c.target(update.version.as_deref()).to_string(),
-        published_at: update
-            .cdate
-            .and_then(|cdate| match cdate {
-                Millis::Text(s) => s.parse().ok(),
-                Millis::Number(n) => Some(n),
-            })
-            .and_then(secs_from_millis),
-        author: doc.vendor.and_then(|vendor| match vendor {
-            Vendor::Name(name) => Some(name),
-            Vendor::Object { name } => name,
-        }),
-        title: doc.name,
-        description: doc.preview,
-        homepage: urls.url,
-        repository: urls.source_code_url,
-        downloads_total: doc.downloads,
-        rating: doc.rating.and_then(|r| five_star(r, 5.0)),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Jetbrains,
+        doc.xml_id.unwrap_or_else(|| c.name().to_string()),
+    );
+    registry.version = c.target(update.version.as_deref()).to_string();
+    registry.published_at = update
+        .cdate
+        .and_then(|cdate| match cdate {
+            Millis::Text(s) => s.parse().ok(),
+            Millis::Number(n) => Some(n),
+        })
+        .and_then(secs_from_millis);
+    registry.author = doc.vendor.and_then(|vendor| match vendor {
+        Vendor::Name(name) => Some(name),
+        Vendor::Object { name } => name,
+    });
+    registry.title = doc.name;
+    registry.description = doc.preview;
+    registry.homepage = urls.url;
+    registry.repository = urls.source_code_url;
+    registry.downloads_total = doc.downloads;
+    registry.rating = doc.rating.and_then(|r| five_star(r, 5.0));
+    Ok(registry)
 }
 
 /// The Marketplace's plugin search results.
@@ -174,7 +174,7 @@ mod tests {
         let updates = serde_json::json!([{"version": "262.8117.29", "cdate": "1619172000000"}]);
         let net = net(&format!("{PLUGIN}/updates?size=1"), &updates);
         let r = lookup("pkg:jetbrains/22407", &net).expect("registry");
-        assert_eq!(r.ecosystem, "jetbrains");
+        assert_eq!(r.ecosystem, Ecosystem::Jetbrains);
         assert_eq!(r.name, "com.jetbrains.rust");
         assert_eq!(r.version, "262.8117.29");
         assert_eq!(r.published_at, Some(1_619_172_000));

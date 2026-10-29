@@ -485,6 +485,7 @@ fn civil_secs(year: i64, month: i64, day: i64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filefacts::Ecosystem;
 
     #[test]
     fn rfc3339_shapes_parse_to_unix_seconds() {
@@ -570,10 +571,9 @@ mod tests {
 
     #[test]
     fn a_timeline_dates_the_first_and_previous_release() {
-        let mut record = Registry {
-            published_at: Some(30),
-            ..Registry::default()
-        };
+        let unknown = || Registry::new(Ecosystem::Npm, "pkg");
+        let mut record = unknown();
+        record.published_at = Some(30);
         set_timeline(&mut record, [40, 10, 30, 20]);
         assert_eq!(record.release_count, Some(4));
         assert_eq!(record.first_published_at, Some(10));
@@ -582,19 +582,17 @@ mod tests {
 
         // The registry's own total and creation date win; the first release
         // has no predecessor; an empty timeline is unknown.
-        let mut record = Registry {
-            published_at: Some(10),
-            first_published_at: Some(5),
-            release_count: Some(99),
-            ..Registry::default()
-        };
+        let mut record = unknown();
+        record.published_at = Some(10);
+        record.first_published_at = Some(5);
+        record.release_count = Some(99);
         set_timeline(&mut record, [10, 20]);
         assert_eq!(record.release_count, Some(99));
         assert_eq!(record.first_published_at, Some(5));
         assert_eq!(record.previous_published_at, None);
-        let mut record = Registry::default();
+        let mut record = unknown();
         set_timeline(&mut record, []);
-        assert_eq!(record, Registry::default());
+        assert_eq!(record, unknown());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Go modules (proxy.golang.org): registry metadata and artifact resolution.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, decode, fetch_json, unix_secs};
@@ -296,14 +296,11 @@ const GOPROXY_WITHHELD: u16 = 403;
 /// `latest_version` are left to the caller, the only side that knows whether
 /// this document describes the release that was asked about.
 fn golang_record(path: &str, doc: VersionInfo) -> Registry {
-    Registry {
-        ecosystem: "golang".into(),
-        name: path.to_string(),
-        version: doc.version.unwrap_or_default(),
-        published_at: doc.time.as_deref().and_then(unix_secs),
-        repository: doc.origin.and_then(|o| o.url),
-        ..Default::default()
-    }
+    let mut registry = Registry::new(Ecosystem::Golang, path.to_string());
+    registry.version = doc.version.unwrap_or_default();
+    registry.published_at = doc.time.as_deref().and_then(unix_secs);
+    registry.repository = doc.origin.and_then(|o| o.url);
+    registry
 }
 
 /// A module proxy `.info` (or `@latest`) document: one version of a module.
@@ -495,7 +492,7 @@ mod tests {
             info.as_bytes(),
         );
         let r = look("pkg:golang/github.com/gin-gonic/gin", &net).expect("registry");
-        assert_eq!(r.ecosystem, "golang");
+        assert_eq!(r.ecosystem, Ecosystem::Golang);
         assert_eq!(r.version, "v1.12.0");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(

@@ -1,6 +1,6 @@
 //! CPAN: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
@@ -80,31 +80,31 @@ pub(crate) fn lookup(
     }
     let facts = release.unwrap_or(&latest);
 
-    Ok(Registry {
-        ecosystem: "cpan".into(),
-        name: latest
+    let mut registry = Registry::new(
+        Ecosystem::Cpan,
+        latest
             .distribution
             .clone()
             .unwrap_or_else(|| c.name().to_string()),
-        version: c.target(latest.version.as_deref()).to_string(),
-        // MetaCPAN dates are naive ISO (no zone), which is UTC.
-        published_at: release.and_then(|r| r.date.as_deref()).and_then(unix_secs),
-        latest_version: latest.version.clone(),
-        author: facts.author.clone(),
-        description: facts.r#abstract.clone(),
-        homepage: facts.resources.homepage.clone(),
-        repository: facts
-            .resources
-            .repository
-            .as_ref()
-            .and_then(|r| r.url.clone()),
-        license: facts.license.first().cloned(),
-        deprecated: flag(facts.deprecated, "deprecated"),
-        // A BackPAN release was deleted from CPAN and survives only in the
-        // archive.
-        version_removed: release.and_then(|r| r.status.as_deref().map(|s| s == "backpan")),
-        ..Default::default()
-    })
+    );
+    registry.version = c.target(latest.version.as_deref()).to_string();
+    // MetaCPAN dates are naive ISO (no zone), which is UTC.
+    registry.published_at = release.and_then(|r| r.date.as_deref()).and_then(unix_secs);
+    registry.latest_version = latest.version.clone();
+    registry.author = facts.author.clone();
+    registry.description = facts.r#abstract.clone();
+    registry.homepage = facts.resources.homepage.clone();
+    registry.repository = facts
+        .resources
+        .repository
+        .as_ref()
+        .and_then(|r| r.url.clone());
+    registry.license = facts.license.first().cloned();
+    registry.deprecated = flag(facts.deprecated, "deprecated");
+    // A BackPAN release was deleted from CPAN and survives only in the
+    // archive.
+    registry.version_removed = release.and_then(|r| r.status.as_deref().map(|s| s == "backpan"));
+    Ok(registry)
 }
 
 /// The per-release endpoint's envelope.
@@ -154,7 +154,7 @@ struct Repository {
 mod tests {
     use crate::fetch::{BlobCache, Fixtures};
     use crate::registry::{RegistryError, lookup};
-    use filefacts::{RefLocator, Registry};
+    use filefacts::{Ecosystem, RefLocator, Registry};
 
     fn look(net: &Fixtures, purl: &str) -> Result<Registry, RegistryError> {
         lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn cpan_release_normalizes() {
         let r = look(&moose(), "pkg:cpan/Moose").expect("registry");
-        assert_eq!(r.ecosystem, "cpan");
+        assert_eq!(r.ecosystem, Ecosystem::Cpan);
         assert_eq!(r.version, "2.4000");
         assert_eq!(r.latest_version.as_deref(), Some("2.4000"));
         assert_eq!(r.published_at, Some(1_619_172_000));

@@ -1,6 +1,6 @@
 //! Pub.dev: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, non_empty, null_default, unix_secs};
@@ -39,22 +39,19 @@ pub(crate) fn lookup(
         .or(doc.latest.as_ref())
         .and_then(|r| r.pubspec.as_ref());
 
-    Ok(Registry {
-        ecosystem: "pub".into(),
-        name: c.name().to_string(),
-        version: c.target(latest).to_string(),
-        published_at: release
-            .and_then(|r| r.published.as_deref())
-            .and_then(unix_secs),
-        latest_version: latest.map(str::to_string),
-        description: spec.and_then(|s| s.description.clone()),
-        homepage: spec.and_then(|s| s.homepage.clone()),
-        repository: spec.and_then(|s| s.repository.clone()),
-        // pub.dev sends `retracted` only for a retracted version, so a listed
-        // version without it is live.
-        version_removed: release.map(|r| r.retracted),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Pub, c.name().to_string());
+    registry.version = c.target(latest).to_string();
+    registry.published_at = release
+        .and_then(|r| r.published.as_deref())
+        .and_then(unix_secs);
+    registry.latest_version = latest.map(str::to_string);
+    registry.description = spec.and_then(|s| s.description.clone());
+    registry.homepage = spec.and_then(|s| s.homepage.clone());
+    registry.repository = spec.and_then(|s| s.repository.clone());
+    // pub.dev sends `retracted` only for a retracted version, so a listed
+    // version without it is live.
+    registry.version_removed = release.map(|r| r.retracted);
+    Ok(registry)
 }
 
 /// The parts of a pub.dev package document the registry record reads.
@@ -93,7 +90,7 @@ struct Pubspec {
 mod tests {
     use crate::fetch::{BlobCache, Fixtures};
     use crate::registry::lookup;
-    use filefacts::RefLocator;
+    use filefacts::{Ecosystem, RefLocator};
 
     #[test]
     fn pub_dev_normalizes() {
@@ -115,7 +112,7 @@ mod tests {
             lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled()).expect("registry")
         };
         let r = look("pkg:pub/http");
-        assert_eq!(r.ecosystem, "pub");
+        assert_eq!(r.ecosystem, Ecosystem::Pub);
         assert_eq!(r.version, "1.6.0");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(

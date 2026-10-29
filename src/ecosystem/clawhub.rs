@@ -1,6 +1,6 @@
 //! ClawHub agent skills: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, non_empty, secs_from_millis};
@@ -27,22 +27,19 @@ pub(crate) fn lookup(
     let latest = skill.tags.and_then(|t| t.latest);
     let version = c.target(latest.as_deref()).to_string();
     let stats = skill.stats.unwrap_or_default();
-    Ok(Registry {
-        ecosystem: "clawhub".into(),
-        name: c.name().to_string(),
-        published_at: skill
-            .updated_at
-            .filter(|_| latest.as_deref() == Some(version.as_str()))
-            .and_then(secs_from_millis),
-        first_published_at: skill.created_at.and_then(secs_from_millis),
-        version,
-        latest_version: latest,
-        title: skill.display_name,
-        description: skill.summary,
-        downloads_total: stats.downloads,
-        release_count: stats.versions.and_then(|v| u32::try_from(v).ok()),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Clawhub, c.name().to_string());
+    registry.published_at = skill
+        .updated_at
+        .filter(|_| latest.as_deref() == Some(version.as_str()))
+        .and_then(secs_from_millis);
+    registry.first_published_at = skill.created_at.and_then(secs_from_millis);
+    registry.version = version;
+    registry.latest_version = latest;
+    registry.title = skill.display_name;
+    registry.description = skill.summary;
+    registry.downloads_total = stats.downloads;
+    registry.release_count = stats.versions.and_then(|v| u32::try_from(v).ok());
+    Ok(registry)
 }
 
 /// A ClawHub skill document: the one skill under `skill`.
@@ -112,7 +109,7 @@ mod tests {
     #[test]
     fn clawhub_skill_normalizes() {
         let r = look("pkg:clawhub/cool-skill", &cool_skill(1_782_654_274_836.0)).expect("registry");
-        assert_eq!(r.ecosystem, "clawhub");
+        assert_eq!(r.ecosystem, Ecosystem::Clawhub);
         assert_eq!(r.name, "cool-skill");
         assert_eq!(r.version, "1.0.2");
         assert_eq!(r.latest_version.as_deref(), Some("1.0.2"));

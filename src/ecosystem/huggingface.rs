@@ -1,6 +1,6 @@
 //! Hugging Face Hub models: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, lenient, non_empty, null_default, unix_secs};
@@ -44,23 +44,20 @@ pub(crate) fn lookup(
                 .find_map(|t| t.strip_prefix("license:"))
                 .map(str::to_string)
         });
-    Ok(Registry {
-        ecosystem: "huggingface".into(),
-        name: c.full_name(),
-        version: version.to_string(),
-        published_at: doc
-            .last_modified
-            .as_deref()
-            .filter(|_| current)
-            .and_then(unix_secs),
-        first_published_at: doc.created_at.as_deref().and_then(unix_secs),
-        author: doc.author,
-        homepage: Some(format!("https://huggingface.co/{}", c.path())),
-        license,
-        // HF's `downloads` is a rolling 30-day count, not a lifetime total.
-        downloads_recent: doc.downloads,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Huggingface, c.full_name());
+    registry.version = version.to_string();
+    registry.published_at = doc
+        .last_modified
+        .as_deref()
+        .filter(|_| current)
+        .and_then(unix_secs);
+    registry.first_published_at = doc.created_at.as_deref().and_then(unix_secs);
+    registry.author = doc.author;
+    registry.homepage = Some(format!("https://huggingface.co/{}", c.path()));
+    registry.license = license;
+    // HF's `downloads` is a rolling 30-day count, not a lifetime total.
+    registry.downloads_recent = doc.downloads;
+    Ok(registry)
 }
 
 /// A Hugging Face Hub model document. A model's license is a top-level
@@ -93,7 +90,7 @@ struct CardData {
 
 #[cfg(test)]
 mod tests {
-    use filefacts::RefLocator;
+    use filefacts::{Ecosystem, RefLocator};
 
     use crate::fetch::{BlobCache, Fixtures};
     use crate::registry::RegistryError;
@@ -118,7 +115,7 @@ mod tests {
     fn huggingface_model_normalizes() {
         let r =
             look("pkg:huggingface/microsoft/resnet-50", &resnet()).expect("huggingface registry");
-        assert_eq!(r.ecosystem, "huggingface");
+        assert_eq!(r.ecosystem, Ecosystem::Huggingface);
         assert_eq!(r.name, "microsoft/resnet-50");
         assert_eq!(r.version, "abc123def");
         assert_eq!(r.author.as_deref(), Some("microsoft"));

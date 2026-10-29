@@ -1,6 +1,6 @@
 //! Hex: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -55,24 +55,21 @@ pub(crate) fn lookup(
                 .unwrap_or_else(|| "deprecated".to_string())
         });
 
-    Ok(Registry {
-        ecosystem: "hex".into(),
-        name: c.name().to_string(),
-        version: version.to_string(),
-        published_at: release
-            .and_then(|r| r.inserted_at.as_deref())
-            .and_then(unix_secs),
-        first_published_at: doc.inserted_at.as_deref().and_then(unix_secs),
-        latest_version: latest.map(str::to_string),
-        description: doc.meta.description,
-        license: doc.meta.licenses.into_iter().next(),
-        repository: links_repo(&doc.meta.links),
-        downloads_total: doc.downloads.all,
-        downloads_recent: doc.downloads.recent,
-        deprecated,
-        version_removed,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Hex, c.name().to_string());
+    registry.version = version.to_string();
+    registry.published_at = release
+        .and_then(|r| r.inserted_at.as_deref())
+        .and_then(unix_secs);
+    registry.first_published_at = doc.inserted_at.as_deref().and_then(unix_secs);
+    registry.latest_version = latest.map(str::to_string);
+    registry.description = doc.meta.description;
+    registry.license = doc.meta.licenses.into_iter().next();
+    registry.repository = links_repo(&doc.meta.links);
+    registry.downloads_total = doc.downloads.all;
+    registry.downloads_recent = doc.downloads.recent;
+    registry.deprecated = deprecated;
+    registry.version_removed = version_removed;
+    Ok(registry)
 }
 
 /// The source repository in a package's free-form `links` map: the first
@@ -152,7 +149,7 @@ struct Downloads {
 mod tests {
     use crate::fetch::{BlobCache, Fixtures};
     use crate::registry::{RegistryError, lookup};
-    use filefacts::{RefLocator, Registry};
+    use filefacts::{Ecosystem, RefLocator, Registry};
 
     fn look(net: &Fixtures, purl: &str) -> Result<Registry, RegistryError> {
         lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
@@ -176,7 +173,7 @@ mod tests {
             "retirements": {}
         }));
         let r = look(&net, "pkg:hex/plug").expect("registry");
-        assert_eq!(r.ecosystem, "hex");
+        assert_eq!(r.ecosystem, Ecosystem::Hex);
         assert_eq!(r.version, "1.20.1");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.license.as_deref(), Some("Apache-2.0"));

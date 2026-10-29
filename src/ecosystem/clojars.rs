@@ -1,6 +1,6 @@
 //! Clojars: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, non_empty, null_default};
@@ -39,18 +39,15 @@ pub(crate) fn lookup(
         .as_deref()
         .or(doc.latest_version.as_deref());
 
-    Ok(Registry {
-        ecosystem: "clojars".into(),
-        name,
-        version: c.target(latest).to_string(),
-        latest_version: doc.latest_version.clone(),
-        description: doc.description,
-        homepage: doc.homepage,
-        repository: doc.scm.and_then(|scm| scm.url),
-        license: doc.licenses.into_iter().find_map(|l| l.name),
-        downloads_total: doc.downloads,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Clojars, name);
+    registry.version = c.target(latest).to_string();
+    registry.latest_version = doc.latest_version.clone();
+    registry.description = doc.description;
+    registry.homepage = doc.homepage;
+    registry.repository = doc.scm.and_then(|scm| scm.url);
+    registry.license = doc.licenses.into_iter().find_map(|l| l.name);
+    registry.downloads_total = doc.downloads;
+    Ok(registry)
 }
 
 /// The parts of a Clojars artifact document the registry record reads.
@@ -91,7 +88,7 @@ struct License {
 mod tests {
     use crate::fetch::{BlobCache, Fixtures};
     use crate::registry::{RegistryError, lookup};
-    use filefacts::{RefLocator, Registry};
+    use filefacts::{Ecosystem, RefLocator, Registry};
 
     fn look(net: &Fixtures, purl: &str) -> Result<Registry, RegistryError> {
         lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
@@ -114,7 +111,7 @@ mod tests {
                 doc.as_bytes(),
             );
         let r = look(&net, "pkg:clojars/ring").expect("registry");
-        assert_eq!(r.ecosystem, "clojars");
+        assert_eq!(r.ecosystem, Ecosystem::Clojars);
         assert_eq!(r.name, "ring");
         assert_eq!(r.version, "1.15.5");
         assert_eq!(r.license.as_deref(), Some("The MIT License"));

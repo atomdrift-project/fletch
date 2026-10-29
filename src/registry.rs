@@ -363,6 +363,7 @@ fn at_requested(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filefacts::Ecosystem;
 
     use crate::fetch::{BlobCache, Fixtures};
 
@@ -388,7 +389,7 @@ mod tests {
         );
 
         let record = record.expect("record");
-        assert_eq!(record.ecosystem, "npm");
+        assert_eq!(record.ecosystem, Ecosystem::Npm);
         assert_eq!(record.name, "left-pad");
 
         // The raw packument is captured verbatim, with its transport facts — the
@@ -538,12 +539,12 @@ mod tests {
                 .map(|r| r.ecosystem)
         };
         assert_eq!(
-            lookup("pkg:alpm/core/pacman?foo=aur.archlinux.org").as_deref(),
-            Some("arch")
+            lookup("pkg:alpm/core/pacman?foo=aur.archlinux.org"),
+            Some(Ecosystem::Arch)
         );
         assert_eq!(
-            lookup("pkg:alpm/arch/pacman?repository_url=https://aur.archlinux.org").as_deref(),
-            Some("aur")
+            lookup("pkg:alpm/arch/pacman?repository_url=https://aur.archlinux.org"),
+            Some(Ecosystem::Aur)
         );
     }
 
@@ -770,7 +771,7 @@ mod tests {
         let cache = BlobCache::disabled();
         let from_aur = lookup(&RefLocator::Purl("pkg:alpm/aur/yay".into()), &net, &cache)
             .expect("aur registry");
-        assert_eq!(from_aur.ecosystem, "aur");
+        assert_eq!(from_aur.ecosystem, Ecosystem::Aur);
         // Spec-compliant form: arch vendor in the namespace, AUR named in a
         // repository_url qualifier — still routes to the AUR RPC.
         let from_spec = lookup(
@@ -779,14 +780,14 @@ mod tests {
             &cache,
         )
         .expect("aur spec registry");
-        assert_eq!(from_spec.ecosystem, "aur");
+        assert_eq!(from_spec.ecosystem, Ecosystem::Aur);
         let from_official = lookup(
             &RefLocator::Purl("pkg:alpm/core/pacman".into()),
             &net,
             &cache,
         )
         .expect("arch registry");
-        assert_eq!(from_official.ecosystem, "arch");
+        assert_eq!(from_official.ecosystem, Ecosystem::Arch);
     }
 
     /// A backend that records each URL asked for and refuses it: routing,

@@ -2,7 +2,7 @@
 //! resolution. Both stores address an extension as `publisher/name` and know
 //! it by the id `publisher.name`.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -138,31 +138,28 @@ pub(crate) fn open_vsx(
         .and_then(|user| user.login_name)
         .filter(|_| this_release);
 
-    Ok(Registry {
-        ecosystem: "openvsx".into(),
-        name: extension_id(c),
-        version,
-        published_at: doc
-            .timestamp
-            .as_deref()
-            .and_then(unix_secs)
-            .filter(|_| this_release),
-        author: publisher.clone(),
-        publisher,
-        // Whether the release was published by a verified member of the
-        // namespace, rather than by anyone with an account.
-        publisher_verified: doc.verified.filter(|_| this_release),
-        title: doc.display_name,
-        description: doc.description,
-        homepage: doc.homepage,
-        repository: doc.repository,
-        license: doc.license.filter(|_| this_release),
-        downloads_total: doc.download_count,
-        rating: doc.average_rating.and_then(|r| five_star(r, 5.0)),
-        rating_count: doc.review_count,
-        deprecated: flag(doc.deprecated, "deprecated"),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Openvsx, extension_id(c));
+    registry.version = version;
+    registry.published_at = doc
+        .timestamp
+        .as_deref()
+        .and_then(unix_secs)
+        .filter(|_| this_release);
+    registry.author = publisher.clone();
+    registry.publisher = publisher;
+    // Whether the release was published by a verified member of the
+    // namespace, rather than by anyone with an account.
+    registry.publisher_verified = doc.verified.filter(|_| this_release);
+    registry.title = doc.display_name;
+    registry.description = doc.description;
+    registry.homepage = doc.homepage;
+    registry.repository = doc.repository;
+    registry.license = doc.license.filter(|_| this_release);
+    registry.downloads_total = doc.download_count;
+    registry.rating = doc.average_rating.and_then(|r| five_star(r, 5.0));
+    registry.rating_count = doc.review_count;
+    registry.deprecated = flag(doc.deprecated, "deprecated");
+    Ok(registry)
 }
 
 /// Look up the extension `c` names on the VS Code Marketplace: one query
@@ -206,25 +203,21 @@ pub(crate) fn marketplace(
     };
     let publisher = ext.publisher.unwrap_or_default();
 
-    let mut record = Registry {
-        ecosystem: "vscode".into(),
-        name: id,
-        version: version.to_string(),
-        published_at,
-        // `publishedDate` is the extension's first listing.
-        first_published_at: ext.published_date.as_deref().and_then(unix_secs),
-        author: publisher.display_name,
-        // The publisher account, and whether the Marketplace verified its
-        // domain: an unverified publisher is one anyone could have registered.
-        publisher: publisher.publisher_name,
-        publisher_verified: publisher.is_domain_verified,
-        title: ext.display_name,
-        description: ext.short_description,
-        downloads_total: stat("install").and_then(whole),
-        rating: stat("averagerating").and_then(|r| five_star(r, 5.0)),
-        rating_count: stat("ratingcount").and_then(whole),
-        ..Default::default()
-    };
+    let mut record = Registry::new(Ecosystem::Vscode, id);
+    record.version = version.to_string();
+    record.published_at = published_at;
+    // `publishedDate` is the extension's first listing.
+    record.first_published_at = ext.published_date.as_deref().and_then(unix_secs);
+    record.author = publisher.display_name;
+    // The publisher account, and whether the Marketplace verified its
+    // domain: an unverified publisher is one anyone could have registered.
+    record.publisher = publisher.publisher_name;
+    record.publisher_verified = publisher.is_domain_verified;
+    record.title = ext.display_name;
+    record.description = ext.short_description;
+    record.downloads_total = stat("install").and_then(whole);
+    record.rating = stat("averagerating").and_then(|r| five_star(r, 5.0));
+    record.rating_count = stat("ratingcount").and_then(whole);
     set_timeline(&mut record, releases.into_values());
     Ok(record)
 }
@@ -423,7 +416,7 @@ mod tests {
             &marketplace_net(&marketplace_answer()),
         )
         .expect("registry");
-        assert_eq!(r.ecosystem, "vscode");
+        assert_eq!(r.ecosystem, Ecosystem::Vscode);
         assert_eq!(r.name, "redhat.java");
         assert_eq!(r.version, "1.55.0");
         assert_eq!(r.title.as_deref(), Some("Language Support for Java"));
@@ -537,7 +530,7 @@ mod tests {
         );
         let r =
             lookup(&format!("pkg:vscode-extension/redhat/java{OPEN_VSX}"), &net).expect("registry");
-        assert_eq!(r.ecosystem, "openvsx");
+        assert_eq!(r.ecosystem, Ecosystem::Openvsx);
         assert_eq!(r.name, "redhat.java");
         assert_eq!(r.version, "1.55.0");
         assert_eq!(r.published_at, Some(1_782_206_196));

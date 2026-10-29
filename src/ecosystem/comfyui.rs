@@ -1,6 +1,6 @@
 //! ComfyUI custom nodes: registry metadata and artifact resolution.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
@@ -103,25 +103,25 @@ pub(crate) fn lookup(
             "comfyui node is not active: security hold"
         );
     }
-    Ok(Registry {
-        ecosystem: "comfyui".into(),
-        name: doc.id.unwrap_or_else(|| c.name().to_string()),
-        published_at: latest
-            .created_at
-            .as_deref()
-            .filter(|_| latest.version.as_deref() == Some(version.as_str()))
-            .and_then(unix_secs),
-        first_published_at: doc.created_at.as_deref().and_then(unix_secs),
-        version,
-        latest_version: latest.version,
-        title: doc.name,
-        description: doc.description,
-        repository: doc.repository,
-        publisher: doc.publisher.and_then(|p| p.id),
-        downloads_total: doc.downloads,
-        security_hold,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Comfyui,
+        doc.id.unwrap_or_else(|| c.name().to_string()),
+    );
+    registry.published_at = latest
+        .created_at
+        .as_deref()
+        .filter(|_| latest.version.as_deref() == Some(version.as_str()))
+        .and_then(unix_secs);
+    registry.first_published_at = doc.created_at.as_deref().and_then(unix_secs);
+    registry.version = version;
+    registry.latest_version = latest.version;
+    registry.title = doc.name;
+    registry.description = doc.description;
+    registry.repository = doc.repository;
+    registry.publisher = doc.publisher.and_then(|p| p.id);
+    registry.downloads_total = doc.downloads;
+    registry.security_hold = security_hold;
+    Ok(registry)
 }
 
 /// A ComfyUI Registry node document: the listing plus its latest release.
@@ -273,7 +273,7 @@ mod tests {
     fn comfyui_node_normalizes() {
         let net = loopstrip(ACTIVE);
         let r = look("pkg:comfyui/comfyui-loopstrip@1.3.1", &net).expect("registry");
-        assert_eq!(r.ecosystem, "comfyui");
+        assert_eq!(r.ecosystem, Ecosystem::Comfyui);
         assert_eq!(r.name, "comfyui-loopstrip");
         assert_eq!(r.version, "1.3.1");
         assert_eq!(r.latest_version.as_deref(), Some("1.3.1"));

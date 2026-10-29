@@ -1,7 +1,7 @@
 //! The Chrome Web Store: registry metadata, read from the public listing
 //! page (the store has no JSON API).
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 
 use crate::ecosystem::{Coordinates, civil_secs, five_star};
 use crate::fetch::{BlobCache, Fetch, cached_metadata_status};
@@ -74,30 +74,27 @@ pub(crate) fn lookup(
         None
     };
 
-    Ok(Registry {
-        ecosystem: "chrome".into(),
-        name: c.name().to_string(),
-        version: version.to_string(),
-        published_at,
-        author: details
-            .and_then(|d| text_after(d, "Offered by"))
-            .map(str::to_string),
-        title,
-        description,
-        homepage: Some(url),
-        // "N,NNN users": the store's reach figure, a downloads analogue.
-        downloads_total: header
-            .and_then(|h| before(h, " users"))
-            .and_then(parse_grouped_u64),
-        rating: header
-            .and_then(|h| before(h, " out of 5 stars"))
-            .and_then(|s| s.parse().ok())
-            .and_then(|v| five_star(v, 5.0)),
-        rating_count: header
-            .and_then(|h| before(h, " ratings"))
-            .and_then(parse_grouped_u64),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Chrome, c.name().to_string());
+    registry.version = version.to_string();
+    registry.published_at = published_at;
+    registry.author = details
+        .and_then(|d| text_after(d, "Offered by"))
+        .map(str::to_string);
+    registry.title = title;
+    registry.description = description;
+    registry.homepage = Some(url);
+    // "N,NNN users": the store's reach figure, a downloads analogue.
+    registry.downloads_total = header
+        .and_then(|h| before(h, " users"))
+        .and_then(parse_grouped_u64);
+    registry.rating = header
+        .and_then(|h| before(h, " out of 5 stars"))
+        .and_then(|s| s.parse().ok())
+        .and_then(|v| five_star(v, 5.0));
+    registry.rating_count = header
+        .and_then(|h| before(h, " ratings"))
+        .and_then(parse_grouped_u64);
+    Ok(registry)
 }
 
 /// The store's listing header: the markup between the title's `</h1>` and the
@@ -269,7 +266,7 @@ mod tests {
             DETAILS_LIST,
         );
         let r = lookup(&format!("pkg:chrome-extension/{ID}"), &html).expect("registry");
-        assert_eq!(r.ecosystem, "chrome");
+        assert_eq!(r.ecosystem, Ecosystem::Chrome);
         assert_eq!(r.name, ID);
         assert_eq!(r.version, "1.2.3");
         assert_eq!(r.title.as_deref(), Some("社媒助手 - 数据采集工具"));

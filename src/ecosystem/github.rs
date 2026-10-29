@@ -1,6 +1,6 @@
 //! GitHub repositories: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, decode, flag, non_empty, unix_secs};
@@ -57,29 +57,26 @@ pub(crate) fn lookup(
         return Err(RegistryError::NoRecord);
     }
 
-    Ok(Registry {
-        ecosystem: "github".into(),
-        name: c.full_name(),
-        version: c.target(None).to_string(),
-        // `pushed_at` (last code change) is the supply-chain-relevant recency;
-        // it dates the default branch, not a requested ref.
-        published_at: if c.version().is_none() {
-            doc.pushed_at.as_deref().and_then(unix_secs)
-        } else {
-            None
-        },
-        author: doc.owner.and_then(|o| o.login),
-        title: doc.full_name,
-        description: doc.description,
-        homepage: doc.homepage,
-        repository: doc.html_url,
-        license: doc
-            .license
-            .and_then(|l| l.spdx_id)
-            .filter(|s| s != "NOASSERTION"),
-        deprecated: flag(doc.archived, "archived"),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Github, c.full_name());
+    registry.version = c.target(None).to_string();
+    // `pushed_at` (last code change) is the supply-chain-relevant recency;
+    // it dates the default branch, not a requested ref.
+    registry.published_at = if c.version().is_none() {
+        doc.pushed_at.as_deref().and_then(unix_secs)
+    } else {
+        None
+    };
+    registry.author = doc.owner.and_then(|o| o.login);
+    registry.title = doc.full_name;
+    registry.description = doc.description;
+    registry.homepage = doc.homepage;
+    registry.repository = doc.html_url;
+    registry.license = doc
+        .license
+        .and_then(|l| l.spdx_id)
+        .filter(|s| s != "NOASSERTION");
+    registry.deprecated = flag(doc.archived, "archived");
+    Ok(registry)
 }
 
 /// The GitHub REST repository document (`/repos/{owner}/{repo}`).
@@ -143,7 +140,7 @@ mod tests {
     #[test]
     fn github_repo_normalizes() {
         let r = look("pkg:github/gin-gonic/gin", &gin(&serde_json::json!({}))).expect("registry");
-        assert_eq!(r.ecosystem, "github");
+        assert_eq!(r.ecosystem, Ecosystem::Github);
         assert_eq!(r.name, "gin-gonic/gin");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.author.as_deref(), Some("gin-gonic"));

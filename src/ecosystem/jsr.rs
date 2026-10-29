@@ -1,6 +1,6 @@
 //! JSR: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, non_empty, optional, unix_secs};
@@ -57,20 +57,17 @@ pub(crate) fn lookup(
         Some(format!("https://github.com/{owner}/{repo}"))
     });
 
-    Ok(Registry {
-        ecosystem: "jsr".into(),
-        name: format!("@{scope}/{pkg}"),
-        version: version.to_string(),
-        published_at: release
-            .as_ref()
-            .and_then(|r| r.created_at.as_deref())
-            .and_then(unix_secs),
-        latest_version: latest.map(str::to_string),
-        description: doc.description,
-        repository,
-        version_removed: release.and_then(|r| r.yanked),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Jsr, format!("@{scope}/{pkg}"));
+    registry.version = version.to_string();
+    registry.published_at = release
+        .as_ref()
+        .and_then(|r| r.created_at.as_deref())
+        .and_then(unix_secs);
+    registry.latest_version = latest.map(str::to_string);
+    registry.description = doc.description;
+    registry.repository = repository;
+    registry.version_removed = release.and_then(|r| r.yanked);
+    Ok(registry)
 }
 
 /// The parts of a JSR package record the registry record reads.
@@ -105,7 +102,7 @@ struct PackageVersion {
 mod tests {
     use crate::fetch::{BlobCache, Fixtures};
     use crate::registry::lookup;
-    use filefacts::{RefLocator, Registry};
+    use filefacts::{Ecosystem, RefLocator, Registry};
 
     fn look(net: &Fixtures, purl: &str) -> Registry {
         lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled()).expect("registry")
@@ -142,7 +139,7 @@ mod tests {
                 release(true).as_bytes(),
             );
         let r = look(&net, "pkg:jsr/%40std/path");
-        assert_eq!(r.ecosystem, "jsr");
+        assert_eq!(r.ecosystem, Ecosystem::Jsr);
         assert_eq!(r.name, "@std/path");
         assert_eq!(r.version, "1.1.5");
         assert_eq!(r.published_at, Some(1_619_172_000));

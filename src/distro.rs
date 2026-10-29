@@ -23,7 +23,7 @@ use std::collections::hash_map::Entry;
 use std::io::{BufRead, BufReader, Cursor, Read};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha512};
 
@@ -88,7 +88,7 @@ pub(crate) fn alpine(
         "https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/x86_64/APKINDEX.tar.gz",
     ];
     first_listing(&REPOS, |url| {
-        lookup(url, parse_apkindex, name, "alpine", net, cache)
+        lookup(url, parse_apkindex, name, Ecosystem::Alpine, net, cache)
     })
 }
 
@@ -103,7 +103,7 @@ pub(crate) fn wolfi(
         "https://packages.wolfi.dev/os/x86_64/APKINDEX.tar.gz",
         parse_apkindex,
         name,
-        "wolfi",
+        Ecosystem::Wolfi,
         net,
         cache,
     )
@@ -120,7 +120,7 @@ pub(crate) fn debian(
         "https://deb.debian.org/debian/dists/stable/main/binary-amd64/Packages.gz",
         parse_packages,
         name,
-        "debian",
+        Ecosystem::Debian,
         net,
         cache,
     )
@@ -138,7 +138,7 @@ pub(crate) fn ubuntu(
         "https://archive.ubuntu.com/ubuntu/dists/noble/universe/binary-amd64/Packages.gz",
     ];
     first_listing(&REPOS, |url| {
-        lookup(url, parse_packages, name, "ubuntu", net, cache)
+        lookup(url, parse_packages, name, Ecosystem::Ubuntu, net, cache)
     })
 }
 
@@ -152,7 +152,7 @@ pub(crate) fn opensuse(
     rpm_repo_lookup(
         "https://download.opensuse.org/tumbleweed/repo/oss",
         name,
-        "opensuse",
+        Ecosystem::Opensuse,
         net,
         cache,
     )
@@ -168,7 +168,7 @@ pub(crate) fn rpmfusion(
     rpm_repo_lookup(
         "https://download1.rpmfusion.org/free/fedora/development/rawhide/Everything/x86_64/os",
         name,
-        "rpmfusion",
+        Ecosystem::Rpmfusion,
         net,
         cache,
     )
@@ -185,7 +185,7 @@ pub(crate) fn netbsd(
         "https://cdn.netbsd.org/pub/pkgsrc/packages/NetBSD/x86_64/10.0/All/pkg_summary.gz",
         parse_pkg_summary,
         name,
-        "netbsd",
+        Ecosystem::Netbsd,
         net,
         cache,
     )
@@ -203,7 +203,7 @@ pub(crate) fn freebsd(
         "https://pkg.freebsd.org/FreeBSD:14:amd64/latest/packagesite.pkg",
         parse_packagesite,
         name,
-        "freebsd",
+        Ecosystem::Freebsd,
         net,
         cache,
     )
@@ -225,12 +225,9 @@ pub(crate) fn openbsd(
         return Err(unreadable(URL, "no package files listed"));
     }
     let version = openbsd_version(text, name).ok_or_else(|| not_found(URL, name))?;
-    Ok(Registry {
-        ecosystem: "openbsd".into(),
-        name: name.to_string(),
-        version,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Openbsd, name.to_string());
+    registry.version = version;
+    Ok(registry)
 }
 
 // --- parsed indexes ---------------------------------------------------------
@@ -249,19 +246,16 @@ struct Listing {
 
 impl Listing {
     /// The registry record of package `name` in `ecosystem`.
-    fn record(&self, ecosystem: &str, name: &str) -> Registry {
+    fn record(&self, ecosystem: Ecosystem, name: &str) -> Registry {
         let text = |s: &Option<Box<str>>| s.as_deref().map(str::to_string);
-        Registry {
-            ecosystem: ecosystem.into(),
-            name: name.to_string(),
-            version: self.version.to_string(),
-            published_at: self.published_at,
-            author: text(&self.author),
-            description: text(&self.description),
-            homepage: text(&self.homepage),
-            license: text(&self.license),
-            ..Default::default()
-        }
+        let mut registry = Registry::new(ecosystem, name.to_string());
+        registry.version = self.version.to_string();
+        registry.published_at = self.published_at;
+        registry.author = text(&self.author);
+        registry.description = text(&self.description);
+        registry.homepage = text(&self.homepage);
+        registry.license = text(&self.license);
+        registry
     }
 }
 
@@ -357,7 +351,7 @@ fn lookup(
     url: &str,
     parse: Parser,
     name: &str,
-    ecosystem: &str,
+    ecosystem: Ecosystem,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
@@ -375,7 +369,7 @@ fn find(
     listings: &Listings,
     url: &str,
     name: &str,
-    ecosystem: &str,
+    ecosystem: Ecosystem,
 ) -> Result<Registry, RegistryError> {
     listings
         .get(name)
@@ -513,7 +507,7 @@ fn deb_listing(stanza: &str) -> Option<(Box<str>, Listing)> {
 fn rpm_repo_lookup(
     base: &str,
     name: &str,
-    ecosystem: &str,
+    ecosystem: Ecosystem,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
@@ -1101,8 +1095,8 @@ mod tests {
                       m:Nat <nat@example.test>\nt:1619172000\no:curl\n";
         let (name, listing) = apkindex_listing(stanza).expect("listing");
         assert_eq!(&*name, "curl");
-        let r = listing.record("alpine", &name);
-        assert_eq!(r.ecosystem, "alpine");
+        let r = listing.record(Ecosystem::Alpine, &name);
+        assert_eq!(r.ecosystem, Ecosystem::Alpine);
         assert_eq!(r.version, "8.5.0-r0");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.author.as_deref(), Some("Nat"));
@@ -1118,7 +1112,7 @@ mod tests {
                       Description: small web server\n more text here\n";
         let (name, listing) = deb_listing(stanza).expect("listing");
         assert_eq!(&*name, "nginx");
-        let r = listing.record("debian", &name);
+        let r = listing.record(Ecosystem::Debian, &name);
         assert_eq!(r.version, "1.24.0-1");
         assert_eq!(r.author.as_deref(), Some("Debian Nginx"));
         assert_eq!(r.homepage.as_deref(), Some("https://nginx.org"));
@@ -1145,7 +1139,7 @@ mod tests {
             </package>"#;
         let (name, listing) = rpm_listing(pkg).expect("listing");
         assert_eq!(&*name, "curl");
-        let r = listing.record("opensuse", &name);
+        let r = listing.record(Ecosystem::Opensuse, &name);
         assert_eq!(r.version, "8.5.0-1.2");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.license.as_deref(), Some("MIT"));
@@ -1171,8 +1165,8 @@ mod tests {
                       BUILD_DATE=2021-04-23 10:00:00 +0000\n";
         let (name, listing) = pkg_summary_listing(stanza).expect("listing");
         assert_eq!(&*name, "curl");
-        let r = listing.record("netbsd", &name);
-        assert_eq!(r.ecosystem, "netbsd");
+        let r = listing.record(Ecosystem::Netbsd, &name);
+        assert_eq!(r.ecosystem, Ecosystem::Netbsd);
         assert_eq!(r.version, "8.5.0");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.description.as_deref(), Some("Client for URLs"));
@@ -1195,8 +1189,8 @@ mod tests {
         .unwrap();
         let (name, listing) = packagesite_listing(o).expect("listing");
         assert_eq!(&*name, "curl");
-        let r = listing.record("freebsd", &name);
-        assert_eq!(r.ecosystem, "freebsd");
+        let r = listing.record(Ecosystem::Freebsd, &name);
+        assert_eq!(r.ecosystem, Ecosystem::Freebsd);
         assert_eq!(r.version, "8.5.0");
         assert_eq!(r.homepage.as_deref(), Some("https://curl.se/"));
         assert_eq!(r.license.as_deref(), Some("MIT"));
@@ -1293,7 +1287,7 @@ mod tests {
         let net =
             Fixtures::default().with(url, b"Package: a\nVersion: 1\n\nPackage: b\nVersion: 2\n");
         let version = |net: &Fixtures, name: &str| {
-            lookup(url, counted, name, "debian", net, &cache).map(|r| r.version)
+            lookup(url, counted, name, Ecosystem::Debian, net, &cache).map(|r| r.version)
         };
         assert_eq!(version(&net, "a"), Ok("1".into()));
         assert_eq!(version(&net, "b"), Ok("2".into()));
@@ -1330,12 +1324,12 @@ mod tests {
             .with(b, b"Package: b\nVersion: 2\n");
         let cache = BlobCache::disabled();
         std::thread::scope(|scope| {
-            let parsing = scope.spawn(|| lookup(a, slow, "a", "debian", &net, &cache));
+            let parsing = scope.spawn(|| lookup(a, slow, "a", Ecosystem::Debian, &net, &cache));
             while !STARTED.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let started = Instant::now();
-            let other = lookup(b, stanza_listings_deb, "b", "debian", &net, &cache);
+            let other = lookup(b, stanza_listings_deb, "b", Ecosystem::Debian, &net, &cache);
             assert_eq!(other.map(|r| r.version), Ok("2".into()));
             assert!(
                 started.elapsed() < Duration::from_secs(5),
@@ -1474,7 +1468,7 @@ mod tests {
         let r = rpm_repo_lookup(
             "https://repo-xz.test",
             "curl",
-            "opensuse",
+            Ecosystem::Opensuse,
             &net,
             &BlobCache::disabled(),
         )
@@ -1492,7 +1486,13 @@ mod tests {
                     repomd(checksum, "repodata/p-primary.xml.gz").as_bytes(),
                 )
                 .with(&format!("{base}/repodata/p-primary.xml.gz"), &primary);
-            rpm_repo_lookup(base, "curl", "opensuse", &net, &BlobCache::disabled())
+            rpm_repo_lookup(
+                base,
+                "curl",
+                Ecosystem::Opensuse,
+                &net,
+                &BlobCache::disabled(),
+            )
         };
         let element =
             |kind: &str, hex: &str| format!(r#"<checksum type="{kind}">{hex}</checksum>"#);
@@ -1545,7 +1545,7 @@ mod tests {
         let got = rpm_repo_lookup(
             "https://repo-latin1.test",
             "curl",
-            "opensuse",
+            Ecosystem::Opensuse,
             &net,
             &BlobCache::disabled(),
         );

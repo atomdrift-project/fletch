@@ -1,6 +1,6 @@
 //! The Dify Marketplace: registry metadata and artifact resolution.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
@@ -108,37 +108,37 @@ pub(crate) fn lookup(
             "dify plugin is not active: security hold"
         );
     }
-    Ok(Registry {
-        ecosystem: "dify".into(),
-        name: plugin.plugin_id.unwrap_or_else(|| c.full_name()),
-        published_at: plugin
-            .version_updated_at
-            .as_deref()
-            .filter(|_| plugin.latest_version.as_deref() == Some(version.as_str()))
-            .and_then(unix_secs),
-        first_published_at: plugin.created_at.as_deref().and_then(unix_secs),
-        version,
-        latest_version: plugin.latest_version,
-        // Localized as `{ "en_US": … }`, underscore where AMO has a hyphen.
-        title: plugin
-            .label
-            .and_then(|l| l.translation("en_US").or_else(|| l.text())),
-        description: plugin
-            .brief
-            .and_then(|b| b.translation("en_US").or_else(|| b.text())),
-        repository: plugin.repository,
-        publisher: c.namespace().first().cloned(),
-        downloads_total: plugin.install_count,
-        // Dify's own and its partners' plugins are vetted; `community` is
-        // anyone's.
-        publisher_verified: plugin
-            .verification
-            .and_then(|v| v.authorized_category)
-            .map(|c| matches!(c.as_str(), "langgenius" | "partner")),
-        deprecated: plugin.deprecated_reason,
-        security_hold,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Dify,
+        plugin.plugin_id.unwrap_or_else(|| c.full_name()),
+    );
+    registry.published_at = plugin
+        .version_updated_at
+        .as_deref()
+        .filter(|_| plugin.latest_version.as_deref() == Some(version.as_str()))
+        .and_then(unix_secs);
+    registry.first_published_at = plugin.created_at.as_deref().and_then(unix_secs);
+    registry.version = version;
+    registry.latest_version = plugin.latest_version;
+    // Localized as `{ "en_US": … }`, underscore where AMO has a hyphen.
+    registry.title = plugin
+        .label
+        .and_then(|l| l.translation("en_US").or_else(|| l.text()));
+    registry.description = plugin
+        .brief
+        .and_then(|b| b.translation("en_US").or_else(|| b.text()));
+    registry.repository = plugin.repository;
+    registry.publisher = c.namespace().first().cloned();
+    registry.downloads_total = plugin.install_count;
+    // Dify's own and its partners' plugins are vetted; `community` is
+    // anyone's.
+    registry.publisher_verified = plugin
+        .verification
+        .and_then(|v| v.authorized_category)
+        .map(|c| matches!(c.as_str(), "langgenius" | "partner"));
+    registry.deprecated = plugin.deprecated_reason;
+    registry.security_hold = security_hold;
+    Ok(registry)
 }
 
 /// A Dify Marketplace plugin document: the listing under `data.plugin`.
@@ -240,7 +240,7 @@ mod tests {
     fn dify_plugin_normalizes() {
         let net = eval_loop(ACTIVE, "");
         let r = look("pkg:dify/fr3on/eval-loop", &net).expect("registry");
-        assert_eq!(r.ecosystem, "dify");
+        assert_eq!(r.ecosystem, Ecosystem::Dify);
         assert_eq!(r.name, "fr3on/eval-loop");
         assert_eq!(r.version, "0.1.1");
         assert_eq!(r.published_at, Some(1_790_387_175)); // 2026-09-26T01:46:15Z

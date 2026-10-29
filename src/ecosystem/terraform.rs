@@ -1,6 +1,6 @@
 //! The Terraform Registry: registry metadata and artifact resolution.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
@@ -148,32 +148,28 @@ pub(crate) fn lookup(
         );
     }
 
-    let mut record = Registry {
-        ecosystem: "terraform".into(),
-        name: c.full_name(),
-        version: version.to_string(),
-        published_at: release
-            .and_then(|r| r.published_at.as_deref())
-            .and_then(unix_secs),
-        latest_version: latest.map(str::to_string),
-        author: attrs.owner_name.clone(),
-        publisher: c.namespace().first().cloned(),
-        // The provider-level description is often empty where the release's
-        // is not.
-        description: release
-            .and_then(|r| r.description.clone())
-            .or_else(|| attrs.description.clone()),
-        repository: attrs.source.clone(),
-        downloads_total: attrs.downloads,
-        // `official` and `partner` providers are vetted by HashiCorp; a
-        // `community` namespace is anyone's GitHub account.
-        publisher_verified: attrs
-            .tier
-            .as_deref()
-            .map(|t| matches!(t, "official" | "partner")),
-        deprecated: attrs.warning.clone(),
-        ..Default::default()
-    };
+    let mut record = Registry::new(Ecosystem::Terraform, c.full_name());
+    record.version = version.to_string();
+    record.published_at = release
+        .and_then(|r| r.published_at.as_deref())
+        .and_then(unix_secs);
+    record.latest_version = latest.map(str::to_string);
+    record.author = attrs.owner_name.clone();
+    record.publisher = c.namespace().first().cloned();
+    // The provider-level description is often empty where the release's
+    // is not.
+    record.description = release
+        .and_then(|r| r.description.clone())
+        .or_else(|| attrs.description.clone());
+    record.repository = attrs.source.clone();
+    record.downloads_total = attrs.downloads;
+    // `official` and `partner` providers are vetted by HashiCorp; a
+    // `community` namespace is anyone's GitHub account.
+    record.publisher_verified = attrs
+        .tier
+        .as_deref()
+        .map(|t| matches!(t, "official" | "partner"));
+    record.deprecated = attrs.warning.clone();
     set_timeline(
         &mut record,
         releases
@@ -356,7 +352,7 @@ mod tests {
         );
         // The mixed-case address routes to the one lowercase provider.
         let r = look(&net, "pkg:terraform/Kreuzwenker/Docker@4.6.0").expect("registry");
-        assert_eq!(r.ecosystem, "terraform");
+        assert_eq!(r.ecosystem, Ecosystem::Terraform);
         assert_eq!(r.name, "kreuzwenker/docker");
         assert_eq!(r.version, "4.6.0");
         assert_eq!(r.published_at, Some(1_790_088_627)); // 2026-09-22T14:50:27Z

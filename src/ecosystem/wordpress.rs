@@ -1,6 +1,6 @@
 //! WordPress plugins: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, civil_secs, fetch_json, five_star, non_empty, strip_html};
@@ -34,26 +34,26 @@ pub(crate) fn lookup(
         None
     };
 
-    Ok(Registry {
-        ecosystem: "wordpress".into(),
-        name: doc.slug.unwrap_or_else(|| c.name().to_string()),
-        version: version.to_string(),
-        published_at,
-        first_published_at: doc.added.as_deref().and_then(utc_date),
-        // The directory wraps the author in an `<a>`.
-        author: doc
-            .author
-            .as_deref()
-            .map(strip_html)
-            .filter(|a| !a.is_empty()),
-        title: doc.name,
-        homepage: doc.homepage,
-        downloads_total: doc.downloaded,
-        // The directory reports rating as a 0–100 percentage.
-        rating: doc.rating.and_then(|r| five_star(r, 100.0)),
-        rating_count: doc.num_ratings,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Wordpress,
+        doc.slug.unwrap_or_else(|| c.name().to_string()),
+    );
+    registry.version = version.to_string();
+    registry.published_at = published_at;
+    registry.first_published_at = doc.added.as_deref().and_then(utc_date);
+    // The directory wraps the author in an `<a>`.
+    registry.author = doc
+        .author
+        .as_deref()
+        .map(strip_html)
+        .filter(|a| !a.is_empty());
+    registry.title = doc.name;
+    registry.homepage = doc.homepage;
+    registry.downloads_total = doc.downloaded;
+    // The directory reports rating as a 0–100 percentage.
+    registry.rating = doc.rating.and_then(|r| five_star(r, 100.0));
+    registry.rating_count = doc.num_ratings;
+    Ok(registry)
 }
 
 /// Unix seconds at UTC midnight of the date a directory timestamp starts with
@@ -121,7 +121,7 @@ mod tests {
     fn wordpress_plugin_normalizes() {
         let r =
             lookup("pkg:wordpress/akismet", &akismet("2021-04-23 10:34pm GMT")).expect("registry");
-        assert_eq!(r.ecosystem, "wordpress");
+        assert_eq!(r.ecosystem, Ecosystem::Wordpress);
         assert_eq!(r.version, "5.7");
         assert_eq!(r.author.as_deref(), Some("Automattic"));
         assert_eq!(r.published_at, Some(1_619_136_000)); // date floored to UTC midnight

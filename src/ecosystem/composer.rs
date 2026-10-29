@@ -1,6 +1,6 @@
 //! Composer / Packagist: registry metadata and artifact resolution.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use std::collections::BTreeMap;
@@ -85,29 +85,26 @@ pub(crate) fn lookup(
     }
     let latest_version = latest.and_then(|v| v.version.as_deref());
 
-    Ok(Registry {
-        ecosystem: "composer".into(),
-        name: c.full_name(),
-        version: release
-            .and_then(|v| v.version.as_deref())
-            .unwrap_or_else(|| c.target(latest_version))
-            .to_string(),
-        latest_version: latest_version.map(str::to_string),
-        published_at: release.and_then(|v| v.time.as_deref()).and_then(unix_secs),
-        author: release
-            .and_then(|v| v.authors.as_ref()?.first())
-            .and_then(|a| a.name.clone()),
-        description: pkg.description.clone(),
-        repository: pkg.repository.clone(),
-        license: release.and_then(|v| v.license.as_ref()?.first()).cloned(),
-        downloads_total: pkg.downloads.as_ref().and_then(|d| d.total),
-        downloads_recent: pkg.downloads.as_ref().and_then(|d| d.monthly),
-        maintainers: pkg
-            .maintainers
-            .as_ref()
-            .and_then(|m| u32::try_from(m.len()).ok()),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Composer, c.full_name());
+    registry.version = release
+        .and_then(|v| v.version.as_deref())
+        .unwrap_or_else(|| c.target(latest_version))
+        .to_string();
+    registry.latest_version = latest_version.map(str::to_string);
+    registry.published_at = release.and_then(|v| v.time.as_deref()).and_then(unix_secs);
+    registry.author = release
+        .and_then(|v| v.authors.as_ref()?.first())
+        .and_then(|a| a.name.clone());
+    registry.description = pkg.description.clone();
+    registry.repository = pkg.repository.clone();
+    registry.license = release.and_then(|v| v.license.as_ref()?.first()).cloned();
+    registry.downloads_total = pkg.downloads.as_ref().and_then(|d| d.total);
+    registry.downloads_recent = pkg.downloads.as_ref().and_then(|d| d.monthly);
+    registry.maintainers = pkg
+        .maintainers
+        .as_ref()
+        .and_then(|m| u32::try_from(m.len()).ok());
+    Ok(registry)
 }
 
 /// Packagist's latest release: the highest stable `version_normalized`, which

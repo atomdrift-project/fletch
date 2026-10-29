@@ -1,6 +1,6 @@
 //! NuGet: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use std::io::{Cursor, Read};
@@ -81,31 +81,30 @@ pub(crate) fn lookup(
         None => latest.unwrap_or_default(),
     };
 
-    let mut reg = Registry {
-        ecosystem: "nuget".into(),
-        name: hit.id.clone().unwrap_or_else(|| c.name().to_string()),
-        version: version.to_string(),
-        latest_version: latest.map(str::to_string),
-        author: hit.authors.as_ref().and_then(Authors::first),
-        description: hit.description.clone(),
-        homepage: hit.project_url.clone(),
-        downloads_total: hit.total_downloads,
-        // `deprecation` is an object with a `message`/`reasons` when the package
-        // is deprecated, absent otherwise — presence is the signal.
-        deprecated: hit.deprecation.as_ref().map(Deprecation::reason),
-        // `owners` is the curated custody set (distinct from free-text
-        // `authors`); its size is the maintainer count. Absent → unknown.
-        maintainers: hit
-            .owners
-            .as_ref()
-            .and_then(|o| u32::try_from(o.len()).ok()),
-        // The search doc carries advisories for the queried package inline.
-        vulnerability_count: hit
-            .vulnerabilities
-            .as_ref()
-            .and_then(|v| u32::try_from(v.len()).ok()),
-        ..Default::default()
-    };
+    let mut reg = Registry::new(
+        Ecosystem::Nuget,
+        hit.id.clone().unwrap_or_else(|| c.name().to_string()),
+    );
+    reg.version = version.to_string();
+    reg.latest_version = latest.map(str::to_string);
+    reg.author = hit.authors.as_ref().and_then(Authors::first);
+    reg.description = hit.description.clone();
+    reg.homepage = hit.project_url.clone();
+    reg.downloads_total = hit.total_downloads;
+    // `deprecation` is an object with a `message`/`reasons` when the package
+    // is deprecated, absent otherwise — presence is the signal.
+    reg.deprecated = hit.deprecation.as_ref().map(Deprecation::reason);
+    // `owners` is the curated custody set (distinct from free-text
+    // `authors`); its size is the maintainer count. Absent → unknown.
+    reg.maintainers = hit
+        .owners
+        .as_ref()
+        .and_then(|o| u32::try_from(o.len()).ok());
+    // The search doc carries advisories for the queried package inline.
+    reg.vulnerability_count = hit
+        .vulnerabilities
+        .as_ref()
+        .and_then(|v| u32::try_from(v.len()).ok());
 
     // Flatcontainer names the manifest `{id}.nuspec` (only the `.nupkg`
     // carries the version); the version lives in the path segment, normalized.
@@ -379,7 +378,7 @@ mod tests {
     use crate::ecosystem::unix_secs;
     use crate::fetch::{BlobCache, Fixtures};
     use crate::registry::{RegistryError, lookup};
-    use filefacts::{RefLocator, Registry};
+    use filefacts::{Ecosystem, RefLocator, Registry};
 
     fn search_url(id: &str) -> String {
         format!(
@@ -440,7 +439,7 @@ mod tests {
         .to_string();
         let net = Fixtures::default().with(&search_url("newtonsoft.json"), doc.as_bytes());
         let r = look(&net, "pkg:nuget/Newtonsoft.Json").expect("registry");
-        assert_eq!(r.ecosystem, "nuget");
+        assert_eq!(r.ecosystem, Ecosystem::Nuget);
         assert_eq!(r.name, "Newtonsoft.Json");
         assert_eq!(r.version, "13.0.3");
         assert_eq!(r.author.as_deref(), Some("James Newton-King"));

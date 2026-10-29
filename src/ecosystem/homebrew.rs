@@ -1,6 +1,6 @@
 //! Homebrew: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -28,29 +28,29 @@ pub(crate) fn lookup(
         cache,
     )?;
 
-    Ok(Registry {
-        ecosystem: "homebrew".into(),
-        name: doc.name.unwrap_or_else(|| c.name().to_string()),
-        version: c
-            .target(doc.versions.and_then(|v| v.stable).as_deref())
-            .to_string(),
-        description: doc.desc,
-        homepage: doc.homepage,
-        license: doc.license,
-        // The 30-day analytics map counts installs per invocation; sum them.
-        downloads_recent: doc
-            .analytics
-            .and_then(|a| a.install)
-            .and_then(|i| i.last_30_days)
-            .map(|m| m.values().sum::<u64>()),
-        deprecated: doc.deprecated.unwrap_or_default().then(|| {
-            doc.deprecation_reason
-                .unwrap_or_else(|| "deprecated".into())
-        }),
-        // A disabled formula can no longer be installed.
-        version_removed: doc.disabled,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Homebrew,
+        doc.name.unwrap_or_else(|| c.name().to_string()),
+    );
+    registry.version = c
+        .target(doc.versions.and_then(|v| v.stable).as_deref())
+        .to_string();
+    registry.description = doc.desc;
+    registry.homepage = doc.homepage;
+    registry.license = doc.license;
+    // The 30-day analytics map counts installs per invocation; sum them.
+    registry.downloads_recent = doc
+        .analytics
+        .and_then(|a| a.install)
+        .and_then(|i| i.last_30_days)
+        .map(|m| m.values().sum::<u64>());
+    registry.deprecated = doc.deprecated.unwrap_or_default().then(|| {
+        doc.deprecation_reason
+            .unwrap_or_else(|| "deprecated".into())
+    });
+    // A disabled formula can no longer be installed.
+    registry.version_removed = doc.disabled;
+    Ok(registry)
 }
 
 /// A Homebrew formula document.
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn homebrew_formula_normalizes() {
         let r = lookup("pkg:brew/wget", &wget(false, false)).expect("registry");
-        assert_eq!(r.ecosystem, "homebrew");
+        assert_eq!(r.ecosystem, Ecosystem::Homebrew);
         assert_eq!(r.version, "1.25.0");
         assert_eq!(r.license.as_deref(), Some("GPL-3.0-or-later"));
         assert_eq!(r.downloads_recent, Some(20_594));
@@ -142,7 +142,7 @@ mod tests {
         ] {
             assert_eq!(
                 lookup(purl, &net).map(|r| r.ecosystem),
-                Ok("homebrew".to_string()),
+                Ok(Ecosystem::Homebrew),
                 "{purl}"
             );
         }

@@ -1,7 +1,7 @@
 //! PyPI: registry metadata and artifact resolution, both read from the JSON
 //! API's project and release documents.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use std::collections::{BTreeMap, HashMap};
@@ -252,45 +252,41 @@ pub(crate) fn lookup(
         );
     }
 
-    let mut p = Registry {
-        ecosystem: "pypi".into(),
-        name: c.name().to_string(),
-        version: target.to_string(),
-        published_at: target_files.and_then(|files| publish_time(files)),
-        latest_version: latest.map(str::to_string),
-        author: info.author.clone().or_else(|| info.maintainer.clone()),
-        description: info.summary.clone(),
-        homepage: info.home_page.clone(),
-        license: info.license.clone(),
-        version_removed,
-        // The project document's `vulnerabilities` are the latest release's;
-        // any other listed version's come from its own document.
-        vulnerability_count: match (target_is_latest, c.encoded_version(), target_files) {
-            (true, _, _) => vulnerability_count(&doc.vulnerabilities),
-            (false, Some(v), Some(_)) => {
-                let url = format!("https://pypi.org/pypi/{name}/{v}/json");
-                optional(fetch_json::<Project>(&url, net, cache), &url)
-                    .and_then(|release| vulnerability_count(&release.vulnerabilities))
-            }
-            _ => None,
-        },
-        // Custody: the owning account (PyPI exposes roles, not a per-version
-        // publisher), and the email domain from the author or maintainer.
-        publisher: doc.ownership.as_ref().and_then(|o| {
-            o.roles
-                .iter()
-                .find(|r| r.role.as_deref() == Some("Owner"))
-                .or_else(|| o.roles.first())?
-                .user
-                .clone()
-        }),
-        publisher_email_domain: info
-            .author_email
-            .as_deref()
-            .or(info.maintainer_email.as_deref())
-            .and_then(email_domain),
-        ..Default::default()
+    let mut p = Registry::new(Ecosystem::Pypi, c.name().to_string());
+    p.version = target.to_string();
+    p.published_at = target_files.and_then(|files| publish_time(files));
+    p.latest_version = latest.map(str::to_string);
+    p.author = info.author.clone().or_else(|| info.maintainer.clone());
+    p.description = info.summary.clone();
+    p.homepage = info.home_page.clone();
+    p.license = info.license.clone();
+    p.version_removed = version_removed;
+    // The project document's `vulnerabilities` are the latest release's;
+    // any other listed version's come from its own document.
+    p.vulnerability_count = match (target_is_latest, c.encoded_version(), target_files) {
+        (true, _, _) => vulnerability_count(&doc.vulnerabilities),
+        (false, Some(v), Some(_)) => {
+            let url = format!("https://pypi.org/pypi/{name}/{v}/json");
+            optional(fetch_json::<Project>(&url, net, cache), &url)
+                .and_then(|release| vulnerability_count(&release.vulnerabilities))
+        }
+        _ => None,
     };
+    // Custody: the owning account (PyPI exposes roles, not a per-version
+    // publisher), and the email domain from the author or maintainer.
+    p.publisher = doc.ownership.as_ref().and_then(|o| {
+        o.roles
+            .iter()
+            .find(|r| r.role.as_deref() == Some("Owner"))
+            .or_else(|| o.roles.first())?
+            .user
+            .clone()
+    });
+    p.publisher_email_domain = info
+        .author_email
+        .as_deref()
+        .or(info.maintainer_email.as_deref())
+        .and_then(email_domain);
     set_timeline(
         &mut p,
         doc.releases
@@ -422,7 +418,7 @@ mod tests {
         let net = Fixtures::default().with("https://pypi.org/pypi/widget/json", doc.as_bytes());
         let p = look("pkg:pypi/widget@0.3.0", &net).expect("provenance");
 
-        assert_eq!(p.ecosystem, "pypi");
+        assert_eq!(p.ecosystem, Ecosystem::Pypi);
         assert_eq!(p.version, "0.3.0");
         assert_eq!(p.published_at, Some(1_619_172_000)); // 2021-04-23
         assert_eq!(p.latest_version.as_deref(), Some("0.3.0"));

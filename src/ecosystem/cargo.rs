@@ -1,7 +1,7 @@
 //! crates.io (Cargo): registry metadata, and artifact resolution for crates.io
 //! and for alternative registries named by `repository_url`.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, null_default, set_timeline, unix_secs};
@@ -198,26 +198,22 @@ pub(crate) fn lookup(
         .iter()
         .find(|v| v.num.as_deref() == Some(version));
 
-    let mut p = Registry {
-        ecosystem: "crates".into(),
-        name: c.name().to_string(),
-        version: version.to_string(),
-        // A version the list lacks has no date of its own; the crate's
-        // `created_at` is its first release, not this one.
-        published_at: ver
-            .and_then(|v| v.created_at.as_deref())
-            .and_then(unix_secs),
-        first_published_at: krate.created_at.as_deref().and_then(unix_secs),
-        latest_version: latest.map(str::to_string),
-        description: krate.description.clone(),
-        homepage: krate.homepage.clone(),
-        repository: krate.repository.clone(),
-        license: ver.and_then(|v| v.license.clone()),
-        downloads_total: krate.downloads,
-        downloads_recent: krate.recent_downloads,
-        version_removed: ver.and_then(|v| v.yanked),
-        ..Default::default()
-    };
+    let mut p = Registry::new(Ecosystem::Crates, c.name().to_string());
+    p.version = version.to_string();
+    // A version the list lacks has no date of its own; the crate's
+    // `created_at` is its first release, not this one.
+    p.published_at = ver
+        .and_then(|v| v.created_at.as_deref())
+        .and_then(unix_secs);
+    p.first_published_at = krate.created_at.as_deref().and_then(unix_secs);
+    p.latest_version = latest.map(str::to_string);
+    p.description = krate.description.clone();
+    p.homepage = krate.homepage.clone();
+    p.repository = krate.repository.clone();
+    p.license = ver.and_then(|v| v.license.clone());
+    p.downloads_total = krate.downloads;
+    p.downloads_recent = krate.recent_downloads;
+    p.version_removed = ver.and_then(|v| v.yanked);
     set_timeline(
         &mut p,
         doc.versions
@@ -290,7 +286,7 @@ mod tests {
         };
 
         let latest = look("pkg:cargo/c");
-        assert_eq!(latest.ecosystem, "crates");
+        assert_eq!(latest.ecosystem, Ecosystem::Crates);
         assert_eq!(latest.name, "c");
         assert_eq!(latest.version, "1.1.0", "the latest stable release");
         assert_eq!(latest.latest_version.as_deref(), Some("1.1.0"));

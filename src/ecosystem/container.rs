@@ -1,7 +1,7 @@
 //! Container images (Docker Hub, Quay, and OCI references): registry metadata
 //! and artifact resolution.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
@@ -179,16 +179,16 @@ fn docker_hub(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Registr
         net,
         cache,
     )?;
-    Ok(Registry {
-        ecosystem: "oci".into(),
-        name: doc.name.unwrap_or_else(|| last_seg(image).to_string()),
-        published_at: doc.last_updated.as_deref().and_then(unix_secs),
-        first_published_at: doc.date_registered.as_deref().and_then(unix_secs),
-        author: doc.namespace.or(doc.user),
-        description: doc.description,
-        downloads_total: doc.pull_count,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Oci,
+        doc.name.unwrap_or_else(|| last_seg(image).to_string()),
+    );
+    registry.published_at = doc.last_updated.as_deref().and_then(unix_secs);
+    registry.first_published_at = doc.date_registered.as_deref().and_then(unix_secs);
+    registry.author = doc.namespace.or(doc.user);
+    registry.description = doc.description;
+    registry.downloads_total = doc.pull_count;
+    Ok(registry)
 }
 
 /// The parts of a Docker Hub repository document the registry record reads.
@@ -231,17 +231,17 @@ fn quay(
     } else {
         None
     };
-    Ok(Registry {
-        ecosystem: "oci".into(),
-        name: doc.name.unwrap_or_else(|| last_seg(image).to_string()),
-        published_at: last_push,
-        author: doc.namespace,
-        description: doc.description,
-        downloads_recent: doc
-            .stats
-            .map(|days| days.iter().filter_map(|d| d.count).sum()),
-        ..Default::default()
-    })
+    let mut registry = Registry::new(
+        Ecosystem::Oci,
+        doc.name.unwrap_or_else(|| last_seg(image).to_string()),
+    );
+    registry.published_at = last_push;
+    registry.author = doc.namespace;
+    registry.description = doc.description;
+    registry.downloads_recent = doc
+        .stats
+        .map(|days| days.iter().filter_map(|d| d.count).sum());
+    Ok(registry)
 }
 
 /// The parts of a Quay repository document the registry record reads.
@@ -311,7 +311,7 @@ mod tests {
             &net,
         )
         .expect("registry");
-        assert_eq!(r.ecosystem, "oci");
+        assert_eq!(r.ecosystem, Ecosystem::Oci);
         assert_eq!(r.name, "nginx");
         assert_eq!(r.author.as_deref(), Some("library"));
         assert_eq!(r.downloads_total, Some(1_000_000_000));

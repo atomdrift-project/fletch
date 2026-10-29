@@ -1,6 +1,6 @@
 //! Conda (Anaconda.org channels): registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, non_empty, null_default, unix_secs};
@@ -41,20 +41,17 @@ pub(crate) fn lookup(
         );
     }
 
-    Ok(Registry {
-        ecosystem: "conda".into(),
-        name: c.name().to_string(),
-        version: version.to_string(),
-        published_at,
-        first_published_at: doc.created_at.as_deref().and_then(unix_secs),
-        latest_version: latest.map(str::to_string),
-        description: doc.summary,
-        homepage: doc.home,
-        repository: doc.source_git_url.or(doc.dev_url),
-        license: doc.license,
-        downloads_total: doc.ndownloads,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Conda, c.name().to_string());
+    registry.version = version.to_string();
+    registry.published_at = published_at;
+    registry.first_published_at = doc.created_at.as_deref().and_then(unix_secs);
+    registry.latest_version = latest.map(str::to_string);
+    registry.description = doc.summary;
+    registry.homepage = doc.home;
+    registry.repository = doc.source_git_url.or(doc.dev_url);
+    registry.license = doc.license;
+    registry.downloads_total = doc.ndownloads;
+    Ok(registry)
 }
 
 /// The parts of an Anaconda.org package document the registry record reads.
@@ -143,7 +140,7 @@ mod tests {
             crate::registry::lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled())
         };
         let r = look("pkg:conda/numpy").expect("registry");
-        assert_eq!(r.ecosystem, "conda");
+        assert_eq!(r.ecosystem, Ecosystem::Conda);
         assert_eq!(r.version, "1.9.3");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(

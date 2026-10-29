@@ -1,6 +1,6 @@
 //! The Snap Store: registry metadata.
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, decode, non_empty, null_default, unix_secs};
@@ -40,22 +40,19 @@ pub(crate) fn lookup(
     }
     let s = doc.snap;
 
-    Ok(Registry {
-        ecosystem: "snap".into(),
-        name: c.name().to_string(),
-        version: c
-            .target(release.and_then(|e| e.version.as_deref()))
-            .to_string(),
-        published_at: release
-            .and_then(|e| e.channel.released_at.as_deref())
-            .and_then(unix_secs),
-        author: s.publisher.and_then(|p| p.display_name),
-        title: s.title,
-        description: s.summary.or(s.description),
-        homepage: s.website.or(s.store_url),
-        license: s.license,
-        ..Default::default()
-    })
+    let mut registry = Registry::new(Ecosystem::Snap, c.name().to_string());
+    registry.version = c
+        .target(release.and_then(|e| e.version.as_deref()))
+        .to_string();
+    registry.published_at = release
+        .and_then(|e| e.channel.released_at.as_deref())
+        .and_then(unix_secs);
+    registry.author = s.publisher.and_then(|p| p.display_name);
+    registry.title = s.title;
+    registry.description = s.summary.or(s.description);
+    registry.homepage = s.website.or(s.store_url);
+    registry.license = s.license;
+    Ok(registry)
 }
 
 /// A Snap Store v2 info document: the snap and its channel map.
@@ -140,7 +137,7 @@ mod tests {
     #[test]
     fn snap_info_normalizes() {
         let r = lookup("pkg:snap/hello").expect("registry");
-        assert_eq!(r.ecosystem, "snap");
+        assert_eq!(r.ecosystem, Ecosystem::Snap);
         assert_eq!(r.version, "2.10");
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.author.as_deref(), Some("Canonical"));
