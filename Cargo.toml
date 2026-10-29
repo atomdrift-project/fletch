@@ -1,6 +1,6 @@
 [package]
 name = "fletch"
-version = "2.0.1"
+version = "3.0.0"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable; edition 2024 implies
 # the MSRV-aware resolver, so this also caps dependency versions.
@@ -8,12 +8,10 @@ rust-version = "1.97"
 license = "Apache-2.0"
 description = "Find and fetch external references (packages and URLs) discovered in analyzed files"
 repository = "https://github.com/atomdrift-project/fletch"
-# filefacts' required API is currently consumed from git, so a crates.io
-# package would be uninstallable. Source releases remain fully reproducible.
+# filefacts is consumed from git (pinned below), so a crates.io package would
+# be uninstallable until filefacts is published there.
 publish = false
 
-# Lint policy mirrors cleave's workspace lints (fletch is a standalone package,
-# so they live here directly rather than via `workspace = true`). Keep in sync.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 rust_2018_idioms = { level = "deny", priority = -1 }
@@ -55,6 +53,8 @@ wildcard_imports = "warn"
 significant_drop_in_scrutinee = "warn"
 significant_drop_tightening = "warn"
 too_many_arguments = "warn"
+too_many_lines = "warn"
+cognitive_complexity = "warn"
 type_complexity = "allow"
 module_name_repetitions = "allow"
 similar_names = "allow"
@@ -63,11 +63,12 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [dependencies]
-# The reference vocabulary (ExternalRef/RefLocator/PinnedHash) + the parsed
-# facts `find` consumes. The reference types now ship in filefacts' published
-# git HEAD, so consume it from git — a path dep here forces every downstream
-# (cleave + scan) into a local override just to satisfy this one line.
-filefacts = { git = "https://github.com/atomdrift-project/filefacts.git" }
+# The reference vocabulary (Reference/RefLocator/PinnedHash) and the parsed
+# facts `find` consumes. Pinned to an exact revision so every build of this
+# tag, including a downstream one, sees the same parser.
+# Its default features (jemalloc, the CLI's signal and log plumbing) serve only
+# the filefacts binary.
+filefacts = { git = "https://github.com/atomdrift-project/filefacts.git", rev = "036bda5e889100fc5be981a293ee8084ae0963c4", default-features = false }
 
 # HTTPS client. rustls-tls avoids a system OpenSSL dependency; blocking keeps
 # the fetcher off any async runtime.
@@ -76,17 +77,14 @@ reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-fea
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
-# ARM/x86 hardware SHA acceleration is automatic in 0.11 (no feature flag), so
-# this drops the sha2-asm dependency the old `asm-aarch64` feature pulled in.
-# That feature was enabled unconditionally and its transitive `asm` broke the
-# x86_64 MSVC build outright: sha2-asm ships GAS-syntax .S files that MSVC's
-# assembler cannot build. Matches cleave, which is already on 0.11.
+# Hardware SHA acceleration is automatic; no assembly feature is needed (and
+# sha2-asm's GAS sources would not build under MSVC).
 sha2 = "0.11"
 # Legacy npm `integrity` pins (`sha1-…`) — every entry in a yarn v1 lockfile.
 sha1 = "0.11"
 base64 = "0.22"
 hex = "0.4"
-zstd = "0.13"
+zstd = "0.14"
 # gzip for OS-distro package indices (Alpine APKINDEX, Debian Packages,
 # openSUSE primary.xml, BSD catalogs); zstd (above) and xz2 (below) cover the
 # other index codecs. flate2 defaults to the pure-Rust miniz_oxide backend.
@@ -94,6 +92,8 @@ flate2 = "1"
 roxmltree = "0.21"
 thiserror = "2"
 tracing = "0.1"
+# The CLI's stderr log; the library only emits events.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 anyhow = "1"
 dirs = "6"
 # `rt` backs `spawn_blocking` in the SSRF resolver: getaddrinfo blocks, so
@@ -104,26 +104,27 @@ xz2 = "0.1.7"
 pep440_rs = "0.7.3"
 node-semver = "2.2.0"
 semver = "1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# Go module zips: read-only, deflate via the flate2 already in the graph.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
+[features]
+# The offline `fetch::Fixtures` backend, for tests in this crate and its
+# dependents.
+test-util = []
 
 [dev-dependencies]
 tempfile = "3"
+# Enables `test-util` for this crate's own integration tests.
+fletch = { path = ".", features = ["test-util"] }
 
-# Forked tree-sitter, pulled in transitively via filefacts. The fork carries
-# illumos support for the vendored endian.h: stock toolchains only test
-# __illumos__, which cross-rs's x86_64-unknown-illumos-gcc does not predefine,
-# so the build hits "#error platform not supported" at endian.h:238.
-#
-# Both crates must come from the same source: tree-sitter uses its in-tree
-# tree-sitter-language, and `links = "tree-sitter-language"` permits only one
-# copy in the graph. filefacts requires tree-sitter ^0.28, which is unpublished
-# (crates.io tops out at 0.27), so this block is load-bearing for resolution,
-# not only for the fix. [patch] applies only in the root crate, so every root
-# in this tree needs an identical block: cleave, filefacts, fletch, hood and
-# scan. Track the fork's master as the siblings do, so `cargo update` moves
-# every root together. Remove from all five once a release carries the fix.
+# tree-sitter, pulled in through filefacts, comes from a fork that carries
+# illumos support for the vendored endian.h (cross-rs's illumos toolchain does
+# not predefine __illumos__). filefacts requires tree-sitter ^0.28, which is not
+# on crates.io, so this block is also what makes the graph resolve. Both
+# tree-sitter crates must come from one source (`links = "tree-sitter-language"`
+# allows a single copy). Each revision is pinned; drop the block once an
+# upstream release carries the fix.
 [patch.crates-io]
-# Inherited from a sibling by update-deps: [patch] applies only in the root.
-tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
-tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
-tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", branch = "master" }
+tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash", rev = "b672c98bad245e1cc41ff698782afe12b9a2718c" }
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", rev = "b6a85b1062dac229f8008613d5017edeadbcfa97" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", rev = "b6a85b1062dac229f8008613d5017edeadbcfa97" }

@@ -13,6 +13,22 @@ pub(crate) fn is_web_scheme(url: &str) -> bool {
             .is_some_and(|p| p.eq_ignore_ascii_case(b"https://"))
 }
 
+/// Whether `url` parses as an absolute URL whose host is exactly `host` (ASCII
+/// case-insensitive). The single answer to "does this URL point at X": a
+/// substring test would accept `https://evil.example/aur.archlinux.org`.
+pub(crate) fn url_host_is(url: &str, host: &str) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.eq_ignore_ascii_case(host)))
+        .unwrap_or(false)
+}
+
+/// Whether `url` is an absolute `http`/`https` URL with a host.
+pub(crate) fn is_http_url(url: &str) -> bool {
+    url::Url::parse(url)
+        .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+}
+
 /// The registry base URL: the PURL's `repository_url` qualifier when it names
 /// a web URL, `default` when it is absent, and `None` for any other scheme.
 pub(crate) fn repository_base(purl: &Purl, default: &str) -> Option<String> {
@@ -23,6 +39,14 @@ pub(crate) fn repository_base(purl: &Purl, default: &str) -> Option<String> {
         Some(_) => None,
         None => Some(default.to_string()),
     }
+}
+
+/// Whether a Cargo `repository_url` names crates.io itself (any crates.io
+/// host, git or sparse), so the public download and API endpoints apply. The
+/// same policy decides whether the registry record is crates.io's, so the
+/// bytes and the reputation always describe one registry.
+pub(crate) fn is_crates_io(repository: &str) -> bool {
+    crate::registry::repository_is_public("cargo", repository)
 }
 
 /// Whether a decoded PURL qualifier can safely be embedded as one artifact

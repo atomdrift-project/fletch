@@ -1,7 +1,8 @@
-//! What fletch knows about each package ecosystem. Each module holds both
-//! halves for its registry, side by side: reading registry metadata into a
-//! [`Registry`](filefacts::Registry) record and resolving artifact downloads.
-//! This module holds the document helpers they share.
+//! What fletch knows about each package ecosystem. Every module reads its
+//! registry's metadata into a [`Registry`](filefacts::Registry) record through
+//! a `lookup` entry point; the modules for registries fletch downloads from
+//! also resolve artifact URLs. This module holds the coordinates and the
+//! document helpers they share.
 
 pub(crate) mod arch;
 pub(crate) mod cargo;
@@ -35,13 +36,162 @@ pub(crate) mod terraform;
 pub(crate) mod vscode;
 pub(crate) mod wordpress;
 
+use filefacts::Registry;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use crate::fetch::{BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata_status};
+use crate::fetch::{
+    BlobCache, Fetch, META_TTL_IMMUTABLE, cached_metadata_status, safe_purl_coordinates,
+};
+use crate::purl::Purl;
 use crate::registry::RegistryError;
+
+/// A package coordinate vetted once for every registry backend and artifact
+/// resolver: the percent-encoded path and version are safe to interpolate
+/// into a registry URL ([`safe_purl_coordinates`]). Backends build URLs from
+/// the encoded forms and name records with the decoded ones, so none decodes
+/// for itself.
+#[derive(Debug)]
+pub(crate) struct Coordinates<'a> {
+    purl: &'a Purl,
+    path: String,
+    version: Option<String>,
+}
+
+/// Test coordinates for `raw`, a PURL with safe coordinates.
+#[cfg(test)]
+pub(crate) fn coordinates(raw: &str) -> Coordinates<'static> {
+    let purl = Box::leak(Box::new(Purl::parse(raw).expect("purl")));
+    Coordinates::new(purl).expect("safe coordinates")
+}
+
+impl<'a> Coordinates<'a> {
+    /// Vet `purl`'s coordinates; [`RegistryError::UnsafeCoordinate`] when its
+    /// path or version could restructure the URL it fills.
+    pub(crate) fn new(purl: &'a Purl) -> Result<Self, RegistryError> {
+        let path = purl.encoded_path();
+        let version = purl.encoded_version();
+        if !safe_purl_coordinates(purl.typ(), &path, version.as_deref()) {
+            tracing::debug!(
+                purl = %purl.to_string().escape_debug(),
+                "refused: coordinate could restructure a registry URL"
+            );
+            return Err(RegistryError::UnsafeCoordinate);
+        }
+        Ok(Self {
+            purl,
+            path,
+            version,
+        })
+    }
+
+    /// The parsed PURL, for its type and qualifiers.
+    pub(crate) fn purl(&self) -> &Purl {
+        self.purl
+    }
+
+    /// The namespace and name as one `/`-joined path of percent-encoded
+    /// segments (`%40scope/name`): the form a registry URL is built from.
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The name, percent-encoded: the last segment of [`path`](Self::path).
+    pub(crate) fn encoded_name(&self) -> &str {
+        last_seg(&self.path)
+    }
+
+    /// The decoded name.
+    pub(crate) fn name(&self) -> &str {
+        self.purl.name()
+    }
+
+    /// The decoded namespace segments.
+    pub(crate) fn namespace(&self) -> &[String] {
+        self.purl.namespace()
+    }
+
+    /// The decoded namespace and name, `/`-joined (`@scope/name`): how a
+    /// registry names the package in its own documents.
+    pub(crate) fn full_name(&self) -> String {
+        let mut segments = self.namespace().to_vec();
+        segments.push(self.name().to_string());
+        segments.join("/")
+    }
+
+    /// The requested version, decoded.
+    pub(crate) fn version(&self) -> Option<&str> {
+        self.purl.version()
+    }
+
+    /// The requested version, percent-encoded.
+    pub(crate) fn encoded_version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    /// The release a record describes: the requested version, else the
+    /// registry's `latest`, else empty — the record's documented "no version".
+    pub(crate) fn target<'b>(&'b self, latest: Option<&'b str>) -> &'b str {
+        self.version().or(latest).unwrap_or_default()
+    }
+
+    /// The encoded `(namespace, name)` of a registry that addresses packages
+    /// as exactly `owner/name`.
+    pub(crate) fn pair(&self) -> Result<(&str, &str), RegistryError> {
+        split_pair(&self.path)
+    }
+
+    /// The encoded name for a backend that reads one repository: the name
+    /// itself when there is no namespace, or when the namespace is one of
+    /// `own`, that repository's own spellings. Any other namespace — a
+    /// third-party tap, PPA, or vendor — names a package elsewhere, and the
+    /// backend's record of the same name would lend it a reputation it never
+    /// earned.
+    pub(crate) fn bare_name(&self, own: &[&str]) -> Result<&str, RegistryError> {
+        let namespace = self.namespace().join("/");
+        if namespace.is_empty() || own.iter().any(|o| o.eq_ignore_ascii_case(&namespace)) {
+            return Ok(self.encoded_name());
+        }
+        tracing::debug!(
+            purl_type = self.purl.typ(),
+            namespace = %namespace.escape_debug(),
+            "registry lookup refused: namespace names another repository"
+        );
+        Err(RegistryError::OffRegistry)
+    }
+}
+
+/// `owner/name` split at its one `/`, both halves non-empty. Anything longer
+/// could reach another endpoint of a registry that addresses packages by
+/// pair, so it is refused as [`RegistryError::UnsafeCoordinate`].
+pub(crate) fn split_pair(path: &str) -> Result<(&str, &str), RegistryError> {
+    match path.split_once('/') {
+        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
+            Ok((owner, name))
+        }
+        _ => {
+            tracing::debug!(
+                path = %path.escape_debug(),
+                "registry lookup refused: coordinate is not owner/name"
+            );
+            Err(RegistryError::UnsafeCoordinate)
+        }
+    }
+}
+
+/// `cache` with the metadata TTL a lookup for `version` warrants. What a
+/// package document says about a published version does not change, so a
+/// versioned lookup trusts a cached copy for the long pinned window; a
+/// versionless one tracks a moving `latest` and revalidates on the short one.
+pub(crate) fn for_version(cache: &BlobCache, version: Option<&str>) -> BlobCache {
+    cache.with_meta_ttl(if version.is_some() {
+        cache.meta_ttl_pinned()
+    } else {
+        cache.meta_ttl_unpinned()
+    })
+}
 
 /// The domain half of an email address (`a@b.com` → `b.com`), lowercased.
 /// `None` when there is no `@` or the domain is empty. Tolerates the
@@ -72,10 +222,25 @@ fn fetch_json<T: DeserializeOwned>(
 /// Decode a registry document, naming it when it is not the shape expected —
 /// a schema change upstream is then a precise error instead of a silent gap.
 fn decode<T: DeserializeOwned>(url: &str, bytes: &[u8]) -> Result<T, RegistryError> {
-    serde_json::from_slice(bytes).map_err(|e| RegistryError::Malformed {
-        url: url.to_string(),
-        reason: e.to_string(),
+    serde_json::from_slice(bytes).map_err(|e| {
+        tracing::debug!(url, error = %e, "registry document is not the expected shape");
+        RegistryError::Malformed {
+            url: url.to_string(),
+            reason: e.to_string(),
+        }
     })
+}
+
+/// A best-effort enrichment's value, or `None` with the reason logged: the
+/// record stands without it, but the gap is never silent.
+fn optional<T>(result: Result<T, RegistryError>, url: &str) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::debug!(url, %error, "registry enrichment skipped");
+            None
+        }
+    }
 }
 
 /// A field that is `T` when the registry sends one, else `None`: for fields a
@@ -84,6 +249,13 @@ fn decode<T: DeserializeOwned>(url: &str, bytes: &[u8]) -> Result<T, RegistryErr
 /// document. Use with `#[serde(default, deserialize_with = "lenient")]`.
 fn lenient<'de, D: Deserializer<'de>, T: DeserializeOwned>(d: D) -> Result<Option<T>, D::Error> {
     Ok(T::deserialize(Value::deserialize(d)?).ok())
+}
+
+/// A text field that is `None` when absent, not a string, or blank —
+/// registries send `""` for "nothing here" as often as they omit the field.
+/// Use with `#[serde(default, deserialize_with = "non_empty")]`.
+fn non_empty<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(lenient::<D, String>(d)?.filter(|s| !s.trim().is_empty()))
 }
 
 /// A field read as its default when the registry sends `null` — registries
@@ -133,13 +305,19 @@ fn flag(set: Option<bool>, label: &str) -> Option<String> {
     set.and_then(|f| f.then(|| label.to_string()))
 }
 
+/// A marketplace rating on a `0..=max` scale, as stars out of five. `None`
+/// for a value off its scale, so every record's `rating` reads the same way.
+fn five_star(value: f64, max: f64) -> Option<f32> {
+    (value.is_finite() && (0.0..=max).contains(&value)).then(|| (value * 5.0 / max) as f32)
+}
+
 /// Resolve through a per-version document that, once published, never
 /// changes: `resolve` reads it trusting a cached copy of any age, and if what
 /// it reads does not check out, once more straight from the network. Without
 /// the second read, a wrong answer cached before the release existed (a `200`
 /// placeholder for a version not yet published) would be served forever —
 /// and the real release, published later under that version, never resolved.
-pub(crate) fn immutable_or_fresh<T>(
+fn immutable_or_fresh<T>(
     cache: &BlobCache,
     resolve: impl Fn(&BlobCache) -> Option<T>,
 ) -> Option<T> {
@@ -147,9 +325,8 @@ pub(crate) fn immutable_or_fresh<T>(
         .or_else(|| resolve(&cache.with_meta_ttl(std::time::Duration::ZERO)))
 }
 
-/// The final path segment — the bare package name, dropping any vendor/namespace
-/// prefix an OS-package locator carries (`pkg:aur/foo`, `pkg:alpm/arch/foo`).
-pub(crate) fn last_seg(path: &str) -> &str {
+/// The final `/`-separated segment of `path`; all of `path` when it has none.
+fn last_seg(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
@@ -159,29 +336,72 @@ pub(crate) fn strip_email(s: &str) -> String {
     s.split('<').next().unwrap_or(s).trim().to_string()
 }
 
-/// Parse a registry timestamp: RFC 3339, or that core followed by a space and
-/// a zone — a UTC word (`… UTC`, `… GMT`, as crandb appends) or a numeric
-/// offset (`… +0000`, pkgsrc's `BUILD_DATE`). Any other trailing text (`PST`,
-/// a 12-hour clock) can't be placed on the timeline, so it is `None` rather
-/// than a guess hours off.
-pub(crate) fn parse_ts(s: &str) -> Option<u64> {
-    parse_rfc3339_secs(s).or_else(|| {
+/// The text of a one-line HTML fragment, its tags dropped and the rest
+/// trimmed (WordPress wraps an author in an `<a>`).
+fn strip_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Record a package's release timeline from every release's publish time, in
+/// any order: the release count (unless the registry reported its own total),
+/// the first release (unless the registry dated the package's creation), the
+/// release just before this record's [`published_at`](Registry::published_at),
+/// and the raw times [`Registry::with_age`] derives the burst counts from. An
+/// empty timeline leaves the record untouched: unknown, not zero releases.
+fn set_timeline(record: &mut Registry, times: impl IntoIterator<Item = u64>) {
+    let mut times: Vec<u64> = times.into_iter().collect();
+    if times.is_empty() {
+        return;
+    }
+    times.sort_unstable();
+    record.release_count = record.release_count.or(u32::try_from(times.len()).ok());
+    record.first_published_at = record.first_published_at.or(times.first().copied());
+    if let Some(this) = record.published_at {
+        let earlier = times.partition_point(|&t| t < this);
+        record.previous_published_at = earlier.checked_sub(1).map(|i| times[i]);
+    }
+    record.release_times = times;
+}
+
+/// Unix seconds from an epoch-milliseconds figure, which some registries send
+/// as a float. `None` for a negative, non-finite, or out-of-range value, never
+/// the epoch.
+fn secs_from_millis(ms: f64) -> Option<u64> {
+    (ms.is_finite() && (0.0..1.0e18).contains(&ms)).then(|| (ms / 1000.0) as u64)
+}
+
+/// Parse a registry timestamp to Unix seconds. The shapes registries emit:
+/// RFC 3339 / ISO 8601 (`2021-04-23T10:00:00.000Z`, `…+00:00`, `…+0000`,
+/// `…+05`, fractional seconds of any width, a space or `T` separator, no zone
+/// meaning UTC), optionally followed by a space and a zone — a UTC word
+/// (`… UTC`, `… GMT`, as crandb appends) or a numeric offset (`… +0000`,
+/// pkgsrc's `BUILD_DATE`). `None` on anything else: an impossible date or
+/// time (`2021-13-45`, `25:00`), trailing text, or a zone abbreviation such
+/// as `PST` that can't be placed — an unparseable date becomes "age unknown",
+/// never a wrong age.
+pub(crate) fn unix_secs(s: &str) -> Option<u64> {
+    rfc3339_secs(s).or_else(|| {
         let (core, zone) = s.trim_end().rsplit_once(' ')?;
         match zone {
-            "UTC" | "GMT" | "Z" => parse_rfc3339_secs(core),
-            _ if zone.starts_with(['+', '-']) => parse_rfc3339_secs(&format!("{core}{zone}")),
+            "UTC" | "GMT" | "Z" => rfc3339_secs(core),
+            _ if zone.starts_with(['+', '-']) => rfc3339_secs(&format!("{core}{zone}")),
             _ => None,
         }
     })
 }
 
-/// Parse an RFC 3339 / ISO 8601 timestamp to Unix seconds, covering the shapes
-/// registries emit: `2021-04-23T10:00:00.000Z`, `…+00:00`, `…+0000`, fractional
-/// seconds of any width, space or `T` separator, no zone meaning UTC. `None` on
-/// anything else, including an impossible date or time (`2021-13-45`, `25:00`)
-/// or trailing text — an unparseable date becomes "age unknown", never a
-/// wrong age.
-fn parse_rfc3339_secs(s: &str) -> Option<u64> {
+/// [`unix_secs`] for exactly one RFC 3339 / ISO 8601 timestamp.
+fn rfc3339_secs(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     // A fixed-width field of digits only: `str::parse` would also take a sign.
     let n = |a: usize, z: usize| -> Option<i64> {
@@ -199,22 +419,11 @@ fn parse_rfc3339_secs(s: &str) -> Option<u64> {
     }
     let (year, month, day) = (n(0, 4)?, n(5, 7)?, n(8, 10)?);
     let (hour, min, sec) = (n(11, 13)?, n(14, 16)?, n(17, 19)?);
-    // Days in the month of the proleptic-Gregorian year.
-    let days_in_month = match month {
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
     // A leap second (`:60`) is legal RFC 3339.
-    if !(1..=12).contains(&month)
-        || !(1..=days_in_month).contains(&day)
-        || hour > 23
-        || min > 59
-        || sec > 60
-    {
+    if hour > 23 || min > 59 || sec > 60 {
         return None;
     }
+    let midnight = i64::try_from(civil_secs(year, month, day)?).ok()?;
 
     let mut i = 19;
     if b.get(i) == Some(&b'.') {
@@ -246,29 +455,31 @@ fn parse_rfc3339_secs(s: &str) -> Option<u64> {
         }
         _ => return None,
     };
-    let days = days_from_civil(year, month, day);
-    u64::try_from(days * 86400 + hour * 3600 + min * 60 + sec - offset).ok()
+    u64::try_from(midnight + hour * 3600 + min * 60 + sec - offset).ok()
 }
 
-/// Days since 1970-01-01 for a proleptic-Gregorian civil date (Howard
-/// Hinnant's algorithm). Valid for any year in range.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
+/// Unix seconds at UTC midnight of a proleptic-Gregorian civil date. `None`
+/// for a month or day that does not exist (`2021-02-29`, `2021-04-31`) or a
+/// date before the epoch.
+fn civil_secs(year: i64, month: i64, day: i64) -> Option<u64> {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    // Days since 1970-01-01 (Howard Hinnant's `days_from_civil`).
+    let y = if month <= 2 { year - 1 } else { year };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-#[cfg(test)]
-/// Build a fresh temp-dir blob cache keyed by a per-test name, purging any
-/// entry a prior run left behind so a changed fixture is never masked by a
-/// stale cached response.
-pub(crate) fn test_cache(_name: &str) -> BlobCache {
-    // Hermetic: an inert cache so every lookup goes straight to the fixture,
-    // with no shared on-disk state across tests or runs.
-    BlobCache::disabled()
+    u64::try_from((era * 146_097 + doe - 719_468).checked_mul(86_400)?).ok()
 }
 
 #[cfg(test)]
@@ -278,44 +489,26 @@ mod tests {
     #[test]
     fn rfc3339_shapes_parse_to_unix_seconds() {
         // 2021-04-23T10:00:00Z == 1619172000.
-        assert_eq!(
-            parse_rfc3339_secs("2021-04-23T10:00:00Z"),
-            Some(1_619_172_000)
-        );
-        assert_eq!(
-            parse_rfc3339_secs("2021-04-23T10:00:00.000Z"),
-            Some(1_619_172_000)
-        );
-        assert_eq!(
-            parse_rfc3339_secs("2021-04-23T10:00:00.123456Z"),
-            Some(1_619_172_000)
-        );
-        // +02:00 offset is two hours earlier in UTC.
-        assert_eq!(
-            parse_rfc3339_secs("2021-04-23T12:00:00+02:00"),
-            Some(1_619_172_000)
-        );
-        assert_eq!(
-            parse_rfc3339_secs("2021-04-23 10:00:00"),
-            Some(1_619_172_000)
-        );
-        // The Unix epoch itself.
-        assert_eq!(parse_rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_rfc3339_secs("garbage"), None);
-        assert_eq!(
-            parse_rfc3339_secs("2021-04-23T12:00:00+0200"),
-            Some(1_619_172_000)
-        );
-        assert_eq!(
-            parse_rfc3339_secs("2021-04-23T12:00:00+02"),
-            Some(1_619_172_000)
-        );
+        for shape in [
+            "2021-04-23T10:00:00Z",
+            "2021-04-23T10:00:00.000Z",
+            "2021-04-23T10:00:00.123456Z",
+            "2021-04-23T12:00:00+02:00",
+            "2021-04-23 10:00:00",
+            "2021-04-23T12:00:00+0200",
+            "2021-04-23T12:00:00+02",
+        ] {
+            assert_eq!(unix_secs(shape), Some(1_619_172_000), "{shape}");
+        }
+        assert_eq!(unix_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(unix_secs("garbage"), None);
     }
 
     #[test]
     fn impossible_or_malformed_timestamps_are_unknown_not_wrong() {
         for bad in [
             "2021-13-01T00:00:00Z",     // month 13
+            "2021-00-01T00:00:00Z",     // month 0
             "2021-02-29T00:00:00Z",     // not a leap year
             "2021-04-31T00:00:00Z",     // April has 30 days
             "2021-04-23T24:00:00Z",     // hour 24
@@ -325,32 +518,124 @@ mod tests {
             "2021-04-23T10:00:00Zjunk", // trailing text
             "2021-04-23T10:00:00+05:30junk",
             "2021-04-23T10:00:00.Z", // a dot with no fraction
+            "1969-12-31T00:00:00Z",  // before the epoch
         ] {
-            assert_eq!(parse_rfc3339_secs(bad), None, "{bad}");
+            assert_eq!(unix_secs(bad), None, "{bad}");
         }
         assert!(
-            parse_rfc3339_secs("2024-02-29T00:00:00Z").is_some(),
+            unix_secs("2024-02-29T00:00:00Z").is_some(),
             "2024 is a leap year"
         );
-        assert!(
-            parse_rfc3339_secs("2016-12-31T23:59:60Z").is_some(),
-            "leap second"
-        );
+        assert!(unix_secs("2016-12-31T23:59:60Z").is_some(), "leap second");
     }
 
     #[test]
     fn a_trailing_zone_is_honoured_or_refused_never_assumed() {
-        let utc = parse_rfc3339_secs("2021-04-23T10:00:00Z");
-        assert_eq!(parse_ts("2021-04-23 10:00:00 UTC"), utc);
-        assert_eq!(parse_ts("2021-04-23 10:00:00 GMT"), utc);
-        assert_eq!(parse_ts("2021-04-23 10:00:00 +0000"), utc);
+        let utc = unix_secs("2021-04-23T10:00:00Z");
+        assert_eq!(unix_secs("2021-04-23 10:00:00 UTC"), utc);
+        assert_eq!(unix_secs("2021-04-23 10:00:00 GMT"), utc);
+        assert_eq!(unix_secs("2021-04-23 10:00:00 +0000"), utc);
         // A non-UTC offset moves the instant instead of being dropped.
         assert_eq!(
-            parse_ts("2021-04-23 15:30:00 +0530"),
+            unix_secs("2021-04-23 15:30:00 +0530"),
             utc,
             "15:30 at +05:30 is 10:00 UTC"
         );
         // A zone abbreviation can't be placed, so it is unknown, not UTC.
-        assert_eq!(parse_ts("2021-04-23 10:00:00 PST"), None);
+        assert_eq!(unix_secs("2021-04-23 10:00:00 PST"), None);
+    }
+
+    #[test]
+    fn civil_dates_are_validated() {
+        assert_eq!(civil_secs(2021, 4, 23), Some(1_619_136_000));
+        assert_eq!(civil_secs(2024, 2, 29), Some(1_709_164_800));
+        for (y, m, d) in [
+            (2021, 2, 29),
+            (2021, 2, 31),
+            (2021, 4, 31),
+            (2021, 13, 1),
+            (2021, 1, 0),
+        ] {
+            assert_eq!(civil_secs(y, m, d), None, "{y}-{m}-{d}");
+        }
+    }
+
+    #[test]
+    fn millisecond_times_never_become_the_epoch() {
+        assert_eq!(secs_from_millis(1_619_172_000_123.0), Some(1_619_172_000));
+        assert_eq!(secs_from_millis(-1.0), None);
+        assert_eq!(secs_from_millis(f64::NAN), None);
+        assert_eq!(secs_from_millis(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn a_timeline_dates_the_first_and_previous_release() {
+        let mut record = Registry {
+            published_at: Some(30),
+            ..Registry::default()
+        };
+        set_timeline(&mut record, [40, 10, 30, 20]);
+        assert_eq!(record.release_count, Some(4));
+        assert_eq!(record.first_published_at, Some(10));
+        assert_eq!(record.previous_published_at, Some(20));
+        assert_eq!(record.release_times, vec![10, 20, 30, 40]);
+
+        // The registry's own total and creation date win; the first release
+        // has no predecessor; an empty timeline is unknown.
+        let mut record = Registry {
+            published_at: Some(10),
+            first_published_at: Some(5),
+            release_count: Some(99),
+            ..Registry::default()
+        };
+        set_timeline(&mut record, [10, 20]);
+        assert_eq!(record.release_count, Some(99));
+        assert_eq!(record.first_published_at, Some(5));
+        assert_eq!(record.previous_published_at, None);
+        let mut record = Registry::default();
+        set_timeline(&mut record, []);
+        assert_eq!(record, Registry::default());
+    }
+
+    #[test]
+    fn ratings_land_on_five_stars_or_nowhere() {
+        assert_eq!(five_star(80.0, 100.0), Some(4.0));
+        assert_eq!(five_star(4.5, 5.0), Some(4.5));
+        assert_eq!(five_star(101.0, 100.0), None);
+        assert_eq!(five_star(-1.0, 5.0), None);
+        assert_eq!(five_star(f64::NAN, 5.0), None);
+    }
+
+    #[test]
+    fn a_pair_is_exactly_owner_and_name() {
+        assert_eq!(split_pair("a/b"), Ok(("a", "b")));
+        for bad in ["a", "a/", "/b", "a/b/c", ""] {
+            assert_eq!(
+                split_pair(bad),
+                Err(RegistryError::UnsafeCoordinate),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinates_carry_both_spellings() {
+        let purl = Purl::parse("pkg:npm/%40scope/na%2Bme@1.0.0%2Bbuild").expect("purl");
+        let c = Coordinates::new(&purl).expect("safe");
+        assert_eq!(c.path(), "%40scope/na%2Bme");
+        assert_eq!(c.encoded_name(), "na%2Bme");
+        assert_eq!(c.name(), "na+me");
+        assert_eq!(c.full_name(), "@scope/na+me");
+        assert_eq!(c.version(), Some("1.0.0+build"));
+        assert_eq!(c.encoded_version(), Some("1.0.0%2Bbuild"));
+        assert_eq!(c.target(Some("2.0.0")), "1.0.0+build");
+        assert_eq!(c.bare_name(&[]), Err(RegistryError::OffRegistry));
+        assert_eq!(c.bare_name(&["@SCOPE"]), Ok("na%2Bme"));
+
+        let purl = Purl::parse("pkg:pypi/w@..%2F..%2Fx").expect("purl");
+        assert_eq!(
+            Coordinates::new(&purl).err(),
+            Some(RegistryError::UnsafeCoordinate)
+        );
     }
 }

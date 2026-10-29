@@ -68,3 +68,31 @@ fn terraform_provider_address_has_one_canonical_form() {
         "pkg:terraform//kreuzwerker//docker@3.0.2",
     ]);
 }
+
+#[test]
+fn jsr_scope_spellings_have_one_canonical_form() {
+    assert_agrees(&[
+        "pkg:jsr/@std/path",
+        "pkg:jsr/%40std/path",
+        "pkg:JSR//@std/path/",
+    ]);
+}
+
+#[test]
+fn homebrew_and_brew_have_one_canonical_form() {
+    assert_agrees(&[
+        "pkg:brew/wget@1.24.5",
+        "pkg:homebrew/wget@1.24.5",
+        "pkg:Homebrew/WGET@1.24.5",
+    ]);
+}
+
+#[test]
+fn distro_vendor_spellings_have_one_canonical_form() {
+    assert_agrees(&[
+        "pkg:rpm/fedora/curl@8.0?distro=fedora-40",
+        "pkg:rpm/Fedora/curl@8.0?distro=fedora-40",
+        "pkg:rpm/curl@8.0?distro=fedora-40",
+        "pkg:fedora/curl@8.0?distro=fedora-40",
+    ]);
+}

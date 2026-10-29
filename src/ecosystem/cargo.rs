@@ -1,45 +1,58 @@
-//! Crates.io (Cargo): registry metadata and artifact resolution.
+//! crates.io (Cargo): registry metadata, and artifact resolution for crates.io
+//! and for alternative registries named by `repository_url`.
 
 use filefacts::Registry;
 use serde::Deserialize;
 
-use crate::ecosystem::{fetch_json, null_default, parse_rfc3339_secs};
+use crate::ecosystem::{Coordinates, fetch_json, null_default, set_timeline, unix_secs};
 use crate::fetch::{
-    ArtifactCandidate, BlobCache, Fetch, artifact_candidate, cached_metadata,
-    deterministic_artifacts, file_name_matches, is_web_scheme, percent_decode, purl_checksums,
+    ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, cached_metadata,
+    deterministic_artifacts, file_name_matches, is_crates_io, is_web_scheme, percent_decode,
+    purl_checksums,
 };
-use crate::purl::Purl;
 use crate::registry::RegistryError;
 
+/// The `.crate` for `purl`. crates.io's download URL is computable; an
+/// alternative registry's comes from its index `config.json` `dl` template,
+/// filled with the PURL's `sha256` checksum or, failing that, the index
+/// record's. Empty when the registry, its template, or the version is
+/// unknown.
 pub(crate) fn cargo_artifacts(
-    purl: &Purl,
-    name: &str,
-    version: Option<&str>,
+    c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Vec<ArtifactCandidate> {
+    let (purl, name, version) = (c.purl(), c.path(), c.encoded_version());
     let Some(repository) = purl.qualifier("repository_url") else {
-        return deterministic_artifacts(purl, "crate");
+        return deterministic_artifacts(purl, ArtifactKind::Crate);
     };
-    let repository = repository.trim_end_matches('/');
-    if matches!(repository, "https://crates.io" | "https://index.crates.io") {
-        return deterministic_artifacts(purl, "crate");
+    if is_crates_io(repository) {
+        return deterministic_artifacts(purl, ArtifactKind::Crate);
     }
+    let repository = repository.trim_end_matches('/');
     let repository = repository.strip_prefix("sparse+").unwrap_or(repository);
     if !is_web_scheme(repository) {
+        tracing::debug!(
+            repository = %repository.escape_debug(),
+            "cargo artifacts unresolved: repository_url is not a web URL"
+        );
         return Vec::new();
     }
     let Some(version) = version.map(percent_decode) else {
+        tracing::debug!(
+            repository = %repository.escape_debug(),
+            "cargo artifacts unresolved: an alternative registry needs a version"
+        );
         return Vec::new();
     };
     let config_url = format!("{repository}/config.json");
-    let Some(download) = cached_metadata(
+    let Some(config) = cached_metadata(
         &config_url,
         net,
         &cache.with_meta_ttl(cache.meta_ttl_pinned()),
     )
-    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-    .and_then(|config| config.get("dl")?.as_str().map(str::to_string)) else {
+    .and_then(|bytes| serde_json::from_slice::<IndexConfig>(&bytes).ok()) else {
+        tracing::debug!(url = %config_url, "cargo artifacts unresolved: no readable index config");
         return Vec::new();
     };
     let mut checksums = purl_checksums(purl);
@@ -48,16 +61,20 @@ pub(crate) fn cargo_artifacts(
     {
         checksums.insert("sha256".into(), checksum);
     }
-    let url = cargo_download_url(
-        &download,
+    let Some(url) = cargo_download_url(
+        &config.dl,
         name,
         &version,
         checksums.get("sha256").map(String::as_str),
-    );
-    let Some(url) = url else {
+    ) else {
+        tracing::debug!(
+            url = %config_url,
+            template = %config.dl.escape_debug(),
+            "cargo artifacts unresolved: the download template does not expand to a web URL"
+        );
         return Vec::new();
     };
-    let mut candidate = artifact_candidate(url, "crate");
+    let mut candidate = artifact_candidate(url, ArtifactKind::Crate);
     candidate.checksums = checksums;
     candidate
         .qualifiers
@@ -66,6 +83,9 @@ pub(crate) fn cargo_artifacts(
     vec![candidate]
 }
 
+/// The `cksum` the registry's index records for `name` `version`: the sparse
+/// index file holds one JSON record per line, one line per version. A line
+/// that is not such a record is skipped.
 fn cargo_index_checksum(
     repository: &str,
     name: &str,
@@ -81,48 +101,52 @@ fn cargo_index_checksum(
         net,
         &cache.with_meta_ttl(cache.meta_ttl_pinned()),
     )?;
-    std::str::from_utf8(&bytes)
-        .ok()?
+    let checksum = String::from_utf8_lossy(&bytes)
         .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find_map(|entry| {
-            (entry.get("vers")?.as_str()? == version)
-                .then(|| entry.get("cksum")?.as_str().map(str::to_string))
-                .flatten()
-        })
+        .filter_map(|line| serde_json::from_str::<IndexEntry>(line).ok())
+        .find(|entry| entry.vers == version)
+        .map(|entry| entry.cksum);
+    if checksum.is_none() {
+        tracing::debug!(url = %index_url, version = %version.escape_debug(), "cargo index has no record of the version");
+    }
+    checksum
 }
 
+/// Expand a registry's `dl` template for `name` `version`. A template with no
+/// `{…}` marker is a base the standard `/{crate}/{version}/download` path is
+/// appended to. `None` when the result is not a web URL, or the template
+/// wants a `{sha256-checksum}` and there is no hex digest to give it: the
+/// digest is never invented, and nothing but hex may enter the path.
 fn cargo_download_url(
     template: &str,
     name: &str,
     version: &str,
     sha256: Option<&str>,
 ) -> Option<String> {
+    let sha256 = sha256.filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_hexdigit()));
     if template.contains("{sha256-checksum}") && sha256.is_none() {
-        // This template cannot be expanded without either an explicit PURL
-        // checksum or the crate's index record. Never invent the digest.
         return None;
     }
     let prefix = cargo_registry_prefix(name)?;
     let lowerprefix = cargo_registry_prefix(&name.to_ascii_lowercase())?;
-    let has_markers = template.contains('{');
-    let expanded = template
-        .replace("{crate}", name)
-        .replace("{version}", version)
-        .replace("{prefix}", &prefix)
-        .replace("{lowerprefix}", &lowerprefix)
-        .replace("{sha256-checksum}", sha256.unwrap_or_default());
-    let url = if has_markers {
-        expanded
+    let url = if template.contains('{') {
+        template
+            .replace("{crate}", name)
+            .replace("{version}", version)
+            .replace("{prefix}", &prefix)
+            .replace("{lowerprefix}", &lowerprefix)
+            .replace("{sha256-checksum}", sha256.unwrap_or_default())
     } else {
         format!(
             "{}/{name}/{version}/download",
-            expanded.trim_end_matches('/')
+            template.trim_end_matches('/')
         )
     };
     is_web_scheme(&url).then_some(url)
 }
 
+/// The index directory a crate name lives under: `1`, `2`, `3/{first}`, or
+/// `{first two}/{next two}` by length. `None` for an empty name.
 fn cargo_registry_prefix(name: &str) -> Option<String> {
     let characters: Vec<char> = name.chars().collect();
     Some(match characters.as_slice() {
@@ -134,16 +158,29 @@ fn cargo_registry_prefix(name: &str) -> Option<String> {
     })
 }
 
-/// crates.io: the per-crate API returns custody-free but rich popularity and
-/// links; the matching version object carries its own publish time.
-pub(crate) fn crates(
-    path: &str,
-    version: Option<&str>,
+/// An alternative registry's index `config.json`, as far as downloads go.
+#[derive(Deserialize)]
+struct IndexConfig {
+    dl: String,
+}
+
+/// One version's record in a sparse index file.
+#[derive(Deserialize)]
+struct IndexEntry {
+    vers: String,
+    cksum: String,
+}
+
+/// Look up the crate `c` names on crates.io. The crate document carries
+/// popularity and links, and lists every version with its own publish time
+/// and yank flag.
+pub(crate) fn lookup(
+    c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
     let doc: CrateResponse = fetch_json(
-        &format!("https://crates.io/api/v1/crates/{path}"),
+        &format!("https://crates.io/api/v1/crates/{}", c.encoded_name()),
         net,
         cache,
     )?;
@@ -155,37 +192,39 @@ pub(crate) fn crates(
         .max_stable_version
         .as_deref()
         .or(krate.max_version.as_deref());
-    let requested = version.map(percent_decode);
-    let version = requested.as_deref().or(latest).unwrap_or_default();
+    let version = c.target(latest);
     let ver = doc
         .versions
         .iter()
         .find(|v| v.num.as_deref() == Some(version));
 
-    Ok(Registry {
+    let mut p = Registry {
         ecosystem: "crates".into(),
-        name: path.to_string(),
+        name: c.name().to_string(),
         version: version.to_string(),
         // A version the list lacks has no date of its own; the crate's
         // `created_at` is its first release, not this one.
         published_at: ver
             .and_then(|v| v.created_at.as_deref())
-            .and_then(parse_rfc3339_secs),
-        first_published_at: krate.created_at.as_deref().and_then(parse_rfc3339_secs),
+            .and_then(unix_secs),
+        first_published_at: krate.created_at.as_deref().and_then(unix_secs),
         latest_version: latest.map(str::to_string),
-        author: None,
-        title: None,
         description: krate.description.clone(),
         homepage: krate.homepage.clone(),
         repository: krate.repository.clone(),
         license: ver.and_then(|v| v.license.clone()),
         downloads_total: krate.downloads,
         downloads_recent: krate.recent_downloads,
-        deprecated: ver
-            .and_then(|v| v.yanked)
-            .and_then(|y| y.then(|| "yanked".to_string())),
+        version_removed: ver.and_then(|v| v.yanked),
         ..Default::default()
-    })
+    };
+    set_timeline(
+        &mut p,
+        doc.versions
+            .iter()
+            .filter_map(|v| v.created_at.as_deref().and_then(unix_secs)),
+    );
+    Ok(p)
 }
 
 /// The crates.io `/api/v1/crates/{name}` response, as far as the record reads it.
@@ -219,4 +258,134 @@ struct CrateVersion {
     created_at: Option<String>,
     license: Option<String>,
     yanked: Option<bool>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::fetch::Fixtures;
+    use filefacts::RefLocator;
+
+    #[test]
+    fn the_crate_document_normalizes() {
+        let doc = serde_json::json!({
+            "crate": {
+                "max_stable_version": "1.1.0", "max_version": "2.0.0-rc.1",
+                "created_at": "2015-01-01T00:00:00Z", "description": "codec",
+                "repository": "https://github.test/c", "downloads": 100u64,
+                "recent_downloads": 10u64
+            },
+            "versions": [
+                {"num": "2.0.0-rc.1", "created_at": "2024-02-01T00:00:00Z", "yanked": false},
+                {"num": "1.1.0", "created_at": "2024-01-01T00:00:00Z", "license": "MIT", "yanked": false},
+                {"num": "1.0.0", "created_at": "2015-01-01T00:00:00Z", "yanked": true}
+            ]
+        })
+        .to_string();
+        let net = Fixtures::default().with("https://crates.io/api/v1/crates/c", doc.as_bytes());
+        let cache = BlobCache::disabled();
+        let look = |purl: &str| {
+            crate::registry::lookup(&RefLocator::Purl(purl.into()), &net, &cache).expect("record")
+        };
+
+        let latest = look("pkg:cargo/c");
+        assert_eq!(latest.ecosystem, "crates");
+        assert_eq!(latest.name, "c");
+        assert_eq!(latest.version, "1.1.0", "the latest stable release");
+        assert_eq!(latest.latest_version.as_deref(), Some("1.1.0"));
+        assert_eq!(latest.license.as_deref(), Some("MIT"));
+        assert_eq!(latest.published_at, Some(1_704_067_200)); // 2024-01-01
+        assert_eq!(latest.version_removed, Some(false));
+        assert_eq!(latest.release_count, Some(3));
+        assert_eq!(latest.first_published_at, Some(1_420_070_400)); // 2015-01-01
+        assert_eq!(latest.previous_published_at, Some(1_420_070_400));
+        assert_eq!(latest.downloads_total, Some(100));
+        assert_eq!(latest.downloads_recent, Some(10));
+
+        let requested = look("pkg:cargo/c@2.0.0-rc.1");
+        assert_eq!(requested.version, "2.0.0-rc.1");
+        assert_eq!(requested.published_at, Some(1_706_745_600)); // 2024-02-01
+
+        let yanked = look("pkg:cargo/c@1.0.0");
+        assert_eq!(yanked.version_removed, Some(true));
+        assert_eq!(yanked.deprecated, None, "a yank is not a deprecation");
+
+        let unlisted = look("pkg:cargo/c@9.9.9");
+        assert_eq!(unlisted.version, "9.9.9");
+        assert_eq!(unlisted.published_at, None);
+        assert_eq!(unlisted.version_removed, None);
+        assert_eq!(unlisted.license, None);
+    }
+
+    #[test]
+    fn download_templates_expand_or_refuse() {
+        let sha = "ab12";
+        assert_eq!(
+            cargo_download_url(
+                "https://dl.test/{crate}/{version}/download",
+                "Serde",
+                "1.0.0",
+                None
+            )
+            .as_deref(),
+            Some("https://dl.test/Serde/1.0.0/download")
+        );
+        assert_eq!(
+            cargo_download_url(
+                "https://dl.test/{prefix}/{lowerprefix}/{crate}",
+                "Serde",
+                "1.0.0",
+                None
+            )
+            .as_deref(),
+            Some("https://dl.test/Se/rd/se/rd/Serde")
+        );
+        assert_eq!(
+            cargo_download_url("https://dl.test/api/", "serde", "1.0.0", None).as_deref(),
+            Some("https://dl.test/api/serde/1.0.0/download"),
+            "a marker-less template is a base"
+        );
+        let checksummed = "https://dl.test/{crate}/{sha256-checksum}.crate";
+        assert_eq!(
+            cargo_download_url(checksummed, "serde", "1.0.0", Some(sha)).as_deref(),
+            Some("https://dl.test/serde/ab12.crate")
+        );
+        assert_eq!(
+            cargo_download_url(checksummed, "serde", "1.0.0", None),
+            None,
+            "the digest is never invented"
+        );
+        assert_eq!(
+            cargo_download_url(checksummed, "serde", "1.0.0", Some("../../x")),
+            None,
+            "a digest that is not hex never enters the path"
+        );
+        assert_eq!(
+            cargo_download_url("file:///{crate}", "serde", "1.0.0", None),
+            None
+        );
+    }
+
+    #[test]
+    fn index_prefixes_follow_the_name_length() {
+        assert_eq!(cargo_registry_prefix(""), None);
+        assert_eq!(cargo_registry_prefix("a").as_deref(), Some("1"));
+        assert_eq!(cargo_registry_prefix("ab").as_deref(), Some("2"));
+        assert_eq!(cargo_registry_prefix("abc").as_deref(), Some("3/a"));
+        assert_eq!(cargo_registry_prefix("serde").as_deref(), Some("se/rd"));
+    }
+
+    #[test]
+    fn the_index_checksum_is_the_requested_versions() {
+        let index = b"{\"name\":\"foo\",\"vers\":\"0.9.0\",\"cksum\":\"aa\"}\nnot json\n{\"name\":\"foo\",\"vers\":\"1.0.0\",\"cksum\":\"bb\"}\n";
+        let net = Fixtures::default().with("https://reg.test/index/3/f/foo", index);
+        let cache = BlobCache::disabled();
+        let checksum = |name, version| {
+            cargo_index_checksum("https://reg.test/index", name, version, &net, &cache)
+        };
+        assert_eq!(checksum("Foo", "1.0.0").as_deref(), Some("bb"));
+        assert_eq!(checksum("foo", "0.9.0").as_deref(), Some("aa"));
+        assert_eq!(checksum("foo", "2.0.0"), None);
+    }
 }

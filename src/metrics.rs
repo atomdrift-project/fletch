@@ -13,6 +13,11 @@
 //! | `metadata` | `host`, `served`, `bytes` |
 //! | `backoff` | `host`, `status`, `delay_ms` |
 //!
+//! `ecosystem` is the PURL type of the locator when it is one this crate
+//! knows, `other` for any other PURL, `oci` for a container reference, and
+//! `url` for anything else: a bounded set, whatever the scanned input says.
+//! `host` is the URL's host alone, never its userinfo.
+//!
 //! `outcome` is a [`FetchRecord`] outcome in snake case; `detail` its reason,
 //! for an unresolved reference (`no_release`, …) or a failure (`status`,
 //! `timeout`, …). `served` is `network`, `cache`, `stale_cache`, or — for a
@@ -25,6 +30,7 @@ use std::time::Duration;
 use filefacts::Registry;
 
 use crate::fetch::{FetchError, FetchRecord, Outcome, Served, Unresolved};
+use crate::purl::{Purl, known_type};
 use crate::registry::RegistryError;
 
 /// The `tracing` target every metric event is emitted on.
@@ -55,6 +61,7 @@ pub(crate) fn fetch(rec: &FetchRecord, elapsed: Duration) {
                 FetchError::TooLarge => "too_large",
                 FetchError::Timeout => "timeout",
                 FetchError::Transport(_) => "transport",
+                FetchError::Io(_) => "io",
                 FetchError::Internal(_) => "internal",
             }),
         ),
@@ -66,11 +73,7 @@ pub(crate) fn fetch(rec: &FetchRecord, elapsed: Duration) {
         outcome,
         detail,
         status = rec.status,
-        served = rec.served.map(|served| match served {
-            Served::Network => "network",
-            Served::Cache => "cache",
-            Served::StaleCache => "stale_cache",
-        }),
+        served = rec.served.map(served_label),
         bytes = rec.size,
         elapsed_ms = millis(elapsed),
     );
@@ -103,18 +106,24 @@ pub(crate) fn registry(locator: &str, result: &Result<Registry, RegistryError>, 
     );
 }
 
-/// One registry metadata document read through the cache: from where, and
-/// how large (`None` when nothing came back).
-pub(crate) fn metadata(url: &str, served: &str, bytes: Option<usize>) {
+/// One registry metadata document read through the cache: from where
+/// (`None` when nothing came back), and how large.
+pub(crate) fn metadata(url: &str, served: Option<Served>, bytes: Option<usize>) {
     tracing::debug!(
         target: TARGET,
         event = "metadata",
-        host = url
-            .split_once("://")
-            .map_or("", |(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or("")),
-        served,
+        host = host(url).as_deref().unwrap_or_default(),
+        served = served.map_or("failed", served_label),
         bytes,
     );
+}
+
+fn served_label(served: Served) -> &'static str {
+    match served {
+        Served::Network => "network",
+        Served::Cache => "cache",
+        Served::StaleCache => "stale_cache",
+    }
 }
 
 /// A registry asked to be left alone for `delay`.
@@ -128,16 +137,66 @@ pub(crate) fn backoff(host: &str, status: u16, delay: Duration) {
     );
 }
 
-/// The ecosystem a locator names: a PURL's type, `oci` for a container
+/// The ecosystem label of a locator: its canonical PURL type when this crate
+/// knows the type, `other` for any other PURL, `oci` for a container
 /// reference, else `url`.
-fn ecosystem(locator: &str) -> &str {
-    match locator.strip_prefix("pkg:") {
-        Some(rest) => rest.split('/').next().unwrap_or(rest),
-        None if locator.starts_with("oci://") => "oci",
-        None => "url",
+fn ecosystem(locator: &str) -> &'static str {
+    match Purl::parse(locator) {
+        Ok(purl) => known_type(purl.typ()).unwrap_or("other"),
+        Err(_) if locator.starts_with("oci://") => "oci",
+        Err(_)
+            if locator
+                .get(..4)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("pkg:")) =>
+        {
+            "other"
+        }
+        Err(_) => "url",
     }
+}
+
+/// The lowercase host of `url`, without any userinfo or port.
+fn host(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
 }
 
 fn millis(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ecosystem, host};
+
+    /// The label is the canonical type, whatever the locator's case or type
+    /// spelling, and a type an input invents never becomes a label value.
+    #[test]
+    fn ecosystem_labels_are_canonical_and_bounded() {
+        for (locator, label) in [
+            ("pkg:npm/a@1", "npm"),
+            ("PKG:NPM/a@1", "npm"),
+            ("pkg:debian/curl", "deb"),
+            ("pkg:homebrew/wget", "brew"),
+            ("pkg:swift/github.com/x/y@1", "swift"),
+            ("pkg:attacker-chosen-1234/x", "other"),
+            ("pkg:npm/", "other"),
+            ("oci://ghcr.io/a/b:1", "oci"),
+            ("https://example.com/x.tgz", "url"),
+            ("", "url"),
+        ] {
+            assert_eq!(ecosystem(locator), label, "{locator}");
+        }
+    }
+
+    #[test]
+    fn host_never_carries_userinfo() {
+        assert_eq!(
+            host("https://user:token@Registry.Example:8443/x?y#z").as_deref(),
+            Some("registry.example")
+        );
+        assert_eq!(host("not a url"), None);
+    }
 }

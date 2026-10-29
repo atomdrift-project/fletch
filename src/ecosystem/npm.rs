@@ -1,120 +1,117 @@
-//! Npm: registry metadata and artifact resolution.
+//! npm: registry metadata and artifact resolution, both read from the one
+//! packument document.
 
 use filefacts::Registry;
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::ecosystem::{email_domain, fetch_json, lenient, null_default, parse_rfc3339_secs};
-use crate::fetch::{
-    ArtifactCandidate, BlobCache, Fetch, Request, artifact_candidate, cached_metadata,
-    file_name_from_url, file_name_matches, percent_decode, repository_base, resolve_purl,
+use crate::ecosystem::{
+    Coordinates, email_domain, fetch_json, for_version, last_seg, lenient, non_empty, null_default,
+    optional, set_timeline, unix_secs,
 };
-use crate::purl::Purl;
+use crate::fetch::{
+    ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, file_name_matches,
+    percent_decode, repository_base,
+};
 use crate::registry::RegistryError;
 
+/// The public registry, the base for a PURL with no `repository_url`.
+const REGISTRY: &str = "https://registry.npmjs.org";
+
+/// The tarball `purl` names: the requested version, or the dist-tag a
+/// non-version spelling names, or `latest` when unversioned. Carries the
+/// release's platform constraints (`os`, `cpu`, `libc`, `engines.node`) and
+/// its registry digests. Empty when the packument is unreadable or names no
+/// such release.
 pub(crate) fn npm_artifacts(
-    path: &str,
-    requested_version: Option<&str>,
-    purl: &Purl,
+    c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Vec<ArtifactCandidate> {
+    let (path, requested_version, purl) = (c.path(), c.encoded_version(), c.purl());
     let name = npm_registry_name(path);
-    let ttl = if requested_version.is_some() {
-        cache.meta_ttl_pinned()
-    } else {
-        cache.meta_ttl_unpinned()
-    };
-    let Some(repository) = repository_base(purl, "https://registry.npmjs.org") else {
+    let Some(repository) = repository_base(purl, REGISTRY) else {
+        tracing::debug!(
+            purl = %purl.to_string().escape_debug(),
+            "npm artifacts unresolved: repository_url is not a web URL"
+        );
         return Vec::new();
     };
     let api = format!("{repository}/{name}");
-    let doc = cached_metadata(&api, net, &cache.with_meta_ttl(ttl))
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-    let requested = requested_version.map(percent_decode);
-    let resolved = requested.as_ref().map_or_else(
-        || {
-            doc.as_ref()?
-                .pointer("/dist-tags/latest")?
-                .as_str()
-                .map(str::to_string)
-        },
-        |value| {
-            doc.as_ref()
-                .and_then(|document| document.get("versions"))
-                .and_then(|versions| versions.get(value))
-                .map(|_| value.clone())
-                .or_else(|| {
-                    doc.as_ref()?
-                        .get("dist-tags")?
-                        .get(value)?
-                        .as_str()
-                        .map(str::to_string)
-                })
-        },
-    );
+    let doc: Packument = match fetch_json(&api, net, &for_version(cache, requested_version)) {
+        Ok(doc) => doc,
+        Err(error) => {
+            tracing::debug!(url = %api, %error, "npm artifacts unresolved: packument unreadable");
+            return Vec::new();
+        }
+    };
+    let resolved = match purl.version() {
+        Some(version) if doc.versions.contains_key(version) => Some(version),
+        Some(tag) => doc.tag(tag),
+        None => doc.tag("latest"),
+    };
     let Some(version) = resolved else {
+        tracing::debug!(
+            url = %api,
+            requested = ?purl.version(),
+            "npm artifacts unresolved: no such version or dist-tag"
+        );
         return Vec::new();
     };
-    let version_doc = doc
-        .as_ref()
-        .and_then(|value| value.get("versions"))
-        .and_then(|versions| versions.get(&version));
-    let base_name = name.rsplit('/').next().unwrap_or(name.as_str());
-    let url = version_doc
-        .and_then(|value| value.pointer("/dist/tarball"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .or_else(|| Some(format!("{repository}/{name}/-/{base_name}-{version}.tgz")));
-    let Some(url) = url else {
-        return Vec::new();
-    };
-    let mut candidate = artifact_candidate(url, "tgz");
-    candidate.attributes.insert("version".into(), version);
-    for key in ["os", "cpu", "libc"] {
-        if let Some(value) = version_doc
-            .and_then(|doc| doc.get(key))
-            .and_then(json_string_list)
-        {
+    let release = doc.versions.get(version);
+    let dist = release.and_then(|r| r.dist.as_ref());
+    let url = dist
+        .and_then(|d| d.tarball.clone())
+        .unwrap_or_else(|| format!("{repository}/{name}/-/{}-{version}.tgz", last_seg(&name)));
+    let mut candidate = artifact_candidate(url, ArtifactKind::Tgz);
+    candidate.version = Some(version.to_string());
+    if let Some(release) = release {
+        for (key, platforms) in [
+            ("os", &release.os),
+            ("cpu", &release.cpu),
+            ("libc", &release.libc),
+        ] {
+            // A list is recorded comma-joined; an empty one is no constraint.
+            let value = match platforms {
+                Some(Platforms::One(value)) => value.clone(),
+                Some(Platforms::Many(values)) if !values.is_empty() => values.join(","),
+                _ => continue,
+            };
             candidate.attributes.insert(key.to_string(), value);
         }
+        if let Some(node) = release.engines.as_ref().and_then(|e| e.node.clone()) {
+            candidate.attributes.insert("node".into(), node);
+        }
     }
-    if let Some(node) = version_doc
-        .and_then(|doc| doc.pointer("/engines/node"))
-        .and_then(serde_json::Value::as_str)
-    {
-        candidate.attributes.insert("node".into(), node.to_string());
-    }
-    if let Some(integrity) = version_doc
-        .and_then(|doc| doc.pointer("/dist/integrity"))
-        .and_then(serde_json::Value::as_str)
-    {
+    if let Some(integrity) = dist.and_then(|d| d.integrity.as_deref()) {
         candidate
             .attributes
             .insert("integrity".into(), integrity.to_string());
         add_sri_checksums(integrity, &mut candidate.checksums);
     }
-    if let Some(sha1) = version_doc
-        .and_then(|doc| doc.pointer("/dist/shasum"))
-        .and_then(serde_json::Value::as_str)
-    {
-        candidate.checksums.insert("sha1".into(), sha1.to_string());
+    if let Some(sha1) = dist.and_then(|d| d.shasum.clone()) {
+        candidate.checksums.insert("sha1".into(), sha1);
     }
     candidate.preferred = file_name_matches(purl, &candidate.file_name);
     vec![candidate]
 }
 
+/// Add each `algorithm-base64` token of a Subresource Integrity string to
+/// `checksums` as lowercase hex, keeping any digest already there. A token
+/// that does not decode is skipped.
 fn add_sri_checksums(integrity: &str, checksums: &mut BTreeMap<String, String>) {
     use base64::Engine as _;
     for token in integrity.split_ascii_whitespace() {
         let Some((algorithm, encoded)) = token.split_once('-') else {
             continue;
         };
-        let Some(bytes) = base64::engine::general_purpose::STANDARD
-            .decode(encoded.split('?').next().unwrap_or(encoded))
-            .ok()
-        else {
+        let encoded = encoded.split('?').next().unwrap_or(encoded);
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            tracing::debug!(
+                algorithm = %algorithm.escape_debug(),
+                "npm integrity token skipped: not base64"
+            );
             continue;
         };
         checksums
@@ -123,29 +120,19 @@ fn add_sri_checksums(integrity: &str, checksums: &mut BTreeMap<String, String>) 
     }
 }
 
+/// The packument path for a PURL's encoded coordinate path: a scope's
+/// encoded `%40` spelled `@` (`%40scope/name` → `@scope/name`), the way the
+/// registry addresses scoped packages.
 pub(crate) fn npm_registry_name(path: &str) -> String {
-    if path
-        .get(..3)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("%40"))
-    {
-        format!("@{}", &path[3..])
-    } else {
-        path.to_string()
+    match path.strip_prefix("%40") {
+        Some(scoped) => format!("@{scoped}"),
+        None => path.to_string(),
     }
 }
 
-fn json_string_list(value: &serde_json::Value) -> Option<String> {
-    if let Some(value) = value.as_str() {
-        return Some(value.to_string());
-    }
-    let values = value
-        .as_array()?
-        .iter()
-        .filter_map(serde_json::Value::as_str)
-        .collect::<Vec<_>>();
-    (!values.is_empty()).then(|| values.join(","))
-}
-
+/// Whether an encoded PURL version names one release rather than a range or
+/// a dist-tag: it starts with a digit (after an optional `v`) and holds no
+/// range operator, wildcard, or whitespace.
 pub(crate) fn npm_version_is_concrete(version: &str) -> bool {
     let version = percent_decode(version);
     let version = version.strip_prefix('v').unwrap_or(&version);
@@ -162,176 +149,140 @@ pub(crate) fn npm_version_is_concrete(version: &str) -> bool {
         })
 }
 
-/// A versionless npm PURL with no declared version requirement resolves through
-/// dist-tags. Manifest ranges are resolved separately by `resolve_requirement`
-/// so a current latest release outside the declared range is never substituted.
-/// The refined locator is the declared PURL at the tagged version, its
-/// qualifiers and subpath kept.
-pub(crate) fn resolve_npm_dist_tag(
-    purl: &Purl,
-    tag: &str,
-    net: &dyn Fetch,
-) -> Option<(String, String)> {
-    let name = npm_registry_name(&purl.encoded_path());
-    let repository = repository_base(purl, "https://registry.npmjs.org")?;
-    let packument = net
-        .send(&Request::get(&format!("{repository}/{name}")))
-        .ok()?;
-    let doc: serde_json::Value = serde_json::from_slice(&packument.bytes).ok()?;
-    let version = doc.get("dist-tags")?.get(tag)?.as_str()?;
-    let exact = purl.with_version(version)?;
-    let url = doc
-        .get("versions")
-        .and_then(|versions| versions.get(version))
-        .and_then(|release| release.pointer("/dist/tarball"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .or_else(|| resolve_purl(&exact))?;
-    if !file_name_matches(purl, &file_name_from_url(&url)) {
-        return None;
-    }
-    Some((exact.canonical(), url))
-}
-
-/// npm: the packument carries publish times, custody, and links in one
-/// document; download counts need a second (cached) endpoint.
-pub(crate) fn npm(
-    path: &str,
-    version: Option<&str>,
+/// Look up the package `c` names on npm. The packument carries publish times,
+/// custody, and links in one document; download counts come from a second,
+/// best-effort endpoint.
+pub(crate) fn lookup(
+    c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let name = path.replace("%40", "@");
-    let doc: Packument = fetch_json(&format!("https://registry.npmjs.org/{name}"), net, cache)?;
+    // A namespace is a scope, `@scope`, or nothing: any other path would
+    // address another endpoint of the registry, not a package.
+    let one_scope = match c.namespace() {
+        [] => true,
+        [scope] => scope.starts_with('@'),
+        _ => false,
+    };
+    if !one_scope {
+        tracing::debug!(
+            namespace = %c.namespace().join("/").escape_debug(),
+            "npm lookup refused: namespace is not one @scope"
+        );
+        return Err(RegistryError::UnsafeCoordinate);
+    }
+    let name = npm_registry_name(c.path());
+    let doc: Packument = fetch_json(&format!("{REGISTRY}/{name}"), net, cache)?;
 
-    let latest = doc.dist_tags.latest.as_deref();
-    let requested = version.map(percent_decode);
-    let version = requested.as_deref().or(latest).unwrap_or_default();
+    let latest = doc.tag("latest");
+    let version = c.target(latest);
     let release = doc.versions.get(version);
-    let published = |version: &str| match doc.time.get(version)? {
-        TimeEntry::At(time) => parse_rfc3339_secs(time),
-        TimeEntry::Other(_) => None,
-    };
-    let published_at = published(version);
-    // A field from the version's own manifest, else the package root's (npm
-    // packuments carry both; the version's copy is authoritative).
-    let text = |own: Option<&String>, root: &Option<String>| {
-        own.or(root.as_ref()).filter(|s| !s.is_empty()).cloned()
-    };
+    let published = |key: &str| doc.time.get(key).and_then(TimeEntry::secs);
 
     let mut p = Registry {
         ecosystem: "npm".into(),
-        name: name.clone(),
+        name: c.full_name(),
         version: version.to_string(),
-        published_at,
+        published_at: published(version),
+        // `created` dates the package itself, before any version's entry.
+        first_published_at: published("created"),
         latest_version: latest.map(str::to_string),
+        // The version's own manifest field, else the package root's: npm
+        // packuments carry both, and the version's copy is authoritative.
         author: release
             .and_then(|r| r.author.as_ref())
             .or(doc.author.as_ref())
             .and_then(Person::name)
             .or_else(|| doc.maintainers.as_deref()?.first()?.name())
             .map(str::to_string),
-        title: None,
-        description: text(
-            release.and_then(|r| r.description.as_ref()),
-            &doc.description,
-        ),
-        homepage: text(release.and_then(|r| r.homepage.as_ref()), &doc.homepage),
+        description: release
+            .and_then(|r| r.description.clone())
+            .or_else(|| doc.description.clone()),
+        homepage: release
+            .and_then(|r| r.homepage.clone())
+            .or_else(|| doc.homepage.clone()),
         repository: release
             .and_then(|r| r.repository.as_ref())
             .or(doc.repository.as_ref())
             .and_then(|r| r.url.clone()),
-        license: text(release.and_then(|r| r.license.as_ref()), &doc.license),
+        license: release
+            .and_then(|r| r.license.clone())
+            .or_else(|| doc.license.clone()),
         deprecated: release
             .and_then(|r| r.deprecated.as_ref())
             .and_then(Deprecated::reason),
-        // npm always lists at least one maintainer for a live package, so a
-        // missing/null/empty array is the anomaly itself — record it as zero
-        // rather than "unknown" so a custody trait can fire on it.
-        maintainers: Some(doc.maintainers.as_ref().map_or(0, |m| m.len() as u32)),
+        // A live package always lists at least one maintainer, so a missing,
+        // null, or empty list is itself the anomaly: zero, not unknown.
+        maintainers: Some(
+            doc.maintainers
+                .as_ref()
+                .map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX)),
+        ),
         // npm replaces a taken-down malicious package with a stub whose
-        // description is exactly `security holding package`. That tombstone is
-        // the registry's own verdict — surface it.
+        // description is exactly this: the registry's own verdict.
         security_hold: Some(doc.description.as_deref() == Some("security holding package")),
-        // An unpublished version keeps its `time` entry (and npm records a
-        // `time.unpublished` block) but loses its `versions` object. A live
-        // package always lists its versions, so "timestamped but gone from
-        // versions" is a removal — for a fresh package, almost always a malware
-        // takedown.
+        // An unpublished version keeps its `time` entry but leaves `versions`;
+        // a live version is in both.
         version_removed: Some(release.is_none() && doc.time.contains_key(version)),
         ..Default::default()
     };
-
-    // Release timeline from the packument `time` map: every entry but the
-    // `created`/`modified` bookkeeping keys is `version → publish time`. The
-    // counts derive from this; `with_age` later turns it into the 24h/48h burst
-    // metrics relative to the scan clock.
-    if !doc.time.is_empty() {
-        let mut times: Vec<u64> = doc
-            .time
-            .keys()
-            .filter(|k| !matches!(k.as_str(), "created" | "modified"))
-            .filter_map(|k| published(k))
-            .collect();
-        times.sort_unstable();
-        p.release_count = Some(times.len() as u32);
-        p.first_published_at = published("created").or_else(|| times.first().copied());
-        if let Some(this) = p.published_at {
-            p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
-        }
-        p.release_times = times;
+    // Every `time` entry but the `created`/`modified` bookkeeping is a
+    // version's publish time.
+    set_timeline(
+        &mut p,
+        doc.time
+            .iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "created" | "modified"))
+            .filter_map(|(_, time)| time.secs()),
+    );
+    if let Some(release) = release {
+        record_release(&mut p, release, doc.maintainers.as_deref());
     }
 
-    // Custody: the account that pushed *this* version (`_npmUser`) and whether
-    // it is among the listed maintainers — a publisher outside that set is the
-    // account-takeover tell.
-    let publisher = release
-        .and_then(|r| r.npm_user.as_ref())
-        .and_then(|u| u.name.as_deref());
+    let downloads = format!("https://api.npmjs.org/downloads/point/last-month/{name}");
+    p.downloads_recent = optional(fetch_json::<Downloads>(&downloads, net, cache), &downloads)
+        .and_then(|d| d.downloads);
+    Ok(p)
+}
+
+/// Record what this version's own manifest says: the account that pushed it
+/// (`_npmUser`) and whether it is a listed maintainer — a publisher outside
+/// that set is the account-takeover tell — then the artifact's shape and its
+/// install hooks.
+fn record_release(p: &mut Registry, release: &Release, maintainers: Option<&[Person]>) {
+    let publisher = release.npm_user.as_ref().and_then(|u| u.name.as_deref());
     p.publisher = publisher.map(str::to_string);
     p.publisher_email_domain = release
-        .and_then(|r| r.npm_user.as_ref())
+        .npm_user
+        .as_ref()
         .and_then(|u| u.email.as_deref())
         .and_then(email_domain);
     if let Some(publisher) = publisher {
-        p.publisher_in_maintainers = doc
-            .maintainers
-            .as_ref()
-            .map(|ms| ms.iter().any(|m| m.name() == Some(publisher)));
+        p.publisher_in_maintainers =
+            maintainers.map(|ms| ms.iter().any(|m| m.name() == Some(publisher)));
     }
-
-    // Artifact shape and the registry's own install-hook flag.
-    let dist = release.and_then(|r| r.dist.as_ref());
+    let dist = release.dist.as_ref();
     p.unpacked_size = dist.and_then(|d| d.unpacked_size);
     p.file_count = dist
         .and_then(|d| d.file_count)
         .and_then(|n| u32::try_from(n).ok());
-    p.has_install_script = release.map(|r| {
-        r.has_install_script.unwrap_or(false)
-            || r.scripts.as_ref().is_some_and(|scripts| {
+    p.has_install_script = Some(
+        release.has_install_script.unwrap_or(false)
+            || release.scripts.as_ref().is_some_and(|scripts| {
                 ["install", "preinstall", "postinstall"]
                     .iter()
                     .any(|hook| scripts.contains_key(*hook))
-            })
-    });
-
-    // Best-effort popularity: last-month downloads from the stats endpoint.
-    p.downloads_recent = fetch_json::<Downloads>(
-        &format!("https://api.npmjs.org/downloads/point/last-month/{name}"),
-        net,
-        cache,
-    )
-    .ok()
-    .and_then(|d| d.downloads);
-    Ok(p)
+            }),
+    );
 }
 
-/// The parts of an npm packument the registry record reads.
+/// The parts of an npm packument the registry record and the artifact
+/// resolver read.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Packument {
-    #[serde(rename = "dist-tags", deserialize_with = "null_default")]
-    dist_tags: DistTags,
+    #[serde(rename = "dist-tags", deserialize_with = "lenient")]
+    dist_tags: Option<HashMap<String, String>>,
     #[serde(deserialize_with = "null_default")]
     versions: HashMap<String, Release>,
     #[serde(deserialize_with = "null_default")]
@@ -340,21 +291,21 @@ struct Packument {
     author: Option<Person>,
     #[serde(deserialize_with = "lenient")]
     maintainers: Option<Vec<Person>>,
-    #[serde(deserialize_with = "lenient")]
+    #[serde(deserialize_with = "non_empty")]
     description: Option<String>,
-    #[serde(deserialize_with = "lenient")]
+    #[serde(deserialize_with = "non_empty")]
     homepage: Option<String>,
     #[serde(deserialize_with = "lenient")]
     repository: Option<Repository>,
-    #[serde(deserialize_with = "lenient")]
+    #[serde(deserialize_with = "non_empty")]
     license: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct DistTags {
-    #[serde(deserialize_with = "lenient")]
-    latest: Option<String>,
+impl Packument {
+    /// The version the dist-tag `tag` points at.
+    fn tag(&self, tag: &str) -> Option<&str> {
+        self.dist_tags.as_ref()?.get(tag).map(String::as_str)
+    }
 }
 
 /// One version's manifest, as the packument lists it.
@@ -363,13 +314,13 @@ struct DistTags {
 struct Release {
     #[serde(deserialize_with = "lenient")]
     author: Option<Person>,
-    #[serde(deserialize_with = "lenient")]
+    #[serde(deserialize_with = "non_empty")]
     description: Option<String>,
-    #[serde(deserialize_with = "lenient")]
+    #[serde(deserialize_with = "non_empty")]
     homepage: Option<String>,
     #[serde(deserialize_with = "lenient")]
     repository: Option<Repository>,
-    #[serde(deserialize_with = "lenient")]
+    #[serde(deserialize_with = "non_empty")]
     license: Option<String>,
     #[serde(deserialize_with = "lenient")]
     deprecated: Option<Deprecated>,
@@ -381,6 +332,14 @@ struct Release {
     has_install_script: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     scripts: Option<HashMap<String, IgnoredAny>>,
+    #[serde(deserialize_with = "lenient")]
+    os: Option<Platforms>,
+    #[serde(deserialize_with = "lenient")]
+    cpu: Option<Platforms>,
+    #[serde(deserialize_with = "lenient")]
+    libc: Option<Platforms>,
+    #[serde(deserialize_with = "lenient")]
+    engines: Option<Engines>,
 }
 
 /// A `time` entry: a version's publish time, or npm's `unpublished` record.
@@ -389,6 +348,16 @@ struct Release {
 enum TimeEntry {
     At(String),
     Other(IgnoredAny),
+}
+
+impl TimeEntry {
+    /// The publish time, Unix seconds.
+    fn secs(&self) -> Option<u64> {
+        match self {
+            Self::At(time) => unix_secs(time),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 /// An `author` or maintainer: a bare string, or an object with a `name`.
@@ -414,7 +383,8 @@ struct Repository {
     url: Option<String>,
 }
 
-/// `deprecated`: absent or `false`, a reason, or a bare `true`.
+/// `deprecated`: absent or `false`, a reason, or a bare `true`. An empty
+/// reason is how npm records an un-deprecation.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Deprecated {
@@ -425,6 +395,7 @@ enum Deprecated {
 impl Deprecated {
     fn reason(&self) -> Option<String> {
         match self {
+            Self::Reason(reason) if reason.trim().is_empty() => None,
             Self::Reason(reason) => Some(reason.clone()),
             Self::Flag(true) => Some("deprecated".to_string()),
             Self::Flag(false) => None,
@@ -432,6 +403,7 @@ impl Deprecated {
     }
 }
 
+/// `_npmUser`: the account that published the version.
 #[derive(Deserialize)]
 struct NpmUser {
     #[serde(default, deserialize_with = "lenient")]
@@ -440,14 +412,39 @@ struct NpmUser {
     email: Option<String>,
 }
 
-#[derive(Deserialize)]
+/// A version's `dist` block: its tarball, digests, and unpacked shape.
+#[derive(Default, Deserialize)]
+#[serde(default)]
 struct Dist {
-    #[serde(rename = "unpackedSize", default, deserialize_with = "lenient")]
+    #[serde(deserialize_with = "non_empty")]
+    tarball: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
+    integrity: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
+    shasum: Option<String>,
+    #[serde(rename = "unpackedSize", deserialize_with = "lenient")]
     unpacked_size: Option<u64>,
-    #[serde(rename = "fileCount", default, deserialize_with = "lenient")]
+    #[serde(rename = "fileCount", deserialize_with = "lenient")]
     file_count: Option<u64>,
 }
 
+/// An `os`, `cpu`, or `libc` constraint: one value or a list of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Platforms {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// A version's `engines` block.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Engines {
+    #[serde(deserialize_with = "non_empty")]
+    node: Option<String>,
+}
+
+/// The downloads endpoint's answer.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Downloads {
@@ -458,10 +455,14 @@ struct Downloads {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecosystem::coordinates;
 
-    use crate::ecosystem::parse_rfc3339_secs;
+    use crate::fetch::{Fixtures, resolve_artifacts};
+    use filefacts::RefLocator;
 
-    use crate::fetch::{BlobCache, Fixtures};
+    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
+        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
+    }
 
     #[test]
     fn npm_packument_normalizes() {
@@ -489,11 +490,15 @@ mod tests {
             }
         })
         .to_string();
-        let net =
-            Fixtures::default().with("https://registry.npmjs.org/left-pad", packument.as_bytes());
-        let cache = BlobCache::disabled();
-        let p = npm("left-pad", Some("1.3.0"), &net, &cache).expect("provenance");
+        let net = Fixtures::default()
+            .with("https://registry.npmjs.org/left-pad", packument.as_bytes())
+            .with(
+                "https://api.npmjs.org/downloads/point/last-month/left-pad",
+                br#"{"downloads": 1234}"#,
+            );
+        let p = look("pkg:npm/left-pad@1.3.0", &net).expect("provenance");
         assert_eq!(p.ecosystem, "npm");
+        assert_eq!(p.name, "left-pad");
         assert_eq!(p.published_at, Some(1_619_172_000));
         assert_eq!(p.latest_version.as_deref(), Some("1.3.0"));
         assert_eq!(p.author.as_deref(), Some("Una"));
@@ -515,6 +520,44 @@ mod tests {
         assert_eq!(p.has_install_script, Some(true));
         // A normal package is not a security-hold tombstone.
         assert_eq!(p.security_hold, Some(false));
+        assert_eq!(p.downloads_recent, Some(1234));
+    }
+
+    #[test]
+    fn a_scoped_package_is_named_and_addressed_as_npm_does() {
+        let doc = br#"{"dist-tags":{"latest":"2.0.0"},"versions":{"2.0.0":{}}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/@scope/util", doc);
+        let p = look("pkg:npm/%40scope/util", &net).expect("record");
+        assert_eq!(p.name, "@scope/util");
+        assert_eq!(p.version, "2.0.0");
+    }
+
+    #[test]
+    fn a_namespace_that_is_not_one_scope_is_refused() {
+        for purl in ["pkg:npm/lodash/4.17.21", "pkg:npm/%40a/%40b/c"] {
+            assert_eq!(
+                look(purl, &Fixtures::default()),
+                Err(RegistryError::UnsafeCoordinate),
+                "{purl}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_deprecation_is_no_deprecation() {
+        let doc = br#"{"dist-tags":{"latest":"1.0.0"},"versions":{"1.0.0":{"deprecated":""},"0.9.0":{"deprecated":"use 1.x"}}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/p", doc);
+        assert_eq!(
+            look("pkg:npm/p@1.0.0", &net).expect("record").deprecated,
+            None
+        );
+        assert_eq!(
+            look("pkg:npm/p@0.9.0", &net)
+                .expect("record")
+                .deprecated
+                .as_deref(),
+            Some("use 1.x")
+        );
     }
 
     #[test]
@@ -530,13 +573,7 @@ mod tests {
         })
         .to_string();
         let net = Fixtures::default().with("https://registry.npmjs.org/evilpkg", stub.as_bytes());
-        let p = npm(
-            "evilpkg",
-            Some("0.0.1-security"),
-            &net,
-            &BlobCache::disabled(),
-        )
-        .expect("provenance");
+        let p = look("pkg:npm/evilpkg@0.0.1-security", &net).expect("provenance");
         assert_eq!(
             p.security_hold,
             Some(true),
@@ -566,16 +603,60 @@ mod tests {
         })
         .to_string();
         let net = Fixtures::default().with("https://registry.npmjs.org/evilpkg", doc.as_bytes());
-        let p = npm("evilpkg", Some("1.0.0"), &net, &BlobCache::disabled()).expect("provenance");
+        let p = look("pkg:npm/evilpkg@1.0.0", &net).expect("provenance");
         assert_eq!(
             p.version_removed,
             Some(true),
             "in `time`, gone from `versions` => removed"
         );
         // The surviving timestamp still gives us the publish date / age signals.
+        assert_eq!(p.published_at, unix_secs("2026-06-22T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn the_artifact_resolver_reads_the_same_packument() {
+        let doc = br#"{"dist-tags":{"latest":"1.0.0","next":"2.0.0"},"versions":{
+            "1.0.0":{"dist":{"tarball":"https://registry.npmjs.org/p/-/p-1.0.0.tgz","shasum":"abc","integrity":"sha512-AAAA"}},
+            "2.0.0":{}}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/p", doc);
+        let cache = BlobCache::disabled();
+        let artifacts = |raw: &str| npm_artifacts(&coordinates(raw), &net, &cache);
+        let latest = artifacts("pkg:npm/p");
+        assert_eq!(latest[0].url, "https://registry.npmjs.org/p/-/p-1.0.0.tgz");
         assert_eq!(
-            p.published_at,
-            parse_rfc3339_secs("2026-06-22T00:00:00.000Z")
+            latest[0].checksums.get("sha1").map(String::as_str),
+            Some("abc")
         );
+        assert_eq!(
+            latest[0].checksums.get("sha512").map(String::as_str),
+            Some("000000")
+        );
+        // A tag spelled as the version, with no tarball listed: the derived URL.
+        let next = artifacts("pkg:npm/p@next");
+        assert_eq!(next[0].url, "https://registry.npmjs.org/p/-/p-2.0.0.tgz");
+        assert!(artifacts("pkg:npm/p@9.9.9").is_empty());
+    }
+
+    #[test]
+    fn registry_names_spell_the_scope_as_npm_does() {
+        assert_eq!(npm_registry_name("%40scope/util"), "@scope/util");
+        assert_eq!(npm_registry_name("left-pad"), "left-pad");
+    }
+
+    #[test]
+    fn the_matrix_records_npm_platform_constraints() {
+        let body = br#"{"versions":{"1.0.0":{"os":["linux","!darwin"],"cpu":["x64"],"libc":"glibc","dist":{"tarball":"https://x/native.tgz"}}}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/native", body);
+        let matrix = resolve_artifacts(
+            &RefLocator::Purl("pkg:npm/native@1.0.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        )
+        .expect("npm matrix");
+        let candidate = &matrix.candidates[0];
+        let attribute = |key: &str| candidate.attributes.get(key).map(String::as_str);
+        assert_eq!(attribute("os"), Some("linux,!darwin"));
+        assert_eq!(attribute("cpu"), Some("x64"));
+        assert_eq!(attribute("libc"), Some("glibc"));
     }
 }

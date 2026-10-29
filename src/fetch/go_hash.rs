@@ -1,5 +1,6 @@
 //! Go module-tree integrity; no extraction or execution.
 //! Algorithm: <https://go.dev/src/cmd/vendor/golang.org/x/mod/sumdb/dirhash/hash.go>
+
 use sha2::{Digest, Sha256};
 
 /// Go's x/mod/sumdb/dirhash.HashZip + Hash1: sorted names, each preceded by
@@ -20,12 +21,15 @@ pub(super) fn zip_h1(archive: impl std::io::Read + std::io::Seek) -> Option<Stri
     let mut name_bytes = 0usize;
     for i in 0..zip.len() {
         let file = zip.by_index(i).ok()?;
-        let name = file.name();
+        let name = file.name().ok()?;
         name_bytes = name_bytes.checked_add(name.len())?;
         if name_bytes > 16 * 1024 * 1024 || file.name_raw() != name.as_bytes() {
             return None;
         }
+        // `enclosed_name` alone admits an absolute name (it drops the root),
+        // which no module zip holds.
         if name.len() > 4096
+            || name.starts_with('/')
             || name.contains(['\n', '\r', '\0', '\\'])
             || file.enclosed_name().is_none()
             || names.insert(name.to_string(), i).is_some()
@@ -79,18 +83,14 @@ pub(super) mod tests {
             files.reverse();
         }
         for (name, value) in files {
-            let Ok(()) = zip.start_file(
+            zip.start_file(
                 name,
                 zip::write::SimpleFileOptions::default().compression_method(method),
-            ) else {
-                return Vec::new();
-            };
-            if zip.write_all(value.as_bytes()).is_err() {
-                return Vec::new();
-            }
+            )
+            .unwrap();
+            zip.write_all(value.as_bytes()).unwrap();
         }
-        zip.finish()
-            .map_or_else(|_| Vec::new(), std::io::Cursor::into_inner)
+        zip.finish().unwrap().into_inner()
     }
 
     #[test]

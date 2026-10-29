@@ -1,26 +1,25 @@
 //! `fletch` — a thin command-line companion to the library.
 //!
-//! Two subcommands today:
-//!
 //! - `registry <purl>` — resolve, fetch, and normalize a package's registry
 //!   metadata, printing a `{record, sources}` JSON envelope to stdout: the
-//!   normalized [`fletch::Registry`] a consumer (scan) reasons over, plus the
-//!   raw provider document(s) it was derived from, so the snapshot can be
-//!   archived and re-normalized later without a re-fetch. Exit `2` when the
-//!   ecosystem is unsupported or the registry can't be reached (empty stdout),
-//!   so a caller can tell "no record" from a usage error (exit `1`).
+//!   normalized [`fletch::Registry`], plus the raw provider document(s) it was
+//!   derived from, so the snapshot can be archived and re-normalized later
+//!   without a re-fetch. This lets a non-Rust collector obtain exactly the
+//!   record the library produces instead of maintaining a parallel metadata
+//!   fetcher.
 //!
 //! - `purl <purl>` — report, without any network I/O, how fletch reads one
 //!   PURL: the parsed coordinates, the registry endpoint the type routes to,
-//!   and the artifact URL the fetcher resolves. This is the cross-tool
-//!   consistency surface hopper's `pkgparse` tests drive, so the generator and
-//!   this fetcher can never silently drift apart.
+//!   and the artifact URL the fetcher resolves. `purl -` reads one PURL per
+//!   stdin line and answers one JSON probe per line. A PURL generator can
+//!   test against this to stay consistent with the fetcher.
 //!
-//! This exists so a non-Rust collector (forager) can obtain exactly the record
-//! scan consumes, instead of maintaining a parallel, drifting metadata fetcher:
-//! fletch is the single owner of how a PURL becomes a [`fletch::Registry`].
+//! Exit status: `0` on success; `1` for a usage error or an I/O failure; `2`
+//! when the argument is not a package URL or the registry has no record for
+//! it (stdout empty, the reason on stderr).
 
 use std::io::Write;
+use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -28,10 +27,68 @@ use serde::Serialize;
 
 use fletch::fetch::{BlobCache, HttpFetch, RecordedSource};
 use fletch::purl::Purl;
-use fletch::{RefKind, RefLocator, Reference, Registry};
+use fletch::{RefKind, RefLocator, Reference, Registry, registry};
 
-/// The CLI envelope: the normalized record scan consumes, alongside the raw
-/// provider responses it was derived from (archived for forensics / re-parsing).
+const USAGE: &str = "\
+usage: fletch registry <purl>
+       fletch purl <purl>
+       fletch purl -
+       fletch --help | --version
+
+Diagnostics go to stderr at the level FLETCH_LOG names
+(error, warn, info, debug, trace; default warn).
+";
+
+/// Send the library's `tracing` events to stderr at the level `FLETCH_LOG`
+/// names, `warn` when unset or unrecognized; stdout stays the JSON channel.
+fn init_logging() {
+    let level = std::env::var("FLETCH_LOG")
+        .ok()
+        .and_then(|level| {
+            level
+                .parse::<tracing_subscriber::filter::LevelFilter>()
+                .ok()
+        })
+        .unwrap_or(tracing_subscriber::filter::LevelFilter::WARN);
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(level)
+        .init();
+}
+
+/// Exit status for an argument that is not a package URL, or a package with
+/// no registry record.
+const NO_RECORD: u8 = 2;
+
+fn main() -> ExitCode {
+    init_logging();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let outcome = match args.as_slice() {
+        ["-h" | "--help"] => {
+            print!("{USAGE}");
+            Ok(ExitCode::SUCCESS)
+        }
+        ["-V" | "--version"] => {
+            println!("fletch {}", env!("CARGO_PKG_VERSION"));
+            Ok(ExitCode::SUCCESS)
+        }
+        ["registry", purl] => run_registry(purl),
+        ["purl", "-"] => run_purl_batch(),
+        ["purl", purl] => run_purl(purl),
+        _ => {
+            eprint!("{USAGE}");
+            Ok(ExitCode::FAILURE)
+        }
+    };
+    outcome.unwrap_or_else(|error| {
+        eprintln!("fletch: {error:#}");
+        ExitCode::FAILURE
+    })
+}
+
+/// The CLI envelope: the normalized record, alongside the raw provider
+/// responses it was derived from (archived for forensics / re-parsing).
 #[derive(Serialize)]
 struct Envelope {
     record: Registry,
@@ -42,6 +99,7 @@ struct Envelope {
 /// One raw provider document observed while building the record. `body` carries
 /// it verbatim when it parses as JSON (the common case — npm, PyPI, crates, …);
 /// otherwise `body_b64` holds the bytes (an HTML listing, a compressed index).
+/// A document over the cache's source limit carries neither, and `truncated`.
 #[derive(Serialize, Clone)]
 struct Source {
     url: String,
@@ -53,61 +111,32 @@ struct Source {
     body: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     body_b64: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
 }
 
 /// Map a recorded raw document onto the CLI's [`Source`] shape: a JSON body
-/// inline (the common npm/PyPI/crates case), anything else base64 in `body_b64`.
+/// inline, anything else base64 in `body_b64`, and no body at all for a
+/// document whose bytes were not kept.
 fn source_from_recorded(s: RecordedSource) -> Source {
-    let bytes = s.bytes.unwrap_or_default();
-    let (body, body_b64) = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(v) => (Some(v), None),
-        Err(_) => (
-            None,
-            Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
-        ),
+    let (body, body_b64) = match &s.bytes {
+        None => (None, None),
+        Some(bytes) => match serde_json::from_slice::<serde_json::Value>(bytes) {
+            Ok(v) => (Some(v), None),
+            Err(_) => (
+                None,
+                Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            ),
+        },
     };
     Source {
+        truncated: s.bytes.is_none(),
         url: s.url,
         status: s.status,
         content_type: s.content_type,
         size: s.size,
         body,
         body_b64,
-    }
-}
-
-fn main() -> anyhow::Result<()> {
-    // Reclaim stale/oversized blob-cache entries on a detached thread. Cheap and
-    // self-gated to once a day; the cache is populated by consumers (scan), but
-    // any process that links fletch can reclaim it.
-    fletch::cache_sweep::cleanup();
-
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("registry") => {
-            let purl = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("usage: fletch registry <purl>"))?;
-            run_registry(&purl)
-        }
-        Some("purl") => {
-            let purl = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("usage: fletch purl <purl> | fletch purl -"))?;
-            if purl == "-" {
-                run_purl_batch()
-            } else if Purl::parse(&purl).is_err() {
-                // Exit `2` (empty stdout) for a string that isn't a PURL at
-                // all, so a caller can tell "not a purl" from a usage error.
-                std::process::exit(2);
-            } else {
-                print_json(&probe_purl(&purl))
-            }
-        }
-        _ => {
-            eprintln!("usage: fletch registry <purl> | fletch purl <purl>");
-            std::process::exit(1);
-        }
     }
 }
 
@@ -124,11 +153,10 @@ struct PurlProbe {
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
-    /// [`fletch::purl::normalize`]d spelling — the canonical form; hopper's
-    /// `pkgparse.CanonicalizePURL` must produce exactly this (crosscheck-tested).
+    /// [`fletch::purl::normalize`]d spelling — the canonical form.
     #[serde(skip_serializing_if = "Option::is_none")]
     normalized: Option<String>,
-    /// [`fletch::purl::identity`] key form — what the bloom filters key on.
+    /// [`fletch::purl::identity`] key form — the package's identity key.
     #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,28 +176,40 @@ impl fletch::fetch::Fetch for ProbeNet {
         &self,
         request: &fletch::fetch::Request<'_>,
     ) -> Result<fletch::fetch::Fetched, fletch::fetch::FetchError> {
-        if let Ok(mut seen) = self.0.lock() {
-            seen.push(request.url.to_string());
-        }
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.url.to_string());
         Err(fletch::fetch::FetchError::Refused("probe".into()))
     }
+}
+
+/// `purl <purl>`: print the probe for one PURL, or exit `2` with the reason
+/// when it is not a package URL.
+fn run_purl(purl: &str) -> anyhow::Result<ExitCode> {
+    if let Err(error) = Purl::parse(purl) {
+        // Escaped: the PURL is often feed data, and may carry terminal
+        // control sequences.
+        eprintln!("fletch: {}: {error}", purl.escape_debug());
+        return Ok(ExitCode::from(NO_RECORD));
+    }
+    print_json(&probe_purl(purl))?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Batch form of [`run_purl`]: one PURL per stdin line, one JSON probe per
 /// stdout line, in order. A line that doesn't parse still emits a probe (just
 /// the `purl` field) rather than aborting, so a differential sweep can push
 /// thousands of adversarial inputs through a single process.
-fn run_purl_batch() -> anyhow::Result<()> {
+fn run_purl_batch() -> anyhow::Result<ExitCode> {
     let stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
     for line in std::io::BufRead::lines(stdin) {
-        let purl = line?;
-        let probe_out = probe_purl(&purl);
-        serde_json::to_writer(&mut stdout, &probe_out)?;
+        serde_json::to_writer(&mut stdout, &probe_purl(&line?))?;
         stdout.write_all(b"\n")?;
     }
     stdout.flush()?;
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Write one JSON document as a line on stdout — the shape both subcommands
@@ -193,18 +233,23 @@ fn probe_purl(purl: &str) -> PurlProbe {
     let locator = RefLocator::Purl(purl.to_string());
 
     // Route probe: the first URL the registry lookup asks for names the
-    // registry this type resolves to; the probe refuses it, so nothing is
-    // actually fetched.
+    // registry this type resolves to. The probe refuses every request, so the
+    // lookup itself always fails; its error says nothing the URL doesn't.
     let probe = ProbeNet::default();
-    let _ = fletch::registry(&locator, &probe, &cache);
-    let registry_url = probe.0.lock().ok().and_then(|seen| seen.first().cloned());
+    let _always_refused = registry::lookup(&locator, &probe, &cache);
+    let registry_url = probe
+        .0
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .into_iter()
+        .next();
 
     // Resolution probe: run the real fetch path against the refusing backend.
     // A resolvable PURL surfaces its download URL on the (expectedly failed)
     // record; `Unresolved` means the fetcher has no artifact mapping.
     let reference = Reference::new(locator, RefKind::Dependency, "cli", "");
-    let rec = fletch::fetch::fetch_ref(&reference, &ProbeNet::default(), &cache);
-    let download_url = rec.resolved_url.clone();
+    let download_url =
+        fletch::fetch::fetch_ref(&reference, &ProbeNet::default(), &cache).resolved_url;
 
     PurlProbe {
         purl: purl.to_string(),
@@ -218,31 +263,30 @@ fn probe_purl(purl: &str) -> PurlProbe {
     }
 }
 
-fn run_registry(purl: &str) -> anyhow::Result<()> {
+/// `registry <purl>`: print the record envelope, or exit `2` with the reason
+/// there is none.
+fn run_registry(purl: &str) -> anyhow::Result<ExitCode> {
     let net = HttpFetch::new()?.with_github_token(std::env::var("GITHUB_TOKEN").ok());
-    // Disable the on-disk cache so every metadata document is fetched fresh and
-    // recorded — a cache hit would still be recorded, but a disabled cache keeps
-    // the CLI's snapshot current rather than serving a stale prior run.
+    // A disabled cache fetches and records every document fresh, so the
+    // snapshot is current rather than a stale prior run's.
     let cache = BlobCache::disabled();
 
     let locator = RefLocator::Purl(purl.to_string());
-    let (record, sources) = fletch::try_registry_with_sources(&locator, &net, &cache);
+    let (record, sources) = registry::lookup_recorded(&locator, &net, &cache);
     let record = match record {
         Ok(record) => record,
         Err(why) => {
-            // Escaped: the PURL is often feed data, and may carry terminal
-            // control sequences.
             eprintln!(
                 "fletch: no registry record for {}: {why}",
                 purl.escape_debug()
             );
-            std::process::exit(2);
+            return Ok(ExitCode::from(NO_RECORD));
         }
     };
 
     // Stamp the wall-clock-relative signals at collection time — the producer's
     // one chance, since `release_times` is transient and never serialized. A
-    // consumer can still re-derive plain age from `published_at` at scan time.
+    // consumer can still re-derive plain age from `published_at` later.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| anyhow::anyhow!("system clock before unix epoch: {e}"))?
@@ -251,7 +295,8 @@ fn run_registry(purl: &str) -> anyhow::Result<()> {
     print_json(&Envelope {
         record: record.with_age(now),
         sources: sources.into_iter().map(source_from_recorded).collect(),
-    })
+    })?;
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -259,34 +304,49 @@ mod tests {
     use super::source_from_recorded;
     use fletch::fetch::RecordedSource;
 
-    #[test]
-    fn maps_json_source_inline() {
-        let source = source_from_recorded(RecordedSource {
+    fn recorded(content_type: &str, bytes: Option<&[u8]>) -> RecordedSource {
+        RecordedSource {
             url: "https://registry.example/pkg".to_string(),
             status: 200,
-            content_type: Some("application/json".to_string()),
+            content_type: Some(content_type.to_string()),
             size: 17,
-            bytes: Some(br#"{"hello":"world"}"#.to_vec()),
-        });
+            bytes: bytes.map(<[u8]>::to_vec),
+        }
+    }
+
+    #[test]
+    fn maps_json_source_inline() {
+        let source =
+            source_from_recorded(recorded("application/json", Some(br#"{"hello":"world"}"#)));
         assert_eq!(source.url, "https://registry.example/pkg");
         assert_eq!(source.status, 200);
         assert_eq!(source.content_type.as_deref(), Some("application/json"));
         // A JSON body is preserved verbatim, not base64-wrapped.
         assert_eq!(source.body.as_ref().unwrap()["hello"], "world");
         assert!(source.body_b64.is_none());
+        assert!(!source.truncated);
     }
 
     #[test]
     fn maps_non_json_source_to_base64() {
-        let source = source_from_recorded(RecordedSource {
-            url: "https://store.example/detail/x".to_string(),
-            status: 200,
-            content_type: Some("text/html".to_string()),
-            size: 39,
-            bytes: Some(b"<html>a chrome listing, not json</html>".to_vec()),
-        });
+        let source = source_from_recorded(recorded("text/html", Some(b"<html>a listing</html>")));
         // Non-JSON bytes fall back to base64 so nothing is lost or corrupted.
         assert!(source.body.is_none());
         assert!(source.body_b64.is_some());
+        assert!(!source.truncated);
+    }
+
+    #[test]
+    fn an_unkept_source_is_truncated_not_empty() {
+        let source = source_from_recorded(recorded("application/json", None));
+        assert!(source.truncated);
+        let json = serde_json::to_value(&source).unwrap();
+        assert!(json.get("body").is_none());
+        assert!(
+            json.get("body_b64").is_none(),
+            "no empty body stands in for the bytes"
+        );
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["size"], 17);
     }
 }

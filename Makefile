@@ -43,7 +43,7 @@ test-purl-spec:
 
 lint:
 	$(CARGO) fmt --all --check
-	$(CARGO) clippy --all-targets -- -D warnings
+	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
 # Auto-fix what clippy and rustfmt can fix on their own. Run fmt last so it
 # tidies any code clippy rewrote. Mirrors what `lint` checks.

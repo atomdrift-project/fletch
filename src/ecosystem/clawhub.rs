@@ -1,45 +1,45 @@
-//! ClawHub: registry metadata and artifact resolution.
+//! ClawHub agent skills: registry metadata.
 
 use filefacts::Registry;
 use serde::Deserialize;
 
-use crate::ecosystem::fetch_json;
+use crate::ecosystem::{Coordinates, fetch_json, non_empty, secs_from_millis};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
 /// ClawHub agent-skill registry: `GET /api/v1/skills/{slug}` returns the one
 /// skill (404 for an unknown slug). Slugs are not unique across publishers, so
-/// `path` is the purl's `[owner/]slug` and the owner handle picks the
-/// publisher; a slug several publishers share, asked for without one, is
-/// refused (409, naming the owners).
-pub(crate) fn clawhub(
-    path: &str,
+/// the coordinate is `[owner/]slug` and the owner handle picks the publisher;
+/// a slug several publishers share, asked for without one, is refused (409,
+/// naming the owners). The skill document describes its latest release only.
+pub(crate) fn lookup(
+    c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let (owner, slug) = path
-        .rsplit_once('/')
-        .map_or((None, path), |(owner, slug)| (Some(owner), slug));
-    let mut url = format!("https://clawhub.ai/api/v1/skills/{slug}");
-    if let Some(owner) = owner {
-        url.push_str("?ownerHandle=");
-        url.push_str(owner);
-    }
-    let doc: SkillDocument = fetch_json(&url, net, cache)?;
-    let skill = doc.skill;
-    // Epoch-millisecond timestamps, occasionally fractional; fold to seconds.
-    let ms_to_secs = |ms: f64| ms as u64 / 1_000;
+    let url = if c.namespace().is_empty() {
+        format!("https://clawhub.ai/api/v1/skills/{}", c.encoded_name())
+    } else {
+        let (owner, slug) = c.pair()?;
+        format!("https://clawhub.ai/api/v1/skills/{slug}?ownerHandle={owner}")
+    };
+    let skill = fetch_json::<SkillDocument>(&url, net, cache)?.skill;
+    let latest = skill.tags.and_then(|t| t.latest);
+    let version = c.target(latest.as_deref()).to_string();
     let stats = skill.stats.unwrap_or_default();
     Ok(Registry {
         ecosystem: "clawhub".into(),
-        name: slug.to_string(),
-        version: skill.tags.and_then(|t| t.latest).unwrap_or_default(),
-        published_at: skill.updated_at.map(ms_to_secs),
-        first_published_at: skill.created_at.map(ms_to_secs),
+        name: c.name().to_string(),
+        published_at: skill
+            .updated_at
+            .filter(|_| latest.as_deref() == Some(version.as_str()))
+            .and_then(secs_from_millis),
+        first_published_at: skill.created_at.and_then(secs_from_millis),
+        version,
+        latest_version: latest,
         title: skill.display_name,
         description: skill.summary,
         downloads_total: stats.downloads,
-        rating_count: stats.stars,
         release_count: stats.versions.and_then(|v| u32::try_from(v).ok()),
         ..Default::default()
     })
@@ -51,11 +51,14 @@ struct SkillDocument {
     skill: Skill,
 }
 
-/// A ClawHub skill listing.
+/// A ClawHub skill listing; its times are epoch milliseconds, occasionally
+/// fractional.
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Skill {
+    #[serde(deserialize_with = "non_empty")]
     display_name: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     summary: Option<String>,
     tags: Option<SkillTags>,
     stats: Option<SkillStats>,
@@ -67,6 +70,7 @@ struct Skill {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct SkillTags {
+    #[serde(deserialize_with = "non_empty")]
     latest: Option<String>,
 }
 
@@ -75,41 +79,63 @@ struct SkillTags {
 #[serde(default)]
 struct SkillStats {
     downloads: Option<u64>,
-    stars: Option<u64>,
     versions: Option<u64>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::test_cache;
+    use filefacts::RefLocator;
 
     use crate::fetch::Fixtures;
 
-    #[test]
-    fn clawhub_skill_normalizes() {
+    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
+        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
+    }
+
+    fn cool_skill(created_at: f64) -> Fixtures {
         let doc = serde_json::json!({"skill": {
             "slug": "cool-skill", "displayName": "Cool Skill",
             "summary": "Does cool things.",
             "tags": {"latest": "1.0.2"},
             "stats": {"downloads": 357u64, "stars": 4u64, "versions": 12u64},
-            "createdAt": 1_782_654_274_836u64,
+            "createdAt": created_at,
             "updatedAt": 1_783_710_964_189u64
         }})
         .to_string();
-        let net = Fixtures::default().with(
+        Fixtures::default().with(
             "https://clawhub.ai/api/v1/skills/cool-skill",
             doc.as_bytes(),
-        );
-        let r = clawhub("cool-skill", &net, &test_cache("clawhub")).expect("registry");
+        )
+    }
+
+    #[test]
+    fn clawhub_skill_normalizes() {
+        let r = look("pkg:clawhub/cool-skill", &cool_skill(1_782_654_274_836.0)).expect("registry");
         assert_eq!(r.ecosystem, "clawhub");
         assert_eq!(r.name, "cool-skill");
         assert_eq!(r.version, "1.0.2");
+        assert_eq!(r.latest_version.as_deref(), Some("1.0.2"));
         assert_eq!(r.published_at, Some(1_783_710_964));
         assert_eq!(r.first_published_at, Some(1_782_654_274));
         assert_eq!(r.downloads_total, Some(357));
-        assert_eq!(r.rating_count, Some(4));
+        // Stars are not ratings: nothing stands behind a `rating`.
+        assert_eq!(r.rating_count, None);
         assert_eq!(r.release_count, Some(12));
+    }
+
+    #[test]
+    fn a_negative_time_is_unknown_not_the_epoch() {
+        let r = look("pkg:clawhub/cool-skill", &cool_skill(-5_000.0)).expect("registry");
+        assert_eq!(r.first_published_at, None);
+    }
+
+    #[test]
+    fn a_requested_version_is_the_record_and_the_latest_does_not_date_it() {
+        let r = look("pkg:clawhub/cool-skill@1.0.0", &cool_skill(0.0)).expect("registry");
+        assert_eq!(r.version, "1.0.0");
+        assert_eq!(r.latest_version.as_deref(), Some("1.0.2"));
+        assert_eq!(r.published_at, None);
     }
 
     /// A slug two publishers share answers 409 without an owner; the purl's
@@ -124,10 +150,24 @@ mod tests {
                 "https://clawhub.ai/api/v1/skills/web-search?ownerHandle=acme",
                 doc.as_bytes(),
             );
-        let cache = test_cache("clawhub-owner");
-        let r = clawhub("acme/web-search", &net, &cache).expect("registry");
+        let r = look("pkg:clawhub/acme/web-search", &net).expect("registry");
         assert_eq!(r.name, "web-search");
         assert_eq!(r.version, "2.0.0");
-        assert!(clawhub("web-search", &net, &cache).is_err());
+        assert!(look("pkg:clawhub/web-search", &net).is_err());
+    }
+
+    #[test]
+    fn an_owner_handle_cannot_restructure_the_query() {
+        // `a&x=y` stays one encoded handle; a nested owner is refused outright.
+        let doc = serde_json::json!({"skill": {"tags": {"latest": "1.0.0"}}}).to_string();
+        let net = Fixtures::default().with(
+            "https://clawhub.ai/api/v1/skills/s?ownerHandle=a%26x%3Dy",
+            doc.as_bytes(),
+        );
+        assert!(look("pkg:clawhub/a%26x%3Dy/s", &net).is_ok());
+        assert_eq!(
+            look("pkg:clawhub/a/b/s", &Fixtures::default()),
+            Err(RegistryError::UnsafeCoordinate)
+        );
     }
 }

@@ -4,50 +4,24 @@
 //! registry's *metadata about* the artifact — publish date, author, downloads,
 //! rating, deprecation — and reduces every ecosystem's bespoke JSON to one
 //! common [`filefacts::Registry`] shape (which filefacts can re-parse from a
-//! serialized `*.registry.json` document into trait-matchable facts). A consumer
-//! (scan) then applies uniform policy — age gating, reputation heuristics —
+//! serialized `*.registry.json` document into trait-matchable facts). A
+//! consumer then applies uniform policy — age gating, reputation heuristics —
 //! without knowing whether the source was npm, PyPI, crates.io, Packagist, or
 //! the AUR.
 //!
 //! The lookup is small (a JSON document, not a tarball) and cached, so it is the
 //! cheap thing to do *first*: learn a dependency's age before deciding whether
-//! the expensive fetch-and-scan of its bytes is worth it.
+//! the expensive fetch and analysis of its bytes is worth it.
+
+use std::sync::{Arc, PoisonError};
 
 use crate::distro;
-use crate::ecosystem::arch::{arch, aur};
-use crate::ecosystem::cargo::crates;
-use crate::ecosystem::chrome::chrome;
-use crate::ecosystem::clawhub::clawhub;
-use crate::ecosystem::clojars::clojars;
-use crate::ecosystem::comfyui::comfyui;
-use crate::ecosystem::composer::composer;
-use crate::ecosystem::conda::conda;
-use crate::ecosystem::container::oci_meta;
-use crate::ecosystem::cpan::cpan;
-use crate::ecosystem::cran::cran;
-use crate::ecosystem::dify::dify;
-use crate::ecosystem::fedora::fedora;
-use crate::ecosystem::firefox::firefox;
-use crate::ecosystem::gem::gem;
-use crate::ecosystem::github::github;
-use crate::ecosystem::golang::golang;
-use crate::ecosystem::hex::hex_pm;
-use crate::ecosystem::homebrew::homebrew;
-use crate::ecosystem::huggingface::huggingface;
-use crate::ecosystem::jetbrains::jetbrains;
-use crate::ecosystem::jsr::jsr;
-use crate::ecosystem::maven::maven;
-use crate::ecosystem::npm::npm;
-use crate::ecosystem::nuget::nuget;
-use crate::ecosystem::pub_dev::pub_dev;
-use crate::ecosystem::pypi::pypi;
-use crate::ecosystem::snap::snap;
-use crate::ecosystem::terraform::terraform;
-use crate::ecosystem::vscode::{openvsx, vscode};
-use crate::ecosystem::wordpress::wordpress;
-use crate::fetch::{BlobCache, Fetch, RecordedSource, safe_coordinate};
-
-use crate::fetch::FetchError;
+use crate::ecosystem::{
+    Coordinates, arch, cargo, chrome, clawhub, clojars, comfyui, composer, conda, container, cpan,
+    cran, dify, fedora, firefox, for_version, gem, github, golang, hex, homebrew, huggingface,
+    jetbrains, jsr, maven, npm, nuget, pub_dev, pypi, snap, terraform, vscode, wordpress,
+};
+use crate::fetch::{BlobCache, Fetch, FetchError, RecordedSource, is_http_url, url_host_is};
 use crate::purl::{Purl, PurlError};
 use filefacts::{RefLocator, Registry};
 
@@ -87,8 +61,9 @@ pub enum RegistryError {
     #[error("no usable record in the registry's answer")]
     NoRecord,
     /// The PURL's bytes come from somewhere other than the registry the lookup
-    /// reads (a `download_url`, or a `repository_url` the backend cannot
-    /// follow), so that registry's record would describe another artifact.
+    /// reads (a `download_url`, a `repository_url` other than that registry,
+    /// or a namespace naming another repository), so that registry's record
+    /// would describe another artifact.
     #[error("package is not served by the registry fletch reads")]
     OffRegistry,
 }
@@ -106,29 +81,63 @@ impl From<FetchError> for RegistryError {
 
 /// Look up and normalize the registry metadata for a dependency `locator`.
 ///
-/// Dispatches on the PURL ecosystem, fetches the metadata document through the
-/// blob cache (one round-trip per package per cache window, free on a hit), and
-/// maps it to [`Registry`]. The returned record leaves [`Registry::age_days`]
-/// unset; the caller stamps it with [`Registry::with_age`] from its own clock.
-/// The error says why there is no record, so the caller can decide what an
-/// absent answer means (scan fails open and fetches).
-pub fn try_registry(
+/// Dispatches on the PURL type, fetches the metadata document through the
+/// blob cache (one round-trip per package per cache window, free on a hit),
+/// and maps it to [`Registry`]. The returned record leaves
+/// [`Registry::age_days`] unset; the caller stamps it with
+/// [`Registry::with_age`] from its own clock. The error says why there is no
+/// record, so the caller can decide what an absent answer means.
+pub fn lookup(
     locator: &RefLocator,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
     let started = std::time::Instant::now();
-    let result = look_up(locator, net, cache);
-    crate::metrics::registry(
-        crate::fetch::locator_str(locator),
-        &result,
-        started.elapsed(),
-    );
+    let result = resolve(locator, net, cache);
+    let raw = crate::fetch::locator_str(locator);
+    match &result {
+        Ok(record) => tracing::debug!(
+            locator = %raw.escape_debug(),
+            ecosystem = %record.ecosystem,
+            version = %record.version,
+            "registry record"
+        ),
+        Err(error) => tracing::debug!(
+            locator = %raw.escape_debug(),
+            %error,
+            "no registry record"
+        ),
+    }
+    crate::metrics::registry(raw, &result, started.elapsed());
     result
 }
 
-/// [`try_registry`]'s work.
-fn look_up(
+/// [`lookup`], also returning the raw provider documents the lookup consumed:
+/// the `(url, bytes)` of every metadata response it read, from the warm cache
+/// or a fresh fetch, in read order — the primary registry document first. A
+/// consumer that archives provenance keeps these beside the normalized record
+/// as its re-parsing backup. On an error, the sources are whatever was read
+/// before the lookup gave up (often none).
+pub fn lookup_recorded(
+    locator: &RefLocator,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> (Result<Registry, RegistryError>, Vec<RecordedSource>) {
+    let (recording, sink) = cache.recording();
+    let record = lookup(locator, net, &recording);
+    drop(recording);
+    // A lookup that panicked mid-read poisons the sink; what it recorded
+    // before then is still the provenance of whatever it returned.
+    let sources = match Arc::try_unwrap(sink) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(PoisonError::into_inner),
+        Err(shared) => std::mem::take(&mut *shared.lock().unwrap_or_else(PoisonError::into_inner)),
+    };
+    (record, sources)
+}
+
+/// [`lookup`]'s work: parse and vet the coordinate, refuse off-registry
+/// bytes, then dispatch under the TTL the version warrants.
+fn resolve(
     locator: &RefLocator,
     net: &dyn Fetch,
     cache: &BlobCache,
@@ -137,344 +146,273 @@ fn look_up(
         return Err(RegistryError::NotAPackage);
     };
     let purl = Purl::parse(raw)?;
-    let (path, version) = (purl.encoded_path(), purl.encoded_version());
-    // Every backend `format!`s these into a registry endpoint, so vet them
-    // once here — see [`crate::fetch::safe_coordinate`].
-    if !safe_coordinate(&path) || version.as_deref().is_some_and(|v| !safe_coordinate(v)) {
-        return Err(RegistryError::UnsafeCoordinate);
-    }
+    let c = Coordinates::new(&purl)?;
     // The fetcher honours these qualifiers, so without this a file could name
     // `pkg:npm/lodash@4.17.21?repository_url=https://evil.test` and have
     // evil.test's bytes judged by lodash's age and popularity.
     if off_registry(&purl) {
+        tracing::debug!(
+            purl = %raw.escape_debug(),
+            "registry lookup refused: the PURL's bytes are not the public registry's"
+        );
         return Err(RegistryError::OffRegistry);
     }
-    let version = version.as_deref();
-    // Package documents are mutable, but what they say about a published
-    // version is not (see the metadata TTL notes in `fetch`), so a versioned
-    // lookup trusts its cached copy for months while a versionless one,
-    // tracking a moving `latest`, revalidates hourly. Selected here, the one
-    // place that knows the PURL's version-ness, and carried on the cache
-    // rather than threaded through every ecosystem fn.
-    let ttl = if version.is_some() {
-        cache.meta_ttl_pinned()
-    } else {
-        cache.meta_ttl_unpinned()
-    };
-    let (first, staged) = cache.with_meta_ttl(ttl).staged();
-    let record = lookup(&purl, &path, version, net, &first);
+    let (first, staged) = for_version(cache, c.version()).staged();
+    let record = dispatch(&c, net, &first);
     // The one fact a months-old copy can't hold is a version published after
     // it was cached. In an ecosystem whose package document dates every
     // version it lists, an undated pinned record means the copy didn't list
     // it, so re-read the document under the versionless TTL before concluding
     // so. A hijacked account's new release is exactly this case, and its
     // publish time, publisher and install hooks are what would flag it.
-    if version.is_some()
+    if c.version().is_some()
         && DATES_EVERY_VERSION.contains(&purl.typ())
         && record.as_ref().is_ok_and(|r| r.published_at.is_none())
     {
-        let fresh = cache.with_meta_ttl(cache.meta_ttl_unpinned());
-        return lookup(&purl, &path, version, net, &fresh);
+        tracing::debug!(
+            purl = %raw.escape_debug(),
+            "pinned version undated in the cached document; re-reading it fresh"
+        );
+        return dispatch(&c, net, &for_version(cache, None));
     }
     cache.commit(staged);
     record
 }
 
-/// [`try_registry`], for a caller that only needs the record.
-#[must_use]
-pub fn registry(locator: &RefLocator, net: &dyn Fetch, cache: &BlobCache) -> Option<Registry> {
-    try_registry(locator, net, cache).ok()
-}
-
 /// Ecosystems whose package document carries a publish time for every version
 /// it lists — so a requested version with none is one the document lacks.
 const DATES_EVERY_VERSION: &[&str] = &[
-    "npm", "cargo", "pypi", "composer", "gem", "hex", "pub", "conda", "jsr", "cran",
+    "npm",
+    "cargo",
+    "pypi",
+    "composer",
+    "gem",
+    "hex",
+    "pub",
+    "conda",
+    "jsr",
+    "cran",
+    "terraform",
 ];
 
 /// Whether `purl` names bytes the registry lookup does not read: any
-/// `download_url`, or a `repository_url` other than the public registry for a
-/// backend that only ever reads that registry.
+/// `download_url`, or a `repository_url` that is not the type's public
+/// registry ([`repository_is_public`]).
 fn off_registry(purl: &Purl) -> bool {
-    if purl.qualifier("download_url").is_some() {
-        return true;
+    purl.qualifier("download_url").is_some()
+        || purl
+            .qualifier("repository_url")
+            .is_some_and(|url| !repository_is_public(purl.typ(), url))
+}
+
+/// Whether `url`, a `repository_url` qualifier on a PURL of type `typ`, names
+/// the public registry fletch reads that type's metadata from.
+///
+/// Deny by default: a type absent from the table has no public repository URL
+/// fletch recognizes, so any `repository_url` on it names somewhere else. For
+/// the rest, the URL must be absolute `http`/`https` and its host exactly one
+/// of the type's registry hosts; the path is not consulted, since each of
+/// these hosts serves one registry. A Cargo `sparse+` prefix is the same
+/// registry over the sparse protocol, so `sparse+https://index.crates.io/`
+/// is public. An OCI `repository_url` is a `host/path` reference rather than
+/// a URL; it is public when its host is Docker Hub or Quay, the registries
+/// whose metadata fletch reads.
+pub(crate) fn repository_is_public(typ: &str, url: &str) -> bool {
+    if matches!(typ, "oci" | "docker") {
+        return container::public_repository(url);
     }
-    let Some(repository) = purl.qualifier("repository_url") else {
-        return false;
+    let hosts: &[&str] = match typ {
+        "npm" => &["registry.npmjs.org"],
+        "pypi" => &["pypi.org", "files.pythonhosted.org"],
+        "cargo" => &["crates.io", "index.crates.io", "static.crates.io"],
+        "gem" => &["rubygems.org"],
+        "golang" => &["proxy.golang.org"],
+        "maven" => &["repo.maven.apache.org", "repo1.maven.org"],
+        "nuget" => &["api.nuget.org", "www.nuget.org", "nuget.org"],
+        "composer" => &["repo.packagist.org", "packagist.org"],
+        "hex" => &["hex.pm", "repo.hex.pm"],
+        "pub" => &["pub.dev"],
+        "conda" => &["conda.anaconda.org", "anaconda.org"],
+        "cran" => &["cran.r-project.org", "cloud.r-project.org"],
+        "clojars" => &["clojars.org", "repo.clojars.org"],
+        "jsr" => &["jsr.io"],
+        "terraform" => &["registry.terraform.io"],
+        "huggingface" => &["huggingface.co"],
+        "alpm" => &["archlinux.org", "aur.archlinux.org"],
+        "vscode-extension" => &["marketplace.visualstudio.com", "open-vsx.org"],
+        _ => &[],
     };
-    let host = url::Url::parse(repository)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-        .unwrap_or_default();
-    match purl.typ() {
-        "npm" => host != "registry.npmjs.org",
-        "pypi" => !matches!(host.as_str(), "pypi.org" | "files.pythonhosted.org"),
-        "cargo" => !matches!(host.as_str(), "crates.io" | "index.crates.io"),
-        "gem" => host != "rubygems.org",
-        "golang" => host != "proxy.golang.org",
-        _ => false,
-    }
+    let url = if typ == "cargo" {
+        url.strip_prefix("sparse+").unwrap_or(url)
+    } else {
+        url
+    };
+    is_http_url(url) && hosts.iter().any(|host| url_host_is(url, host))
 }
 
-/// The Arch Linux repositories `archlinux.org` answers for, as an `alpm`
-/// namespace: the vendor itself, and its official repos.
-const ARCH_REPOSITORIES: &[&str] = &[
-    "arch",
-    "core",
-    "extra",
-    "multilib",
-    "community",
-    "testing",
-    "core-testing",
-    "extra-testing",
-    "multilib-testing",
-    "community-testing",
-    "staging",
-    "core-staging",
-    "extra-staging",
-    "gnome-unstable",
-    "kde-unstable",
-];
-
-/// The namespaces naming Homebrew's own formula repository, the one
-/// `formulae.brew.sh` describes.
-const HOMEBREW_CORE: &[&str] = &["homebrew", "homebrew-core", "homebrew/core", "core"];
-
-/// The bare package name for a backend that reads one repository: `path`
-/// itself, or its name under a namespace in `own`, that repository's own
-/// spellings. Any other namespace — a third-party tap, PPA, or vendor —
-/// names a package elsewhere, and the backend's record of the same name would
-/// lend it a reputation it never earned.
-fn bare<'a>(path: &'a str, own: &[&str]) -> Result<&'a str, RegistryError> {
-    match path.rsplit_once('/') {
-        None => Ok(path),
-        Some((namespace, name)) if own.iter().any(|o| o.eq_ignore_ascii_case(namespace)) => {
-            Ok(name)
-        }
-        Some(_) => Err(RegistryError::OffRegistry),
-    }
-}
-
-/// One registry lookup: dispatch on the PURL type to its backend.
-fn lookup(
-    purl: &Purl,
-    path: &str,
-    version: Option<&str>,
+/// One registry lookup: dispatch on the PURL type to its backend. The OS
+/// types carry the distribution in their one namespace segment
+/// (`pkg:deb/debian/curl`); any other vendor (a PPA, a derivative, a
+/// third-party repo) names its own repository, whose package of the same
+/// name the official record does not describe.
+fn dispatch(
+    c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let repository_url = purl.qualifier("repository_url");
-    match purl.typ() {
-        "npm" => npm(path, version, net, cache),
-        "cargo" => crates(path, version, net, cache),
-        "pypi" => pypi(path, version, net, cache),
-        "composer" => composer(path, version, net, cache),
-        "gem" => gem(path, version, net, cache),
-        "golang" => golang(path, version, net, cache),
-        // A `pkg:github/<owner>/<repo>` source: the repo *is* the upstream. Its
-        // metadata is the closest thing to a registry record.
-        "github" => github(path, net, cache),
-        // Language registries with a clean JSON API: one GET mapped onto the
-        // common shape.
-        "nuget" => nuget(path, version, net, cache),
-        "maven" => maven(path, version, net, cache),
-        // Hugging Face model repos: `owner/model` (or a canonical bare `model`),
-        // the attacker-reachable half of the ML supply chain forager mirrors.
-        "huggingface" => huggingface(path, version, net, cache),
-        "hex" => hex_pm(path, version, net, cache),
-        "cran" => cran(bare(path, &[])?, version, net, cache),
-        // The namespace is the PAUSE id that released the distribution; another
-        // author's upload of the same name is not the one CPAN indexes.
-        "cpan" => match path.split_once('/') {
-            Some((author, dist)) => cpan(bare(dist, &[])?, net, cache).and_then(|record| {
-                record
-                    .author
-                    .as_deref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(author))
-                    .then_some(record)
-                    .ok_or(RegistryError::OffRegistry)
-            }),
-            None => cpan(path, net, cache),
-        },
-        "pub" => pub_dev(bare(path, &[])?, version, net, cache),
-        "conda" => conda(
-            bare(path, &[])?,
-            purl.qualifier("channel"),
-            version,
-            net,
-            cache,
-        ),
-        "clojars" => clojars(path, net, cache),
-        // JSR ships through npm-compatible mirrors, but its own API carries the
-        // richer record (score, repo, per-version dates).
-        "jsr" => jsr(path, version, net, cache),
-        // Terraform providers: `pkg:terraform/<namespace>/<type>` on
-        // registry.terraform.io, whose addresses the PURL already lowercases.
-        "terraform" => terraform(path, version, net, cache),
-        // OS package registries each get their own PURL type so a scan can name
-        // `pkg:fedora/curl` vs `pkg:arch/pacman` directly. The package name is
-        // the last path segment (any vendor namespace is dropped).
-        "arch" => arch(bare(path, &[])?, net, cache),
-        "fedora" => fedora(bare(path, &[])?, net, cache),
-        // The AUR is the user-contributed, attacker-reachable half of Arch. Three
-        // spellings reach it: the bare `pkg:aur/<name>` legacy type; the
-        // spec-compliant `pkg:alpm/arch/<name>?repository_url=https://aur.archlinux.org`,
-        // which keeps the `arch` vendor in the namespace (where the spec puts the
-        // vendor) and names the AUR in a qualifier; and the older `pkg:alpm/aur/<name>`,
-        // which put `aur` in the namespace slot. All route to the AUR RPC; any other
-        // alpm namespace is an official repo. Normalization folds the spec form
-        // into the `aur` namespace; a repository URL it doesn't fold is read
-        // from the qualifier.
-        "aur" => aur(bare(path, &[])?, net, cache),
-        "alpm" if repository_url.is_some_and(|url| url.contains("aur.archlinux.org")) => {
-            aur(bare(path, &["arch", "aur"])?, net, cache)
+    let typ = c.purl().typ();
+    let vendor = match c.namespace() {
+        [vendor] => Some(vendor.as_str()),
+        _ => None,
+    };
+    match (typ, vendor) {
+        ("npm", _) => npm::lookup(c, net, cache),
+        ("cargo", _) => cargo::lookup(c, net, cache),
+        ("pypi", _) => pypi::lookup(c, net, cache),
+        ("composer", _) => composer::lookup(c, net, cache),
+        ("gem", _) => gem::lookup(c, net, cache),
+        ("golang", _) => golang::lookup(c, net, cache),
+        ("github", _) => github::lookup(c, net, cache),
+        ("nuget", _) => nuget::lookup(c, net, cache),
+        ("maven", _) => maven::lookup(c, net, cache),
+        ("huggingface", _) => huggingface::lookup(c, net, cache),
+        ("hex", _) => hex::lookup(c, net, cache),
+        ("cran", _) => cran::lookup(c, net, cache),
+        ("cpan", _) => cpan::lookup(c, net, cache),
+        ("pub", _) => pub_dev::lookup(c, net, cache),
+        ("conda", _) => conda::lookup(c, net, cache),
+        ("clojars", _) => clojars::lookup(c, net, cache),
+        ("jsr", _) => jsr::lookup(c, net, cache),
+        ("terraform", _) => terraform::lookup(c, net, cache),
+        ("alpm", Some("aur")) => arch::user(c, net, cache),
+        ("alpm", Some(repo)) if arch::REPOSITORIES.contains(&repo) => arch::official(c, net, cache),
+        ("deb", Some("debian")) => at_requested(c, distro::debian(c.name(), net, cache)),
+        ("deb", Some("ubuntu")) => at_requested(c, distro::ubuntu(c.name(), net, cache)),
+        ("rpm", Some("fedora")) => fedora::lookup(c, net, cache),
+        ("rpm", Some("opensuse")) => at_requested(c, distro::opensuse(c.name(), net, cache)),
+        ("rpm", Some("rpmfusion")) => at_requested(c, distro::rpmfusion(c.name(), net, cache)),
+        ("apk", Some("alpine")) => at_requested(c, distro::alpine(c.name(), net, cache)),
+        ("apk", Some("wolfi")) => at_requested(c, distro::wolfi(c.name(), net, cache)),
+        ("alpm" | "deb" | "rpm" | "apk", _) => {
+            tracing::debug!(
+                purl_type = typ,
+                namespace = %c.namespace().join("/").escape_debug(),
+                "registry lookup refused: not an official repository"
+            );
+            Err(RegistryError::OffRegistry)
         }
-        "alpm" => match path.split_once('/') {
-            Some(("aur", name)) => aur(bare(name, &[])?, net, cache),
-            Some((repo, name)) if ARCH_REPOSITORIES.contains(&repo) => {
-                arch(bare(name, &[])?, net, cache)
-            }
-            Some(_) => Err(RegistryError::OffRegistry),
-            None => arch(path, net, cache),
-        },
-        // Distro registries with no JSON API: each metadata lookup fetches a
-        // compressed index/catalog and scans it. See [`crate::distro`].
-        "alpine" => distro::alpine(bare(path, &[])?, net, cache),
-        "wolfi" => distro::wolfi(bare(path, &[])?, net, cache),
-        "debian" => distro::debian(bare(path, &[])?, net, cache),
-        "ubuntu" => distro::ubuntu(bare(path, &[])?, net, cache),
-        "opensuse" => distro::opensuse(bare(path, &[])?, net, cache),
-        "rpmfusion" => distro::rpmfusion(bare(path, &[])?, net, cache),
-        "netbsd" => distro::netbsd(bare(path, &[])?, net, cache),
-        "freebsd" => distro::freebsd(bare(path, &[])?, net, cache),
-        "openbsd" => distro::openbsd(bare(path, &[])?, net, cache),
-        // Package managers and app stores.
-        "homebrew" => homebrew(bare(path, HOMEBREW_CORE)?, net, cache),
-        "snap" => snap(bare(path, &[])?, net, cache),
-        "wordpress" => wordpress(bare(path, &[])?, net, cache),
-        // Agent-skill registry: `pkg:clawhub/[owner/]slug`.
-        "clawhub" => clawhub(path, net, cache),
-        // Plugin registries of ML apps: a ComfyUI custom node
-        // (`pkg:comfyui/<node_id>`) and a Dify Marketplace plugin
-        // (`pkg:dify/<org>/<name>`).
-        "comfyui" => comfyui(path, version, net, cache),
-        "dify" => dify(path, version, net, cache),
-        // Container images: `pkg:oci/<name>?repository_url=<host%2Fpath>`,
-        // the ratified registry-agnostic type (`pkg:docker` is its legacy
-        // spelling — same repositories, so it routes identically). The
-        // registry host picks the metadata API.
-        "oci" | "docker" => oci_meta(repository_url, path, net, cache),
-        // Browser-extension / plugin marketplaces — the same listing shape as
-        // the Chrome and VS Code stores (rating, downloads, recency).
-        "firefox" => firefox(bare(path, &[])?, net, cache),
-        "jetbrains" => jetbrains(bare(path, &[])?, net, cache),
-        // Browser extensions: `pkg:chrome/<extension-id>`. The store's risk
-        // signals (reach, rating, recency, the developer's own description of
-        // what it harvests) live on the listing, not in a manifest.
-        // `chrome-extension` is the ratified purl-spec spelling of the same type.
-        "chrome" | "chrome-extension" => chrome(bare(path, &[])?, net, cache),
-        // VS Code / editor extensions: `pkg:openvsx/<namespace>/<name>`. Open
-        // VSX exposes a clean JSON API, so no scraping — the same marketplace
-        // shape (rating, downloads, publisher, recency) as the Chrome store.
-        // `vscode-extension` is the ratified type and covers both stores; Open
-        // VSX is flagged by the `repository_url` qualifier. The parsed PURL is
-        // normalized, so a legacy `pkg:openvsx/<pub>/<ext>` (which carries the
-        // store in its type) arrives here with that qualifier too.
-        "openvsx" => openvsx(path, version, net, cache),
-        "vscode-extension" if repository_url.is_some_and(|url| url.contains("open-vsx.org")) => {
-            openvsx(path, version, net, cache)
+        ("netbsd", _) => c
+            .bare_name(&[])
+            .and_then(|_| at_requested(c, distro::netbsd(c.name(), net, cache))),
+        ("freebsd", _) => c
+            .bare_name(&[])
+            .and_then(|_| at_requested(c, distro::freebsd(c.name(), net, cache))),
+        ("openbsd", _) => c
+            .bare_name(&[])
+            .and_then(|_| at_requested(c, distro::openbsd(c.name(), net, cache))),
+        ("brew" | "homebrew", _) => homebrew::lookup(c, net, cache),
+        ("snap", _) => snap::lookup(c, net, cache),
+        ("wordpress", _) => wordpress::lookup(c, net, cache),
+        ("clawhub", _) => clawhub::lookup(c, net, cache),
+        ("comfyui", _) => comfyui::lookup(c, net, cache),
+        ("dify", _) => dify::lookup(c, net, cache),
+        // `pkg:docker` is the pre-ratification spelling of `pkg:oci`: the
+        // same repositories, so it routes identically.
+        ("oci" | "docker", _) => container::lookup(c, net, cache),
+        ("firefox", _) => firefox::lookup(c, net, cache),
+        ("jetbrains", _) => jetbrains::lookup(c, net, cache),
+        ("chrome-extension", _) => chrome::lookup(c, net, cache),
+        // One ratified type covers both editor marketplaces; a
+        // `repository_url` on Open VSX names that store.
+        ("vscode-extension", _)
+            if c.purl()
+                .qualifier("repository_url")
+                .is_some_and(|url| url_host_is(url, "open-vsx.org")) =>
+        {
+            vscode::open_vsx(c, net, cache)
         }
-        // The Microsoft VS Code Marketplace: `pkg:vscode/<publisher>/<name>`.
-        // Its data lives behind a JSON-RPC `POST` query — same marketplace shape
-        // as Open VSX, just a different transport.
-        "vscode" | "vscode-extension" => vscode(path, net, cache),
-        // Spec-form aliases (purl-spec / common practice) for the same registries,
-        // so a PURL generated per spec fetches identically to our legacy spelling.
-        // The OS types carry the distro in the namespace (`pkg:deb/debian/curl`).
-        // Any other vendor (a PPA, a derivative) names its own repository,
-        // whose package of the same name the official record does not describe.
-        "deb" => match path.split_once('/') {
-            Some(("ubuntu", name)) => distro::ubuntu(bare(name, &[])?, net, cache),
-            Some(("debian", name)) => distro::debian(bare(name, &[])?, net, cache),
-            Some(_) => Err(RegistryError::OffRegistry),
-            None => distro::debian(path, net, cache),
-        },
-        "rpm" => match path.split_once('/') {
-            Some(("opensuse", name)) => distro::opensuse(bare(name, &[])?, net, cache),
-            Some(("rpmfusion", name)) => distro::rpmfusion(bare(name, &[])?, net, cache),
-            Some(("fedora", name)) => fedora(bare(name, &[])?, net, cache),
-            Some(_) => Err(RegistryError::OffRegistry),
-            None => fedora(path, net, cache),
-        },
-        "apk" => match path.split_once('/') {
-            Some(("wolfi", name)) => distro::wolfi(bare(name, &[])?, net, cache),
-            Some(("alpine", name)) => distro::alpine(bare(name, &[])?, net, cache),
-            Some(_) => Err(RegistryError::OffRegistry),
-            None => distro::alpine(path, net, cache),
-        },
-        other => Err(RegistryError::Unsupported(other.to_string())),
+        ("vscode-extension", _) => vscode::marketplace(c, net, cache),
+        (other, _) => Err(RegistryError::Unsupported(other.to_string())),
     }
 }
 
-/// Like [`try_registry`], but also returns the raw provider documents the
-/// lookup consumed: the `(url, bytes)` of every metadata response it read, from
-/// the warm cache or a fresh fetch. A consumer that archives provenance (scan's
-/// `--upload`) keeps these as the re-parsing backup beside the normalized
-/// record, without re-deriving which endpoints an ecosystem needs. On an error
-/// `sources` is whatever was read before the lookup gave up (often empty).
-/// Order matches read order — the primary registry document first.
-pub fn try_registry_with_sources(
-    locator: &RefLocator,
-    net: &dyn Fetch,
-    cache: &BlobCache,
-) -> (Result<Registry, RegistryError>, Vec<RecordedSource>) {
-    let (recording, sink) = cache.recording();
-    let record = try_registry(locator, net, &recording);
-    let sources = sink
-        .lock()
-        .map(|mut s| std::mem::take(&mut *s))
-        .unwrap_or_default();
-    (record, sources)
+/// A distro index lists only each package's current build, which becomes the
+/// record's `latest_version`. A requested version other than that build is
+/// still the version the record describes — undated, since the index does not
+/// say when it was built.
+fn at_requested(
+    c: &Coordinates<'_>,
+    record: Result<Registry, RegistryError>,
+) -> Result<Registry, RegistryError> {
+    let mut record = record?;
+    record.latest_version = Some(record.version.clone());
+    if let Some(requested) = c.version()
+        && requested != record.version
+    {
+        tracing::debug!(
+            requested = %requested.escape_debug(),
+            current = %record.version,
+            "requested build is not the index's current one; leaving it undated"
+        );
+        record.version = requested.to_string();
+        record.published_at = None;
+    }
+    Ok(record)
 }
-
-/// [`try_registry_with_sources`], for a caller that only needs the record.
-#[must_use]
-pub fn registry_with_sources(
-    locator: &RefLocator,
-    net: &dyn Fetch,
-    cache: &BlobCache,
-) -> (Option<Registry>, Vec<RecordedSource>) {
-    let (record, sources) = try_registry_with_sources(locator, net, cache);
-    (record.ok(), sources)
-}
-
-/// Split a PURL into `(type, name-path, version?)`: the normalized type and
-/// the percent-encoded coordinates (a scope is `%40`) the registry lookup keys
-/// on.
-#[deprecated(
-    note = "use `Purl::parse`, whose `typ`, `encoded_path` and `encoded_version` name these \
-            coordinates and whose qualifiers this tuple drops"
-)]
-#[must_use]
-pub fn parse_purl(purl: &str) -> Option<(String, String, Option<String>)> {
-    let purl = Purl::parse(purl).ok()?;
-    Some((
-        purl.typ().to_string(),
-        purl.encoded_path(),
-        purl.encoded_version(),
-    ))
-}
-
-// --- HTML scraping helpers --------------------------------------------------
-
-// --- JSON shaping helpers ---------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::test_cache;
 
     use crate::fetch::{BlobCache, Fixtures};
+
+    #[test]
+    fn lookup_recorded_returns_record_and_raw_documents() {
+        let packument = serde_json::json!({
+            "dist-tags": {"latest": "1.3.0"},
+            "versions": {"1.3.0": {"license": "MIT"}},
+            "time": {"1.3.0": "2021-04-23T10:00:00.000Z"},
+            "maintainers": [{"name": "una"}],
+        })
+        .to_string();
+        let net = Fixtures::default().with_headers(
+            "https://registry.npmjs.org/left-pad",
+            packument.as_bytes(),
+            &[("Content-Type", "application/json")],
+        );
+        // Disabled cache: every read is a fresh fetch through the recorder.
+        let (record, sources) = lookup_recorded(
+            &RefLocator::Purl("pkg:npm/left-pad@1.3.0".into()),
+            &net,
+            &BlobCache::disabled(),
+        );
+
+        let record = record.expect("record");
+        assert_eq!(record.ecosystem, "npm");
+        assert_eq!(record.name, "left-pad");
+
+        // The raw packument is captured verbatim, with its transport facts — the
+        // downloads endpoint isn't in the fixtures, so it fails and isn't recorded.
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].url, "https://registry.npmjs.org/left-pad");
+        assert_eq!(sources[0].status, 200);
+        assert_eq!(sources[0].content_type.as_deref(), Some("application/json"));
+        let bytes = sources[0].bytes.as_deref().expect("kept: no source limit");
+        assert_eq!(sources[0].size, bytes.len() as u64);
+        let body: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(body["dist-tags"]["latest"], "1.3.0");
+
+        // Past the cache's source limit the document is still named, with
+        // its size, but its bytes are not copied.
+        let (_, sources) = lookup_recorded(
+            &RefLocator::Purl("pkg:npm/left-pad@1.3.0".into()),
+            &net,
+            &BlobCache::disabled().with_source_limit(16),
+        );
+        assert_eq!(sources[0].url, "https://registry.npmjs.org/left-pad");
+        assert_eq!(sources[0].size, bytes.len() as u64);
+        assert_eq!(sources[0].bytes, None);
+    }
 
     #[test]
     fn pinned_metadata_outlives_unpinned_and_honours_the_override() {
@@ -494,79 +432,78 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_locator_is_none() {
+    fn an_unsupported_or_unreachable_locator_has_no_record() {
         let net = Fixtures::default();
         let cache = BlobCache::disabled();
         assert!(
-            registry(
+            lookup(
                 &RefLocator::Url("https://x.test/a.tgz".into()),
                 &net,
                 &cache
             )
-            .is_none()
+            .is_err()
         );
         assert!(
-            registry(
+            lookup(
                 &RefLocator::Purl("pkg:gem/rails@7.0.0".into()),
                 &net,
                 &cache
             )
-            .is_none()
+            .is_err()
         );
     }
 
     #[test]
     fn a_lookup_says_why_it_has_no_record() {
         let url = "https://pypi.org/pypi/w/json";
-        let lookup = |net: &Fixtures, raw: &str| {
-            try_registry(&RefLocator::Purl(raw.into()), net, &test_cache("why")).err()
+        let why = |net: &Fixtures, raw: &str| {
+            lookup(&RefLocator::Purl(raw.into()), net, &BlobCache::disabled()).err()
         };
         let none = Fixtures::default();
         assert_eq!(
-            try_registry(
+            lookup(
                 &RefLocator::Url("https://example.test/x".into()),
                 &none,
-                &test_cache("why")
+                &BlobCache::disabled()
             )
             .err(),
             Some(RegistryError::NotAPackage)
         );
         assert_eq!(
-            lookup(&none, "not a purl"),
-            Some(RegistryError::InvalidPurl(PurlError::Syntax))
+            why(&none, "not a purl"),
+            Some(RegistryError::InvalidPurl(PurlError::Syntax("no scheme")))
         );
         assert_eq!(
-            lookup(&none, "pkg:pypi/w@..%2F..%2Fx"),
+            why(&none, "pkg:pypi/w@..%2F..%2Fx"),
             Some(RegistryError::UnsafeCoordinate)
         );
         assert_eq!(
-            lookup(&none, "pkg:swift/github.com/apple/swift-nio@1.0.0"),
+            why(&none, "pkg:swift/github.com/apple/swift-nio@1.0.0"),
             Some(RegistryError::Unsupported("swift".into()))
         );
         // What the registry said, or failed to say.
         assert_eq!(
-            lookup(&Fixtures::default().refusing(url, 404), "pkg:pypi/w"),
+            why(&Fixtures::default().refusing(url, 404), "pkg:pypi/w"),
             Some(RegistryError::NotFound)
         );
         assert_eq!(
-            lookup(&Fixtures::default().refusing(url, 503), "pkg:pypi/w"),
+            why(&Fixtures::default().refusing(url, 503), "pkg:pypi/w"),
             Some(RegistryError::Unavailable(FetchError::Status(503)))
         );
         assert!(matches!(
-            lookup(&none, "pkg:pypi/w"),
+            why(&none, "pkg:pypi/w"),
             Some(RegistryError::Unavailable(FetchError::Transport(_)))
         ));
         assert_eq!(
-            lookup(&Fixtures::default().with(url, b"{}"), "pkg:pypi/w"),
+            why(&Fixtures::default().with(url, b"{}"), "pkg:pypi/w"),
             Some(RegistryError::NoRecord)
         );
     }
 
     #[test]
     fn a_subpath_does_not_hide_the_package_from_its_registry() {
-        // A Go module addressed with a subpath is still that module. The old
-        // splitter left `#…` in the coordinate, which the URL vetting then
-        // refused, so no lookup happened at all.
+        // A Go module addressed with a subpath is still that module: the
+        // subpath never reaches the coordinate the URL is built from.
         let doc = br#"{"Version":"v0.0.0-20240101","Time":"2024-01-01T00:00:00Z"}"#;
         let net = Fixtures::default().with(
             "https://proxy.golang.org/google.golang.org/genproto/@latest",
@@ -574,7 +511,7 @@ mod tests {
         );
         let locator =
             RefLocator::Purl("pkg:golang/google.golang.org/genproto#googleapis/api".into());
-        let record = registry(&locator, &net, &test_cache("go-subpath")).expect("record");
+        let record = lookup(&locator, &net, &BlobCache::disabled()).expect("record");
         assert_eq!(record.version, "v0.0.0-20240101");
     }
 
@@ -583,7 +520,8 @@ mod tests {
         // Both stores answer for `pacman`; which one the lookup asks decides
         // the record. A qualifier that merely mentions the AUR host is not a
         // route there, so an official package goes to the official repository.
-        let arch = br#"{"results":[{"pkgname":"pacman","pkgver":"7.1.0","pkgrel":"2"}]}"#;
+        let arch =
+            br#"{"results":[{"pkgname":"pacman","repo":"core","pkgver":"7.1.0","pkgrel":"2"}]}"#;
         let aur = br#"{"results":[{"Name":"pacman","Version":"6.0-1"}]}"#;
         let net = Fixtures::default()
             .with(
@@ -595,7 +533,9 @@ mod tests {
                 aur,
             );
         let lookup = |purl: &str| {
-            registry(&RefLocator::Purl(purl.into()), &net, &test_cache("alpm")).map(|r| r.ecosystem)
+            lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled())
+                .ok()
+                .map(|r| r.ecosystem)
         };
         assert_eq!(
             lookup("pkg:alpm/core/pacman?foo=aur.archlinux.org").as_deref(),
@@ -618,21 +558,21 @@ mod tests {
             doc.as_bytes(),
         );
         let locator = RefLocator::Purl("pkg:docker/myorg/nginx".into());
-        let r = registry(&locator, &net, &test_cache("oci-ns")).expect("registry");
+        let r = lookup(&locator, &net, &BlobCache::disabled()).expect("registry");
         assert_eq!(r.author.as_deref(), Some("myorg"));
         assert_eq!(r.downloads_total, Some(3));
         // A bare name is still the official image.
         assert_eq!(
-            crate::ecosystem::container::oci_repository("nginx", None),
-            "docker.io/library/nginx"
+            crate::ecosystem::container::oci_repository("nginx", None).as_deref(),
+            Ok("docker.io/library/nginx")
         );
     }
 
     #[test]
     fn an_unlisted_version_is_undated_in_every_backend() {
         // Each registry knows the package and its latest release, but not
-        // version 9.9.9. Every backend used to date it from something else: the
-        // newest release, or the package's own creation.
+        // version 9.9.9, which must stay undated rather than borrow the newest
+        // release's date or the package's own creation.
         let docs = [
             (
                 "https://crates.io/api/v1/crates/c",
@@ -666,6 +606,11 @@ mod tests {
                 "https://api.jsr.io/scopes/s/packages/j",
                 serde_json::json!({"latestVersion": "1.0.0"}),
             ),
+            (
+                "https://azuresearch-usnc.nuget.org/query?q=packageid:n&prerelease=true&semVerLevel=2.0.0",
+                serde_json::json!({"data": [{"id": "n", "version": "1.0.0",
+                    "versions": [{"version": "1.0.0"}]}]}),
+            ),
         ];
         let net = docs
             .iter()
@@ -673,7 +618,7 @@ mod tests {
                 net.with(url, doc.to_string().as_bytes())
             })
             .refusing("https://api.jsr.io/scopes/s/packages/j/versions/9.9.9", 404);
-        let cache = test_cache("unlisted");
+        let cache = BlobCache::disabled();
         let first_release = Some(1_420_070_400); // 2015-01-01
 
         let records = [
@@ -683,8 +628,9 @@ mod tests {
             "pkg:pub/p",
             "pkg:conda/k",
             "pkg:jsr/%40s/j",
+            "pkg:nuget/n",
         ]
-        .map(|purl| registry(&RefLocator::Purl(format!("{purl}@9.9.9")), &net, &cache));
+        .map(|purl| lookup(&RefLocator::Purl(format!("{purl}@9.9.9")), &net, &cache));
         for r in records {
             let r = r.expect("the package itself resolves");
             assert_eq!(r.version, "9.9.9", "{}", r.ecosystem);
@@ -700,7 +646,7 @@ mod tests {
     #[test]
     fn a_package_with_no_stable_release_still_has_a_latest() {
         // Each registry sends `null` for the stable release and names the
-        // newest pre-release beside it; that `null` used to blank the version.
+        // newest pre-release beside it, which is then the latest.
         let docs = [
             (
                 "https://crates.io/api/v1/crates/c",
@@ -718,9 +664,9 @@ mod tests {
         let net = docs.iter().fold(Fixtures::default(), |net, (url, doc)| {
             net.with(url, doc.to_string().as_bytes())
         });
-        let cache = test_cache("prerelease");
+        let cache = BlobCache::disabled();
         let version = |purl: &str| {
-            registry(&RefLocator::Purl(purl.into()), &net, &cache)
+            lookup(&RefLocator::Purl(purl.into()), &net, &cache)
                 .expect("the package resolves")
                 .version
         };
@@ -730,40 +676,10 @@ mod tests {
     }
 
     #[test]
-    fn huggingface_model_normalizes() {
-        // No version in the locator → the record carries the current commit sha;
-        // `downloads` maps to the 30-day recent count and `likes` to rating_count.
-        let doc = serde_json::json!({
-            "id": "microsoft/resnet-50", "author": "microsoft", "sha": "abc123def",
-            "createdAt": "2022-03-16T10:00:00.000Z", "lastModified": "2023-04-23T10:00:00.000Z",
-            "downloads": 1_234_567u64, "likes": 89u64, "license": "apache-2.0"
-        })
-        .to_string();
-        let net = Fixtures::default().with(
-            "https://huggingface.co/api/models/microsoft/resnet-50",
-            doc.as_bytes(),
-        );
-        let r = registry(
-            &RefLocator::Purl("pkg:huggingface/microsoft/resnet-50".into()),
-            &net,
-            &test_cache("huggingface"),
-        )
-        .expect("huggingface registry");
-        assert_eq!(r.ecosystem, "huggingface");
-        assert_eq!(r.name, "microsoft/resnet-50");
-        assert_eq!(r.version, "abc123def");
-        assert_eq!(r.author.as_deref(), Some("microsoft"));
-        assert_eq!(r.license.as_deref(), Some("apache-2.0"));
-        assert_eq!(r.downloads_recent, Some(1_234_567));
-        assert_eq!(r.rating_count, Some(89));
-        assert_eq!(r.first_published_at, Some(1_647_424_800)); // createdAt
-    }
-
-    #[test]
     fn off_registry_bytes_never_borrow_the_public_record() {
         // No fixtures: an off-registry PURL must be refused before any read.
         let (net, cache) = (Fixtures::default(), BlobCache::disabled());
-        let look = |purl: &str| try_registry(&RefLocator::Purl(purl.into()), &net, &cache);
+        let look = |purl: &str| lookup(&RefLocator::Purl(purl.into()), &net, &cache);
         for purl in [
             "pkg:npm/lodash@4.17.21?repository_url=https://evil.test",
             "pkg:npm/lodash@4.17.21?download_url=https://evil.test/x.tgz",
@@ -785,7 +701,7 @@ mod tests {
     fn a_foreign_vendor_never_borrows_the_official_record() {
         // No fixtures: each must be refused before any read.
         let (net, cache) = (Fixtures::default(), BlobCache::disabled());
-        let look = |purl: &str| try_registry(&RefLocator::Purl(purl.into()), &net, &cache);
+        let look = |purl: &str| lookup(&RefLocator::Purl(purl.into()), &net, &cache);
         for purl in [
             "pkg:deb/attacker-ppa/curl",
             "pkg:rpm/evilrepo/openssl",
@@ -811,7 +727,7 @@ mod tests {
             doc,
         );
         let cache = BlobCache::disabled();
-        let look = |purl: &str| try_registry(&RefLocator::Purl(purl.into()), &net, &cache);
+        let look = |purl: &str| lookup(&RefLocator::Purl(purl.into()), &net, &cache);
         assert_eq!(
             look("pkg:cpan/GDT/URI-PackageURL").map(|r| r.author),
             Ok(Some("GDT".to_string()))
@@ -828,9 +744,9 @@ mod tests {
 
     #[test]
     fn alpm_namespace_routes_aur_vs_official() {
-        // Both the legacy `pkg:alpm/aur/<name>` and the spec-compliant
-        // `pkg:alpm/arch/<name>?repository_url=…aur.archlinux.org` → AUR RPC; any
-        // other namespace → official repos.
+        // Both `pkg:alpm/aur/<name>` and the vendor-plus-qualifier spelling
+        // `pkg:alpm/arch/<name>?repository_url=…aur.archlinux.org` → AUR RPC;
+        // an official repository namespace → archlinux.org.
         let aur_rpc = serde_json::json!({
             "resultcount": 1,
             "results": [{"Name": "yay", "Version": "12.0.0-1", "Maintainer": "jverify",
@@ -838,7 +754,7 @@ mod tests {
         })
         .to_string();
         let arch_json = serde_json::json!({"results": [{
-            "pkgname": "pacman", "pkgver": "7.1.0", "pkgrel": "2", "packager": "eworm",
+            "pkgname": "pacman", "repo": "core", "pkgver": "7.1.0", "pkgrel": "2", "packager": "eworm",
             "last_update": "2021-04-23T10:00:00Z"
         }]})
         .to_string();
@@ -851,20 +767,20 @@ mod tests {
                 "https://archlinux.org/packages/search/json/?name=pacman",
                 arch_json.as_bytes(),
             );
-        let cache = test_cache("alpm");
-        let from_aur = registry(&RefLocator::Purl("pkg:alpm/aur/yay".into()), &net, &cache)
+        let cache = BlobCache::disabled();
+        let from_aur = lookup(&RefLocator::Purl("pkg:alpm/aur/yay".into()), &net, &cache)
             .expect("aur registry");
         assert_eq!(from_aur.ecosystem, "aur");
         // Spec-compliant form: arch vendor in the namespace, AUR named in a
         // repository_url qualifier — still routes to the AUR RPC.
-        let from_spec = registry(
+        let from_spec = lookup(
             &RefLocator::Purl("pkg:alpm/arch/yay?repository_url=https://aur.archlinux.org".into()),
             &net,
             &cache,
         )
         .expect("aur spec registry");
         assert_eq!(from_spec.ecosystem, "aur");
-        let from_official = registry(
+        let from_official = lookup(
             &RefLocator::Purl("pkg:alpm/core/pacman".into()),
             &net,
             &cache,
@@ -873,45 +789,152 @@ mod tests {
         assert_eq!(from_official.ecosystem, "arch");
     }
 
-    #[test]
-    #[expect(deprecated, reason = "the deprecated helper keeps its own test")]
-    fn parse_purl_tolerates_misplaced_version() {
-        // Spec order: `@version` before `?qualifiers`.
-        assert_eq!(
-            parse_purl("pkg:alpm/arch/yay@1.0-1?repository_url=https://aur.archlinux.org"),
-            Some(("alpm".into(), "aur/yay".into(), Some("1.0-1".into())))
-        );
-        // The non-spec `?qualifiers@version` ordering older hopper exports
-        // emitted: the trailing version is still recovered.
-        assert_eq!(
-            parse_purl("pkg:alpm/arch/yay?repository_url=https://aur.archlinux.org@1.0-1"),
-            Some(("alpm".into(), "aur/yay".into(), Some("1.0-1".into())))
-        );
-        // A qualifier value containing `@` (URL userinfo) is not a version.
-        assert_eq!(
-            parse_purl("pkg:alpm/arch/yay?repository_url=https://user@example.com/repo"),
-            Some(("alpm".into(), "arch/yay".into(), None))
-        );
-    }
+    /// A backend that records each URL asked for and refuses it: routing,
+    /// observed without a network.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<String>>);
 
-    #[test]
-    #[expect(deprecated, reason = "the deprecated helper keeps its own test")]
-    fn parse_purl_canonicalizes_a_versionless_literal_npm_scope() {
-        assert_eq!(
-            parse_purl("pkg:npm/@scope/name"),
-            Some(("npm".into(), "%40scope/name".into(), None))
-        );
-    }
-
-    #[test]
-    #[expect(deprecated, reason = "the deprecated helper keeps its own test")]
-    fn registry_parser_rejects_type_prohibited_namespaces() {
-        for invalid in [
-            "pkg:pypi/namespace/name@1",
-            "pkg:gem/namespace/name@1",
-            "pkg:cargo/namespace/name@1",
-        ] {
-            assert_eq!(parse_purl(invalid), None, "{invalid}");
+    impl Fetch for Recorder {
+        fn send(
+            &self,
+            request: &crate::fetch::Request<'_>,
+        ) -> Result<crate::fetch::Fetched, FetchError> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request.url.to_string());
+            Err(FetchError::Refused("recorder".into()))
         }
+    }
+
+    /// The first URL a lookup of `purl` asks for.
+    fn first_url(purl: &str) -> Option<String> {
+        let net = Recorder::default();
+        let _refused = lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled());
+        net.0
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner)
+            .into_iter()
+            .next()
+    }
+
+    #[test]
+    fn legacy_spellings_route_like_their_canonical_form() {
+        let chrome = "pkg:chrome/aapbdbdomjkkjkaonfhkkikfgjllcleb";
+        for (legacy, canonical) in [
+            ("pkg:arch/pacman", "pkg:alpm/arch/pacman"),
+            ("pkg:aur/yay", "pkg:alpm/aur/yay"),
+            ("pkg:debian/curl", "pkg:deb/debian/curl"),
+            ("pkg:ubuntu/curl", "pkg:deb/ubuntu/curl"),
+            ("pkg:fedora/curl", "pkg:rpm/fedora/curl"),
+            ("pkg:opensuse/curl", "pkg:rpm/opensuse/curl"),
+            ("pkg:rpmfusion/ffmpeg", "pkg:rpm/rpmfusion/ffmpeg"),
+            ("pkg:alpine/curl", "pkg:apk/alpine/curl"),
+            ("pkg:wolfi/curl", "pkg:apk/wolfi/curl"),
+            (
+                chrome,
+                "pkg:chrome-extension/aapbdbdomjkkjkaonfhkkikfgjllcleb",
+            ),
+            (
+                "pkg:openvsx/redhat/java",
+                "pkg:vscode-extension/redhat/java?repository_url=https://open-vsx.org",
+            ),
+            ("pkg:vscode/redhat/java", "pkg:vscode-extension/redhat/java"),
+            ("pkg:homebrew/wget", "pkg:brew/wget"),
+            ("pkg:docker/nginx", "pkg:oci/nginx"),
+        ] {
+            let routed = first_url(canonical);
+            assert!(routed.is_some(), "{canonical} reaches a registry");
+            assert_eq!(first_url(legacy), routed, "{legacy}");
+        }
+        assert!(
+            first_url("pkg:vscode-extension/redhat/java?repository_url=https://open-vsx.org")
+                .is_some_and(|url| url_host_is(&url, "open-vsx.org"))
+        );
+        assert!(
+            first_url(
+                "pkg:vscode-extension/redhat/java?repository_url=https://evil.test/open-vsx.org"
+            )
+            .is_none(),
+            "a path naming the store is not the store"
+        );
+    }
+
+    #[test]
+    fn only_a_public_registry_host_is_public() {
+        for (typ, url) in [
+            ("npm", "https://registry.npmjs.org"),
+            ("npm", "HTTPS://Registry.NPMJS.org/"),
+            ("pypi", "https://pypi.org/simple"),
+            ("cargo", "https://index.crates.io/"),
+            ("cargo", "sparse+https://index.crates.io/"),
+            ("cargo", "https://crates.io"),
+            ("maven", "https://repo1.maven.org/maven2"),
+            ("vscode-extension", "https://open-vsx.org"),
+            ("oci", "docker.io/library/nginx"),
+            ("docker", "quay.io/org/img"),
+        ] {
+            assert!(repository_is_public(typ, url), "{typ} {url}");
+        }
+        for (typ, url) in [
+            ("npm", "https://evil.test"),
+            ("npm", "https://evil.test/registry.npmjs.org"),
+            ("npm", "https://registry.npmjs.org.evil.test"),
+            ("npm", "registry.npmjs.org"),
+            ("npm", "ftp://registry.npmjs.org"),
+            ("cargo", "sparse+https://evil.test/index.crates.io"),
+            ("pypi", "https://registry.npmjs.org"),
+            ("nuget", "https://evil.test/v3/index.json"),
+            ("composer", "https://evil.test"),
+            ("deb", "https://deb.debian.org/debian"),
+            ("snap", "https://snapcraft.io"),
+            ("swift", "https://github.com"),
+            ("oci", "ghcr.io/owner/img"),
+            ("oci", "https://docker.io/library/nginx"),
+        ] {
+            assert!(!repository_is_public(typ, url), "{typ} {url}");
+        }
+    }
+
+    #[test]
+    fn any_foreign_repository_is_off_registry() {
+        // Every type denies a repository it does not recognize.
+        let (net, cache) = (Fixtures::default(), BlobCache::disabled());
+        for purl in [
+            "pkg:maven/org.example/lib@1.0?repository_url=https://evil.test/maven2",
+            "pkg:nuget/Newtonsoft.Json@13.0.1?repository_url=https://evil.test/v3/index.json",
+            "pkg:composer/acme/lib@1.0?repository_url=https://evil.test",
+            "pkg:vscode-extension/redhat/java?repository_url=https://evil.test",
+            "pkg:hex/plug@1.0?repository_url=https://evil.test",
+            "pkg:snap/firefox?repository_url=https://evil.test",
+            "pkg:alpm/arch/pacman?repository_url=https://evil.test/aur.archlinux.org",
+        ] {
+            assert_eq!(
+                lookup(&RefLocator::Purl(purl.into()), &net, &cache),
+                Err(RegistryError::OffRegistry),
+                "{purl}"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_sources_survive_and_are_ordered() {
+        let doc = br#"{"Version":"v1.0.0","Time":"2024-01-01T00:00:00Z"}"#;
+        let url = "https://proxy.golang.org/example.com/m/@latest";
+        let net = Fixtures::default().with(url, doc);
+        let (record, sources) = lookup_recorded(
+            &RefLocator::Purl("pkg:golang/example.com/m".into()),
+            &net,
+            &BlobCache::disabled(),
+        );
+        assert_eq!(record.map(|r| r.version), Ok("v1.0.0".to_string()));
+        assert_eq!(sources.first().map(|s| s.url.as_str()), Some(url));
+        let (record, sources) = lookup_recorded(
+            &RefLocator::Url("https://example.test/x".into()),
+            &net,
+            &BlobCache::disabled(),
+        );
+        assert_eq!(record, Err(RegistryError::NotAPackage));
+        assert!(sources.is_empty());
     }
 }

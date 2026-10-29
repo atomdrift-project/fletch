@@ -1,62 +1,56 @@
-//! JSR: registry metadata and artifact resolution.
+//! JSR: registry metadata.
 
 use filefacts::Registry;
 use serde::Deserialize;
 
-use crate::ecosystem::{fetch_json, parse_ts};
-use crate::fetch::{BlobCache, Fetch, percent_decode};
+use crate::ecosystem::{Coordinates, fetch_json, non_empty, optional, unix_secs};
+use crate::fetch::{BlobCache, Fetch};
 use crate::purl::encode_component;
 use crate::registry::RegistryError;
 
-/// Whether `s` is a JSR scope or package name: non-empty lowercase ASCII
-/// letters, digits and hyphens.
-fn jsr_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
-/// JSR: the native API's package record (description, score, repo, latest) plus
-/// the release's own version document (its `createdAt` publish time). `path` is the
-/// `@scope/name` the locator carries, percent-encoded (`%40` is `@`).
-pub(crate) fn jsr(
-    path: &str,
-    version: Option<&str>,
+/// JSR's native API: the package record (description, repository, latest)
+/// plus the release's own version document (its `createdAt` publish time and
+/// `yanked` flag). The PURL names the package `@scope/name`.
+pub(crate) fn lookup(
+    c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let decoded = path.replace("%40", "@");
-    // Exactly `@scope/name`: a lenient `@@@std/path` must not borrow
-    // `@std/path`'s record. JSR scopes and names are `[a-z0-9-]`.
-    let (scope, pkg) = decoded
-        .strip_prefix('@')
-        .unwrap_or(&decoded)
-        .split_once('/')
-        .filter(|(scope, pkg)| [scope, pkg].iter().all(|s| jsr_segment(s)))
-        .ok_or(RegistryError::NoRecord)?;
+    // Exactly `@scope/name`, both `[a-z0-9-]` as JSR spells them, so they
+    // fill the URL as they are and a lenient `@@@std/path` never borrows
+    // `@std/path`'s record.
+    let jsr_segment = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    let names = match c.namespace() {
+        [scope] => Some((scope.strip_prefix('@').unwrap_or(scope), c.name())),
+        _ => None,
+    };
+    let Some((scope, pkg)) = names.filter(|(scope, pkg)| jsr_segment(scope) && jsr_segment(pkg))
+    else {
+        tracing::debug!(
+            purl = %c.purl().to_string().escape_debug(),
+            "JSR lookup refused: not an @scope/name package"
+        );
+        return Err(RegistryError::NoRecord);
+    };
     let doc: Package = fetch_json(
         &format!("https://api.jsr.io/scopes/{scope}/packages/{pkg}"),
         net,
         cache,
     )?;
     let latest = doc.latest_version.as_deref();
-    let requested = version.map(percent_decode);
-    let want = requested.as_deref().or(latest).unwrap_or_default();
+    let version = c.target(latest);
 
     // The release's own document dates it; a version JSR does not have is a
     // 404 there, and gets no date rather than the newest's.
-    let published_at = fetch_json::<PackageVersion>(
-        &format!(
-            "https://api.jsr.io/scopes/{scope}/packages/{pkg}/versions/{}",
-            encode_component(want)
-        ),
-        net,
-        cache,
-    )
-    .ok()
-    .and_then(|v| v.created_at)
-    .as_deref()
-    .and_then(parse_ts);
+    let url = format!(
+        "https://api.jsr.io/scopes/{scope}/packages/{pkg}/versions/{}",
+        encode_component(version)
+    );
+    let release = optional(fetch_json::<PackageVersion>(&url, net, cache), &url);
     let repository = doc.github_repository.and_then(|g| {
         let owner = g.owner?;
         let repo = g.name?;
@@ -66,13 +60,15 @@ pub(crate) fn jsr(
     Ok(Registry {
         ecosystem: "jsr".into(),
         name: format!("@{scope}/{pkg}"),
-        version: want.to_string(),
-        published_at,
+        version: version.to_string(),
+        published_at: release
+            .as_ref()
+            .and_then(|r| r.created_at.as_deref())
+            .and_then(unix_secs),
         latest_version: latest.map(str::to_string),
         description: doc.description,
         repository,
-        // JSR's 0–100 quality score is its popularity analogue.
-        rating: doc.score.map(|f| f as f32),
+        version_removed: release.and_then(|r| r.yanked),
         ..Default::default()
     })
 }
@@ -82,16 +78,18 @@ pub(crate) fn jsr(
 #[serde(default, rename_all = "camelCase")]
 struct Package {
     latest_version: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     description: Option<String>,
     github_repository: Option<GithubRepository>,
-    score: Option<f64>,
 }
 
 /// The package's linked GitHub repository.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct GithubRepository {
+    #[serde(deserialize_with = "non_empty")]
     owner: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     name: Option<String>,
 }
 
@@ -100,14 +98,18 @@ struct GithubRepository {
 #[serde(default, rename_all = "camelCase")]
 struct PackageVersion {
     created_at: Option<String>,
+    yanked: Option<bool>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ecosystem::test_cache;
+    use crate::fetch::{BlobCache, Fixtures};
+    use crate::registry::lookup;
+    use filefacts::{RefLocator, Registry};
 
-    use crate::fetch::Fixtures;
+    fn look(net: &Fixtures, purl: &str) -> Registry {
+        lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled()).expect("registry")
+    }
 
     #[test]
     fn jsr_api_normalizes() {
@@ -117,11 +119,13 @@ mod tests {
             "githubRepository": {"owner": "denoland", "name": "std"}
         })
         .to_string();
-        let release = serde_json::json!({
-            "scope": "std", "package": "path", "version": "1.1.5",
-            "createdAt": "2021-04-23T10:00:00.000Z", "yanked": false
-        })
-        .to_string();
+        let release = |yanked: bool| {
+            serde_json::json!({
+                "scope": "std", "package": "path", "version": "1.1.5",
+                "createdAt": "2021-04-23T10:00:00.000Z", "yanked": yanked
+            })
+            .to_string()
+        };
         let net = Fixtures::default()
             .with(
                 "https://api.jsr.io/scopes/std/packages/path",
@@ -129,9 +133,15 @@ mod tests {
             )
             .with(
                 "https://api.jsr.io/scopes/std/packages/path/versions/1.1.5",
-                release.as_bytes(),
+                release(false).as_bytes(),
+            )
+            // The version is a path segment: encoded once, whatever the PURL
+            // percent-encoded.
+            .with(
+                "https://api.jsr.io/scopes/std/packages/path/versions/1.0.0%2Bbuild",
+                release(true).as_bytes(),
             );
-        let r = jsr("%40std/path", None, &net, &test_cache("jsr")).expect("registry");
+        let r = look(&net, "pkg:jsr/%40std/path");
         assert_eq!(r.ecosystem, "jsr");
         assert_eq!(r.name, "@std/path");
         assert_eq!(r.version, "1.1.5");
@@ -140,22 +150,13 @@ mod tests {
             r.repository.as_deref(),
             Some("https://github.com/denoland/std")
         );
-        assert_eq!(r.rating, Some(100.0));
+        // The 0-100 score rates the package's quality, not its users' opinion.
+        assert_eq!(r.rating, None);
+        assert_eq!(r.version_removed, Some(false));
 
-        // The version is a path segment: encoded once, whatever the PURL
-        // percent-encoded.
-        let net = net.with(
-            "https://api.jsr.io/scopes/std/packages/path/versions/1.0.0%2Bbuild",
-            release.as_bytes(),
-        );
-        let r = jsr(
-            "%40std/path",
-            Some("1.0.0%2Bbuild"),
-            &net,
-            &test_cache("jsr"),
-        )
-        .expect("registry");
+        let r = look(&net, "pkg:jsr/%40std/path@1.0.0%2Bbuild");
         assert_eq!(r.version, "1.0.0+build");
         assert_eq!(r.published_at, Some(1_619_172_000));
+        assert_eq!(r.version_removed, Some(true), "a yanked release");
     }
 }

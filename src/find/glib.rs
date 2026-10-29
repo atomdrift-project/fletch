@@ -1,16 +1,24 @@
-//! Leading literal CSS imports in a GLib file-write body. No CSS or JS runs.
+//! Leading literal CSS imports in a GLib file-write body
+//! (`GLib.file_set_contents(path, "@import url('https://…');")`), the way a
+//! GNOME extension installs a stylesheet that loads remote CSS. No CSS or JS
+//! runs.
+
 use filefacts::{Arg, RefKind, RefLocator, Reference, Symbol};
 
-use super::FetchCallDiscovery;
+use super::Discovery;
+use super::UnresolvedFetchCall;
+use crate::fetch::is_http_url;
 
+/// The file-write API whose body is read.
+const WRITE_API: &str = "GLib.file_set_contents";
+
+/// The longest body read. Each parsed import consumes a whole statement, so
+/// this bounds both the work and the references one body yields.
 const MAX_BODY: usize = 16_384;
 
 /// Read the next simple import's URL token. Escapes, dynamic values and
 /// unsupported token forms remain unresolved; leading comments are skipped.
 fn initial_import(body: &str) -> Option<(&str, &str)> {
-    if body.len() > MAX_BODY {
-        return None;
-    }
     let mut body = body.trim_start();
     while let Some(comment) = body.strip_prefix("/*") {
         body = comment.get(comment.find("*/")? + 2..)?.trim_start();
@@ -61,8 +69,10 @@ fn initial_import(body: &str) -> Option<(&str, &str)> {
     Some((url, &tail[1..]))
 }
 
-pub(super) fn discover(symbols: &[Symbol]) -> FetchCallDiscovery {
-    let mut discovery = FetchCallDiscovery::default();
+/// Remote stylesheets imported by the bodies a JavaScript file writes, and the
+/// writes whose body is a runtime value.
+pub(super) fn discover(symbols: &[Symbol]) -> Discovery {
+    let mut out = Discovery::default();
     for symbol in symbols {
         let Symbol::Call {
             target: Some(target),
@@ -72,24 +82,35 @@ pub(super) fn discover(symbols: &[Symbol]) -> FetchCallDiscovery {
         else {
             continue;
         };
-        if target != "GLib.file_set_contents" {
+        if target != WRITE_API {
             continue;
         }
-        let Some(Arg::String { value }) = args.get(1) else {
-            continue;
+        let value = match args.get(1) {
+            Some(Arg::String { value }) => value,
+            Some(_) => {
+                out.unresolved.push(UnresolvedFetchCall {
+                    command: WRITE_API.to_owned(),
+                    offset: *offset,
+                });
+                continue;
+            }
+            None => continue,
         };
         if value.len() > MAX_BODY {
+            out.truncated = true;
+            tracing::debug!(
+                recognizer = "glib",
+                limit = MAX_BODY,
+                bytes = value.len(),
+                "stylesheet body too long to read"
+            );
             continue;
         }
         let mut rest = value.as_str();
-        // Each successful parse consumes a complete statement. The body-size
-        // bound limits total work and output without a first-import shortcut.
         while let Some((url, tail)) = initial_import(rest) {
             rest = tail;
             // A local/data import must not hide a later external import.
-            if !url::Url::parse(url).is_ok_and(|url| {
-                matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
-            }) {
+            if !is_http_url(url) {
                 continue;
             }
             let mut reference = Reference::new(
@@ -99,22 +120,25 @@ pub(super) fn discover(symbols: &[Symbol]) -> FetchCallDiscovery {
                 url,
             );
             reference.offset = *offset;
-            discovery.references.push(reference);
+            out.references.push(reference);
         }
     }
-    super::dedup(&mut discovery.references);
-    discovery
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn refs(source: &str) -> Vec<Reference> {
+    fn discovered(source: &str) -> Discovery {
         let parsed = filefacts::OpenOptions::new()
             .path(std::path::Path::new("extension.js"))
             .open(source.as_bytes());
-        discover(parsed.symbols().as_slice()).references
+        discover(parsed.symbols().as_slice())
+    }
+
+    fn refs(source: &str) -> Vec<Reference> {
+        discovered(source).references
     }
 
     #[test]
@@ -144,7 +168,7 @@ mod tests {
         );
         assert_eq!(
             multiple.iter().map(|r| &r.locator).collect::<Vec<_>>(),
-            vec![
+            [
                 &RefLocator::Url("https://example.invalid/a.css".into()),
                 &RefLocator::Url("https://example.invalid/b.css".into()),
             ]
@@ -152,10 +176,11 @@ mod tests {
         let local_first = refs(
             r#"GLib.file_set_contents(path, "@import 'local.css'; @import url('https://example.invalid/remote.css');");"#,
         );
-        assert_eq!(local_first.len(), 1);
         assert_eq!(
-            local_first[0].locator,
-            RefLocator::Url("https://example.invalid/remote.css".into())
+            local_first.iter().map(|r| &r.locator).collect::<Vec<_>>(),
+            [&RefLocator::Url(
+                "https://example.invalid/remote.css".into()
+            )]
         );
     }
 
@@ -173,5 +198,29 @@ mod tests {
         ] {
             assert!(refs(source).is_empty(), "{source}");
         }
+    }
+
+    #[test]
+    fn a_runtime_body_is_a_gap_and_an_oversized_one_is_truncation() {
+        let dynamic = discovered("GLib.file_set_contents(path, css);");
+        assert_eq!(dynamic.unresolved.len(), 1);
+        assert_eq!(dynamic.unresolved[0].command, WRITE_API);
+        assert!(!dynamic.truncated);
+
+        let body = format!(
+            "@import url('https://example.invalid/a.css');{}",
+            " ".repeat(MAX_BODY)
+        );
+        let oversized = discover(&[Symbol::Call {
+            target: Some(WRITE_API.to_owned()),
+            args: vec![
+                Arg::Identifier {
+                    name: "path".into(),
+                },
+                Arg::String { value: body },
+            ],
+            offset: Some(0),
+        }]);
+        assert!(oversized.references.is_empty() && oversized.truncated);
     }
 }

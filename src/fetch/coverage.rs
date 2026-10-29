@@ -1,8 +1,10 @@
 //! What limited, or decided, how much of a reference was analyzed.
 //!
 //! A [`super::FetchRecord`] says what was fetched; its [`Coverage`] says what
-//! that left unexamined, and why. Each entry is one fact a consumer can act
-//! on without reading prose; [`std::fmt::Display`] renders it for people.
+//! that left unexamined, and why. fletch only carries these facts: the
+//! consumer that analyzes fetched content records them on the record, and
+//! fletch never adds one itself. Each entry is one fact a consumer can act on
+//! without reading prose; [`std::fmt::Display`] renders it for people.
 
 use std::fmt;
 
@@ -30,8 +32,8 @@ pub enum Coverage {
     Supplied {
         /// Where in the artifact.
         path: String,
-        /// Whether the supplied archive matched the declared pin; `None` when
-        /// there was no pin to check it against.
+        /// Whether the supplied archive matched the declared pin: `Some(false)`
+        /// is a mismatch, and `None` means there was no pin to check it against.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pin_verified: Option<bool>,
     },
@@ -55,7 +57,8 @@ pub enum Coverage {
     },
     /// The fetch budget ran out before it.
     BudgetExceeded {
-        /// Which limit was reached.
+        /// The consumer's account of which of its limits was reached, in its
+        /// own terms (a command-line flag, a per-file allowance).
         notice: String,
         /// Fetches the allowance granted.
         fetches: u64,
@@ -115,7 +118,7 @@ impl fmt::Display for Coverage {
             Self::Supplied { path, pin_verified } => {
                 let pin = match pin_verified {
                     Some(true) => "archive pin verified",
-                    Some(false) => "archive pin unverified",
+                    Some(false) => "archive pin mismatch",
                     None => "registry archive identity not verified",
                 };
                 write!(f, "supplied code already analyzed: {path}; {pin}")
@@ -209,6 +212,26 @@ mod tests {
         ] {
             assert!(!chosen.is_gap(), "{chosen:?}");
         }
+    }
+
+    #[test]
+    fn a_supplied_archive_renders_its_pin_verdict() {
+        let supplied = |pin_verified| Coverage::Supplied {
+            path: "vendor/x".into(),
+            pin_verified,
+        };
+        assert_eq!(
+            supplied(Some(true)).to_string(),
+            "supplied code already analyzed: vendor/x; archive pin verified"
+        );
+        assert_eq!(
+            supplied(Some(false)).to_string(),
+            "supplied code already analyzed: vendor/x; archive pin mismatch"
+        );
+        assert_eq!(
+            supplied(None).to_string(),
+            "supplied code already analyzed: vendor/x; registry archive identity not verified"
+        );
     }
 
     #[test]

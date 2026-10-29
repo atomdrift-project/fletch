@@ -106,7 +106,7 @@ fn fetches_lookups_and_reads_are_counted() {
         let _ = fetch_ref(&dep("pkg:npm/a@1.0.0"), &net, &cache);
         let _ = fetch_ref(&dep("pkg:npm/b@1.0.0"), &net, &cache);
         let _ = fetch_ref(&dep("pkg:swift/x/y@1.0.0"), &net, &cache);
-        let _ = fletch::try_registry(&RefLocator::Purl("pkg:pypi/gone".into()), &net, &cache);
+        let _ = fletch::registry::lookup(&RefLocator::Purl("pkg:pypi/gone".into()), &net, &cache);
     }
     assert_eq!(
         events(

@@ -3,45 +3,57 @@
 use filefacts::Registry;
 use serde::Deserialize;
 
-use crate::ecosystem::immutable_or_fresh;
-use crate::ecosystem::{Localized, fetch_json, flag, null_default, parse_ts};
-use crate::fetch::{BlobCache, Fetch, cached_metadata};
+use crate::ecosystem::{
+    Coordinates, Localized, fetch_json, five_star, immutable_or_fresh, last_seg, null_default,
+    optional, set_timeline, unix_secs,
+};
+use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
-/// Resolve a Firefox Add-ons slug to the XPI AMO serves. A requested version
-/// goes through the immutable per-version endpoint, so an old pin can never be
-/// silently replaced by the latest release. Without a version, the add-on
-/// document's `current_version` supplies both the concrete version and file.
+/// The AMO v5 add-on API root: `/<slug>/` is the add-on's listing,
+/// `/<slug>/versions/<version>/` one release's document.
+const AMO_API: &str = "https://addons.mozilla.org/api/v5/addons/addon";
+
+/// Resolve a Firefox Add-ons slug to the XPI AMO serves, as `(version, url)`.
+/// A requested version goes through the immutable per-version endpoint, so an
+/// old pin can never be silently replaced by the latest release. Without a
+/// version, the add-on's `current_version` supplies both the concrete version
+/// and file.
 pub(crate) fn resolve_firefox(
-    path: &str,
-    version: Option<&str>,
+    c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Option<(String, String)> {
-    let slug = path.rsplit('/').next().unwrap_or(path);
-    if slug.is_empty() {
-        return None;
-    }
+    let (path, version) = (c.path(), c.encoded_version());
+    let slug = last_seg(path);
     let api = match version {
-        Some(v) => format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/versions/{v}/"),
-        None => format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/"),
+        Some(v) => format!("{AMO_API}/{slug}/versions/{v}/"),
+        None => format!("{AMO_API}/{slug}/"),
     };
     let resolve = |cache: &BlobCache| {
-        let bytes = cached_metadata(&api, net, cache)?;
-        let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let release = if version.is_some() {
-            &json
-        } else {
-            json.get("current_version")?
-        };
-        let resolved_version = release.get("version")?.as_str()?.to_string();
-        // Defensive equality check: a malformed or surprising API response must
-        // not substitute another release for an explicitly requested version.
-        if version.is_some_and(|want| want != resolved_version) {
+        let release = match version {
+            Some(_) => fetch_json::<AddonVersion>(&api, net, cache).map(Some),
+            None => fetch_json::<Addon>(&api, net, cache).map(|addon| addon.current_version),
+        }
+        .inspect_err(|error| tracing::debug!(url = api, %error, "AMO release unresolved"))
+        .ok()
+        .flatten()?;
+        let resolved = release.version?;
+        // A surprising answer must not substitute another release for the
+        // requested one.
+        if version.is_some_and(|want| want != resolved) {
+            tracing::debug!(
+                url = api,
+                got = %resolved.escape_debug(),
+                "AMO release refused: the document describes another release"
+            );
             return None;
         }
-        let url = release.pointer("/file/url")?.as_str()?.to_string();
-        Some((resolved_version, url))
+        let url = release.file.and_then(|file| file.url);
+        if url.is_none() {
+            tracing::debug!(url = api, "AMO release unresolved: no file URL");
+        }
+        Some((resolved, url?))
     };
     match version {
         Some(_) => immutable_or_fresh(cache, resolve),
@@ -49,40 +61,52 @@ pub(crate) fn resolve_firefox(
     }
 }
 
-/// Firefox Add-ons (addons.mozilla.org v5): the same marketplace shape as the
-/// Chrome and VS Code stores — localized name/summary, rating, weekly installs,
-/// and the current version with its review date.
-pub(crate) fn firefox(
-    slug: &str,
+/// Look up the add-on `c` names: its listing (localized name and summary,
+/// rating, installs, current release) and the first page of its releases for
+/// the timeline. A requested version other than the current one is dated from
+/// its own release document, or left undated when AMO does not list it.
+pub(crate) fn lookup(
+    c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let doc: Addon = fetch_json(
-        &format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/"),
-        net,
-        cache,
-    )?;
+    let slug = c.bare_name(&[])?;
+    let doc: Addon = fetch_json(&format!("{AMO_API}/{slug}/"), net, cache)?;
     let current = doc.current_version.unwrap_or_default();
+    let version = c.target(current.version.as_deref()).to_string();
+    let (release, published_at) = match c.encoded_version() {
+        Some(v) if current.version.as_deref() != Some(version.as_str()) => {
+            let url = format!("{AMO_API}/{slug}/versions/{v}/");
+            let release = optional(fetch_json::<AddonVersion>(&url, net, cache), &url)
+                .filter(|release| release.version.as_deref() == Some(version.as_str()))
+                .unwrap_or_default();
+            let published_at = release.reviewed.as_deref().and_then(unix_secs);
+            if published_at.is_none() {
+                tracing::debug!(url, "requested release undated on AMO");
+            }
+            (release, published_at)
+        }
+        // `reviewed` (the release's approval) is when it reached users.
+        _ => {
+            let published_at = current
+                .reviewed
+                .as_deref()
+                .or(doc.last_updated.as_deref())
+                .and_then(unix_secs);
+            (current, published_at)
+        }
+    };
     let ratings = doc.ratings.unwrap_or_default();
 
-    let mut p = Registry {
+    let mut record = Registry {
         ecosystem: "firefox".into(),
-        name: doc.slug.unwrap_or_else(|| slug.to_string()),
-        version: current.version.unwrap_or_default(),
-        // `reviewed` (the current version's approval) is the supply-chain recency.
-        published_at: current
-            .reviewed
-            .or(doc.last_updated)
-            .as_deref()
-            .and_then(parse_ts),
-        // `created` is the add-on's first listing — the package-age signal.
-        first_published_at: doc.created.as_deref().and_then(parse_ts),
-        author: doc
-            .authors
-            .as_ref()
-            .and_then(|authors| authors.first()?.name.clone()),
-        // The author set is the custody signal AMO exposes.
-        maintainers: doc.authors.as_ref().map(|a| a.len() as u32),
+        name: doc.slug.unwrap_or_else(|| c.name().to_string()),
+        version,
+        published_at,
+        // `created` is the add-on's first listing.
+        first_published_at: doc.created.as_deref().and_then(unix_secs),
+        author: doc.authors.first().and_then(|author| author.name.clone()),
+        maintainers: u32::try_from(doc.authors.len()).ok(),
         title: doc.name.as_ref().and_then(Localized::text),
         description: doc.summary.as_ref().and_then(Localized::text),
         homepage: doc
@@ -90,57 +114,55 @@ pub(crate) fn firefox(
             .and_then(|h| h.url)
             .as_ref()
             .and_then(Localized::text),
-        license: current
+        license: release
             .license
             .and_then(|l| l.name)
             .as_ref()
             .and_then(Localized::text),
-        // `average_daily_users` is the install base (a lifetime-reach analogue);
-        // `weekly_downloads` stays the recent-window figure.
+        // `average_daily_users` is the install base, the reach a lifetime
+        // download count stands for elsewhere; `weekly_downloads` is recent.
         downloads_total: doc.average_daily_users,
         downloads_recent: doc.weekly_downloads,
-        rating: ratings.average.map(|f| f as f32),
+        rating: ratings.average.and_then(|r| five_star(r, 5.0)),
         rating_count: ratings.count,
-        deprecated: flag(doc.is_disabled, "disabled"),
+        // Mozilla disables an add-on it has taken down; a developer disables
+        // one to withdraw it.
+        security_hold: match doc.status.as_deref() {
+            Some("disabled") => Some(true),
+            Some("public") => Some(false),
+            _ => None,
+        },
+        version_removed: doc.is_disabled,
         ..Default::default()
     };
 
-    // One extra GET to the versions endpoint yields the release timeline (each
-    // version's `reviewed` approval time) for the cadence metrics. Best-effort:
-    // a failure leaves the package-age signal (from `created`) intact.
-    if let Ok(versions) = fetch_json::<AddonVersions>(
-        &format!("https://addons.mozilla.org/api/v5/addons/addon/{slug}/versions/?page_size=50"),
-        net,
-        cache,
-    ) {
-        let mut times: Vec<u64> = versions
-            .results
-            .iter()
-            .filter_map(|v| v.reviewed.as_deref().or(v.created.as_deref()))
-            .filter_map(parse_ts)
-            .collect();
-        times.sort_unstable();
-        if !times.is_empty() {
-            p.release_count = Some(times.len() as u32);
-            if let Some(this) = p.published_at {
-                p.previous_published_at = times.iter().copied().filter(|&t| t < this).max();
-            }
-            p.release_times = times;
-        }
+    // The newest page of releases gives the timeline; `count` is how many
+    // AMO lists in all.
+    let url = format!("{AMO_API}/{slug}/versions/?page_size=50");
+    if let Some(page) = optional(fetch_json::<AddonVersions>(&url, net, cache), &url) {
+        record.release_count = page.count;
+        set_timeline(
+            &mut record,
+            page.results
+                .iter()
+                .filter_map(|v| v.reviewed.as_deref().or(v.created.as_deref()))
+                .filter_map(unix_secs),
+        );
     }
-
-    Ok(p)
+    Ok(record)
 }
 
-/// An AMO add-on document: the listing plus its current version.
+/// An AMO add-on document: the listing plus its current release.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Addon {
     slug: Option<String>,
+    status: Option<String>,
     current_version: Option<AddonVersion>,
     last_updated: Option<String>,
     created: Option<String>,
-    authors: Option<Vec<AddonAuthor>>,
+    #[serde(deserialize_with = "null_default")]
+    authors: Vec<AddonAuthor>,
     name: Option<Localized>,
     summary: Option<Localized>,
     homepage: Option<AddonHomepage>,
@@ -150,16 +172,25 @@ struct Addon {
     is_disabled: Option<bool>,
 }
 
-/// The add-on's current version.
+/// One release of an add-on: the add-on's `current_version`, or a
+/// per-version document.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct AddonVersion {
     version: Option<String>,
     reviewed: Option<String>,
     license: Option<AddonLicense>,
+    file: Option<AddonFile>,
 }
 
-/// The license a version ships under.
+/// The XPI a release ships.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AddonFile {
+    url: Option<String>,
+}
+
+/// The license a release ships under.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct AddonLicense {
@@ -188,15 +219,16 @@ struct AddonRatings {
     count: Option<u64>,
 }
 
-/// One page of an add-on's versions.
+/// One page of an add-on's releases, with the total AMO lists.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct AddonVersions {
+    count: Option<u32>,
     #[serde(deserialize_with = "null_default")]
     results: Vec<ListedVersion>,
 }
 
-/// One version on the versions page.
+/// One release on a page of releases.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct ListedVersion {
@@ -207,16 +239,20 @@ struct ListedVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::test_cache;
-
-    use crate::ecosystem::parse_rfc3339_secs;
-
     use crate::fetch::Fixtures;
+    use filefacts::RefLocator;
 
-    #[test]
-    fn firefox_amo_normalizes() {
-        let doc = serde_json::json!({
-            "slug": "ublock-origin",
+    const ADDON: &str = "https://addons.mozilla.org/api/v5/addons/addon/ublock-origin/";
+    const VERSIONS: &str =
+        "https://addons.mozilla.org/api/v5/addons/addon/ublock-origin/versions/?page_size=50";
+
+    fn lookup(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
+        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
+    }
+
+    fn addon() -> String {
+        serde_json::json!({
+            "slug": "ublock-origin", "status": "public",
             "name": {"en-US": "uBlock Origin"}, "summary": {"en-US": "An efficient blocker"},
             "homepage": {"url": {"en-US": "https://github.com/gorhill/uBlock"}},
             "authors": [{"name": "Raymond Hill"}, {"name": "co-author"}],
@@ -227,26 +263,30 @@ mod tests {
             "current_version": {"version": "1.66.4", "reviewed": "2021-04-23T10:00:00Z",
                                 "license": {"name": {"en-US": "GPL-3.0-only"}}}
         })
-        .to_string();
-        // The versions endpoint (one extra GET) supplies the release timeline.
-        let versions = serde_json::json!({
+        .to_string()
+    }
+
+    fn versions() -> String {
+        serde_json::json!({
+            "count": 151,
             "results": [
                 {"version": "1.66.4", "reviewed": "2021-04-23T10:00:00Z"},
                 {"version": "1.66.3", "reviewed": "2021-04-20T10:00:00Z"},
                 {"version": "1.66.2", "reviewed": "2021-03-01T10:00:00Z"}
             ]
         })
-        .to_string();
-        let net = Fixtures::default()
-            .with(
-                "https://addons.mozilla.org/api/v5/addons/addon/ublock-origin/",
-                doc.as_bytes(),
-            )
-            .with(
-                "https://addons.mozilla.org/api/v5/addons/addon/ublock-origin/versions/?page_size=50",
-                versions.as_bytes(),
-            );
-        let r = firefox("ublock-origin", &net, &test_cache("firefox")).expect("registry");
+        .to_string()
+    }
+
+    fn net() -> Fixtures {
+        Fixtures::default()
+            .with(ADDON, addon().as_bytes())
+            .with(VERSIONS, versions().as_bytes())
+    }
+
+    #[test]
+    fn firefox_amo_normalizes() {
+        let r = lookup("pkg:firefox/ublock-origin", &net()).expect("registry");
         assert_eq!(r.ecosystem, "firefox");
         assert_eq!(r.title.as_deref(), Some("uBlock Origin"));
         assert_eq!(r.version, "1.66.4");
@@ -258,14 +298,68 @@ mod tests {
         assert_eq!(r.license.as_deref(), Some("GPL-3.0-only"));
         assert_eq!(r.rating, Some(4.7997));
         assert_eq!(r.rating_count, Some(21_850));
-        // New: first-listing date, install base, author count, release timeline.
-        assert!(r.first_published_at.is_some()); // `created`
-        assert_eq!(r.downloads_total, Some(8_000_000)); // average_daily_users
-        assert_eq!(r.maintainers, Some(2)); // two authors
-        assert_eq!(r.release_count, Some(3));
-        assert_eq!(
-            r.previous_published_at,
-            parse_rfc3339_secs("2021-04-20T10:00:00Z")
+        assert_eq!(r.first_published_at, unix_secs("2015-04-25T07:26:22Z"));
+        assert_eq!(r.downloads_total, Some(8_000_000));
+        assert_eq!(r.maintainers, Some(2));
+        assert_eq!(r.previous_published_at, unix_secs("2021-04-20T10:00:00Z"));
+        assert_eq!(r.security_hold, Some(false));
+        assert_eq!(r.version_removed, Some(false));
+        assert_eq!(r.deprecated, None);
+    }
+
+    #[test]
+    fn the_release_count_is_amos_total_not_the_page() {
+        let r = lookup("pkg:firefox/ublock-origin", &net()).expect("registry");
+        assert_eq!(r.release_count, Some(151));
+        assert_eq!(r.release_times.len(), 3);
+        assert_eq!(r.first_published_at, unix_secs("2015-04-25T07:26:22Z"));
+    }
+
+    #[test]
+    fn a_missing_timeline_leaves_the_listing_intact() {
+        let net = Fixtures::default()
+            .with(ADDON, addon().as_bytes())
+            .refusing(VERSIONS, 503);
+        let r = lookup("pkg:firefox/ublock-origin", &net).expect("registry");
+        assert_eq!(r.version, "1.66.4");
+        assert_eq!(r.release_count, None);
+    }
+
+    #[test]
+    fn a_requested_release_is_dated_from_its_own_document_or_not_at_all() {
+        let old = serde_json::json!({
+            "version": "1.60.0", "reviewed": "2024-09-26T14:47:20Z",
+            "license": {"name": {"en-US": "MPL-2.0"}}
+        })
+        .to_string();
+        let net = net()
+            .with(&format!("{ADDON}versions/1.60.0/"), old.as_bytes())
+            .refusing(&format!("{ADDON}versions/9.9.9/"), 404);
+
+        let r = lookup("pkg:firefox/ublock-origin@1.60.0", &net).expect("registry");
+        assert_eq!(r.version, "1.60.0");
+        assert_eq!(r.published_at, unix_secs("2024-09-26T14:47:20Z"));
+        assert_eq!(r.license.as_deref(), Some("MPL-2.0"));
+
+        let r = lookup("pkg:firefox/ublock-origin@9.9.9", &net).expect("registry");
+        assert_eq!(r.version, "9.9.9");
+        assert_eq!(r.published_at, None);
+        assert_eq!(r.license, None);
+
+        let r = lookup("pkg:firefox/ublock-origin@1.66.4", &net).expect("registry");
+        assert_eq!(r.published_at, Some(1_619_172_000));
+    }
+
+    #[test]
+    fn a_takedown_is_a_hold_and_a_withdrawal_a_removal() {
+        let doc = serde_json::json!({"status": "disabled", "is_disabled": true}).to_string();
+        let net = Fixtures::default().with(
+            "https://addons.mozilla.org/api/v5/addons/addon/gone/",
+            doc.as_bytes(),
         );
+        let r = lookup("pkg:firefox/gone", &net).expect("registry");
+        assert_eq!(r.security_hold, Some(true));
+        assert_eq!(r.version_removed, Some(true));
+        assert_eq!(r.deprecated, None);
     }
 }

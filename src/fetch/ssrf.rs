@@ -60,7 +60,12 @@ fn is_blocked_v6(v6: Ipv6Addr) -> bool {
     let s = v6.segments();
     let embedded = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
     // NAT64 well-known prefix, 64:ff9b::<v4>/96: outside 2000::/3, and as
-    // public as the v4 address it carries.
+    // public as the v4 address it carries. A network-specific NAT64 prefix
+    // (RFC 6052, an operator's own /32–/96 inside 2000::/3) cannot be told
+    // from ordinary global unicast, so a name resolving into one reaches
+    // whatever v4 address the local translator maps it to, internal ones
+    // included. That residual case is left to the network: on a host behind
+    // such a translator, filter its prefix at the translator.
     if s[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
         return is_blocked_v4(embedded(s[6], s[7]));
     }
@@ -106,13 +111,40 @@ impl reqwest::dns::Resolve for SafeResolver {
                     .await
                     .map_err(BoxError::from)?
                     .map_err(BoxError::from)?;
-            let safe: Vec<SocketAddr> = resolved.filter(|a| !is_blocked_ip(a.ip())).collect();
-            if safe.is_empty() {
-                return Err(BoxError::from(NonPublicHost(host)));
-            }
+            let safe = public_addresses(host, resolved).map_err(BoxError::from)?;
             Ok(Box::new(safe.into_iter()) as reqwest::dns::Addrs)
         })
     }
+}
+
+/// The globally routable subset of `host`'s resolved addresses, or a refusal
+/// when none remain. The resolver's whole policy, apart from the lookup.
+fn public_addresses(
+    host: String,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+) -> Result<Vec<SocketAddr>, NonPublicHost> {
+    let (safe, blocked): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        resolved.into_iter().partition(|a| !is_blocked_ip(a.ip()));
+    if safe.is_empty() {
+        tracing::warn!(
+            target: "ssrf",
+            host,
+            reason = "resolves only to non-public addresses",
+            addresses = blocked.len(),
+            "refused"
+        );
+        return Err(NonPublicHost(host));
+    }
+    if !blocked.is_empty() {
+        tracing::debug!(
+            target: "ssrf",
+            host,
+            dropped = blocked.len(),
+            kept = safe.len(),
+            "dropped non-public addresses"
+        );
+    }
+    Ok(safe)
 }
 
 /// The ports the WHATWG Fetch standard forbids browsers to connect to: mail,
@@ -132,36 +164,57 @@ const BAD_PORTS: &[u16] = &[
 /// DNS resolver never sees (the SSRF resolver guards hostname targets; a bare
 /// IP must be checked directly).
 pub(crate) fn guard_host(url: &reqwest::Url) -> Result<(), FetchError> {
+    let refuse = |reason: String| {
+        tracing::debug!(target: "ssrf", host = url.host_str(), reason, "refused");
+        Err(FetchError::Refused(reason))
+    };
     if url.scheme() != "https" {
-        return Err(FetchError::Refused(format!(
-            "non-https scheme: {}",
-            url.scheme()
-        )));
+        return refuse(format!("non-https scheme: {}", url.scheme()));
     }
     if let Some(port) = url.port()
         && BAD_PORTS.contains(&port)
     {
-        return Err(FetchError::Refused(format!("non-web port: {port}")));
+        return refuse(format!("non-web port: {port}"));
     }
-    match url.host_str() {
-        Some(host) => {
-            let bare = host
-                .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or(host);
-            if let Ok(ip) = bare.parse::<IpAddr>()
-                && is_blocked_ip(ip)
-            {
-                return Err(FetchError::Refused(format!("non-public host: {host}")));
-            }
-            Ok(())
-        }
-        None => Err(FetchError::Refused("missing host".into())),
+    // The URL parser has already turned every IPv4 spelling a browser
+    // accepts (`0x7f.1`, `2130706433`, a trailing dot) into `Host::Ipv4`.
+    let blocked = match url.host() {
+        None => return refuse("missing host".into()),
+        Some(url::Host::Ipv4(ip)) => is_blocked_v4(ip),
+        Some(url::Host::Ipv6(ip)) => is_blocked_v6(ip),
+        Some(url::Host::Domain(_)) => false,
+    };
+    if blocked {
+        tracing::warn!(target: "ssrf", host = url.host_str(), "refused a non-public address");
+        return Err(FetchError::Refused(format!(
+            "non-public host: {}",
+            url.host_str().unwrap_or_default()
+        )));
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_host_keeps_only_its_public_addresses() {
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let refused = public_addresses(
+            "rebind.test".into(),
+            [addr("127.0.0.1:0"), addr("[fd00::1]:0")],
+        )
+        .unwrap_err();
+        assert_eq!(refused.to_string(), "refused non-public host: rebind.test");
+        assert_eq!(
+            public_addresses(
+                "mixed.test".into(),
+                [addr("10.0.0.1:0"), addr("93.184.215.14:0")]
+            )
+            .unwrap(),
+            vec![addr("93.184.215.14:0")]
+        );
+    }
+
     use super::*;
 
     #[test]
