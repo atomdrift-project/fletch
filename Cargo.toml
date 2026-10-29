@@ -8,7 +8,7 @@ rust-version = "1.97"
 license = "Apache-2.0"
 description = "Find and fetch external references (packages and URLs) discovered in analyzed files"
 repository = "https://github.com/atomdrift-project/fletch"
-# filefacts is consumed from git (pinned below), so a crates.io package would
+# filefacts is consumed from git, so a crates.io package would
 # be uninstallable until filefacts is published there.
 publish = false
 
@@ -64,11 +64,11 @@ missing_panics_doc = "allow"
 
 [dependencies]
 # The reference vocabulary (Reference/RefLocator/PinnedHash) and the parsed
-# facts `find` consumes. Pinned to an exact revision so every build of this
-# tag, including a downstream one, sees the same parser.
+# facts `find` consumes. Use the same bare git URL as sibling consumers;
+# Cargo.lock records the selected revision.
 # Its default features (jemalloc, the CLI's signal and log plumbing) serve only
 # the filefacts binary.
-filefacts = { git = "https://github.com/atomdrift-project/filefacts.git", rev = "036bda5e889100fc5be981a293ee8084ae0963c4", default-features = false }
+filefacts = { git = "https://github.com/atomdrift-project/filefacts.git", default-features = false }
 
 # HTTPS client. rustls-tls avoids a system OpenSSL dependency; blocking keeps
 # the fetcher off any async runtime.
@@ -122,9 +122,10 @@ fletch = { path = ".", features = ["test-util"] }
 # not predefine __illumos__). filefacts requires tree-sitter ^0.28, which is not
 # on crates.io, so this block is also what makes the graph resolve. Both
 # tree-sitter crates must come from one source (`links = "tree-sitter-language"`
-# allows a single copy). Each revision is pinned; drop the block once an
-# upstream release carries the fix.
+# allows a single copy). Keep these bare fork URLs in sync across sibling
+# roots; Cargo.lock records revisions. Drop once an upstream release carries the fix.
 [patch.crates-io]
-tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash", rev = "b672c98bad245e1cc41ff698782afe12b9a2718c" }
-tree-sitter = { git = "https://github.com/tstromberg/tree-sitter", rev = "b6a85b1062dac229f8008613d5017edeadbcfa97" }
-tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter", rev = "b6a85b1062dac229f8008613d5017edeadbcfa97" }
+# Inherited from a sibling by update-deps: [patch] applies only in the root.
+tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
+tree-sitter = { git = "https://github.com/tstromberg/tree-sitter" }
+tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }
