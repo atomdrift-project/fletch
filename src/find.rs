@@ -18,6 +18,20 @@ use filefacts::{Arg, FileType, ParsedFile, RefKind, RefLocator, Reference, Symbo
 #[path = "find_js_commands.rs"]
 mod js_commands;
 
+#[path = "find_ruby_fetch.rs"]
+mod ruby_fetch;
+
+#[path = "find_batch_programs.rs"]
+mod batch_programs;
+#[path = "find_glib_stylesheet.rs"]
+mod glib_stylesheet;
+
+/// Program targets and explicit unresolved-target gaps from Batch source facts.
+#[must_use]
+pub fn discover_batch_programs(file_type: &str, values: &serde_json::Value) -> FetchCallDiscovery {
+    batch_programs::discover(file_type, values)
+}
+
 /// All external references a file points at: filefacts' declared dependencies,
 /// plus the imperative ones recognized here.
 #[must_use]
@@ -25,9 +39,28 @@ pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
     let file_type = parsed.fileid().file_type();
     let text = scan_text(parsed.bytes(), file_type);
     let mut found = Found::new(parsed.references().to_vec(), text.as_deref());
+    let python_stub = file_type == FileType::Python
+        && parsed
+            .values()
+            .as_json()
+            .pointer("/file/basename")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| name.ends_with(".pyi"));
     // Value-driven recognition (npm lifecycle hooks) works from facts alone, so
     // it runs for every file — it no-ops when there is no `npm.scripts` branch.
     npm_scripts(parsed.values().as_json(), &mut found);
+    found
+        .refs
+        .extend(fetch_calls(file_type.label(), parsed.symbols().as_slice()));
+    found
+        .refs
+        .extend(discover_batch_programs(file_type.label(), parsed.values().as_json()).references);
+    if !python_stub {
+        found.refs.extend(python_imports(
+            file_type.label(),
+            parsed.symbols().as_slice(),
+        ));
+    }
     // String-driven recognition: URLs that stng surfaced from the extracted
     // strings — crucially including ones it recovered from *encoding* (a base64-
     // or url-encoded URL the raw bytes never show in the clear).
@@ -40,7 +73,7 @@ pub fn references(parsed: &ParsedFile<'_>) -> Vec<Reference> {
             scan_source(parsed, "javascript", &mut found);
             js_commands::scan(parsed, &mut found);
         }
-        FileType::Python => scan_source(parsed, "python", &mut found),
+        FileType::Python if !python_stub => scan_source(parsed, "python", &mut found),
         FileType::PowerShell => scan_powershell(found.text, "powershell", &mut found),
         _ => {}
     }
@@ -255,12 +288,359 @@ pub fn import_calls(file_type: &str, symbols: &[Symbol]) -> Vec<Reference> {
             continue;
         };
         if let Some((locator, kind)) = import_locator(eco, value) {
-            let mut r = Reference::new(locator, kind, "ast-call", value.clone());
+            let source = if eco == "pypi" {
+                "ast-python-import-candidate"
+            } else {
+                "ast-call"
+            };
+            let mut r = Reference::new(locator, kind, source, value.clone());
             r.offset = *offset;
             refs.push(r);
         }
     }
     refs
+}
+
+/// PyPI *candidates* from ordinary Python imports retained in source facts.
+/// Import names do not establish distribution identity or an installed version.
+/// Consumers must exclude supplied modules and verify a candidate's namespace
+/// before treating its bytes as a potential provider. Relative and stdlib
+/// imports never name external candidates here.
+#[must_use]
+pub fn python_imports(file_type: &str, symbols: &[Symbol]) -> Vec<Reference> {
+    if file_type != "python" {
+        return Vec::new();
+    }
+    let mut refs = Vec::new();
+    for symbol in symbols {
+        let Symbol::Import {
+            name,
+            library,
+            offset,
+            ..
+        } = symbol
+        else {
+            continue;
+        };
+        let module = library.as_deref().unwrap_or(name);
+        if module.starts_with('.') || module.split('.').any(|part| !is_package_name(part)) {
+            continue;
+        }
+        let Some((locator, kind)) = import_locator("pypi", module) else {
+            continue;
+        };
+        let mut reference = Reference::new(locator, kind, "ast-python-import-candidate", module);
+        reference.offset = *offset;
+        refs.push(reference);
+    }
+    refs.sort_by_key(|r| r.offset.unwrap_or(u64::MAX));
+    dedup(&mut refs);
+    refs
+}
+
+/// Literal HTTP(S) retrieval targets of parsed source calls. Unlike a raw-text
+/// hunt, this also works after an archive member's bytes have been discarded.
+/// Option values are not targets; computed arguments are not resolved here.
+#[must_use]
+pub fn fetch_calls(file_type: &str, symbols: &[Symbol]) -> Vec<Reference> {
+    discover_fetch_calls(file_type, symbols).references
+}
+
+/// Resolved literal targets and downloader calls that cannot be enumerated
+/// without runtime argument values. No expansion or command is executed.
+#[derive(Debug, Default)]
+pub struct FetchCallDiscovery {
+    /// Concrete candidate references recognized by the existing option parser.
+    pub references: Vec<Reference>,
+    /// Calls whose unknown arguments prevented complete target discovery.
+    pub unresolved: Vec<UnresolvedFetchCall>,
+}
+
+/// A syntactically observed downloader call with runtime-dependent arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedFetchCall {
+    /// Downloader name, without arguments or potentially sensitive values.
+    pub command: String,
+    /// Original call-site byte offset, when the producer provides one.
+    pub offset: Option<u64>,
+}
+
+/// Discover literal fetch targets and explicit coverage gaps from call facts.
+#[must_use]
+pub fn discover_fetch_calls(file_type: &str, symbols: &[Symbol]) -> FetchCallDiscovery {
+    if matches!(file_type, "javascript" | "typescript") {
+        return glib_stylesheet::discover(symbols);
+    }
+    if file_type == "ruby" {
+        return ruby_fetch::discover(symbols);
+    }
+    if file_type != "shell" {
+        return FetchCallDiscovery::default();
+    }
+    let mut refs = Vec::new();
+    let mut unresolved = Vec::new();
+    for symbol in symbols {
+        let Symbol::Call {
+            target: Some(target),
+            args,
+            offset,
+        } = symbol
+        else {
+            continue;
+        };
+        let command = tool_name(target);
+        let (tool, curl) = match command {
+            "curl" => (&CURL, true),
+            "wget" => (&WGET, false),
+            _ => continue,
+        };
+        let mut index = 0;
+        let mut options = true;
+        let mut unknown = false;
+        while index < args.len() {
+            let arg = match &args[index] {
+                Arg::String { value } => value.as_str(),
+                Arg::Identifier { name } => name.as_str(),
+                _ => {
+                    unknown = true;
+                    break;
+                }
+            };
+            index += 1;
+            // An expansion can introduce an option consuming the next word,
+            // so do not guess how the remaining arguments will be interpreted.
+            if arg.contains(['$', '`', '\n', '\r']) {
+                unknown = true;
+                break;
+            }
+            if options && arg == "--" {
+                options = false;
+                continue;
+            }
+            let target = if options && curl && arg == "--url" {
+                let Some(next) = args.get(index) else {
+                    break;
+                };
+                index += 1;
+                match next {
+                    Arg::String { value } => value.as_str(),
+                    Arg::Identifier { name } => name.as_str(),
+                    _ => {
+                        unknown = true;
+                        break;
+                    }
+                }
+            } else if options && curl && arg.starts_with("--url=") {
+                &arg[6..]
+            } else if options && arg.starts_with('-') {
+                if (tool.takes_value)(arg) {
+                    index += 1;
+                }
+                continue;
+            } else {
+                arg
+            };
+            if target.contains(['$', '`', '\n', '\r']) {
+                unknown = true;
+                break;
+            }
+            let url = if url::Url::parse(target)
+                .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+            {
+                target.to_owned()
+            } else if looks_like_protocolless_url(target) {
+                format!("https://{target}")
+            } else {
+                continue;
+            };
+            let mut reference = Reference::new(
+                RefLocator::Url(url),
+                RefKind::UrlFetch,
+                "ast-fetch-call",
+                target,
+            );
+            reference.offset = *offset;
+            refs.push(reference);
+        }
+        if unknown {
+            unresolved.push(UnresolvedFetchCall {
+                command: command.to_owned(),
+                offset: *offset,
+            });
+        }
+    }
+    dedup(&mut refs);
+    FetchCallDiscovery {
+        references: refs,
+        unresolved,
+    }
+}
+
+#[cfg(test)]
+mod ast_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn python_static_imports_are_namespace_candidates_and_keep_owner_offsets() {
+        let source = b"# import comment_only\nfrom scapy.tools.UTscapy import main as entry\nimport requests as client\nfrom .helpers import requests as helper\nfrom pathlib import Path\nimport __main__\n";
+        let parsed = filefacts::OpenOptions::new()
+            .path(std::path::Path::new("entry.py"))
+            .open(source);
+        let refs = python_imports("python", parsed.symbols().as_slice());
+        assert_eq!(
+            refs.iter()
+                .map(|r| crate::fetch::locator_str(&r.locator))
+                .collect::<Vec<_>>(),
+            ["pkg:pypi/scapy", "pkg:pypi/requests"]
+        );
+        assert!(
+            refs.iter()
+                .all(|r| r.source == "ast-python-import-candidate" && r.kind == RefKind::Command)
+        );
+        assert_eq!(refs[0].evidence, "scapy.tools.UTscapy");
+        assert_eq!(
+            refs[0].offset,
+            Some(std::str::from_utf8(source).unwrap().find("scapy").unwrap() as u64)
+        );
+        assert!(python_imports("javascript", parsed.symbols().as_slice()).is_empty());
+        let root_refs = references(&parsed);
+        assert!(
+            root_refs
+                .iter()
+                .any(|r| crate::fetch::locator_str(&r.locator) == "pkg:pypi/scapy")
+        );
+        assert!(!root_refs.iter().any(|r| matches!(
+            crate::fetch::locator_str(&r.locator),
+            "pkg:pypi/entry"
+                | "pkg:pypi/main"
+                | "pkg:pypi/helper"
+                | "pkg:pypi/comment_only"
+                | "pkg:pypi/pathlib"
+                | "pkg:pypi/__main__"
+        )));
+    }
+
+    #[test]
+    fn python_dynamic_imports_have_the_same_candidate_uncertainty() {
+        let source = b"import importlib\nimportlib.import_module('scapy.tools.UTscapy')\n__import__('builtins')\n";
+        let parsed = filefacts::OpenOptions::new()
+            .path(std::path::Path::new("entry.py"))
+            .open(source);
+        let refs = import_calls("python", parsed.symbols().as_slice());
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].source, "ast-python-import-candidate");
+        assert_eq!(
+            crate::fetch::locator_str(&refs[0].locator),
+            "pkg:pypi/scapy"
+        );
+    }
+
+    #[test]
+    fn python_stub_imports_do_not_become_runtime_dependencies() {
+        let source = b"import requests\nfrom scapy.tools.UTscapy import main\nimport importlib\nAlias = importlib.import_module('httpx')\n";
+        let parsed = filefacts::OpenOptions::new()
+            .path(std::path::Path::new("types.pyi"))
+            .open(source);
+        assert!(
+            !references(&parsed)
+                .iter()
+                .any(|r| r.source == "ast-python-import-candidate")
+        );
+    }
+
+    #[test]
+    fn shell_fetch_calls_report_unknown_targets_without_exposing_arguments() {
+        let script = br##"#!/bin/sh
+curl "$PRIVATE_ENDPOINT"
+wget --output-document "$DEST" "$REMOTE"
+curl "$OPTIONS" https://not-yet-a-target.test/stage
+curl https://known.test/stage "$ANOTHER"
+curl --url "$TARGET"
+curl --url="$TARGET"
+curl $(choose_url)
+"##;
+        let parsed = filefacts::OpenOptions::new()
+            .path(std::path::Path::new("test.sh"))
+            .open(script);
+        let discovery = discover_fetch_calls("shell", parsed.symbols().as_slice());
+        assert_eq!(
+            discovery
+                .references
+                .iter()
+                .map(|r| crate::fetch::locator_str(&r.locator))
+                .collect::<Vec<_>>(),
+            ["https://known.test/stage"]
+        );
+        assert_eq!(discovery.unresolved.len(), 7);
+        assert!(
+            discovery
+                .unresolved
+                .iter()
+                .all(|call| matches!(call.command.as_str(), "curl" | "wget")
+                    && call.offset.is_some())
+        );
+        assert!(
+            discover_fetch_calls("javascript", parsed.symbols().as_slice())
+                .unresolved
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shell_fetch_option_values_do_not_create_unknown_target_gaps() {
+        let script = br##"#!/bin/sh
+# curl "$COMMENT"
+printf '%s' 'curl "$PRINTED"'
+curl --header "$AUTH" --data "$BODY" --output "$DEST" https://known.test/stage
+wget -O "$DEST" --header "$AUTH" https://second.test/stage
+curl --output "$DEST" --version
+curl --url
+"##;
+        let parsed = filefacts::OpenOptions::new()
+            .path(std::path::Path::new("test.sh"))
+            .open(script);
+        let discovery = discover_fetch_calls("shell", parsed.symbols().as_slice());
+        assert!(
+            discovery.unresolved.is_empty(),
+            "{:?}",
+            discovery.unresolved
+        );
+        assert_eq!(discovery.references.len(), 2);
+    }
+
+    #[test]
+    fn shell_fetch_calls_keep_targets_and_skip_option_values_and_printed_text() {
+        let script = br##"#!/bin/sh
+# curl https://comment.test/no
+printf '%s\n' 'curl https://printed.test/no'
+curl -fsSLo stage.sh -H 'Referer: https://header.test/no' --data 'https://body.test/no' 'https://one.test/a?x=1&y=2'
+/usr/bin/wget -O stage --header='https://header.test/no' https://two.test/b
+curl --url https://three.test/c --url=https://four.test/d
+curl "$options" https://computed-options.test/no
+curl "$endpoint"
+xinput test device
+"##;
+        let parsed = filefacts::OpenOptions::new()
+            .path(std::path::Path::new("test.sh"))
+            .open(script);
+        let refs = fetch_calls("shell", parsed.symbols().as_slice());
+        assert_eq!(
+            refs.iter()
+                .map(|r| crate::fetch::locator_str(&r.locator))
+                .collect::<Vec<_>>(),
+            [
+                "https://one.test/a?x=1&y=2",
+                "https://two.test/b",
+                "https://three.test/c",
+                "https://four.test/d"
+            ]
+        );
+        assert!(
+            refs.iter()
+                .all(|r| r.kind == RefKind::UrlFetch && r.offset.is_some())
+        );
+        assert!(fetch_calls("javascript", parsed.symbols().as_slice()).is_empty());
+    }
 }
 
 /// The hunted package references whose package is **not** among the declared
@@ -541,7 +921,11 @@ fn scan_source(parsed: &ParsedFile<'_>, source: &str, out: &mut Found<'_>) {
                 out.push_at(
                     locator,
                     kind,
-                    "ast-call",
+                    if eco == "pypi" {
+                        "ast-python-import-candidate"
+                    } else {
+                        "ast-call"
+                    },
                     spec,
                     Some(node.start_byte() as u64),
                 );
@@ -1109,7 +1493,7 @@ const NODE_BUILTINS: &[&str] = &[
 /// or a squat, and neither is what the code loads.
 #[rustfmt::skip]
 const PY_STDLIB: &[&str] = &[
-    "__future__", "_abc", "_aix_support", "_android_support", "_apple_support", "_ast",
+    "__main__", "__future__", "_abc", "_aix_support", "_android_support", "_apple_support", "_ast",
     "_ast_unparse", "_asyncio", "_bisect", "_blake2", "_bz2", "_codecs", "_codecs_cn",
     "_codecs_hk", "_codecs_iso2022", "_codecs_jp", "_codecs_kr", "_codecs_tw",
     "_collections", "_collections_abc", "_colorize", "_compat_pickle", "_contextvars",

@@ -18,6 +18,7 @@ use crate::purl::Purl;
 
 mod cache;
 mod coordinate;
+mod coverage;
 mod go_hash;
 mod select;
 mod ssrf;
@@ -32,6 +33,7 @@ pub(crate) use cache::{
 pub(crate) use coordinate::{
     is_web_scheme, percent_decode, repository_base, safe_coordinate, safe_filename_part,
 };
+pub use coverage::{CandidateSource, Coverage};
 pub use select::{ArtifactCandidate, ArtifactMatrix, ArtifactTarget, SelectionPolicy};
 pub(crate) use select::{
     artifact_candidate, file_name_from_url, file_name_matches, purl_checksums,
@@ -40,7 +42,7 @@ pub use transport::{
     DEFAULT_MAX_FETCH_BYTES, Fetch, FetchError, Fetched, Fixtures, HttpFetch, Method, Request,
 };
 
-use crate::ecosystem::arch::resolve_aur;
+use crate::ecosystem::arch::{resolve_arch_current, resolve_aur};
 use crate::ecosystem::cargo::cargo_artifacts;
 use crate::ecosystem::comfyui::resolve_comfyui;
 use crate::ecosystem::composer::resolve_composer;
@@ -183,9 +185,9 @@ pub struct FetchRecord {
     /// Declaring dependency scope and installation metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<filefacts::DependencyContext>,
-    /// Explanation of an orchestration limit or local coverage decision.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coverage_note: Option<String>,
+    /// What limited, or decided, how much of the reference was analyzed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage: Vec<Coverage>,
 }
 
 impl FetchRecord {
@@ -209,7 +211,7 @@ impl FetchRecord {
             pin_verified: None,
             outcome,
             context: None,
-            coverage_note: None,
+            coverage: Vec::new(),
         }
     }
 
@@ -870,7 +872,7 @@ fn record(
         pin_verified,
         outcome,
         context: None,
-        coverage_note: None,
+        coverage: Vec::new(),
     }
 }
 
@@ -1541,6 +1543,14 @@ fn resolved_target(
             .next()
             .unwrap_or(coordinate_path);
         return Ok((p, resolve_aur(name, net, cache)));
+    }
+    if ty == "alpm" && coordinate_path.starts_with("arch/") && coordinate_version.is_none() {
+        let name = coordinate_path
+            .strip_prefix("arch/")
+            .ok_or(Unresolved::UnsafeCoordinate)?;
+        return resolve_arch_current(name, net, cache)
+            .map(|url| (p, url))
+            .ok_or(Unresolved::NoRelease);
     }
     if ty == "composer"
         && let Some(version) = coordinate_version
@@ -3343,6 +3353,35 @@ mod tests {
         assert_eq!(
             unresolved("pkg:npm/w@..%2F..%2Fx"),
             Outcome::Unresolved(Unresolved::UnsafeCoordinate)
+        );
+    }
+
+    #[test]
+    fn official_arch_fetches_current_candidate_but_does_not_guess_pins() {
+        let net = Fixtures::default()
+            .with(
+                "https://archlinux.org/packages/search/json/?name=bash",
+                br#"{"results":[{"pkgname":"bash","repo":"Core","arch":"x86_64"}]}"#,
+            )
+            .with(
+                "https://archlinux.org/packages/core/os/x86_64/bash/download/",
+                b"PACKAGE",
+            );
+        let cache = BlobCache::disabled();
+        let current = dep(RefLocator::Purl("pkg:alpm/arch/bash".into()), None);
+        assert_eq!(fetch_ref(&current, &net, &cache).outcome, Outcome::Ok);
+        let pinned = dep(RefLocator::Purl("pkg:alpm/arch/bash@5.0-1".into()), None);
+        assert_eq!(
+            fetch_ref(&pinned, &net, &cache).outcome,
+            Outcome::Unresolved(Unresolved::Unsupported)
+        );
+        let constrained = dep(
+            RefLocator::Purl("pkg:alpm/arch/bash?version_requirement=%3E%3D5".into()),
+            None,
+        );
+        assert_eq!(
+            fetch_ref(&constrained, &net, &cache).outcome,
+            Outcome::Unresolved(Unresolved::NoRelease)
         );
     }
 

@@ -1,4 +1,4 @@
-//! Bounded, syntax-based resolution of commands passed to execution APIs.
+//! Bounded syntax-based resolution of execution commands and browser PAC URLs.
 //! No JavaScript runs: unknown values, writes, shadowing and cycles stop resolution.
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -45,6 +45,8 @@ struct Resolver<'a> {
     /// Identifiers inside a `with` body, which may name any property of its
     /// object: they resolve to nothing.
     opaque: HashSet<usize>,
+    /// Namespace roots assigned anywhere in the file are not trusted globals.
+    written_roots: HashSet<&'a str>,
     /// [`Resolver::value`] steps left.
     fuel: Cell<u32>,
 }
@@ -292,6 +294,7 @@ pub(super) fn scan(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
         scope_of: HashMap::new(),
         imports: HashMap::new(),
         opaque: HashSet::new(),
+        written_roots: HashSet::new(),
         fuel: Cell::new(0),
     };
     // Each node with its innermost enclosing scope, its parent's kind, and
@@ -407,6 +410,18 @@ pub(super) fn scan(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
     // constant. A member target writes a property, not a binding.
     let mut targets = writes;
     while let Some(node) = targets.pop() {
+        let mut root = node;
+        while matches!(root.kind(), "member_expression" | "subscript_expression") {
+            let Some(object) = root.child_by_field_name("object") else {
+                break;
+            };
+            root = object;
+        }
+        if root.kind() == "identifier"
+            && let Some(name) = resolver.raw(root)
+        {
+            resolver.written_roots.insert(name);
+        }
         match node.kind() {
             "identifier" | "shorthand_property_identifier_pattern" => {
                 if let Some(name) = resolver.raw(node)
@@ -435,6 +450,22 @@ pub(super) fn scan(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
         }
         let budget = CALL_FUEL.min(fuel);
         resolver.fuel.set(budget);
+        if let Some(url) = proxy_pac_url(&resolver, node) {
+            let locator = super::url_locator(&url);
+            // Prefer the API-bound citation over the same URL recovered as
+            // generic string/text hunts; declared references keep priority.
+            out.refs.retain(|reference| {
+                !matches!(reference.source.as_str(), "string" | "javascript")
+                    || reference.locator != locator
+            });
+            out.push_at(
+                locator,
+                filefacts::RefKind::UrlFetch,
+                "ast-browser-pac-url",
+                clip(resolver.raw(node).unwrap_or(&url)),
+                Some(node.start_byte() as u64),
+            );
+        }
         let resolved = resolve_call(&resolver, node);
         fuel -= budget - resolver.fuel.get();
         let Some((shell, command)) = resolved else {
@@ -458,6 +489,103 @@ pub(super) fn scan(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
             reference.evidence = clip(resolver.raw(node).unwrap_or(&command)).to_owned();
         }
     }
+}
+
+/// A direct object field. Spreads, computed keys, duplicate keys and methods
+/// make the entire object unresolved: none may silently override the URL/mode.
+fn object_field<'a>(resolver: &Resolver<'a>, object: Node<'a>, wanted: &str) -> Option<Node<'a>> {
+    if object.kind() != "object" {
+        return None;
+    }
+    let mut cursor = object.walk();
+    let mut names = HashSet::new();
+    let mut found = None;
+    for pair in object
+        .named_children(&mut cursor)
+        .filter(|child| !child.is_extra())
+    {
+        if pair.kind() != "pair" {
+            return None;
+        }
+        let key = pair.child_by_field_name("key")?;
+        let key = match key.kind() {
+            "property_identifier" => resolver.raw(key)?.to_owned(),
+            "string" => {
+                let Value::Text(key) = resolver.value(key, 0)? else {
+                    return None;
+                };
+                key
+            }
+            _ => return None,
+        };
+        if !names.insert(key.clone()) {
+            return None;
+        }
+        if key == wanted {
+            found = pair.child_by_field_name("value");
+        }
+    }
+    found
+}
+
+/// Firefox/Chrome proxy settings select a separately downloaded PAC program.
+/// Require the real API shape, an unshadowed namespace, the active PAC mode,
+/// and a bounded resolved URL. Documentation, POST sinks and saved settings
+/// do not supply code dependencies. This does not execute or trust the PAC.
+fn proxy_pac_url<'a>(resolver: &Resolver<'a>, call: Node<'a>) -> Option<String> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let mut callee = call.child_by_field_name("function")?;
+    for name in ["set", "settings", "proxy"] {
+        if callee.kind() != "member_expression"
+            || resolver.raw(callee.child_by_field_name("property")?)? != name
+            || resolver.raw(callee)?.contains("?.")
+        {
+            return None;
+        }
+        callee = callee.child_by_field_name("object")?;
+    }
+    let root = resolver.raw(callee)?;
+    if callee.kind() != "identifier"
+        || !matches!(root, "browser" | "chrome")
+        || resolver.key(callee, root).is_some()
+        || resolver.imports.contains_key(root)
+        || resolver.opaque.contains(&callee.id())
+        || resolver.written_roots.contains(root)
+    {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let config = arguments
+        .named_children(&mut cursor)
+        .find(|child| !child.is_extra())?;
+    let value = object_field(resolver, config, "value")?;
+    let mode = object_field(
+        resolver,
+        value,
+        if root == "browser" {
+            "proxyType"
+        } else {
+            "mode"
+        },
+    )?;
+    let Value::Text(mode) = resolver.value(mode, 0)? else {
+        return None;
+    };
+    let url = if root == "browser" && mode == "autoConfig" {
+        object_field(resolver, value, "autoConfigUrl")?
+    } else if root == "chrome" && mode == "pac_script" {
+        object_field(resolver, object_field(resolver, value, "pacScript")?, "url")?
+    } else {
+        return None;
+    };
+    let Value::Text(url) = resolver.value(url, 0)? else {
+        return None;
+    };
+    let parsed = url::Url::parse(&url).ok()?;
+    (matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()).then_some(url)
 }
 
 /// The shell command a process-execution call runs, when it resolves, and
@@ -492,6 +620,72 @@ fn resolve_call<'a>(resolver: &Resolver<'a>, node: Node<'a>) -> Option<(bool, St
 mod tests {
     use super::super::references_in_bytes;
     use filefacts::{RefKind, RefLocator};
+
+    fn pac_urls(source: &str, filename: &str) -> Vec<filefacts::Reference> {
+        let all = references_in_bytes(source.as_bytes(), filename);
+        all.into_iter()
+            .filter(|reference| reference.source == "ast-browser-pac-url")
+            .collect()
+    }
+
+    #[test]
+    fn browser_pac_programs_follow_active_settings_with_source_offsets() {
+        for (source, filename, url) in [
+            (
+                r#"browser.runtime.onInstalled.addListener(()=>{browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:'https://example.invalid/proxy.pac'}});});"#,
+                "background.js",
+                "https://example.invalid/proxy.pac",
+            ),
+            (
+                r#"const host='https://example.invalid'; browser.proxy.settings.set(/*config*/{'value':{'proxyType':'autoConfig','autoConfigUrl':host+'/next.pac'}});"#,
+                "background.ts",
+                "https://example.invalid/next.pac",
+            ),
+            (
+                r#"chrome.proxy.settings.set({value:{mode:'pac_script',pacScript:{url:'https://example.invalid/chrome.pac'}}});"#,
+                "background.js",
+                "https://example.invalid/chrome.pac",
+            ),
+        ] {
+            let refs = pac_urls(source, filename);
+            assert_eq!(refs.len(), 1, "{source}");
+            assert_eq!(refs[0].locator, RefLocator::Url(url.to_owned()));
+            assert_eq!(refs[0].kind, RefKind::UrlFetch);
+            let offset = refs[0].offset.unwrap() as usize;
+            assert!(
+                source[offset..].starts_with("browser.proxy.settings.set")
+                    || source[offset..].starts_with("chrome.proxy.settings.set")
+            );
+        }
+    }
+
+    #[test]
+    fn browser_pac_unknown_overridden_shadowed_and_documented_values_have_no_api_citation() {
+        let config =
+            "{value:{proxyType:'autoConfig',autoConfigUrl:'https://example.invalid/proxy.pac'}}";
+        for source in [
+            format!("// browser.proxy.settings.set({config});"),
+            format!("const documentation=\"browser.proxy.settings.set({config})\";"),
+            format!("function f(browser){{browser.proxy.settings.set({config});}}"),
+            format!("const browser=local; browser.proxy.settings.set({config});"),
+            format!("import browser from 'some-polyfill'; browser.proxy.settings.set({config});"),
+            format!("browser=local; browser.proxy.settings.set({config});"),
+            format!("browser.proxy.settings=local; browser.proxy.settings.set({config});"),
+            format!("with(local){{browser.proxy.settings.set({config});}}"),
+            "browser.proxy.settings.set({value:{proxyType:'system',autoConfigUrl:'https://example.invalid/unused.pac'}});".into(),
+            "browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:unknown}});".into(),
+            "browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:`https://${host}/proxy.pac`}});".into(),
+            "browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:'https://example.invalid/decoy.pac',...other}});".into(),
+            "browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:'https://example.invalid/decoy.pac',autoConfigUrl:unknown}});".into(),
+            "browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:'https://example.invalid/decoy.pac',[key]:unknown}});".into(),
+            "browser.proxy.settings.set({value:{proxyType:'autoConfig',autoConfigUrl:'data:application/x-ns-proxy-autoconfig,return DIRECT'}});".into(),
+            "chrome.proxy.settings.set({value:{mode:'fixed_servers',pacScript:{url:'https://example.invalid/unused.pac'}}});".into(),
+            "browser.storage.local.set({autoConfigUrl:'https://example.invalid/saved.pac'});".into(),
+            "fetch('https://example.invalid/submission',{method:'POST',body:JSON.stringify({autoConfigUrl:'https://example.invalid/saved.pac'})});".into(),
+        ] {
+            assert!(pac_urls(&source, "background.js").is_empty(), "{source}");
+        }
+    }
 
     fn commands(source: &str) -> Vec<filefacts::Reference> {
         references_in_bytes(source.as_bytes(), "extension.js")
