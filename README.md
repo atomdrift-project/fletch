@@ -26,7 +26,8 @@ Three modules, deliberately walled apart so the dangerous half stays auditable:
   retrieve it through an SSRF-guarded HTTP client, cache it, verify any pin,
   and record provenance. Pure mechanism; no recognition logic leaks in.
 - **`registry`** — look up and normalize a package's *registry metadata*
-  (publish date, author, download counts, rating, removal and hold status)
+  (publish date, author, download and favorite counts, rating, removal and
+  hold status)
   across ecosystems into one shape, so a consumer can judge a dependency before
   paying to fetch and scan its bytes.
 

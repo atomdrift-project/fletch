@@ -29,6 +29,7 @@ use crate::ecosystem::pypi::pypi_artifacts;
 use crate::ecosystem::terraform::terraform_artifact;
 use crate::ecosystem::vscode::{resolve_openvsx, resolve_vscode};
 use crate::purl::Purl;
+use crate::registry::RegistryError;
 
 /// Why a reference resolved to no fetchable artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
@@ -49,14 +50,33 @@ impl From<Unresolved> for ResolveError {
     }
 }
 
+impl From<RegistryError> for ResolveError {
+    /// A registry that could not be read is a failure a later attempt may
+    /// overcome; one that answered without a usable release named none.
+    fn from(error: RegistryError) -> Self {
+        match error {
+            RegistryError::Unavailable(error) => Self::Failed(error),
+            RegistryError::InvalidPurl(_) => Unresolved::InvalidPurl.into(),
+            RegistryError::UnsafeCoordinate => Unresolved::UnsafeCoordinate.into(),
+            RegistryError::NotAPackage
+            | RegistryError::Unsupported(_)
+            | RegistryError::OffRegistry => Unresolved::Unsupported.into(),
+            RegistryError::NotFound | RegistryError::Malformed { .. } | RegistryError::NoRecord => {
+                Unresolved::NoRelease.into()
+            }
+        }
+    }
+}
+
 /// An artifact URL computed from coordinates alone.
 type DeriveFn = fn(&Coordinates<'_>) -> Option<String>;
 /// The registry's listing of every artifact one release publishes.
-type ListFn = fn(&Coordinates<'_>, &dyn Fetch, &BlobCache) -> Vec<ArtifactCandidate>;
+type ListFn =
+    fn(&Coordinates<'_>, &dyn Fetch, &BlobCache) -> Result<Vec<ArtifactCandidate>, RegistryError>;
 /// A registry API naming the artifact URL, and the release it chose when the
 /// coordinates pin none.
 type ApiFn =
-    fn(&Coordinates<'_>, &dyn Fetch, &BlobCache) -> Result<(Option<String>, String), Unresolved>;
+    fn(&Coordinates<'_>, &dyn Fetch, &BlobCache) -> Result<(Option<String>, String), ResolveError>;
 
 /// How fletch reaches one ecosystem's artifacts.
 enum Artifact {
@@ -145,7 +165,7 @@ pub(super) fn rules(typ: &str) -> Rules {
             None,
             Artifact::Derived {
                 derive: None,
-                list: Some(|c, net, cache| terraform_artifact(c, net, cache).into_iter().collect()),
+                list: Some(|c, net, cache| terraform_artifact(c, net, cache).map(|a| vec![a])),
                 listed: |_| true,
             },
         ),
@@ -188,7 +208,10 @@ pub(super) fn rules(typ: &str) -> Rules {
         // (and the latest version) only through their APIs; the ratified
         // `vscode-extension` type covers both, Open VSX named by its
         // `repository_url`.
-        "openvsx" => (None, Artifact::Api(open_vsx)),
+        "openvsx" => (
+            None,
+            Artifact::Api(|c, net, cache| unrefined(resolve_openvsx(c, net, cache))),
+        ),
         "vscode" | "vscode-extension" => (None, Artifact::Api(vscode)),
         // AMO, the ComfyUI Registry and the Dify Marketplace name their
         // artifact only through their APIs (a publisher-keyed CDN path, a
@@ -218,10 +241,15 @@ pub(super) fn rules(typ: &str) -> Rules {
 }
 
 /// An API answer that names the release it chose and its artifact URL.
-fn refined(named: Option<(String, String)>) -> Result<(Option<String>, String), Unresolved> {
-    named
-        .map(|(version, url)| (Some(version), url))
-        .ok_or(Unresolved::NoRelease)
+fn refined(
+    named: Result<(String, String), RegistryError>,
+) -> Result<(Option<String>, String), ResolveError> {
+    Ok(named.map(|(version, url)| (Some(version), url))?)
+}
+
+/// An API answer that names only the artifact URL.
+fn unrefined(url: Result<String, RegistryError>) -> Result<(Option<String>, String), ResolveError> {
+    Ok((None, url?))
 }
 
 /// Whether a Cargo PURL names crates.io, explicitly or by default. A named
@@ -317,30 +345,18 @@ fn clawhub_url(c: &Coordinates<'_>) -> Option<String> {
     Some(url)
 }
 
-fn open_vsx(
-    c: &Coordinates<'_>,
-    net: &dyn Fetch,
-    cache: &BlobCache,
-) -> Result<(Option<String>, String), Unresolved> {
-    resolve_openvsx(c, net, cache)
-        .map(|url| (None, url))
-        .ok_or(Unresolved::NoRelease)
-}
-
 fn vscode(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Result<(Option<String>, String), Unresolved> {
+) -> Result<(Option<String>, String), ResolveError> {
     if c.purl()
         .qualifier("repository_url")
         .is_some_and(|url| url_host_is(url, "open-vsx.org"))
     {
-        return open_vsx(c, net, cache);
+        return unrefined(resolve_openvsx(c, net, cache));
     }
-    resolve_vscode(c, net, cache)
-        .map(|url| (None, url))
-        .ok_or(Unresolved::NoRelease)
+    unrefined(resolve_vscode(c, net, cache))
 }
 
 /// The AUR serves one artifact per package: the current PKGBUILD-tree
@@ -354,7 +370,7 @@ fn aur(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Result<(Option<String>, String), Unresolved> {
+) -> Result<(Option<String>, String), ResolveError> {
     let name = c.path().rsplit('/').next().unwrap_or(c.path());
     Ok((None, resolve_aur(name, net, cache)))
 }
@@ -366,7 +382,7 @@ fn alpm(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Result<(Option<String>, String), Unresolved> {
+) -> Result<(Option<String>, String), ResolveError> {
     if c.path().starts_with("aur/")
         || c.purl()
             .qualifier("repository_url")
@@ -375,10 +391,8 @@ fn alpm(
         return aur(c, net, cache);
     }
     match (c.path().strip_prefix("arch/"), c.encoded_version()) {
-        (Some(name), None) => resolve_arch_current(name, net, cache)
-            .map(|url| (None, url))
-            .ok_or(Unresolved::NoRelease),
-        _ => Err(Unresolved::Unsupported),
+        (Some(name), None) => unrefined(resolve_arch_current(name, net, cache)),
+        _ => Err(Unresolved::Unsupported.into()),
     }
 }
 
@@ -386,13 +400,11 @@ fn composer(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Result<(Option<String>, String), Unresolved> {
+) -> Result<(Option<String>, String), ResolveError> {
     if c.encoded_version().is_none() {
-        return Err(Unresolved::Unsupported);
+        return Err(Unresolved::Unsupported.into());
     }
-    resolve_composer(c, net, cache)
-        .map(|url| (None, url))
-        .ok_or(Unresolved::NoRelease)
+    unrefined(resolve_composer(c, net, cache))
 }
 
 /// Where a PURL's artifact is: the refined PURL its bytes are filed under,
@@ -442,6 +454,29 @@ fn refused(
         "resolution refused"
     );
     why.into()
+}
+
+/// `error` from the `branch` resolution took for `purl`, logged: a refusal
+/// with `reason`, or the registry failure that left the question open.
+fn logged(
+    purl: &Purl,
+    branch: &'static str,
+    error: ResolveError,
+    reason: &'static str,
+) -> ResolveError {
+    match error {
+        ResolveError::Unresolved(why) => refused(purl, branch, why, reason),
+        ResolveError::Failed(error) => {
+            tracing::debug!(
+                locator = %purl,
+                r#type = purl.typ(),
+                branch,
+                %error,
+                "resolution failed: the registry could not be read"
+            );
+            ResolveError::Failed(error)
+        }
+    }
 }
 
 /// Resolve `purl` to its artifact. Online, a declared requirement is first
@@ -534,7 +569,7 @@ fn locate_artifact(c: &Coordinates<'_>, online: Online<'_>) -> Result<Located, R
             }),
         (Artifact::Api(api), Some((net, cache))) => {
             let (named, url) = api(c, net, cache)
-                .map_err(|why| refused(purl, "api", why, "registry API named no artifact"))?;
+                .map_err(|error| logged(purl, "api", error, "registry API named no artifact"))?;
             let refined = match (c.encoded_version(), named) {
                 (None, Some(version)) => purl.with_version(&version).ok_or_else(|| {
                     refused(
@@ -566,7 +601,7 @@ fn listed_artifact(
     cache: &BlobCache,
 ) -> Result<Located, ResolveError> {
     let purl = c.purl();
-    let Some(candidate) = listing(purl, list(c, net, cache))
+    let Some(candidate) = listing(purl, listed(c, list, net, cache)?)
         .into_iter()
         .find(|candidate| candidate.preferred)
     else {
@@ -604,6 +639,29 @@ fn listed_artifact(
         url: candidate.url,
         file_name: candidate.file_name,
     })
+}
+
+/// The registry's listing for `c`. A registry that answered without the
+/// release lists nothing; only one that could not be read is an error.
+fn listed(
+    c: &Coordinates<'_>,
+    list: ListFn,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Vec<ArtifactCandidate>, ResolveError> {
+    match list(c, net, cache).map_err(ResolveError::from) {
+        Ok(candidates) => Ok(candidates),
+        Err(ResolveError::Unresolved(why)) => {
+            tracing::debug!(locator = %c.purl(), unresolved = ?why, "registry listed nothing");
+            Ok(Vec::new())
+        }
+        Err(error) => Err(logged(
+            c.purl(),
+            "listing",
+            error,
+            "registry listing failed",
+        )),
+    }
 }
 
 /// `candidates` with the PURL's common qualifiers applied and their release
@@ -742,7 +800,7 @@ fn purl_artifacts(
         match rules(purl.typ()).artifact {
             Artifact::Derived {
                 list: Some(list), ..
-            } => list(&coordinates, net, cache),
+            } => listed(&coordinates, list, net, cache)?,
             _ => {
                 return Err(refused(
                     purl,
@@ -1252,5 +1310,61 @@ pub(super) mod tests {
         ));
         assert!(!cargo("?repository_url=https:%2F%2Fcrates.io.evil.test"));
         assert!(!cargo("?repository_url=https:%2F%2Fevil.test%2Fcrates.io"));
+    }
+
+    #[test]
+    fn an_unreachable_registry_is_a_failure_not_a_missing_release() {
+        let unreachable = Fixtures::default();
+        let cache = BlobCache::disabled();
+        let resolved =
+            |raw: &str, net: &Fixtures| target(&RefLocator::Purl(raw.into()), net, &cache);
+        // Listings, then registry APIs.
+        for raw in [
+            "pkg:npm/left-pad",
+            "pkg:pypi/requests@2.31.0",
+            "pkg:gem/rails",
+            "pkg:terraform/hashicorp/aws",
+            "pkg:cargo/serde@1.0.0?repository_url=https:%2F%2Fcargo.example.test%2Findex",
+            "pkg:firefox/ublock-origin",
+            "pkg:comfyui/node@1.0",
+            "pkg:dify/org/plugin",
+            "pkg:composer/monolog/monolog@3.0.0",
+            "pkg:vscode/redhat/java",
+            "pkg:openvsx/redhat/java",
+            "pkg:alpm/arch/bash",
+        ] {
+            assert!(
+                matches!(resolved(raw, &unreachable), Err(ResolveError::Failed(_))),
+                "{raw}"
+            );
+        }
+        assert!(matches!(
+            resolve_artifacts(
+                &RefLocator::Purl("pkg:npm/left-pad".into()),
+                &unreachable,
+                &cache
+            ),
+            Err(ResolveError::Failed(_))
+        ));
+        // A registry that answers without the package named no release.
+        let absent = Fixtures::default().refusing("https://registry.npmjs.org/left-pad", 404);
+        assert_eq!(
+            resolved("pkg:npm/left-pad", &absent).err(),
+            Some(ResolveError::Unresolved(Unresolved::NoRelease))
+        );
+    }
+
+    #[test]
+    fn an_alternate_cargo_index_is_needed_only_when_the_template_wants_its_checksum() {
+        let config = "https://cargo.example.test/index/config.json";
+        let purl = "pkg:cargo/serde@1.0.0?repository_url=https:%2F%2Fcargo.example.test%2Findex";
+        let net = Fixtures::default().with(
+            config,
+            br#"{"dl":"https://cargo.example.test/files/{crate}/{version}/{sha256-checksum}"}"#,
+        );
+        assert!(matches!(
+            target(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled()),
+            Err(ResolveError::Failed(_))
+        ));
     }
 }

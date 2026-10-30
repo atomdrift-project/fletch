@@ -23,7 +23,7 @@ pub(crate) fn resolve_firefox(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<(String, String)> {
+) -> Result<(String, String), RegistryError> {
     let (path, version) = (c.path(), c.encoded_version());
     let slug = last_seg(path);
     let api = match version {
@@ -35,10 +35,9 @@ pub(crate) fn resolve_firefox(
             Some(_) => fetch_json::<AddonVersion>(&api, net, cache).map(Some),
             None => fetch_json::<Addon>(&api, net, cache).map(|addon| addon.current_version),
         }
-        .inspect_err(|error| tracing::debug!(url = api, %error, "AMO release unresolved"))
-        .ok()
-        .flatten()?;
-        let resolved = release.version?;
+        .inspect_err(|error| tracing::debug!(url = api, %error, "AMO release unresolved"))?
+        .ok_or(RegistryError::NoRecord)?;
+        let resolved = release.version.ok_or(RegistryError::NoRecord)?;
         // A surprising answer must not substitute another release for the
         // requested one.
         if version.is_some_and(|want| want != resolved) {
@@ -47,13 +46,13 @@ pub(crate) fn resolve_firefox(
                 got = %resolved.escape_debug(),
                 "AMO release refused: the document describes another release"
             );
-            return None;
+            return Err(RegistryError::NoRecord);
         }
-        let url = release.file.and_then(|file| file.url);
-        if url.is_none() {
+        let Some(url) = release.file.and_then(|file| file.url) else {
             tracing::debug!(url = api, "AMO release unresolved: no file URL");
-        }
-        Some((resolved, url?))
+            return Err(RegistryError::NoRecord);
+        };
+        Ok((resolved, url))
     };
     match version {
         Some(_) => immutable_or_fresh(cache, resolve),

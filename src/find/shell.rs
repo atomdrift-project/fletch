@@ -42,17 +42,11 @@ pub(super) fn scan(lang: Lang, out: &mut Found<'_>) {
 }
 
 /// npm lifecycle hooks: a `postinstall` that `wget … | sh` or `npm install`s a
-/// package. The command string is the reference site. Reads the hooks from the
-/// filefacts values JSON (`npm.scripts.{hook}`), so it works equally on a live
-/// file and on the retained facts of an archive member.
-pub(super) fn npm_hooks(values: &serde_json::Value, out: &mut Found<'_>) {
-    let Some(scripts) = values.get("npm").and_then(|n| n.get("scripts")) else {
-        return;
-    };
-    for hook in ["preinstall", "install", "postinstall"] {
-        let Some(cmd) = scripts.get(hook).and_then(serde_json::Value::as_str) else {
-            continue;
-        };
+/// package. The command string is the reference site. Reads the hooks from
+/// filefacts' values, so it works equally on a live file and on the retained
+/// facts of an archive member.
+pub(super) fn npm_hooks(values: &filefacts::Values, out: &mut Found<'_>) {
+    for (hook, cmd) in filefacts::values::npm_install_hooks(values) {
         let source = format!("npm.scripts.{hook}");
         for url in urls::extract_urls(cmd) {
             out.push(

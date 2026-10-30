@@ -25,38 +25,40 @@ const PROVIDERS: &str = "https://registry.terraform.io";
 /// the downloaded bytes — and a response without a well-formed one is refused
 /// rather than fetched unverified. A versionless PURL takes the
 /// [`latest`] version the registry lists, as the registry record does.
-/// `path` and `version` are
-/// `purl`'s percent-encoded coordinates.
+/// [`RegistryError::NoRecord`] when the registry names no usable release.
 pub(crate) fn terraform_artifact(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<ArtifactCandidate> {
+) -> Result<ArtifactCandidate, RegistryError> {
     let (path, version, purl) = (c.path(), c.encoded_version(), c.purl());
-    let (namespace, name) = split_pair(path).ok()?;
+    let (namespace, name) = split_pair(path)?;
     // A value from the registry fills one URL path segment only once encoded
     // and checked, like the PURL's own coordinates.
-    let segment = |value: &str| {
+    let segment = |value: Option<&str>| {
+        let value = value.ok_or(RegistryError::NoRecord)?;
         let encoded = encode_component(value);
-        let safe = safe_coordinate(&encoded);
-        if !safe {
+        if !safe_coordinate(&encoded) {
             tracing::debug!(value = %value.escape_debug(), "Terraform segment refused");
+            return Err(RegistryError::NoRecord);
         }
-        safe.then_some(encoded)
+        Ok(encoded)
     };
     // The version list grows, so it is read with the unpinned TTL.
     let versions = || {
         let url = format!("{PROVIDERS}/v1/providers/{namespace}/{name}/versions");
         fetch_json::<VersionList>(&url, net, &cache.with_meta_ttl(cache.meta_ttl_unpinned()))
             .inspect_err(|error| tracing::debug!(url, %error, "Terraform version list unavailable"))
-            .ok()
     };
     let (version, encoded_version) = match (purl.version(), version) {
         (Some(decoded), Some(encoded)) => (decoded.to_string(), encoded.to_string()),
         _ => {
             let list = versions()?;
-            let current = latest(list.versions.iter().filter_map(|v| v.version.as_deref()))?;
-            (current.to_string(), segment(current)?)
+            let current = latest(list.versions.iter().filter_map(|v| v.version.as_deref()));
+            (
+                current.ok_or(RegistryError::NoRecord)?.to_string(),
+                segment(current)?,
+            )
         }
     };
     let base = format!("{PROVIDERS}/v1/providers/{namespace}/{name}/{encoded_version}");
@@ -72,26 +74,25 @@ pub(crate) fn terraform_artifact(
             let platform = list
                 .versions
                 .iter()
-                .find(|v| v.version.as_deref() == Some(version.as_str()))?
-                .platforms
-                .first()?;
+                .find(|v| v.version.as_deref() == Some(version.as_str()))
+                .and_then(|v| v.platforms.first())
+                .ok_or(RegistryError::NoRecord)?;
             let (os, arch) = (
-                segment(platform.os.as_deref()?)?,
-                segment(platform.arch.as_deref()?)?,
+                segment(platform.os.as_deref())?,
+                segment(platform.arch.as_deref())?,
             );
             tracing::debug!(os, arch, "Terraform provider has no linux_amd64 build");
             download(&os, &arch)
-                .inspect_err(|error| tracing::debug!(%error, "Terraform download unavailable"))
-                .ok()?
+                .inspect_err(|error| tracing::debug!(%error, "Terraform download unavailable"))?
         }
         Err(error) => {
             tracing::debug!(%error, "Terraform download unavailable");
-            return None;
+            return Err(error);
         }
     };
     let (Some(url), Some(shasum)) = (info.download_url, info.shasum) else {
         tracing::debug!("Terraform download names no URL or checksum");
-        return None;
+        return Err(RegistryError::NoRecord);
     };
     if shasum.len() != 64 || !shasum.bytes().all(|b| b.is_ascii_hexdigit()) || !is_web_scheme(&url)
     {
@@ -99,7 +100,7 @@ pub(crate) fn terraform_artifact(
             url = %url.escape_debug(),
             "Terraform download refused: no sha256 to verify it, or not a web URL"
         );
-        return None;
+        return Err(RegistryError::NoRecord);
     }
     let mut candidate = artifact_candidate(url, ArtifactKind::Provider);
     candidate.preferred = file_name_matches(purl, &candidate.file_name);
@@ -115,7 +116,7 @@ pub(crate) fn terraform_artifact(
         }
     }
     candidate.version = Some(version);
-    Some(candidate)
+    Ok(candidate)
 }
 
 /// The Terraform Registry's v2 provider document is the whole record in one
@@ -425,7 +426,7 @@ mod tests {
     }
 
     fn artifact(net: &Fixtures, purl: &str) -> Option<ArtifactCandidate> {
-        terraform_artifact(&coordinates(purl), net, &BlobCache::disabled())
+        terraform_artifact(&coordinates(purl), net, &BlobCache::disabled()).ok()
     }
 
     #[test]

@@ -71,13 +71,14 @@ pub(crate) fn resolve_arch_current(
     name: &str,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<String> {
+) -> Result<String, RegistryError> {
     if !safe_coordinate(name) {
         tracing::debug!(name = %name.escape_debug(), "arch download refused: unsafe name");
-        return None;
+        return Err(RegistryError::UnsafeCoordinate);
     }
     let url = search_url(name);
-    let doc: ArchSearch = serde_json::from_slice(&cached_metadata(&url, net, cache)?).ok()?;
+    let doc: ArchSearch = fetch_json(&url, net, cache)
+        .inspect_err(|error| tracing::debug!(url, %error, "arch download unresolved"))?;
     let Some((repo, arch)) = named(&doc, name, DOWNLOAD_REPOSITORIES)
         .filter_map(|(repo, p)| match p.arch.as_deref()? {
             arch @ ("x86_64" | "any") => Some((repo, arch)),
@@ -86,9 +87,9 @@ pub(crate) fn resolve_arch_current(
         .min_by_key(|&(_, arch)| arch != "x86_64")
     else {
         tracing::debug!(url = %url, "arch download unresolved: no stable x86_64 or any package of that name");
-        return None;
+        return Err(RegistryError::NoRecord);
     };
-    Some(format!(
+    Ok(format!(
         "https://archlinux.org/packages/{repo}/os/{arch}/{name}/download/"
     ))
 }
@@ -400,10 +401,16 @@ mod tests {
             doc.as_bytes(),
         );
         assert_eq!(
-            resolve_arch_current("bash", &net, &BlobCache::disabled()).as_deref(),
+            resolve_arch_current("bash", &net, &BlobCache::disabled())
+                .ok()
+                .as_deref(),
             Some("https://archlinux.org/packages/core/os/x86_64/bash/download/")
         );
-        assert!(resolve_arch_current("../bash", &net, &BlobCache::disabled()).is_none());
+        assert!(
+            resolve_arch_current("../bash", &net, &BlobCache::disabled())
+                .ok()
+                .is_none()
+        );
     }
 
     #[test]

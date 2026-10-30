@@ -21,35 +21,28 @@ use crate::registry::RegistryError;
 /// when unversioned). The `file_name` qualifier picks one exactly; else the
 /// `platform` qualifier's build, else the pure-Ruby one, is preferred and
 /// sorted first. A platform that could restructure the download URL is
-/// dropped.
+/// dropped. An error when the versions document cannot be read.
 pub(crate) fn gem_artifacts(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Vec<ArtifactCandidate> {
+) -> Result<Vec<ArtifactCandidate>, RegistryError> {
     let (name, requested_version, purl) = (c.path(), c.encoded_version(), c.purl());
     let Some(repository) = repository_base(purl, "https://rubygems.org") else {
         tracing::debug!(
             purl = %purl.to_string().escape_debug(),
             "gem artifacts unresolved: repository_url is not a web URL"
         );
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let api = format!("{repository}/api/v1/versions/{name}.json");
-    let builds: Vec<GemVersion> = match fetch_json(
-        &api,
-        net,
-        &for_version(cache, requested_version),
-    ) {
-        Ok(builds) => builds,
-        Err(error) => {
+    let builds: Vec<GemVersion> = fetch_json(&api, net, &for_version(cache, requested_version))
+        .inspect_err(|error| {
             tracing::debug!(url = %api, %error, "gem artifacts unresolved: versions unreadable");
-            return Vec::new();
-        }
-    };
+        })?;
     let Some(version) = purl.version().or_else(|| builds.first()?.number.as_deref()) else {
         tracing::debug!(url = %api, "gem artifacts unresolved: no version listed");
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut candidates: Vec<_> = builds
         .iter()
@@ -81,7 +74,7 @@ pub(crate) fn gem_artifacts(
         candidate.preferred = Some(index) == preferred;
     }
     candidates.sort_by_key(|candidate| !candidate.preferred);
-    candidates
+    Ok(candidates)
 }
 
 /// The candidate for one platform's build of `name` `version`.
@@ -276,7 +269,8 @@ mod tests {
             &coordinates("pkg:gem/rails?platform=x86_64-linux"),
             &net,
             &BlobCache::disabled(),
-        );
+        )
+        .expect("listing");
         assert_eq!(builds.len(), 2, "the unsafe platform is dropped");
         assert!(builds[0].preferred);
         assert_eq!(

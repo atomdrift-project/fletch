@@ -4,8 +4,7 @@ use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
-    Coordinates, Localized, fetch_json, immutable_or_fresh, non_empty, optional, split_pair,
-    unix_secs,
+    Coordinates, Localized, fetch_json, immutable_or_fresh, non_empty, split_pair, unix_secs,
 };
 use crate::fetch::{BlobCache, Fetch, percent_decode, safe_coordinate};
 use crate::registry::RegistryError;
@@ -25,21 +24,24 @@ pub(crate) fn resolve_dify(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<(String, String)> {
+) -> Result<(String, String), RegistryError> {
     let (path, version) = (c.path(), c.encoded_version());
-    let (org, name) = split_pair(path).ok()?;
+    let (org, name) = split_pair(path)?;
     if !safe_coordinate(path) || version.is_some_and(|v| !safe_coordinate(v)) {
         tracing::debug!(
             path = %path.escape_debug(),
             "dify artifact refused: coordinate could restructure the marketplace URL"
         );
-        return None;
+        return Err(RegistryError::UnsafeCoordinate);
     }
     let base = format!("https://marketplace.dify.ai/api/v1/plugins/{org}/{name}");
     let plugin_id = percent_decode(path);
     let wanted = version.map(percent_decode);
     let vetted = |resolved: Option<String>, identifier: Option<String>, url: &str| {
-        let (resolved, identifier) = (resolved?, identifier?);
+        let (Some(resolved), Some(identifier)) = (resolved, identifier) else {
+            tracing::debug!(url, "dify artifact unresolved: no release or identifier");
+            return Err(RegistryError::NoRecord);
+        };
         let checksum = identifier.strip_prefix(&format!("{plugin_id}:{resolved}@"));
         if wanted.as_ref().is_some_and(|want| *want != resolved)
             || !checksum.is_some_and(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -49,21 +51,23 @@ pub(crate) fn resolve_dify(
                 identifier = %identifier.escape_debug(),
                 "dify artifact refused: the answer is not the plugin and release asked for"
             );
-            return None;
+            return Err(RegistryError::NoRecord);
         }
-        Some((resolved, identifier))
+        Ok((resolved, identifier))
     };
     let (resolved, identifier) = match version {
         Some(v) => immutable_or_fresh(cache, |cache| {
             let url = format!("{base}/{v}");
-            let release = optional(fetch_json::<VersionDocument>(&url, net, cache), &url)?
+            let release = fetch_json::<VersionDocument>(&url, net, cache)
+                .inspect_err(|error| tracing::debug!(url, %error, "dify release unreadable"))?
                 .data
                 .version;
             vetted(release.version, release.unique_identifier, &url)
         })?,
         None => {
             let cache = cache.with_meta_ttl(cache.meta_ttl_unpinned());
-            let plugin = optional(fetch_json::<PluginDocument>(&base, net, &cache), &base)?
+            let plugin = fetch_json::<PluginDocument>(&base, net, &cache)
+                .inspect_err(|error| tracing::debug!(url = base, %error, "dify plugin unreadable"))?
                 .data
                 .plugin;
             vetted(
@@ -73,7 +77,7 @@ pub(crate) fn resolve_dify(
             )?
         }
     };
-    Some((
+    Ok((
         resolved,
         format!(
             "https://marketplace.dify.ai/api/v1/plugins/download?unique_identifier={}",
@@ -282,7 +286,8 @@ mod tests {
                 &coordinates("pkg:dify/fr3on/eval-loop"),
                 &eval_loop(ACTIVE, ""),
                 &cache
-            ),
+            )
+            .ok(),
             Some(("0.1.1".to_string(), download.to_string()))
         );
         let release = |identifier: &str| {
@@ -298,6 +303,7 @@ mod tests {
                 &release("fr3on/eval-loop:0.1.0@ff"),
                 &cache
             )
+            .ok()
             .is_some()
         );
         for identifier in [
@@ -311,7 +317,8 @@ mod tests {
                     &coordinates("pkg:dify/fr3on/eval-loop@0.1.0"),
                     &release(identifier),
                     &cache
-                ),
+                )
+                .ok(),
                 None,
                 "{identifier}"
             );

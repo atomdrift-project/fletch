@@ -20,19 +20,19 @@ use crate::registry::RegistryError;
 /// unversioned), each a candidate carrying its kind, wheel tags, Python
 /// constraints, yank status, and registry digests. A `file_name` qualifier
 /// selects one exactly; otherwise [`pypi_rank`] orders them and the first is
-/// preferred. Empty when the document is unreadable.
+/// preferred. An error when the document cannot be read.
 pub(crate) fn pypi_artifacts(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Vec<ArtifactCandidate> {
+) -> Result<Vec<ArtifactCandidate>, RegistryError> {
     let (name, version, purl) = (c.path(), c.encoded_version(), c.purl());
     let Some(repository) = repository_base(purl, "https://pypi.org") else {
         tracing::debug!(
             purl = %purl.to_string().escape_debug(),
             "pypi artifacts unresolved: repository_url is not a web URL"
         );
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let api = version.map_or_else(
         || format!("{repository}/pypi/{name}/json"),
@@ -40,19 +40,16 @@ pub(crate) fn pypi_artifacts(
     );
     // A release's files are fixed once uploaded, but their `yanked` flags are
     // not, so a pinned release revalidates on the pinned window.
-    let doc: Project = match fetch_json(&api, net, &for_version(cache, version)) {
-        Ok(doc) => doc,
-        Err(error) => {
+    let doc: Project =
+        fetch_json(&api, net, &for_version(cache, version)).inspect_err(|error| {
             tracing::debug!(url = %api, %error, "pypi artifacts unresolved: document unreadable");
-            return Vec::new();
-        }
-    };
+        })?;
     let Some(resolved) = purl
         .version()
         .or_else(|| doc.info.as_ref()?.version.as_deref())
     else {
         tracing::debug!(url = %api, "pypi artifacts unresolved: no version named");
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut candidates: Vec<_> = doc
         .urls
@@ -77,7 +74,7 @@ pub(crate) fn pypi_artifacts(
     for (index, candidate) in candidates.iter_mut().enumerate() {
         candidate.preferred = Some(index) == preferred;
     }
-    candidates
+    Ok(candidates)
 }
 
 /// One uploaded file as an artifact candidate; `None` for a file record with
@@ -527,7 +524,8 @@ mod tests {
             &coordinates("pkg:pypi/w@1.0.0"),
             &net,
             &BlobCache::disabled(),
-        );
+        )
+        .expect("listing");
         assert_eq!(files.len(), 2, "a file record with no URL is no candidate");
         assert!(files[0].preferred);
         assert_eq!(files[0].file_name, "w-1.0.0-py3-none-any.whl");

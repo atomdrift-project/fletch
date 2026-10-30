@@ -38,6 +38,7 @@ pub(crate) fn lookup(
     registry.title = skill.display_name;
     registry.description = skill.summary;
     registry.downloads_total = stats.downloads;
+    registry.favorites = stats.stars;
     registry.release_count = stats.versions.and_then(|v| u32::try_from(v).ok());
     Ok(registry)
 }
@@ -76,6 +77,7 @@ struct SkillTags {
 #[serde(default)]
 struct SkillStats {
     downloads: Option<u64>,
+    stars: Option<u64>,
     versions: Option<u64>,
 }
 
@@ -116,7 +118,8 @@ mod tests {
         assert_eq!(r.published_at, Some(1_783_710_964));
         assert_eq!(r.first_published_at, Some(1_782_654_274));
         assert_eq!(r.downloads_total, Some(357));
-        // Stars are not ratings: nothing stands behind a `rating`.
+        // Stars are favorites, not ratings: nothing stands behind a `rating`.
+        assert_eq!(r.favorites, Some(4));
         assert_eq!(r.rating_count, None);
         assert_eq!(r.release_count, Some(12));
     }

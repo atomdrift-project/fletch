@@ -188,6 +188,7 @@ fn docker_hub(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Registr
     registry.author = doc.namespace.or(doc.user);
     registry.description = doc.description;
     registry.downloads_total = doc.pull_count;
+    registry.favorites = doc.star_count;
     Ok(registry)
 }
 
@@ -206,6 +207,7 @@ struct HubRepository {
     #[serde(deserialize_with = "non_empty")]
     description: Option<String>,
     pull_count: Option<u64>,
+    star_count: Option<u64>,
 }
 
 /// Quay repository metadata: anonymous JSON with the description, the owning
@@ -315,7 +317,8 @@ mod tests {
         assert_eq!(r.name, "nginx");
         assert_eq!(r.author.as_deref(), Some("library"));
         assert_eq!(r.downloads_total, Some(1_000_000_000));
-        // Stars are not ratings: nothing stands behind a `rating`.
+        // Stars are favorites, not ratings: nothing stands behind a `rating`.
+        assert_eq!(r.favorites, Some(20_000));
         assert_eq!(r.rating_count, None);
         assert_eq!(r.version, "");
         assert!(r.published_at.is_some());

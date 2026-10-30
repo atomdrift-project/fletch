@@ -714,7 +714,7 @@ pub(super) mod tests {
     fn skipped_and_unresolved() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = BlobCache::with_dir(dir.path().to_path_buf());
-        let net = Fixtures::default();
+        let net = Fixtures::default().refusing("https://pypi.org/pypi/requests/2.0/json", 404);
 
         let mut repo = dep(RefLocator::Purl("pkg:github/o/r".into()), None);
         repo.kind = RefKind::Repository;
@@ -727,6 +727,11 @@ pub(super) mod tests {
             unresolved("pkg:pypi/requests@2.0"),
             Outcome::Unresolved(Unresolved::NoRelease)
         );
+        // A registry that cannot be reached named nothing: the fetch failed.
+        assert!(matches!(
+            unresolved("pkg:pypi/requests@2.1"),
+            Outcome::Failed(FetchError::Transport(_))
+        ));
         assert_eq!(
             unresolved("pkg:swift/github.com/apple/swift-nio@1.0.0"),
             Outcome::Unresolved(Unresolved::Unsupported)

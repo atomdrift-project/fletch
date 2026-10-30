@@ -317,12 +317,16 @@ fn five_star(value: f64, max: f64) -> Option<f32> {
 /// the second read, a wrong answer cached before the release existed (a `200`
 /// placeholder for a version not yet published) would be served forever —
 /// and the real release, published later under that version, never resolved.
+/// A registry that could not be reached is not asked twice.
 fn immutable_or_fresh<T>(
     cache: &BlobCache,
-    resolve: impl Fn(&BlobCache) -> Option<T>,
-) -> Option<T> {
-    resolve(&cache.with_meta_ttl(META_TTL_IMMUTABLE))
-        .or_else(|| resolve(&cache.with_meta_ttl(std::time::Duration::ZERO)))
+    resolve: impl Fn(&BlobCache) -> Result<T, RegistryError>,
+) -> Result<T, RegistryError> {
+    match resolve(&cache.with_meta_ttl(META_TTL_IMMUTABLE)) {
+        Err(RegistryError::Unavailable(error)) => Err(RegistryError::Unavailable(error)),
+        Err(_) => resolve(&cache.with_meta_ttl(std::time::Duration::ZERO)),
+        resolved => resolved,
+    }
 }
 
 /// The final `/`-separated segment of `path`; all of `path` when it has none.
@@ -593,6 +597,27 @@ mod tests {
         let mut record = unknown();
         set_timeline(&mut record, []);
         assert_eq!(record, unknown());
+    }
+
+    #[test]
+    fn an_immutable_document_is_reread_only_when_its_answer_fails_the_check() {
+        let cache = BlobCache::disabled();
+        let asked = std::cell::Cell::new(0);
+        let answering = |error: fn() -> RegistryError| {
+            asked.set(0);
+            let result = immutable_or_fresh(&cache, |_| {
+                asked.set(asked.get() + 1);
+                Err::<(), _>(error())
+            });
+            (result, asked.get())
+        };
+        let (result, asked_times) =
+            answering(|| RegistryError::Unavailable(crate::fetch::FetchError::Timeout));
+        assert!(matches!(result, Err(RegistryError::Unavailable(_))));
+        assert_eq!(asked_times, 1, "an unreachable registry is not asked again");
+        let (result, asked_times) = answering(|| RegistryError::NoRecord);
+        assert!(matches!(result, Err(RegistryError::NoRecord)));
+        assert_eq!(asked_times, 2, "a stale answer is re-read from the network");
     }
 
     #[test]

@@ -22,13 +22,13 @@ const REGISTRY: &str = "https://registry.npmjs.org";
 /// The tarball `purl` names: the requested version, or the dist-tag a
 /// non-version spelling names, or `latest` when unversioned. Carries the
 /// release's platform constraints (`os`, `cpu`, `libc`, `engines.node`) and
-/// its registry digests. Empty when the packument is unreadable or names no
-/// such release.
+/// its registry digests. Empty when the packument names no such release; an
+/// error when the packument cannot be read.
 pub(crate) fn npm_artifacts(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Vec<ArtifactCandidate> {
+) -> Result<Vec<ArtifactCandidate>, RegistryError> {
     let (path, requested_version, purl) = (c.path(), c.encoded_version(), c.purl());
     let name = npm_registry_name(path);
     let Some(repository) = repository_base(purl, REGISTRY) else {
@@ -36,16 +36,13 @@ pub(crate) fn npm_artifacts(
             purl = %purl.to_string().escape_debug(),
             "npm artifacts unresolved: repository_url is not a web URL"
         );
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let api = format!("{repository}/{name}");
-    let doc: Packument = match fetch_json(&api, net, &for_version(cache, requested_version)) {
-        Ok(doc) => doc,
-        Err(error) => {
+    let doc: Packument = fetch_json(&api, net, &for_version(cache, requested_version))
+        .inspect_err(|error| {
             tracing::debug!(url = %api, %error, "npm artifacts unresolved: packument unreadable");
-            return Vec::new();
-        }
-    };
+        })?;
     let resolved = match purl.version() {
         Some(version) if doc.versions.contains_key(version) => Some(version),
         Some(tag) => doc.tag(tag),
@@ -57,7 +54,7 @@ pub(crate) fn npm_artifacts(
             requested = ?purl.version(),
             "npm artifacts unresolved: no such version or dist-tag"
         );
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let release = doc.versions.get(version);
     let dist = release.and_then(|r| r.dist.as_ref());
@@ -94,7 +91,7 @@ pub(crate) fn npm_artifacts(
         candidate.checksums.insert("sha1".into(), sha1);
     }
     candidate.preferred = file_name_matches(purl, &candidate.file_name);
-    vec![candidate]
+    Ok(vec![candidate])
 }
 
 /// Add each `algorithm-base64` token of a Subresource Integrity string to
@@ -616,7 +613,8 @@ mod tests {
             "2.0.0":{}}}"#;
         let net = Fixtures::default().with("https://registry.npmjs.org/p", doc);
         let cache = BlobCache::disabled();
-        let artifacts = |raw: &str| npm_artifacts(&coordinates(raw), &net, &cache);
+        let artifacts =
+            |raw: &str| npm_artifacts(&coordinates(raw), &net, &cache).expect("listing");
         let latest = artifacts("pkg:npm/p");
         assert_eq!(latest[0].url, "https://registry.npmjs.org/p/-/p-1.0.0.tgz");
         assert_eq!(

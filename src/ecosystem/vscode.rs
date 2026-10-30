@@ -29,15 +29,14 @@ pub(crate) fn resolve_openvsx(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<String> {
-    let (namespace, name) = c.pair().ok()?;
+) -> Result<String, RegistryError> {
+    let (namespace, name) = c.pair()?;
     let url = match c.encoded_version() {
         Some(v) => format!("{OPEN_VSX_API}/{namespace}/{name}/{v}"),
         None => format!("{OPEN_VSX_API}/{namespace}/{name}"),
     };
     let doc: OpenVsxExtension = fetch_json(&url, net, &for_version(cache, c.version()))
-        .inspect_err(|error| tracing::debug!(url, %error, "Open VSX artifact unresolved"))
-        .ok()?;
+        .inspect_err(|error| tracing::debug!(url, %error, "Open VSX artifact unresolved"))?;
     // A surprising answer must not substitute another release for the
     // requested one.
     if let Some(want) = c.version()
@@ -49,13 +48,12 @@ pub(crate) fn resolve_openvsx(
             got = ?doc.version,
             "Open VSX artifact refused: the document describes another release"
         );
-        return None;
+        return Err(RegistryError::NoRecord);
     }
-    let download = doc.files.and_then(|files| files.download);
-    if download.is_none() {
+    doc.files.and_then(|files| files.download).ok_or_else(|| {
         tracing::debug!(url, "Open VSX artifact unresolved: no download URL");
-    }
-    download
+        RegistryError::NoRecord
+    })
 }
 
 /// The `.vsix` the VS Code Marketplace serves for the extension `purl` names,
@@ -65,8 +63,8 @@ pub(crate) fn resolve_vscode(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<String> {
-    let (publisher, name) = c.pair().ok()?;
+) -> Result<String, RegistryError> {
+    let (publisher, name) = c.pair()?;
     // The publisher becomes a label of the gallery's hostname, so it must be a
     // publisher ID as `vsce` enforces it (`^[a-z0-9][a-z0-9-]*$`, any case),
     // which is also one hostname label of at most 63 bytes.
@@ -80,27 +78,27 @@ pub(crate) fn resolve_vscode(
             publisher = %publisher.escape_debug(),
             "VS Code artifact refused: publisher is not a hostname label"
         );
-        return None;
+        return Err(RegistryError::UnsafeCoordinate);
     }
     let version = match c.encoded_version() {
         Some(v) => v.to_string(),
         None => {
             let id = extension_id(c);
-            let ext = marketplace_extension(&id, net, &for_version(cache, None))
-                .inspect_err(|error| {
+            let ext = marketplace_extension(&id, net, &for_version(cache, None)).inspect_err(
+                |error| {
                     tracing::debug!(%id, %error, "VS Code artifact unresolved");
-                })
-                .ok()?;
+                },
+            )?;
             let Some(latest) = ext.versions.into_iter().next().and_then(|v| v.version) else {
                 tracing::debug!(%id, "VS Code artifact unresolved: no version listed");
-                return None;
+                return Err(RegistryError::NoRecord);
             };
             // The registry's version goes into a URL path: encoded, it can
             // only ever be one segment.
             encode_component(&latest)
         }
     };
-    Some(format!(
+    Ok(format!(
         "https://{publisher}.gallery.vsassets.io/_apis/public/gallery/publisher/{publisher}/extension/{name}/{version}/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage"
     ))
 }
@@ -603,7 +601,9 @@ mod tests {
                 open_vsx_doc("1.55.0", "2026-06-23T00:00:00Z").as_bytes(),
             );
         assert_eq!(
-            resolve_openvsx(&purl("pkg:vscode-extension/redhat/java"), &net, &cache).as_deref(),
+            resolve_openvsx(&purl("pkg:vscode-extension/redhat/java"), &net, &cache)
+                .ok()
+                .as_deref(),
             Some("https://open-vsx.org/api/redhat/java/1.55.0/file/redhat.java-1.55.0.vsix")
         );
         assert_eq!(
@@ -612,6 +612,7 @@ mod tests {
                 &net,
                 &cache
             )
+            .ok()
             .as_deref(),
             Some("https://open-vsx.org/api/redhat/java/1.54.0/file/redhat.java-1.54.0.vsix")
         );
@@ -620,11 +621,12 @@ mod tests {
                 &purl("pkg:vscode-extension/redhat/java@1.53.0"),
                 &net,
                 &cache
-            ),
+            )
+            .ok(),
             None
         );
         assert_eq!(
-            resolve_openvsx(&purl("pkg:vscode-extension/redhat/x/java"), &net, &cache),
+            resolve_openvsx(&purl("pkg:vscode-extension/redhat/x/java"), &net, &cache).ok(),
             None
         );
     }
@@ -635,7 +637,9 @@ mod tests {
         let cache = BlobCache::disabled();
         let net = marketplace_net(&marketplace_answer());
         assert_eq!(
-            resolve_vscode(&purl("pkg:vscode/redhat/java"), &net, &cache).as_deref(),
+            resolve_vscode(&purl("pkg:vscode/redhat/java"), &net, &cache)
+                .ok()
+                .as_deref(),
             Some(
                 "https://redhat.gallery.vsassets.io/_apis/public/gallery/publisher/redhat/extension/java/1.55.0/assetbyname/Microsoft.VisualStudio.Services.VSIXPackage"
             )
@@ -648,6 +652,7 @@ mod tests {
                 &marketplace_net(answer),
                 &cache
             )
+            .ok()
             .is_some_and(|url| url.contains("/1.0%2F..%2Fx/"))
         );
     }

@@ -3,9 +3,7 @@
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
-use crate::ecosystem::{
-    Coordinates, fetch_json, immutable_or_fresh, non_empty, optional, unix_secs,
-};
+use crate::ecosystem::{Coordinates, fetch_json, immutable_or_fresh, non_empty, unix_secs};
 use crate::fetch::{BlobCache, Fetch, is_web_scheme, percent_decode, safe_coordinate};
 use crate::registry::RegistryError;
 
@@ -22,7 +20,7 @@ pub(crate) fn resolve_comfyui(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<(String, String)> {
+) -> Result<(String, String), RegistryError> {
     let (path, version) = (c.path(), c.encoded_version());
     // A node id is one global segment: the registry has no namespace.
     if path.is_empty()
@@ -34,7 +32,7 @@ pub(crate) fn resolve_comfyui(
             path = %path.escape_debug(),
             "comfyui artifact refused: not a node id"
         );
-        return None;
+        return Err(RegistryError::UnsafeCoordinate);
     }
     let base = format!("https://api.comfy.org/nodes/{path}/install");
     let api = match version {
@@ -44,13 +42,15 @@ pub(crate) fn resolve_comfyui(
     let node_id = percent_decode(path);
     let wanted = version.map(percent_decode);
     let resolve = |cache: &BlobCache| {
-        let install: Install = optional(fetch_json(&api, net, cache), &api)?;
+        let install: Install = fetch_json(&api, net, cache).inspect_err(|error| {
+            tracing::debug!(url = %api, %error, "comfyui artifact unresolved");
+        })?;
         let (Some(resolved), Some(url)) = (install.version, install.download_url) else {
             tracing::debug!(
                 url = %api,
                 "comfyui artifact unresolved: the install answer lacks a version or URL"
             );
-            return None;
+            return Err(RegistryError::NoRecord);
         };
         if wanted.as_ref().is_some_and(|want| *want != resolved)
             || install.node_id.as_deref() != Some(node_id.as_str())
@@ -61,9 +61,9 @@ pub(crate) fn resolve_comfyui(
                 resolved = %resolved.escape_debug(),
                 "comfyui artifact refused: the answer is not the node and release asked for"
             );
-            return None;
+            return Err(RegistryError::NoRecord);
         }
-        Some((resolved, url))
+        Ok((resolved, url))
     };
     match version {
         Some(_) => immutable_or_fresh(cache, resolve),
@@ -218,7 +218,8 @@ mod tests {
                 &coordinates("pkg:comfyui/n@1.0"),
                 &net,
                 &BlobCache::disabled()
-            ),
+            )
+            .ok(),
             Some(("1.0".to_string(), "https://cdn.comfy.org/n.zip".to_string()))
         );
         assert_eq!(
@@ -232,7 +233,7 @@ mod tests {
     fn an_install_answer_for_another_node_or_release_is_refused() {
         let cache = BlobCache::disabled();
         assert_eq!(
-            resolve_comfyui(&coordinates("pkg:comfyui/n@1.0"), &install("0.9"), &cache),
+            resolve_comfyui(&coordinates("pkg:comfyui/n@1.0"), &install("0.9"), &cache).ok(),
             None
         );
         let other = serde_json::json!({"version": "1.0", "node_id": "evil",
@@ -243,7 +244,7 @@ mod tests {
             other.as_bytes(),
         );
         assert_eq!(
-            resolve_comfyui(&coordinates("pkg:comfyui/n@1.0"), &net, &cache),
+            resolve_comfyui(&coordinates("pkg:comfyui/n@1.0"), &net, &cache).ok(),
             None
         );
     }

@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::ecosystem::{Coordinates, fetch_json, null_default, set_timeline, unix_secs};
 use crate::fetch::{
-    ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, cached_metadata,
+    ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, cached_metadata_status,
     deterministic_artifacts, file_name_matches, is_crates_io, is_web_scheme, percent_decode,
     purl_checksums,
 };
@@ -16,18 +16,18 @@ use crate::registry::RegistryError;
 /// alternative registry's comes from its index `config.json` `dl` template,
 /// filled with the PURL's `sha256` checksum or, failing that, the index
 /// record's. Empty when the registry, its template, or the version is
-/// unknown.
+/// unknown; an error when the registry cannot be read.
 pub(crate) fn cargo_artifacts(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Vec<ArtifactCandidate> {
+) -> Result<Vec<ArtifactCandidate>, RegistryError> {
     let (purl, name, version) = (c.purl(), c.path(), c.encoded_version());
     let Some(repository) = purl.qualifier("repository_url") else {
-        return deterministic_artifacts(purl, ArtifactKind::Crate);
+        return Ok(deterministic_artifacts(purl, ArtifactKind::Crate));
     };
     if is_crates_io(repository) {
-        return deterministic_artifacts(purl, ArtifactKind::Crate);
+        return Ok(deterministic_artifacts(purl, ArtifactKind::Crate));
     }
     let repository = repository.trim_end_matches('/');
     let repository = repository.strip_prefix("sparse+").unwrap_or(repository);
@@ -36,30 +36,35 @@ pub(crate) fn cargo_artifacts(
             repository = %repository.escape_debug(),
             "cargo artifacts unresolved: repository_url is not a web URL"
         );
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(version) = version.map(percent_decode) else {
         tracing::debug!(
             repository = %repository.escape_debug(),
             "cargo artifacts unresolved: an alternative registry needs a version"
         );
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let config_url = format!("{repository}/config.json");
-    let Some(config) = cached_metadata(
+    let config: IndexConfig = fetch_json(
         &config_url,
         net,
         &cache.with_meta_ttl(cache.meta_ttl_pinned()),
     )
-    .and_then(|bytes| serde_json::from_slice::<IndexConfig>(&bytes).ok()) else {
-        tracing::debug!(url = %config_url, "cargo artifacts unresolved: no readable index config");
-        return Vec::new();
-    };
+    .inspect_err(|error| {
+        tracing::debug!(url = %config_url, %error, "cargo artifacts unresolved: no readable index config");
+    })?;
     let mut checksums = purl_checksums(purl);
-    if !checksums.contains_key("sha256")
-        && let Some(checksum) = cargo_index_checksum(repository, name, &version, net, cache)
-    {
-        checksums.insert("sha256".into(), checksum);
+    if !checksums.contains_key("sha256") {
+        // The index's checksum enriches the candidate, unless the download
+        // URL cannot be built without it.
+        match cargo_index_checksum(repository, name, &version, net, cache) {
+            Ok(Some(checksum)) => {
+                checksums.insert("sha256".into(), checksum);
+            }
+            Err(error) if config.dl.contains("{sha256-checksum}") => return Err(error),
+            Ok(None) | Err(_) => {}
+        }
     }
     let Some(url) = cargo_download_url(
         &config.dl,
@@ -72,7 +77,7 @@ pub(crate) fn cargo_artifacts(
             template = %config.dl.escape_debug(),
             "cargo artifacts unresolved: the download template does not expand to a web URL"
         );
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut candidate = artifact_candidate(url, ArtifactKind::Crate);
     candidate.checksums = checksums;
@@ -80,27 +85,40 @@ pub(crate) fn cargo_artifacts(
         .qualifiers
         .insert("repository_url".into(), repository.to_string());
     candidate.preferred = file_name_matches(purl, &candidate.file_name);
-    vec![candidate]
+    Ok(vec![candidate])
 }
 
 /// The `cksum` the registry's index records for `name` `version`: the sparse
 /// index file holds one JSON record per line, one line per version. A line
-/// that is not such a record is skipped.
+/// that is not such a record is skipped; an index without the crate has no
+/// checksum, and one that cannot be read is an error.
 fn cargo_index_checksum(
     repository: &str,
     name: &str,
     version: &str,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<String> {
+) -> Result<Option<String>, RegistryError> {
     let lower = name.to_ascii_lowercase();
-    let prefix = cargo_registry_prefix(&lower)?;
+    let Some(prefix) = cargo_registry_prefix(&lower) else {
+        return Ok(None);
+    };
     let index_url = format!("{repository}/{prefix}/{lower}");
-    let bytes = cached_metadata(
+    let bytes = match cached_metadata_status(
         &index_url,
+        &[],
         net,
         &cache.with_meta_ttl(cache.meta_ttl_pinned()),
-    )?;
+    )
+    .map_err(RegistryError::from)
+    {
+        Ok(bytes) => bytes,
+        Err(RegistryError::NotFound) => return Ok(None),
+        Err(error) => {
+            tracing::debug!(url = %index_url, %error, "cargo index unreadable");
+            return Err(error);
+        }
+    };
     let checksum = String::from_utf8_lossy(&bytes)
         .lines()
         .filter_map(|line| serde_json::from_str::<IndexEntry>(line).ok())
@@ -109,7 +127,7 @@ fn cargo_index_checksum(
     if checksum.is_none() {
         tracing::debug!(url = %index_url, version = %version.escape_debug(), "cargo index has no record of the version");
     }
-    checksum
+    Ok(checksum)
 }
 
 /// Expand a registry's `dl` template for `name` `version`. A template with no
@@ -379,6 +397,7 @@ mod tests {
         let cache = BlobCache::disabled();
         let checksum = |name, version| {
             cargo_index_checksum("https://reg.test/index", name, version, &net, &cache)
+                .expect("index read")
         };
         assert_eq!(checksum("Foo", "1.0.0").as_deref(), Some("bb"));
         assert_eq!(checksum("foo", "0.9.0").as_deref(), Some("aa"));

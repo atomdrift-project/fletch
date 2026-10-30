@@ -162,6 +162,7 @@ fn resolve_pypi(
     );
     let purl = Purl::parse(&format!("pkg:pypi/{rest}")).ok()?;
     pypi_artifacts(&crate::ecosystem::Coordinates::new(&purl).ok()?, net, cache)
+        .ok()?
         .into_iter()
         .find(|candidate| candidate.preferred)
         .map(|candidate| candidate.url)

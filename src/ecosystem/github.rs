@@ -75,6 +75,7 @@ pub(crate) fn lookup(
         .license
         .and_then(|l| l.spdx_id)
         .filter(|s| s != "NOASSERTION");
+    registry.favorites = doc.stargazers_count;
     registry.deprecated = flag(doc.archived, "archived");
     Ok(registry)
 }
@@ -94,6 +95,7 @@ struct Repo {
     license: Option<License>,
     archived: Option<bool>,
     private: Option<bool>,
+    stargazers_count: Option<u64>,
 }
 
 /// The account that owns the repository.
@@ -145,7 +147,8 @@ mod tests {
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.author.as_deref(), Some("gin-gonic"));
         assert_eq!(r.license.as_deref(), Some("MIT"));
-        // Stars are not ratings: nothing stands behind a `rating`.
+        // Stars are favorites, not ratings: nothing stands behind a `rating`.
+        assert_eq!(r.favorites, Some(88_739));
         assert_eq!(r.rating_count, None);
         assert_eq!(r.deprecated, None);
     }

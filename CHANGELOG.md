@@ -29,6 +29,13 @@ strongly typed; the migration notes below cover every breaking change.
 - Distro indices are streamed with per-format caps; openSUSE's sha512
   `primary.xml` checksum is now verified.
 
+### Added
+
+- Registry records report `favorites`, the star/like count with no score
+  behind it: GitHub stars, Hugging Face likes, Docker Hub stars, Packagist
+  favers, ClawHub stars. `rating_count` stays the votes behind a `rating`.
+  Requires a filefacts with `Registry::favorites`.
+
 ### Fixes
 
 - SRI `sha256-<base64>` pins verify; they were always reported as mismatches.
@@ -45,6 +52,11 @@ strongly typed; the migration notes below cover every breaking change.
   (`conda -c conda-forge`, `gem -v 1.2.3`, `apt -t …`); npm names ending in
   `.js` are found; `RUN [...]` exec forms keep the `FROM` distro.
 - A transient 5xx is retried per request instead of holding the whole host.
+- A registry that cannot be reached while resolving an artifact is a failed
+  fetch (`Outcome::Failed`, retryable), never `Unresolved::NoRelease`, for
+  every ecosystem; a registry that answers without the release still names
+  none. An alternate Cargo registry's index is required only when its
+  download template needs the checksum.
 
 ### Migration
 
@@ -70,7 +82,11 @@ strongly typed; the migration notes below cover every breaking change.
 - `references`, `references_in_bytes`, `references_from_facts` return
   `Discovery { references, unresolved, truncated }`.
 - `fetch_calls`, `discover_fetch_calls`, `discover_batch_programs` →
-  `references_from_facts(file_type, values, symbols, declared)`.
+  `references_from_facts(file_type, values, symbols, declared)`, where
+  `values` is a `&filefacts::Values`, not its `as_json()` tree: pass
+  `parsed.values()`, or rebuild retained JSON with
+  `filefacts::Values::from(json)`. Requires a filefacts with
+  `filefacts::values`.
 - `file_type: &str` parameters take `filefacts::FileType`.
 
 **fetch**

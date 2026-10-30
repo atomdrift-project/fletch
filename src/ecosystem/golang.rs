@@ -15,15 +15,22 @@ use crate::registry::RegistryError;
 /// Go module zips: the proxy's URL for the module path as written, unless
 /// the proxy's refusal names the spelling it wants ([`goproxy_canonical_path`]),
 /// in which case the candidate is built for that spelling.
+///
+/// Never an error: a proxy that cannot be asked leaves the path as written,
+/// and the fetch reports the proxy's failure.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "shaped to fit the resolution table"
+)]
 pub(crate) fn golang_artifacts(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Vec<ArtifactCandidate> {
+) -> Result<Vec<ArtifactCandidate>, RegistryError> {
     let (purl, path, version) = (c.purl(), c.path(), c.encoded_version());
     let resolved = goproxy_canonical_path(path, version, net, cache);
     if resolved.path == path {
-        return deterministic_artifacts(purl, ArtifactKind::Zip);
+        return Ok(deterministic_artifacts(purl, ArtifactKind::Zip));
     }
     // The canonical string opens with the path as written; anything after it
     // (version, qualifiers, subpath) carries over to the proxy's spelling.
@@ -37,9 +44,9 @@ pub(crate) fn golang_artifacts(
             canonical = %resolved.path.escape_debug(),
             "go proxy spelling does not form a PURL; using the path as written"
         );
-        return deterministic_artifacts(purl, ArtifactKind::Zip);
+        return Ok(deterministic_artifacts(purl, ArtifactKind::Zip));
     };
-    deterministic_artifacts(&proxy_spelled, ArtifactKind::Zip)
+    Ok(deterministic_artifacts(&proxy_spelled, ArtifactKind::Zip))
 }
 
 /// What [`goproxy_canonical_path`] learned about a module path.

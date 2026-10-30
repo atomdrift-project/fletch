@@ -2,7 +2,8 @@
 //! `RunHTMLApplication` scriptlet) in retained Batch command-site facts.
 //! No CMD expansion, JavaScript evaluation, COM activation or fetch runs here.
 
-use filefacts::{RefKind, RefLocator, Reference};
+use filefacts::values::BatchCommandSite;
+use filefacts::{RefKind, RefLocator, Reference, Values};
 
 use super::Discovery;
 use super::UnresolvedFetchCall;
@@ -84,16 +85,10 @@ fn scriptlet(input: &str) -> Option<&str> {
 }
 
 /// Remote programs the command sites of a Batch file's `values` load, and
-/// the sites whose target is a runtime value. The tree is filefacts' values
-/// JSON, read by path since filefacts exposes no typed view of it.
-pub(super) fn discover(values: &serde_json::Value) -> Discovery {
+/// the sites whose target is a runtime value.
+pub(super) fn discover(values: &Values) -> Discovery {
     let mut out = Discovery::default();
-    let batch = values.pointer("/source/batch");
-    if batch
-        .and_then(|v| v.get("command_sites_truncated"))
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
+    if filefacts::values::batch_command_sites_truncated(values) {
         out.truncated = true;
         tracing::debug!(
             recognizer = "batch",
@@ -101,39 +96,32 @@ pub(super) fn discover(values: &serde_json::Value) -> Discovery {
             "command sites were truncated at extraction; later sites are not read"
         );
     }
-    let Some(sites) = batch
-        .and_then(|v| v.get("command_sites"))
-        .and_then(serde_json::Value::as_array)
-    else {
-        return out;
-    };
-    if sites.len() > MAX_SITES {
+    let mut sites = filefacts::values::batch_command_sites(values);
+    for site in sites.by_ref().take(MAX_SITES) {
+        site_targets(&site, &mut out);
+    }
+    if sites.next().is_some() {
         out.truncated = true;
         tracing::debug!(
             recognizer = "batch",
             limit = MAX_SITES,
-            sites = sites.len(),
             "more command sites than filefacts records; the rest are not read"
         );
-    }
-    for site in sites.iter().take(MAX_SITES) {
-        site_targets(site, &mut out);
     }
     out
 }
 
 /// The remote program one command site loads, or the gap when its target is
 /// a runtime value.
-fn site_targets(site: &serde_json::Value, out: &mut Discovery) {
-    let (Some(name), Some(text), Some(offset), Some(name_offset), Some(name_end)) = (
-        site["name"].as_str(),
-        site["text"].as_str(),
-        site["offset"].as_u64(),
-        site["name_offset"].as_u64(),
-        site["name_end"].as_u64(),
-    ) else {
-        return;
-    };
+fn site_targets(site: &BatchCommandSite<'_>, out: &mut Discovery) {
+    let &BatchCommandSite {
+        name,
+        text,
+        offset,
+        name_offset,
+        name_end,
+        ..
+    } = site;
     let relative = |at: u64| at.checked_sub(offset).and_then(|x| usize::try_from(x).ok());
     let (Some(start), Some(end)) = (relative(name_offset), relative(name_end)) else {
         return;
@@ -191,7 +179,7 @@ mod tests {
         let parsed = filefacts::OpenOptions::new()
             .file_type(filefacts::FileType::Batch)
             .open(source.as_bytes());
-        discover(parsed.values().as_json())
+        discover(parsed.values())
     }
 
     #[test]
@@ -239,15 +227,18 @@ mod tests {
 
     #[test]
     fn truncated_sites_are_reported_as_truncation_not_as_a_call() {
-        let truncated =
-            discover(&serde_json::json!({"source":{"batch":{"command_sites_truncated":true}}}));
+        let truncated = discover(&Values::from(
+            serde_json::json!({"source":{"batch":{"command_sites_truncated":true}}}),
+        ));
         assert!(truncated.truncated);
         assert!(truncated.unresolved.is_empty() && truncated.references.is_empty());
 
         let site = serde_json::json!({"name": "mshta", "text": "mshta https://p.test/a.hta",
             "offset": 0, "name_offset": 0, "name_end": 5});
         let sites = vec![site; MAX_SITES + 1];
-        let many = discover(&serde_json::json!({"source":{"batch":{"command_sites": sites}}}));
+        let many = discover(&Values::from(
+            serde_json::json!({"source":{"batch":{"command_sites": sites}}}),
+        ));
         assert!(many.truncated);
         assert_eq!(many.references.len(), MAX_SITES);
     }

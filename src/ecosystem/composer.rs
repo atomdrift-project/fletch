@@ -19,12 +19,14 @@ pub(crate) fn resolve_composer(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> Option<String> {
-    let (name, version) = (c.path(), c.encoded_version()?);
+) -> Result<String, RegistryError> {
+    let (name, version) = (
+        c.path(),
+        c.encoded_version().ok_or(RegistryError::NoRecord)?,
+    );
     let url = format!("https://repo.packagist.org/p2/{name}.json");
     let mut doc: ReleaseList = fetch_json(&url, net, &for_version(cache, Some(version)))
-        .inspect_err(|error| tracing::debug!(url, %error, "Packagist release list unavailable"))
-        .ok()?;
+        .inspect_err(|error| tracing::debug!(url, %error, "Packagist release list unavailable"))?;
     let want = version.trim_start_matches('v');
     let dist = doc
         .packages
@@ -38,14 +40,14 @@ pub(crate) fn resolve_composer(
         })
         .and_then(|v| v.dist)
         .and_then(|d| d.url);
-    if dist.is_none() {
+    dist.ok_or_else(|| {
         tracing::debug!(
             package = %name.escape_debug(),
             version = %version.escape_debug(),
             "Packagist lists no dist for this release"
         );
-    }
-    dist
+        RegistryError::NoRecord
+    })
 }
 
 /// Packagist's package document: lifetime downloads alongside every
@@ -100,6 +102,7 @@ pub(crate) fn lookup(
     registry.license = release.and_then(|v| v.license.as_ref()?.first()).cloned();
     registry.downloads_total = pkg.downloads.as_ref().and_then(|d| d.total);
     registry.downloads_recent = pkg.downloads.as_ref().and_then(|d| d.monthly);
+    registry.favorites = pkg.favers;
     registry.maintainers = pkg
         .maintainers
         .as_ref()
@@ -156,6 +159,7 @@ struct Package {
     #[serde(deserialize_with = "non_empty")]
     repository: Option<String>,
     downloads: Option<Downloads>,
+    favers: Option<u64>,
     maintainers: Option<Vec<IgnoredAny>>,
 }
 
@@ -233,7 +237,8 @@ mod tests {
                 &coordinates("pkg:composer/monolog/monolog@3.0.0"),
                 &net,
                 &cache
-            ),
+            )
+            .ok(),
             Some("https://api.github.com/repos/Seldaek/monolog/zipball/abc".to_string())
         );
         assert_eq!(
@@ -241,7 +246,8 @@ mod tests {
                 &coordinates("pkg:composer/monolog/monolog@v2.9.1"),
                 &net,
                 &cache
-            ),
+            )
+            .ok(),
             Some("https://api.github.com/repos/Seldaek/monolog/zipball/old".to_string()),
             "a minified `__unset` field costs the field, not the list"
         );
@@ -251,7 +257,8 @@ mod tests {
                 &coordinates("pkg:composer/monolog/monolog@9.9.9"),
                 &net,
                 &cache
-            ),
+            )
+            .ok(),
             None
         );
     }
@@ -270,7 +277,8 @@ mod tests {
                 &coordinates("pkg:composer/monolog/monolog@3.0.0"),
                 &warm,
                 &cache
-            ),
+            )
+            .ok(),
             url
         );
         // The registry is gone; the cached list still answers.
@@ -279,7 +287,8 @@ mod tests {
                 &coordinates("pkg:composer/monolog/monolog@3.0.0"),
                 &Fixtures::default(),
                 &cache
-            ),
+            )
+            .ok(),
             url
         );
     }
@@ -309,7 +318,8 @@ mod tests {
         assert_eq!(r.version, "10.0.0");
         assert_eq!(r.latest_version.as_deref(), Some("10.0.0"));
         assert_eq!(r.published_at, Some(1_609_459_200)); // 2021-01-01
-        // Favers are stars with no rating behind them.
+        // Favers are favorites with no rating behind them.
+        assert_eq!(r.favorites, Some(4242));
         assert_eq!(r.rating_count, None);
 
         // A requested version the package lacks keeps its own name, undated.

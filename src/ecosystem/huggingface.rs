@@ -57,6 +57,7 @@ pub(crate) fn lookup(
     registry.license = license;
     // HF's `downloads` is a rolling 30-day count, not a lifetime total.
     registry.downloads_recent = doc.downloads;
+    registry.favorites = doc.likes;
     Ok(registry)
 }
 
@@ -77,6 +78,7 @@ struct Model {
     #[serde(deserialize_with = "null_default")]
     tags: Vec<String>,
     downloads: Option<u64>,
+    likes: Option<u64>,
 }
 
 /// The model card's front matter, as the Hub parsed it.
@@ -121,7 +123,8 @@ mod tests {
         assert_eq!(r.author.as_deref(), Some("microsoft"));
         assert_eq!(r.license.as_deref(), Some("apache-2.0"));
         assert_eq!(r.downloads_recent, Some(1_234_567));
-        // Likes are not ratings: nothing stands behind a `rating`.
+        // Likes are favorites, not ratings: nothing stands behind a `rating`.
+        assert_eq!(r.favorites, Some(89));
         assert_eq!(r.rating_count, None);
         assert_eq!(r.published_at, Some(1_682_244_000)); // lastModified
         assert_eq!(r.first_published_at, Some(1_647_424_800)); // createdAt
