@@ -454,9 +454,9 @@ dependencies = [
 
 [[package]]
 name = "encoding_rs"
-version = "0.8.43"
+version = "0.8.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "844dfa6d76a4e6b9d98e03ae5ead89fbedd02cbd1206b7817d6d3dca62326967"
+checksum = "89253175e704ab869b04f9db224d38630e0211a53841a79181deae0889e169f5"
 dependencies = [
  "cfg-if",
  "core_detect",
@@ -525,7 +525,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#630d957f6bde8923f107b979767950ff2eb4e2ca"
+source = "git+https://github.com/atomdrift-project/filefacts.git#2b8a29db8427236543d7ee649aac32cbecde21e6"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2575,7 +2575,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#630d957f6bde8923f107b979767950ff2eb4e2ca"
+source = "git+https://github.com/atomdrift-project/filefacts.git#2b8a29db8427236543d7ee649aac32cbecde21e6"
 dependencies = [
  "cc",
  "tree-sitter",
