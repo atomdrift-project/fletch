@@ -257,29 +257,52 @@ impl Drop for Claim {
     }
 }
 
-/// Entries written to each cache by this process since it last triggered a
+/// What this process has written to each cache since it last triggered a
 /// sweep of that cache.
-static WRITES: Mutex<BTreeMap<PathBuf, usize>> = Mutex::new(BTreeMap::new());
+static WRITES: Mutex<BTreeMap<PathBuf, Written>> = Mutex::new(BTreeMap::new());
 
-/// Record one entry written to the blob cache at `dir`, sweeping it once this
-/// process has written `limits.max_entries` there.
+/// Writes to one cache since this process last triggered a sweep of it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Written {
+    entries: usize,
+    bytes: u64,
+}
+
+impl Written {
+    /// Count one entry of `bytes`. Once these writes call for a sweep, returns
+    /// the tally that did and starts it over.
+    ///
+    /// Bytes trigger at a tenth of the byte ceiling, so the cache runs at most
+    /// about a tenth past it between sweeps: the ceiling guards the disk, and
+    /// a worker can download many times it in a day. Entries trigger at the
+    /// whole entry ceiling, since overshooting that costs inodes, not space,
+    /// and each trigger walks the entire cache.
+    fn add(&mut self, bytes: u64, limits: &Limits) -> Option<Self> {
+        self.entries += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        (self.entries >= limits.max_entries || self.bytes >= limits.max_bytes / 10)
+            .then(|| std::mem::take(self))
+    }
+}
+
+/// Record one entry of `bytes` written to the blob cache at `dir`, sweeping
+/// it once this process's writes there could have carried it past a ceiling
+/// (see [`Written::add`]).
 ///
 /// The marker gates sweeps on elapsed *time*, which a bulk fetch defeats: it
 /// can write far past the ceiling between two daily sweeps, all within one
 /// process whose startup sweep found nothing to do. Counting writes closes
 /// that gap without a second timer.
-pub(crate) fn note_write(dir: &Path, limits: Limits) {
-    let mut writes = WRITES.lock().unwrap_or_else(PoisonError::into_inner);
-    let count = writes.entry(dir.to_path_buf()).or_insert(0);
-    *count += 1;
-    let reached = *count >= limits.max_entries;
-    if reached {
-        *count = 0;
-    }
-    drop(writes);
-    if !reached {
+pub(crate) fn note_write(dir: &Path, limits: Limits, bytes: u64) {
+    let Some(written) = WRITES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(dir.to_path_buf())
+        .or_default()
+        .add(bytes, &limits)
+    else {
         return;
-    }
+    };
     if !disk::is_blob_cache(dir) {
         tracing::warn!(
             target: "cache_sweep",
@@ -288,11 +311,14 @@ pub(crate) fn note_write(dir: &Path, limits: Limits) {
         );
         return;
     }
-    tracing::debug!(
+    tracing::info!(
         target: "cache_sweep",
         root = %dir.display(),
-        writes = limits.max_entries,
-        "write count reached the entry ceiling; sweeping"
+        written_entries = written.entries,
+        written_bytes = written.bytes,
+        max_entries = limits.max_entries,
+        max_bytes = limits.max_bytes,
+        "writes since the last sweep reached a trigger; sweeping"
     );
     start(vec![Budget::new(Some(dir.to_path_buf()), limits)], true);
 }
@@ -368,7 +394,7 @@ fn run(root: &Path, limits: &Limits, force: bool) {
     // Record completion, so the next run waits a full interval rather than
     // retrying. Not reached if this thread dies with its process mid-sweep.
     mark(&marker, MARK_DONE);
-    tracing::debug!(
+    tracing::info!(
         target: "cache_sweep",
         root = %root.display(),
         removed,
@@ -785,6 +811,40 @@ mod tests {
         assert!(!second.rerun());
         drop(second);
         assert!(Claim::take(&a, false).is_some(), "released for good");
+    }
+
+    /// Few large writes trigger a sweep on bytes, long before the entry
+    /// ceiling: the gap that let a worker fill a disk between daily sweeps.
+    #[test]
+    fn writes_trigger_a_sweep_on_a_tenth_of_the_bytes_or_all_the_entries() {
+        let limits = Limits {
+            max_bytes: 1000,
+            max_entries: 3,
+            ..generous()
+        };
+        let mut written = Written::default();
+        assert_eq!(written.add(60, &limits), None);
+        assert_eq!(
+            written.add(40, &limits),
+            Some(Written {
+                entries: 2,
+                bytes: 100
+            }),
+            "a tenth of the byte ceiling"
+        );
+        assert_eq!(written, Written::default(), "the tally starts over");
+
+        for _ in 0..2 {
+            assert_eq!(written.add(0, &limits), None);
+        }
+        assert_eq!(
+            written.add(0, &limits),
+            Some(Written {
+                entries: 3,
+                bytes: 0
+            }),
+            "the entry ceiling"
+        );
     }
 
     #[test]

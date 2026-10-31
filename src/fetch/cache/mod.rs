@@ -546,8 +546,13 @@ impl BlobCache {
         let Some(shard) = self.writable_shard(key) else {
             return;
         };
+        // Bytes this entry occupies on disk, the compressed blob and its
+        // sidecar, as the sweep measures them.
+        let mut on_disk = 0u64;
         let stored = disk::write_replacing(&shard.join(disk::blob_name(key)), |out| {
-            zstd::stream::copy_encode(body, out, 3)
+            zstd::stream::copy_encode(body, &mut *out, 3)?;
+            on_disk = out.metadata()?.len();
+            Ok(())
         })
         .and_then(|()| {
             let meta = CachedMeta {
@@ -555,6 +560,7 @@ impl BlobCache {
                 ..meta.clone()
             };
             let json = serde_json::to_vec(&meta)?;
+            on_disk = on_disk.saturating_add(json.len() as u64);
             disk::write_replacing(&shard.join(disk::meta_name(key)), |out| {
                 out.write_all(&json)
             })
@@ -565,7 +571,7 @@ impl BlobCache {
         }
         // A bulk fetch can outgrow the cache ceiling inside one process, long
         // before the next daily sweep would notice.
-        sweep::note_write(&self.dir, self.limits);
+        sweep::note_write(&self.dir, self.limits, on_disk);
     }
 }
 

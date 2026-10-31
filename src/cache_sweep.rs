@@ -5,8 +5,8 @@
 //! overridden by `FLETCH_CACHE_TTL_DAYS`, `FLETCH_CACHE_MAX_BYTES` and
 //! `FLETCH_CACHE_MAX_ENTRIES` (read once per process). It runs on a detached
 //! thread that dies with the process; a `.last-sweep` marker in the cache
-//! keeps it to about once a day, and a process that writes a budget's worth of
-//! entries sweeps sooner.
+//! keeps it to about once a day, and a process that writes a tenth of the byte
+//! budget, or the whole entry budget, sweeps sooner.
 //!
 //! The sweep only touches a cache directory owned by this user and writable
 //! by no one else. That ownership check is Unix-only: on other platforms the
