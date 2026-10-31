@@ -552,7 +552,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#e007a755c697ed4260fdc616375986c3837e7ca1"
+source = "git+https://github.com/atomdrift-project/filefacts.git#e0abf4093b995a9a95420f859896384d99570009"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -1192,9 +1192,9 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "log"
-version = "0.4.34"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lru-slab"
@@ -2185,7 +2185,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#71d5949549d6010dd1e7283fe6372e40a305f2a0"
+source = "git+https://github.com/atomdrift-project/stng.git#f3af4ea8bb2c06da0742f217edca8b1fdb258eec"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2210,7 +2210,7 @@ dependencies = [
 [[package]]
 name = "stng-process"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/stng.git#71d5949549d6010dd1e7283fe6372e40a305f2a0"
+source = "git+https://github.com/atomdrift-project/stng.git#f3af4ea8bb2c06da0742f217edca8b1fdb258eec"
 dependencies = [
  "libc",
 ]
@@ -2612,7 +2612,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#e007a755c697ed4260fdc616375986c3837e7ca1"
+source = "git+https://github.com/atomdrift-project/filefacts.git#e0abf4093b995a9a95420f859896384d99570009"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -3264,9 +3264,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.1.3"
+version = "9.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1156b39d142a34b999c2310a50455e0cb3760bf7efad0122f796d813bee26ccb"
+checksum = "3f5b58784007ff6e5f280ec82c8596686a3b9b5dd5836c63288d4479f84728b9"
 dependencies = [
  "crc32fast",
  "flate2",
