@@ -7,17 +7,25 @@ use serde::de::IgnoredAny;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ecosystem::{
-    Coordinates, email_domain, fetch_json, for_version, last_seg, lenient, non_empty, null_default,
-    optional, set_timeline, unix_secs,
+    Coordinates, decode, email_domain, fetch_json, for_version, last_seg, lenient, non_empty,
+    null_default, optional, set_timeline, unix_secs,
 };
 use crate::fetch::{
-    ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, file_name_matches,
-    percent_decode, repository_base,
+    ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, cached_post,
+    file_name_matches, percent_decode, repository_base,
 };
 use crate::registry::RegistryError;
 
 /// The public registry, the base for a PURL with no `repository_url`.
 const REGISTRY: &str = "https://registry.npmjs.org";
+
+/// npm's audit endpoint: the advisories that apply to the exact versions
+/// asked about, keyed by package name.
+const ADVISORIES: &str = "https://registry.npmjs.org/-/npm/v1/security/advisories/bulk";
+
+/// The CWE an advisory carries when the release itself is the attack
+/// ("Embedded Malicious Code"), as opposed to a vulnerability in honest code.
+const MALICIOUS_CODE: &str = "CWE-506";
 
 /// The tarball `purl` names: the requested version, or the dist-tag a
 /// non-version spelling names, or `latest` when unversioned. Carries the
@@ -213,12 +221,19 @@ pub(crate) fn lookup(
             .as_ref()
             .map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX)),
     );
-    // npm replaces a taken-down malicious package with a stub whose
-    // description is exactly this: the registry's own verdict.
-    p.security_hold = Some(doc.description.as_deref() == Some("security holding package"));
     // An unpublished version keeps its `time` entry but leaves `versions`;
     // a live version is in both.
-    p.version_removed = Some(release.is_none() && doc.time.contains_key(version));
+    let removed = release.is_none() && doc.time.contains_key(version);
+    p.version_removed = Some(removed);
+    // npm replaces a taken-down malicious package with a stub whose
+    // description is exactly this: the registry's own verdict. A single
+    // malicious version is deleted instead, leaving no stub; only then is the
+    // audit endpoint worth a request, and a malware advisory on that exact
+    // version is the same verdict.
+    p.security_hold = Some(
+        doc.description.as_deref() == Some("security holding package")
+            || (removed && has_malware_advisory(&name, version, net, cache)),
+    );
     // Every `time` entry but the `created`/`modified` bookkeeping is a
     // version's publish time.
     set_timeline(
@@ -236,6 +251,30 @@ pub(crate) fn lookup(
     p.downloads_recent = optional(fetch_json::<Downloads>(&downloads, net, cache), &downloads)
         .and_then(|d| d.downloads);
     Ok(p)
+}
+
+/// Whether npm's audit endpoint holds a malware advisory (CWE-506) for this
+/// exact `version` of `name`. The endpoint answers only for the versions
+/// asked about. Best effort: an endpoint that cannot be read is no verdict,
+/// and the record stands on its removal alone.
+fn has_malware_advisory(name: &str, version: &str, net: &dyn Fetch, cache: &BlobCache) -> bool {
+    let body = serde_json::json!({ name: [version] }).to_string();
+    let headers = [("Content-Type", "application/json")];
+    let answer = cached_post(ADVISORIES, body.as_bytes(), &headers, net, cache)
+        .map_err(RegistryError::from)
+        .and_then(|bytes| decode::<HashMap<String, Vec<Advisory>>>(ADVISORIES, &bytes));
+    let malware = optional(answer, ADVISORIES)
+        .and_then(|mut by_name| by_name.remove(name))
+        .into_iter()
+        .flatten()
+        .find(|advisory| advisory.cwe.iter().any(|cwe| cwe == MALICIOUS_CODE));
+    tracing::debug!(
+        package = %name.escape_debug(),
+        version = %version.escape_debug(),
+        advisory = ?malware.as_ref().and_then(|a| a.url.as_deref()),
+        "npm removed version checked for a malware advisory"
+    );
+    malware.is_some()
 }
 
 /// Record what this version's own manifest says: the account that pushed it
@@ -437,6 +476,16 @@ struct Engines {
     node: Option<String>,
 }
 
+/// One advisory from the audit endpoint: its link and weakness classes.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Advisory {
+    #[serde(deserialize_with = "non_empty")]
+    url: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    cwe: Vec<String>,
+}
+
 /// The downloads endpoint's answer.
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -604,6 +653,48 @@ mod tests {
         );
         // The surviving timestamp still gives us the publish date / age signals.
         assert_eq!(p.published_at, unix_secs("2026-06-22T00:00:00.000Z"));
+        // No advisory endpoint answered: removal alone is not a hold.
+        assert_eq!(p.security_hold, Some(false));
+    }
+
+    #[test]
+    fn a_removed_version_under_a_malware_advisory_is_a_security_hold() {
+        // color@5.0.1: deleted by npm with no holder package left behind,
+        // its `time` entry the only trace; the audit endpoint names it.
+        let doc = br#"{"dist-tags":{"latest":"5.0.2"},
+            "time":{"5.0.0":"2025-02-12T11:17:30.996Z","5.0.1":"2025-09-08T13:16:24.320Z",
+                    "5.0.2":"2025-09-13T17:19:21.869Z"},
+            "versions":{"5.0.0":{},"5.0.2":{}}}"#;
+        let malware = br#"{"color":[{"url":"https://github.com/advisories/GHSA-qrmh-qg46-72pp",
+            "title":"color@5.0.1 contains malware after npm account takeover",
+            "vulnerable_versions":"=5.0.1","cwe":["CWE-506"]}]}"#;
+        let net = Fixtures::default()
+            .with("https://registry.npmjs.org/color", doc)
+            .with(ADVISORIES, malware);
+        let removed = look("pkg:npm/color@5.0.1", &net).expect("record");
+        assert_eq!(removed.version_removed, Some(true));
+        assert_eq!(
+            removed.security_hold,
+            Some(true),
+            "malware advisory on a removed version"
+        );
+        // A listed version is never put to the endpoint, whatever it would say.
+        let listed = look("pkg:npm/color@5.0.0", &net).expect("record");
+        assert_eq!(listed.security_hold, Some(false));
+    }
+
+    #[test]
+    fn a_vulnerability_advisory_on_a_removed_version_is_not_a_security_hold() {
+        // An author may pull a release that had an ordinary vulnerability;
+        // only "embedded malicious code" makes the removal a takedown.
+        let doc = br#"{"time":{"1.0.0":"2025-01-01T00:00:00.000Z"},"versions":{}}"#;
+        let vulnerable = br#"{"p":[{"title":"Prototype Pollution in p","cwe":["CWE-1321"]}]}"#;
+        let net = Fixtures::default()
+            .with("https://registry.npmjs.org/p", doc)
+            .with(ADVISORIES, vulnerable);
+        let p = look("pkg:npm/p@1.0.0", &net).expect("record");
+        assert_eq!(p.version_removed, Some(true));
+        assert_eq!(p.security_hold, Some(false));
     }
 
     #[test]
