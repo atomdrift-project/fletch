@@ -94,6 +94,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "binform"
+version = "0.1.0"
+source = "git+https://github.com/atomdrift-project/binform.git#3542ed751dd073cb1a97cd34b0bd17aa2934b26c"
+dependencies = [
+ "gimli",
+ "iced-x86",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -552,11 +561,12 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "2.0.1"
-source = "git+https://github.com/atomdrift-project/filefacts.git#86fa38e18ce0484c441ee8dfd5af9b8fb71491a3"
+source = "git+https://github.com/atomdrift-project/filefacts.git#d14a1ec10598442e4baaf2f7c0c193c64ef71a1f"
 dependencies = [
  "aes",
  "aho-corasick",
  "base64 0.22.1",
+ "binform",
  "cab",
  "cfb",
  "cms",
@@ -585,7 +595,6 @@ dependencies = [
  "sha1 0.10.7",
  "sha2 0.10.9",
  "stng",
- "stng-process",
  "tar",
  "tempfile",
  "thiserror 2.0.21",
@@ -2612,7 +2621,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#86fa38e18ce0484c441ee8dfd5af9b8fb71491a3"
+source = "git+https://github.com/atomdrift-project/filefacts.git#d14a1ec10598442e4baaf2f7c0c193c64ef71a1f"
 dependencies = [
  "cc",
  "tree-sitter",
