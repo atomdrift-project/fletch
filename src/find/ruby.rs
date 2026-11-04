@@ -93,7 +93,6 @@ fn command(args: &[Arg], offset: Option<u64>) -> Option<Discovery> {
             let parsed = filefacts::OpenOptions::new()
                 .file_type(FileType::Shell)
                 .cache(false)
-                .rizin(false)
                 .open(value.as_bytes());
             Some(fetch_calls(parsed.symbols().as_slice()))
         }
