@@ -41,7 +41,11 @@ layers — is treated as hostile.
   must be global unicast), re-checked on **every redirect hop**, and connects
   only to the addresses it vetted, so DNS rebinding has nothing to swap. HTTPS
   only, never through an environment proxy, and never to a port browsers refuse
-  (SMTP, SSH, IRC, …). Container pulls go through the same client.
+  (SMTP, SSH, IRC, …). Container pulls go through the same client. The one
+  exception to HTTPS: a URL a scanned file names verbatim may also be fetched
+  over plain HTTP, since its author already chose its content and implants are
+  commonly served that way. Only the scheme is relaxed for it; the address,
+  port and resolver guards are unchanged, and registry artifacts stay HTTPS.
 - **Bounded.** Every response is size-capped (a request may lower the
   operator's ceiling, never raise it), every request and every batch has a
   deadline, and a batch's registry metadata traffic counts against its budget

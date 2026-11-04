@@ -679,8 +679,8 @@ fn listing(purl: &Purl, mut candidates: Vec<ArtifactCandidate>) -> Vec<ArtifactC
 /// A URL locator is verbatim text out of a scanned file, so it may name a
 /// *destination* but never pick a *transport*: [`fetch_ref`](super::fetch_ref)
 /// routes an `oci://` target to the container puller, which is reached only
-/// from a `pkg:oci` coordinate. Plain `http` still resolves and is refused at
-/// connect, which records the more informative outcome.
+/// from a `pkg:oci` coordinate. Plain `http` resolves too, and is fetched
+/// under the same SSRF guard (see [`Request::plain_http`](super::Request::plain_http)).
 #[must_use]
 pub fn resolve(locator: &RefLocator) -> Option<String> {
     match locator {

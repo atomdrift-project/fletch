@@ -5,7 +5,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use filefacts::{RefKind, Reference};
+use filefacts::{RefKind, RefLocator, Reference};
 
 use super::cache::{self, CachedMeta, Spool, TTL_PINNED, TTL_UNPINNED};
 use super::coverage::Coverage;
@@ -309,7 +309,10 @@ fn fetch_and_record(
     // An artifact is spooled to disk as it arrives, judged and cached from
     // there, and never held in memory whole.
     let spool = cache.spool(&key);
-    let landed = retrieve(&url, &spool, net).and_then(|f| {
+    // A URL the scanned file names verbatim may be plain http; a URL a
+    // registry names (any PURL target) stays https only.
+    let plain_http = matches!(r.locator, RefLocator::Url(_));
+    let landed = retrieve(&url, &spool, net, plain_http).and_then(|f| {
         let meta = CachedMeta {
             fetched_at: now(),
             status: f.status,
@@ -364,8 +367,15 @@ fn fetch_and_record(
 ///
 /// Artifact downloads never carry the GitHub token: their URLs come from a
 /// scanned file or a registry response, and the transport grants the token
-/// only to repository documents fletch addresses itself.
-fn retrieve(url: &str, spool: &Spool, net: &dyn Fetch) -> Result<Fetched, FetchError> {
+/// only to repository documents fletch addresses itself. `plain_http` lets a
+/// URL a scanned file names verbatim be fetched over http (see
+/// [`Request::plain_http`]).
+fn retrieve(
+    url: &str,
+    spool: &Spool,
+    net: &dyn Fetch,
+    plain_http: bool,
+) -> Result<Fetched, FetchError> {
     if let Some(oci_ref) = url.strip_prefix("oci://") {
         if !net.allows_oci() {
             return Err(FetchError::Refused(
@@ -380,7 +390,12 @@ fn retrieve(url: &str, spool: &Spool, net: &dyn Fetch) -> Result<Fetched, FetchE
             redirects: Vec::new(),
         });
     }
-    net.send(&Request::get(url).spool_to(spool.path()))
+    let request = Request::get(url).spool_to(spool.path());
+    net.send(&if plain_http {
+        request.plain_http()
+    } else {
+        request
+    })
 }
 
 /// What one read of a body tells: its digests, and how its pins compare
@@ -599,6 +614,51 @@ pub(super) mod tests {
             &BlobCache::disabled(),
         );
         assert_eq!(record.outcome, Outcome::Ok);
+    }
+
+    /// Records whether each request it sees allows plain http, and refuses it.
+    #[derive(Default)]
+    struct SchemeProbe(std::sync::Mutex<Vec<(String, bool)>>);
+
+    impl Fetch for SchemeProbe {
+        fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+            self.0
+                .lock()
+                .expect("probe lock")
+                .push((request.url.to_owned(), request.plain_http));
+            Err(FetchError::Refused("probe".into()))
+        }
+    }
+
+    /// A URL the scanned file names verbatim may be fetched over plain http;
+    /// an artifact a PURL resolves to never asks for it.
+    #[test]
+    fn only_a_verbatim_url_locator_allows_plain_http() {
+        let url = "http://93.184.215.14/18/stage.js";
+        let probe = SchemeProbe::default();
+        let _ = fetch_ref(
+            &dep(RefLocator::Url(url.into()), None),
+            &probe,
+            &BlobCache::disabled(),
+        );
+        let purl = SchemeProbe::default();
+        let _ = fetch_ref(
+            &dep(
+                RefLocator::Purl(
+                    "pkg:npm/left-pad@1.3.0?download_url=https://registry.npmjs.org/x.tgz".into(),
+                ),
+                None,
+            ),
+            &purl,
+            &BlobCache::disabled(),
+        );
+        assert_eq!(
+            probe.0.into_inner().expect("probe lock"),
+            [(url.to_owned(), true)]
+        );
+        let sent = purl.0.into_inner().expect("probe lock");
+        assert!(!sent.is_empty(), "the PURL target was requested");
+        assert!(sent.iter().all(|(_, plain_http)| !plain_http), "{sent:?}");
     }
 
     /// A refusal reached the network, so the record keeps the code the server

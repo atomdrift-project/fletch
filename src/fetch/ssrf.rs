@@ -160,15 +160,23 @@ const BAD_PORTS: &[u16] = &[
 ];
 
 /// The pre-connect floor every request passes — each GET hop and the one POST:
-/// https only, on a port a browser would use, and refuse a literal-IP host the
-/// DNS resolver never sees (the SSRF resolver guards hostname targets; a bare
-/// IP must be checked directly).
-pub(crate) fn guard_host(url: &reqwest::Url) -> Result<(), FetchError> {
+/// https only (plain http too when `plain_http`, see
+/// [`Request::plain_http`](super::Request::plain_http)), on a port a browser
+/// would use, and refuse a literal-IP host the DNS resolver never sees (the
+/// SSRF resolver guards hostname targets; a bare IP must be checked directly).
+/// Allowing plain http relaxes the scheme only: the port and address checks
+/// and the resolver apply to an http target exactly as to an https one.
+pub(crate) fn guard_host(url: &reqwest::Url, plain_http: bool) -> Result<(), FetchError> {
     let refuse = |reason: String| {
         tracing::debug!(target: "ssrf", host = url.host_str(), reason, "refused");
         Err(FetchError::Refused(reason))
     };
-    if url.scheme() != "https" {
+    let scheme_ok = match url.scheme() {
+        "https" => true,
+        "http" => plain_http,
+        _ => false,
+    };
+    if !scheme_ok {
         return refuse(format!("non-https scheme: {}", url.scheme()));
     }
     if let Some(port) = url.port()
@@ -303,22 +311,42 @@ mod tests {
         ] {
             let parsed = reqwest::Url::parse(url).expect("url");
             assert!(
-                matches!(guard_host(&parsed), Err(FetchError::Refused(_))),
+                matches!(guard_host(&parsed, false), Err(FetchError::Refused(_))),
                 "{url} ({parsed}) should be refused"
             );
         }
-        assert!(guard_host(&reqwest::Url::parse("http://example.com/").expect("url")).is_err());
-        assert!(guard_host(&reqwest::Url::parse("https://example.com/").expect("url")).is_ok());
-        assert!(
-            guard_host(&reqwest::Url::parse("https://example.com:8443/").expect("url")).is_ok()
-        );
+        let ok = |url: &str| guard_host(&reqwest::Url::parse(url).expect("url"), false).is_ok();
+        assert!(!ok("http://example.com/"));
+        assert!(ok("https://example.com/"));
+        assert!(ok("https://example.com:8443/"));
         for url in [
             "https://example.com:25/",
             "https://example.com:22/",
             "https://example.com:6667/",
         ] {
-            let parsed = reqwest::Url::parse(url).expect("url");
-            assert!(guard_host(&parsed).is_err(), "{url} should be refused");
+            assert!(!ok(url), "{url} should be refused");
+        }
+    }
+
+    #[test]
+    fn plain_http_relaxes_the_scheme_and_nothing_else() {
+        let allowed = |url: &str| guard_host(&reqwest::Url::parse(url).expect("url"), true).is_ok();
+        assert!(allowed("http://example.com/stage.js"));
+        assert!(allowed("http://93.184.215.14/18/stage.js"));
+        assert!(!allowed("http://198.51.100.7/"), "documentation range");
+        assert!(allowed("http://example.com:8080/"));
+        assert!(allowed("https://example.com/"));
+        for url in [
+            "http://127.0.0.1/",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "http://2130706433/",
+            "http://example.com:25/",
+            "ftp://example.com/",
+            "file:///etc/passwd",
+        ] {
+            assert!(!allowed(url), "{url} should still be refused");
         }
     }
 }

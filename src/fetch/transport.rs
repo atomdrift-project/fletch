@@ -155,6 +155,14 @@ pub struct Request<'a> {
     /// declared size). It can only lower the backend's ceiling, never raise
     /// it. `None` keeps the backend's.
     pub max_bytes: Option<u64>,
+    /// Accept plain `http` as well as `https`, on the first hop and every
+    /// redirect. Set only for a URL a scanned file names verbatim: its author
+    /// already chose the destination and its content, so TLS protects nothing
+    /// fletch relies on, while implants and exploit-kit stages are commonly
+    /// served from bare IPs over plain HTTP. Never set for a URL fletch or a
+    /// registry names; those keep https only. Only the scheme is relaxed: the
+    /// SSRF address and port guards apply unchanged.
+    pub plain_http: bool,
 }
 
 impl<'a> Request<'a> {
@@ -169,6 +177,7 @@ impl<'a> Request<'a> {
             spool: None,
             github_auth: false,
             max_bytes: None,
+            plain_http: false,
         }
     }
 
@@ -222,6 +231,16 @@ impl<'a> Request<'a> {
     pub fn max_bytes(self, limit: u64) -> Self {
         Self {
             max_bytes: Some(limit),
+            ..self
+        }
+    }
+
+    /// This request, allowed over plain `http` (see
+    /// [`plain_http`](Self::plain_http)).
+    #[must_use]
+    pub fn plain_http(self) -> Self {
+        Self {
+            plain_http: true,
             ..self
         }
     }
@@ -415,7 +434,8 @@ impl HttpFetch {
         }
     }
 
-    /// The shared GET path: per-hop https + SSRF enforcement, redirect following,
+    /// The shared GET path: per-hop https (or http, for a
+    /// [`plain_http`](Request::plain_http) request) + SSRF enforcement, redirect following,
     /// the response-size cap and the [`REQUEST_DEADLINE`]. `headers` are
     /// attached to every hop, less credentials once the chain has left the
     /// starting origin ([`forward_header`]). Every GET funnels through here so
@@ -436,7 +456,7 @@ impl HttpFetch {
                 return Err(FetchError::Timeout);
             }
             // Re-checked on every hop, so a redirect can't escape the floor.
-            guard_host(&current)?;
+            guard_host(&current, request.plain_http)?;
             let left_origin = chain.hop(&current);
             let host = current.host_str().unwrap_or_default().to_string();
             self.backoff.wait(&host, deadline)?;
@@ -526,7 +546,7 @@ impl HttpFetch {
         let target =
             reqwest::Url::parse(request.url).map_err(|e| FetchError::Transport(e.to_string()))?;
         let limit = self.body_limit(request, &target);
-        guard_host(&target)?;
+        guard_host(&target, request.plain_http)?;
         let host = target.host_str().unwrap_or_default().to_string();
         let mut waits = 0;
         let resp = loop {
@@ -1100,6 +1120,33 @@ mod tests {
                 Err(FetchError::Refused(_)) => {}
                 other => panic!("{url} should be refused, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn plain_http_keeps_the_address_guard_without_network() {
+        // Opting into plain http must not open a path to internal hosts:
+        // every one of these is refused before a socket is opened.
+        let net = HttpFetch::new().expect("client");
+        for url in [
+            "http://127.0.0.1/x",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/x",
+            "http://10.0.0.1/x",
+            "http://192.168.1.20/js/status.js",
+            "http://example.com:25/",
+        ] {
+            match net.send(&Request::get(url).plain_http()) {
+                Err(FetchError::Refused(_)) => {}
+                other => panic!("{url} should be refused, got {other:?}"),
+            }
+        }
+        // The resolver guards a plain-http hostname just as an https one.
+        match net.send(&Request::get("http://localhost/x").plain_http()) {
+            Err(FetchError::Refused(why)) => {
+                assert!(why.contains("non-public host: localhost"), "{why}");
+            }
+            other => panic!("localhost should be refused by the resolver, got {other:?}"),
         }
     }
 
