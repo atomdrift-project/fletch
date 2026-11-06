@@ -49,8 +49,9 @@ layers — is treated as hostile.
 - **Bounded.** Every response is size-capped (a request may lower the
   operator's ceiling, never raise it), every request and every batch has a
   deadline, and a batch's registry metadata traffic counts against its budget
-  alongside the artifacts. Container layers are spooled to disk and streamed,
-  never held in memory whole.
+  alongside the artifacts — every byte received, including those of a body
+  abandoned as too large. Container layers are spooled to disk and streamed,
+  never held in memory whole, and an image's entry count is capped.
 - **Pins are verified.** A reference that carries a hash (hex or SRI base64) is
   checked against the bytes retrieved; a mismatch is always reported as one.
   Immutable artifacts are cached long, mutable `@latest` tags briefly.
@@ -80,9 +81,11 @@ See [SECURITY.md](SECURITY.md) for reporting and known limitations.
 
 The binary is a thin companion to the library, so a non-Rust collector can obtain
 exactly the record the library produces instead of maintaining a parallel,
-drifting fetcher.
+drifting fetcher. It is built with the `cli` feature, so a library consumer
+never compiles its dependencies:
 
 ```bash
+cargo install --git https://github.com/atomdrift-project/fletch.git --features cli
 fletch registry pkg:npm/left-pad@1.3.0   # resolve + fetch + normalize registry metadata
 fletch purl pkg:pypi/requests@2.31.0      # report how the PURL routes — no network I/O
 fletch purl -                             # same, batched: one PURL per stdin line
@@ -108,7 +111,9 @@ let net = HttpFetch::new()?;
 let record = registry::lookup(&RefLocator::Purl(purl), &net, &BlobCache::open()?)?;
 ```
 
-Add it as a git dependency:
+Add it as a git dependency (fletch is not on crates.io while its
+[filefacts](https://github.com/atomdrift-project/filefacts) dependency is
+git-only):
 
 ```toml
 fletch = { git = "https://github.com/atomdrift-project/fletch.git" }

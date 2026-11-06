@@ -10,8 +10,8 @@
 //! progressively more expensive.
 //!
 //! Three properties keep it cheap and safe:
-//! - A `.last-sweep` marker gates the walk, so the common case is a single
-//!   `stat`, never a scan of a large directory. The marker records whether the
+//! - A `.last-sweep` marker gates the walk, so the common case is the trust
+//!   check and a `stat`, never a scan of a large directory. The marker records whether the
 //!   sweep it names *finished*: a detached thread dies with its process, and a
 //!   sweep cut short that way must not book itself as a full day's work, or a
 //!   cache too large to sweep in one short run would never be swept at all.
@@ -48,12 +48,12 @@ const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// `FLETCH_CACHE_MAX_ENTRIES`.
 const DEFAULT_MAX_ENTRIES: usize = 1 << 18;
 /// Re-walk a cache at most this often; cheaper runs just read the marker.
-const SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const SWEEP_INTERVAL: Duration = Duration::from_hours(24);
 /// Re-walk this soon after a sweep that never reported finishing. A sweep in
 /// another process still running after this long can be joined by a second,
 /// which costs a redundant walk but nothing else: each deletes what it decided
 /// was oldest, and a failed delete is ignored.
-const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const RETRY_INTERVAL: Duration = Duration::from_hours(1);
 /// Marker contents: a sweep is in flight, or died with its process.
 const MARK_STARTED: &[u8] = b"s";
 /// Marker contents: the sweep that wrote it ran to completion.
@@ -333,10 +333,13 @@ struct Entry {
 }
 
 fn run(root: &Path, limits: &Limits, force: bool) {
-    if !root.is_dir() || (!force && !due(root)) {
+    if !root.is_dir() {
         return;
     }
-    // Trust first: a refused root is left exactly as found, marker and all.
+    // Trust first: a refused root is left exactly as found, marker and all —
+    // and its marker is not even read, since in a directory others can write
+    // it could be swapped for a FIFO between the check and the open, and the
+    // open would never return.
     let trusted = match disk::trust_root(root) {
         Ok(trusted) => trusted,
         Err(why) => {
@@ -344,6 +347,9 @@ fn run(root: &Path, limits: &Limits, force: bool) {
             return;
         }
     };
+    if !force && !due(root) {
+        return;
+    }
     // Mark the start (mtime = now) so a racing process sees a fresh marker
     // and skips.
     let marker = root.join(MARKER);
@@ -364,6 +370,11 @@ fn run(root: &Path, limits: &Limits, force: bool) {
             true
         }
     });
+
+    // A spool or write in progress is another worker's, renamed into place
+    // when it lands: evicting it would fail that fetch. Only the age pass
+    // reclaims one, once abandoned.
+    entries.retain(|e| !e.paths.iter().any(|path| disk::in_progress(path)));
 
     // Count/size pass: over either ceiling, evict oldest first until under 90%
     // of both. Stopping at 90% rather than exactly at the cap keeps a cache
@@ -444,9 +455,7 @@ fn read_marker(marker: &Path) -> Option<Vec<u8>> {
 /// writing through it: a symlink planted in its place would otherwise aim the
 /// write at any file this user can reach.
 fn mark(marker: &Path, state: &[u8]) {
-    let _ = fs::remove_file(marker);
-    let written = disk::create_private(marker).and_then(|mut file| file.write_all(state));
-    if let Err(error) = written {
+    if let Err(error) = disk::write_replacing(marker, |file| file.write_all(state)) {
         tracing::debug!(
             target: "cache_sweep",
             marker = %marker.display(),
@@ -666,6 +675,31 @@ mod tests {
         for kept in ["e3.zst", "e4.zst"] {
             assert!(dir.path().join(kept).exists(), "{kept}: newest kept");
         }
+    }
+
+    /// A spool still being written belongs to a fetch in flight: the size
+    /// pass never evicts it, however old its first byte, while the age pass
+    /// reclaims one long abandoned.
+    #[test]
+    fn a_spool_in_progress_is_left_to_the_age_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        write_aged(&dir.path().join("live.part.1"), 900, day(3));
+        write_aged(&dir.path().join("old.tmp.2"), 10, day(60));
+        write_aged(&dir.path().join("e.zst"), 400, day(1));
+        let limits = Limits {
+            max_bytes: 1000,
+            ..generous()
+        };
+        run(dir.path(), &limits, false);
+        assert!(dir.path().join("live.part.1").exists(), "in flight: kept");
+        assert!(
+            !dir.path().join("old.tmp.2").exists(),
+            "abandoned: reclaimed"
+        );
+        assert!(
+            dir.path().join("e.zst").exists(),
+            "under the cap once spools are set aside"
+        );
     }
 
     /// A blob and its sidecar are one entry: the oldest pair goes whole, and

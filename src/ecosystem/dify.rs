@@ -4,10 +4,16 @@ use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
-    Coordinates, Localized, fetch_json, immutable_or_fresh, non_empty, split_pair, unix_secs,
+    Coordinates, Localized, fetch_json, held, immutable_or_fresh, non_empty, release_time,
+    unix_secs,
 };
-use crate::fetch::{BlobCache, Fetch, percent_decode, safe_coordinate};
+use crate::fetch::{BlobCache, Fetch};
+use crate::purl::encode_component;
 use crate::registry::RegistryError;
+
+/// The marketplace's plugin API root: `/<org>/<name>` is a plugin's
+/// document, `/<org>/<name>/<version>` one release's.
+const PLUGINS: &str = "https://marketplace.dify.ai/api/v1/plugins";
 
 /// The status the marketplace gives a plugin in good standing.
 const ACTIVE: &str = "active";
@@ -25,25 +31,17 @@ pub(crate) fn resolve_dify(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<(String, String), RegistryError> {
-    let (path, version) = (c.path(), c.encoded_version());
-    let (org, name) = split_pair(path)?;
-    if !safe_coordinate(path) || version.is_some_and(|v| !safe_coordinate(v)) {
-        tracing::debug!(
-            path = %path.escape_debug(),
-            "dify artifact refused: coordinate could restructure the marketplace URL"
-        );
-        return Err(RegistryError::UnsafeCoordinate);
-    }
-    let base = format!("https://marketplace.dify.ai/api/v1/plugins/{org}/{name}");
-    let plugin_id = percent_decode(path);
-    let wanted = version.map(percent_decode);
+    let (org, name) = c.pair()?;
+    let version = c.encoded_version();
+    let base = format!("{PLUGINS}/{org}/{name}");
+    let (plugin_id, wanted) = (c.full_name(), c.version());
     let vetted = |resolved: Option<String>, identifier: Option<String>, url: &str| {
         let (Some(resolved), Some(identifier)) = (resolved, identifier) else {
             tracing::debug!(url, "dify artifact unresolved: no release or identifier");
             return Err(RegistryError::NoRecord);
         };
         let checksum = identifier.strip_prefix(&format!("{plugin_id}:{resolved}@"));
-        if wanted.as_ref().is_some_and(|want| *want != resolved)
+        if wanted.is_some_and(|want| want != resolved)
             || !checksum.is_some_and(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_hexdigit()))
         {
             tracing::debug!(
@@ -80,8 +78,8 @@ pub(crate) fn resolve_dify(
     Ok((
         resolved,
         format!(
-            "https://marketplace.dify.ai/api/v1/plugins/download?unique_identifier={}",
-            crate::purl::encode_component(&identifier)
+            "{PLUGINS}/download?unique_identifier={}",
+            encode_component(&identifier)
         ),
     ))
 }
@@ -97,52 +95,38 @@ pub(crate) fn lookup(
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
     let (org, name) = c.pair()?;
-    let doc: PluginDocument = fetch_json(
-        &format!("https://marketplace.dify.ai/api/v1/plugins/{org}/{name}"),
-        net,
-        cache,
-    )?;
+    let doc: PluginDocument = fetch_json(&format!("{PLUGINS}/{org}/{name}"), net, cache)?;
     let plugin = doc.data.plugin;
-    let version = c.target(plugin.latest_version.as_deref()).to_string();
-    let security_hold = plugin.status.as_deref().map(|status| status != ACTIVE);
-    if let Some(status) = plugin.status.as_deref().filter(|s| *s != ACTIVE) {
-        tracing::debug!(
-            plugin = %c.full_name().escape_debug(),
-            status = %status.escape_debug(),
-            "dify plugin is not active: security hold"
-        );
-    }
-    let mut registry = Registry::new(
+    let mut record = c.record(
         Ecosystem::Dify,
         plugin.plugin_id.unwrap_or_else(|| c.full_name()),
+        plugin.latest_version,
     );
-    registry.published_at = plugin
-        .version_updated_at
-        .as_deref()
-        .filter(|_| plugin.latest_version.as_deref() == Some(version.as_str()))
-        .and_then(unix_secs);
-    registry.first_published_at = plugin.created_at.as_deref().and_then(unix_secs);
-    registry.version = version;
-    registry.latest_version = plugin.latest_version;
+    record.published_at = release_time(
+        &record,
+        record.latest_version.as_deref(),
+        plugin.version_updated_at.as_deref().and_then(unix_secs),
+    );
+    record.first_published_at = plugin.created_at.as_deref().and_then(unix_secs);
     // Localized as `{ "en_US": … }`, underscore where AMO has a hyphen.
-    registry.title = plugin
+    record.title = plugin
         .label
         .and_then(|l| l.translation("en_US").or_else(|| l.text()));
-    registry.description = plugin
+    record.description = plugin
         .brief
         .and_then(|b| b.translation("en_US").or_else(|| b.text()));
-    registry.repository = plugin.repository;
-    registry.publisher = c.namespace().first().cloned();
-    registry.downloads_total = plugin.install_count;
+    record.repository = plugin.repository;
+    record.publisher = c.namespace().first().cloned();
+    record.downloads_total = plugin.install_count;
     // Dify's own and its partners' plugins are vetted; `community` is
     // anyone's.
-    registry.publisher_verified = plugin
+    record.publisher_verified = plugin
         .verification
         .and_then(|v| v.authorized_category)
         .map(|c| matches!(c.as_str(), "langgenius" | "partner"));
-    registry.deprecated = plugin.deprecated_reason;
-    registry.security_hold = security_hold;
-    Ok(registry)
+    record.deprecated = plugin.deprecated_reason;
+    record.security_hold = held(plugin.status.as_deref(), ACTIVE, &c.full_name());
+    Ok(record)
 }
 
 /// A Dify Marketplace plugin document: the listing under `data.plugin`.
@@ -213,8 +197,7 @@ struct Release {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::coordinates;
-    use filefacts::RefLocator;
+    use crate::ecosystem::{coordinates, look};
 
     use crate::fetch::Fixtures;
 
@@ -236,10 +219,6 @@ mod tests {
         Fixtures::default().with(EVAL_LOOP, doc.as_bytes())
     }
 
-    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
-
     #[test]
     fn dify_plugin_normalizes() {
         let net = eval_loop(ACTIVE, "");
@@ -256,10 +235,15 @@ mod tests {
         assert_eq!(r.downloads_total, Some(9));
         assert_eq!(r.deprecated, None);
         assert_eq!(r.security_hold, Some(false));
-        assert_eq!(
-            look("pkg:dify/eval-loop", &net),
-            Err(RegistryError::UnsafeCoordinate)
-        );
+        for purl in ["pkg:dify/eval-loop", "pkg:dify/fr3on/eval-loop/x"] {
+            assert_eq!(look(purl, &net), Err(RegistryError::UnsafeCoordinate));
+            // The resolver holds the coordinate to the same shape.
+            assert_eq!(
+                resolve_dify(&coordinates(purl), &net, &BlobCache::disabled()),
+                Err(RegistryError::UnsafeCoordinate),
+                "{purl}"
+            );
+        }
     }
 
     #[test]

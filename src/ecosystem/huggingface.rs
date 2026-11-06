@@ -3,7 +3,9 @@
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
-use crate::ecosystem::{Coordinates, fetch_json, lenient, non_empty, null_default, unix_secs};
+use crate::ecosystem::{
+    Coordinates, fetch_json, lenient, non_empty, null_default, release_time, unix_secs,
+};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
@@ -29,13 +31,21 @@ pub(crate) fn lookup(
         cache,
     )?;
 
-    // No version in the locator → the current default-branch commit.
-    let version = c.target(doc.sha.as_deref());
+    // The current default-branch commit is the latest revision, and the one
+    // a versionless locator names.
+    let mut record = c.record(Ecosystem::Huggingface, c.full_name(), doc.sha);
     // `lastModified` is that commit's time, so it dates only that revision;
     // `createdAt` is the repo's birth — a long-dormant model that suddenly
     // ships again is the hijack tell.
-    let current = doc.sha.as_deref() == Some(version);
-    let license = doc
+    record.published_at = release_time(
+        &record,
+        record.latest_version.as_deref(),
+        doc.last_modified.as_deref().and_then(unix_secs),
+    );
+    record.first_published_at = doc.created_at.as_deref().and_then(unix_secs);
+    record.author = doc.author;
+    record.homepage = Some(format!("https://huggingface.co/{}", c.path()));
+    record.license = doc
         .license
         .or_else(|| doc.card_data.and_then(|c| c.license))
         .or_else(|| {
@@ -44,21 +54,10 @@ pub(crate) fn lookup(
                 .find_map(|t| t.strip_prefix("license:"))
                 .map(str::to_string)
         });
-    let mut registry = Registry::new(Ecosystem::Huggingface, c.full_name());
-    registry.version = version.to_string();
-    registry.published_at = doc
-        .last_modified
-        .as_deref()
-        .filter(|_| current)
-        .and_then(unix_secs);
-    registry.first_published_at = doc.created_at.as_deref().and_then(unix_secs);
-    registry.author = doc.author;
-    registry.homepage = Some(format!("https://huggingface.co/{}", c.path()));
-    registry.license = license;
     // HF's `downloads` is a rolling 30-day count, not a lifetime total.
-    registry.downloads_recent = doc.downloads;
-    registry.favorites = doc.likes;
-    Ok(registry)
+    record.downloads_recent = doc.downloads;
+    record.favorites = doc.likes;
+    Ok(record)
 }
 
 /// A Hugging Face Hub model document. A model's license is a top-level
@@ -92,9 +91,10 @@ struct CardData {
 
 #[cfg(test)]
 mod tests {
-    use filefacts::{Ecosystem, RefLocator};
+    use filefacts::Ecosystem;
 
-    use crate::fetch::{BlobCache, Fixtures};
+    use crate::ecosystem::look;
+    use crate::fetch::Fixtures;
     use crate::registry::RegistryError;
 
     const RESNET: &str = "https://huggingface.co/api/models/microsoft/resnet-50";
@@ -107,10 +107,6 @@ mod tests {
         })
         .to_string();
         Fixtures::default().with(RESNET, doc.as_bytes())
-    }
-
-    fn look(purl: &str, net: &Fixtures) -> Result<filefacts::Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
     }
 
     #[test]
@@ -138,6 +134,7 @@ mod tests {
     fn a_requested_revision_is_the_version_and_the_head_does_not_date_it() {
         let r = look("pkg:huggingface/microsoft/resnet-50@0ld", &resnet()).expect("registry");
         assert_eq!(r.version, "0ld");
+        assert_eq!(r.latest_version.as_deref(), Some("abc123def"));
         assert_eq!(r.published_at, None);
         let r = look("pkg:huggingface/microsoft/resnet-50@abc123def", &resnet()).expect("registry");
         assert_eq!(r.published_at, Some(1_682_244_000));

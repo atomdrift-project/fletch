@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use crate::fetch::digest::{Algorithm, Digest};
 use crate::fetch::transport::{DEFAULT_MAX_FETCH_BYTES, Fetch, FetchError, Fetched, Request};
 use crate::fetch::{Served, now, sha256_hex};
 
@@ -22,16 +23,16 @@ mod disk;
 pub(crate) mod sweep;
 
 use disk::Trusted;
-pub(crate) use disk::{Counted, create_private};
+pub(crate) use disk::{Capped, Counted, create_private};
 use sweep::Limits;
 
 /// Cache lifetime for a pinned reference — immutable, so a stale hit is
 /// still correct (and re-verified).
-pub(crate) const TTL_PINNED: Duration = Duration::from_secs(7 * 24 * 3600);
+pub(crate) const TTL_PINNED: Duration = Duration::from_hours(7 * 24);
 
 /// Cache lifetime for an unpinned reference — `@latest`/mutable tags can
 /// move, so staleness is bounded.
-pub(crate) const TTL_UNPINNED: Duration = Duration::from_secs(12 * 3600);
+pub(crate) const TTL_UNPINNED: Duration = Duration::from_hours(12);
 
 /// Registry-*metadata* cache lifetimes, distinct from the artifact TTLs above.
 /// Keyed on the *resource's* mutability, not whether the PURL named a version:
@@ -53,7 +54,7 @@ pub(crate) const TTL_UNPINNED: Duration = Duration::from_secs(12 * 3600);
 ///   self-heal from a bad parse. The one thing a cached copy can't know is a
 ///   version published after it was fetched, so a lookup whose copy doesn't
 ///   list the requested version re-reads it under the unpinned TTL (see
-///   [`crate::registry::registry`]).
+///   `ecosystem::for_version`).
 /// - **Unpinned** — a `latest`/versionless lookup resolves through dist-tags,
 ///   which are repointable at will. That is where the real mutability lives, so
 ///   it keeps a tight bound.
@@ -70,9 +71,9 @@ pub(crate) const TTL_UNPINNED: Duration = Duration::from_secs(12 * 3600);
 /// [`BlobCache::with_registry_ttl`]; the immutable tier is never re-checked.
 pub(crate) const META_TTL_IMMUTABLE: Duration = Duration::MAX;
 
-const META_TTL_PINNED_DEFAULT: Duration = Duration::from_secs(90 * 86_400);
+const META_TTL_PINNED_DEFAULT: Duration = Duration::from_hours(90 * 24);
 
-const META_TTL_UNPINNED_DEFAULT: Duration = Duration::from_secs(3600);
+const META_TTL_UNPINNED_DEFAULT: Duration = Duration::from_hours(1);
 
 /// The largest sidecar read back. Ours hold a status, a few URLs, and the
 /// response headers (which the HTTP client already bounds), so this is ample;
@@ -97,9 +98,31 @@ pub(crate) struct CachedMeta {
     /// callers leave it `None`; absent from entries written before it existed.
     #[serde(default)]
     pub(crate) size: Option<u64>,
+    /// SHA-256 (hex) of the blob, recorded by [`BlobCache::put`]: it names the
+    /// bytes without reading them back (see [`cached_metadata_digest`]).
+    #[serde(default)]
+    pub(crate) sha256: Option<String>,
+    /// Whether the blob is the body as it came rather than zstd-compressed:
+    /// [`BlobCache::store`] keeps one already compressed in a format that
+    /// checks its own integrity ([`self_checked`]) as it is.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) raw: bool,
 }
 
 impl CachedMeta {
+    /// The provenance of `fetched`, as fetched now; its size and digest are
+    /// recorded when it is stored.
+    pub(crate) fn of(fetched: &Fetched) -> Self {
+        Self {
+            fetched_at: now(),
+            status: fetched.status,
+            final_url: fetched.final_url.clone(),
+            redirects: fetched.redirects.clone(),
+            headers: fetched.headers.clone(),
+            ..Self::default()
+        }
+    }
+
     /// The decompression ceiling for this entry's blob: the size recorded when
     /// it was stored. An entry admitted under a larger cap than the per-fetch
     /// `max_bytes` (a container image) is still served, and a blob planted in
@@ -132,9 +155,27 @@ pub struct RecordedSource {
     pub bytes: Option<Vec<u8>>,
 }
 
-/// Shared sink of [`RecordedSource`]s, populated by a recording [`BlobCache`].
-/// See [`BlobCache::recording`].
-pub type RawSink = Arc<Mutex<Vec<RecordedSource>>>;
+/// The [`RecordedSource`]s a recording [`BlobCache`] collects (see
+/// [`BlobCache::recording`]), shared by the cache's clones.
+#[derive(Debug, Clone, Default)]
+pub struct RawSink(Arc<Mutex<Vec<RecordedSource>>>);
+
+impl RawSink {
+    /// Everything recorded so far, in read order, leaving the sink empty. A
+    /// reader that panicked mid-lookup leaves whole records behind; they are
+    /// returned too.
+    #[must_use]
+    pub fn take(&self) -> Vec<RecordedSource> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn push(&self, source: RecordedSource) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(source);
+    }
+}
 
 /// Content-addressed cache of fetched responses — bytes (`<key>.zst`) plus a
 /// provenance sidecar (`<key>.json`), keyed by `sha256(locator)`. Two
@@ -155,9 +196,11 @@ pub struct BlobCache {
     trust: Arc<OnceLock<Option<Trusted>>>,
     /// Staleness tolerance for registry-*metadata* reads
     /// ([`cached_metadata`], [`cached_metadata_status`], [`cached_post`]).
-    /// [`registry`](crate::registry::registry) overrides it per PURL via
-    /// [`with_meta_ttl`](Self::with_meta_ttl); artifact fetches ignore it.
-    pub(crate) meta_ttl: Duration,
+    /// A registry lookup sets it per PURL (`ecosystem::for_version`) via
+    /// [`with_meta_ttl`](Self::with_meta_ttl); `None`, for a read no lookup
+    /// classified, is the unpinned tier — the safe choice for a document
+    /// that may change. Artifact fetches ignore it.
+    meta_ttl: Option<Duration>,
     /// When set, every metadata document this cache serves — from a hit or a
     /// fresh fetch — is appended to the sink as `(url, bytes)`, so a caller can
     /// recover the raw provider documents a registry lookup consumed without
@@ -175,6 +218,9 @@ pub struct BlobCache {
     /// The size the sweep holds this cache to; a process that writes
     /// `max_entries` entries triggers one.
     limits: Limits,
+    /// The distro indices lookups through this cache have parsed, shared by
+    /// its clones.
+    pub(crate) parsed_indices: crate::distro::ParsedIndices,
 }
 
 /// The blob cache root (`…/fletch/refs`), or `None` when no OS cache directory
@@ -215,12 +261,13 @@ impl BlobCache {
             dir,
             enabled,
             trust: Arc::default(),
-            meta_ttl: TTL_PINNED,
+            meta_ttl: None,
             recorder: None,
             registry_ttl: None,
             max_bytes: DEFAULT_MAX_FETCH_BYTES,
             source_limit: usize::MAX,
             limits: Limits::from_env(),
+            parsed_indices: crate::distro::ParsedIndices::default(),
         }
     }
 
@@ -268,6 +315,12 @@ impl BlobCache {
         self.registry_ttl.unwrap_or(META_TTL_PINNED_DEFAULT)
     }
 
+    /// The staleness tolerance of this cache's metadata reads (see the
+    /// `meta_ttl` field).
+    pub(crate) fn meta_ttl(&self) -> Duration {
+        self.meta_ttl.unwrap_or_else(|| self.meta_ttl_unpinned())
+    }
+
     /// Metadata TTL for an unpinned (`latest`/versionless) lookup.
     #[must_use]
     pub(crate) fn meta_ttl_unpinned(&self) -> Duration {
@@ -281,9 +334,9 @@ impl BlobCache {
     /// extra fetch.
     #[must_use]
     pub fn recording(&self) -> (Self, RawSink) {
-        let sink: RawSink = Arc::new(Mutex::new(Vec::new()));
+        let sink = RawSink::default();
         let cache = Self {
-            recorder: Some(Arc::clone(&sink)),
+            recorder: Some(sink.clone()),
             ..self.clone()
         };
         (cache, sink)
@@ -307,26 +360,22 @@ impl BlobCache {
     /// records, so its contents are kept.
     pub(crate) fn commit(&self, staged: Option<RawSink>) {
         if let (Some(sink), Some(staged)) = (&self.recorder, staged) {
-            let mut read =
-                std::mem::take(&mut *staged.lock().unwrap_or_else(PoisonError::into_inner));
-            sink.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .append(&mut read);
+            for source in staged.take() {
+                sink.push(source);
+            }
         }
     }
 
     /// Append a served metadata document to the recorder, if one is installed.
     fn record(&self, url: &str, status: u16, content_type: Option<&str>, bytes: &[u8]) {
         if let Some(sink) = &self.recorder {
-            sink.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(RecordedSource {
-                    url: url.to_string(),
-                    status,
-                    content_type: content_type.map(str::to_string),
-                    size: bytes.len() as u64,
-                    bytes: (bytes.len() <= self.source_limit).then(|| bytes.to_vec()),
-                });
+            sink.push(RecordedSource {
+                url: url.to_string(),
+                status,
+                content_type: content_type.map(str::to_string),
+                size: bytes.len() as u64,
+                bytes: (bytes.len() <= self.source_limit).then(|| bytes.to_vec()),
+            });
         }
     }
 
@@ -337,7 +386,7 @@ impl BlobCache {
     #[must_use]
     pub(crate) fn with_meta_ttl(&self, ttl: Duration) -> Self {
         Self {
-            meta_ttl: ttl,
+            meta_ttl: Some(ttl),
             ..self.clone()
         }
     }
@@ -355,35 +404,46 @@ impl BlobCache {
                 return None;
             }
             disk::trust_root(&self.dir)
-                .map_err(|why| {
+                .inspect_err(|why| {
                     tracing::warn!(target: "cache", %root, %why, "not using the blob cache");
                 })
                 .ok()
         })
     }
 
+    /// The shard directory for `key`. Keys are digests; anything else — one
+    /// holding a `/` or spelling `..` — is refused rather than joined into a
+    /// path.
+    fn shard_path(&self, key: &str) -> Option<PathBuf> {
+        if !disk::is_key(key) {
+            tracing::warn!(target: "cache", key = %key.escape_debug(), "refusing a malformed cache key");
+            return None;
+        }
+        Some(self.dir.join(disk::shard_name(key)))
+    }
+
     /// The shard holding `key`, when it exists and is trusted.
     fn readable_shard(&self, key: &str) -> Option<PathBuf> {
         let trusted = self.trusted_root()?;
-        let shard = self.dir.join(disk::shard_name(key));
+        let shard = self.shard_path(key)?;
         if !shard.exists() {
             return None;
         }
-        self.admit(trusted, shard)
+        Self::admit(trusted, shard)
     }
 
     /// The shard to hold `key`, created if need be, when it is trusted.
     fn writable_shard(&self, key: &str) -> Option<PathBuf> {
         let trusted = self.trusted_root()?;
-        let shard = self.dir.join(disk::shard_name(key));
+        let shard = self.shard_path(key)?;
         if let Err(error) = disk::create_private_dir(&shard) {
             tracing::warn!(target: "cache", shard = %shard.display(), %error, "cannot create cache shard");
             return None;
         }
-        self.admit(trusted, shard)
+        Self::admit(trusted, shard)
     }
 
-    fn admit(&self, trusted: Trusted, shard: PathBuf) -> Option<PathBuf> {
+    fn admit(trusted: Trusted, shard: PathBuf) -> Option<PathBuf> {
         match trusted.admit(&shard) {
             Ok(()) => Some(shard),
             Err(why) => {
@@ -437,23 +497,18 @@ impl BlobCache {
     ) -> Option<(T, CachedMeta)> {
         let shard = self.readable_shard(key)?;
         let blob_path = shard.join(disk::blob_name(key));
+        let meta_path = shard.join(disk::meta_name(key));
         let blob = std::fs::File::open(&blob_path).ok()?;
         let blob_mtime = blob.metadata().and_then(|m| m.modified()).ok()?;
-        let meta: CachedMeta = match std::fs::File::open(shard.join(disk::meta_name(key))) {
-            Ok(sidecar) => match serde_json::from_reader(sidecar.take(MAX_SIDECAR_BYTES)) {
-                Ok(meta) => meta,
-                Err(error) => return rejected(key, "corrupt sidecar", &error),
-            },
-            Err(error) => return rejected(key, "blob without a sidecar", &error),
-        };
-        let age = Duration::from_secs(now().saturating_sub(meta.fetched_at));
-        if max_age.is_some_and(|max_age| age > max_age) {
-            return None;
-        }
+        let meta = sidecar(key, &meta_path, max_age)?;
         let limit = meta.read_limit(self.max_bytes);
-        let decoder = match zstd::stream::read::Decoder::new(blob) {
-            Ok(decoder) => decoder,
-            Err(error) => return rejected(key, "corrupt blob", &error),
+        let decoder: Box<dyn Read> = if meta.raw {
+            Box::new(blob)
+        } else {
+            match zstd::stream::read::Decoder::new(blob) {
+                Ok(decoder) => Box::new(decoder),
+                Err(error) => return rejected(key, "corrupt blob", &error),
+            }
         };
         let count = Cell::new(0);
         let value = match read(&mut Counted::new(
@@ -471,8 +526,23 @@ impl BlobCache {
         {
             return rejected(key, "size does not match its sidecar", &size);
         }
-        mark_accessed(&[blob_path, shard.join(disk::meta_name(key))], blob_mtime);
+        mark_accessed(&[blob_path, meta_path], blob_mtime);
         Some((value, meta))
+    }
+
+    /// The sidecar of `key`'s entry when the entry is fresh by `max_age`,
+    /// marking the entry used: what [`cached_metadata_digest`] reads in
+    /// place of the blob.
+    fn fresh_sidecar(&self, key: &str, max_age: Duration) -> Option<CachedMeta> {
+        let shard = self.readable_shard(key)?;
+        let blob_path = shard.join(disk::blob_name(key));
+        let meta_path = shard.join(disk::meta_name(key));
+        let blob_mtime = std::fs::metadata(&blob_path)
+            .and_then(|m| m.modified())
+            .ok()?;
+        let meta = sidecar(key, &meta_path, Some(max_age))?;
+        mark_accessed(&[blob_path, meta_path], blob_mtime);
+        Some(meta)
     }
 
     /// `key`'s entry unpacked into a spool, for a reader that must seek (a Go
@@ -499,7 +569,8 @@ impl BlobCache {
     /// The name ends in an unguessable tag ([`disk::unique_suffix`]), so no
     /// one sharing the temp directory can plant the path first.
     pub(crate) fn spool(&self, key: &str) -> Spool {
-        let name = format!("{key}.part.{}", disk::unique_suffix());
+        let stem = if disk::is_key(key) { key } else { "spool" };
+        let name = format!("{stem}.part.{}", disk::unique_suffix());
         if self.enabled {
             if let Some(shard) = self.writable_shard(key) {
                 return Spool(shard.join(name));
@@ -524,39 +595,81 @@ impl BlobCache {
     /// The cached bytes for a locator, at any age — for re-analysing a
     /// fetched stage. `None` if it was never fetched.
     ///
+    /// The whole entry is read into memory. A container image's entry is a
+    /// flattened rootfs of up to 2 GiB; stream one with
+    /// [`load_with`](Self::load_with) instead.
+    ///
     /// These are the fetched bytes as they arrived, for analysis only. A
     /// container image's entry in particular is a flattened rootfs tar whose
     /// symlinks point where the image's do (`/etc/…`, `../../…`) and which
     /// keeps device nodes and setuid bits: it must never be extracted to disk.
     #[must_use]
     pub fn load(&self, locator: &str) -> Option<Vec<u8>> {
-        self.any(&sha256_hex(locator.as_bytes()))
-            .map(|(bytes, _)| bytes)
+        self.load_with(locator, read_all)
+    }
+
+    /// [`load`](Self::load), streamed: `read` is handed the cached bytes for
+    /// `locator` as they decompress, and what it returns is returned — the
+    /// entry is never held in memory whole. `None` when nothing is cached,
+    /// when `read` fails, or when the entry proves damaged once read (its size
+    /// disagrees with its record); then whatever `read` made of it must be
+    /// discarded.
+    pub fn load_with<T>(
+        &self,
+        locator: &str,
+        read: impl FnOnce(&mut dyn Read) -> std::io::Result<T>,
+    ) -> Option<T> {
+        self.read_with(&sha256_hex(locator.as_bytes()), None, read)
+            .map(|(value, _)| value)
     }
 
     /// Store `bytes` and `meta` for `key`. Best-effort — a write failure is
     /// logged and otherwise non-fatal (the next run re-fetches).
     pub(crate) fn put(&self, key: &str, bytes: &[u8], meta: &CachedMeta) {
-        self.store(key, bytes, bytes.len() as u64, meta);
+        let meta = CachedMeta {
+            sha256: Some(sha256_hex(bytes)),
+            ..meta.clone()
+        };
+        self.store(key, bytes, bytes.len() as u64, &meta);
     }
 
     /// Store the `size`-byte `body` and `meta` for `key`, compressing it as it
-    /// streams. Best-effort, as [`put`](Self::put).
-    pub(crate) fn store(&self, key: &str, body: impl Read, size: u64, meta: &CachedMeta) {
+    /// streams unless it is already compressed. Best-effort, as
+    /// [`put`](Self::put).
+    pub(crate) fn store(&self, key: &str, mut body: impl Read, size: u64, meta: &CachedMeta) {
         let Some(shard) = self.writable_shard(key) else {
             return;
         };
-        // Bytes this entry occupies on disk, the compressed blob and its
-        // sidecar, as the sweep measures them.
+        // Bytes this entry occupies on disk, the blob and its sidecar, as the
+        // sweep measures them.
         let mut on_disk = 0u64;
+        let mut raw = false;
         let stored = disk::write_replacing(&shard.join(disk::blob_name(key)), |out| {
-            zstd::stream::copy_encode(body, &mut *out, 3)?;
+            let mut head = Vec::with_capacity(8);
+            (&mut body).take(8).read_to_end(&mut head)?;
+            let mut body = head.as_slice().chain(body);
+            // A body already compressed, in a format whose own checksums catch
+            // damage (a .tgz, a wheel, an image export), is kept as it came:
+            // zstd would gain nothing and cost a pass on every write and read.
+            // Anything else is compressed, its frame checksum making a blob
+            // damaged on disk (a crash mid-write, bit rot) a read error, never
+            // different bytes of the recorded size.
+            raw = self_checked(&head);
+            if raw {
+                std::io::copy(&mut body, out)?;
+            } else {
+                let mut encoder = zstd::stream::write::Encoder::new(&mut *out, 3)?;
+                encoder.include_checksum(true)?;
+                std::io::copy(&mut body, &mut encoder)?;
+                encoder.finish()?;
+            }
             on_disk = out.metadata()?.len();
             Ok(())
         })
         .and_then(|()| {
             let meta = CachedMeta {
                 size: Some(size),
+                raw,
                 ..meta.clone()
             };
             let json = serde_json::to_vec(&meta)?;
@@ -575,6 +688,41 @@ impl BlobCache {
     }
 }
 
+/// Whether `head`, a body's first bytes, opens a format that checks its own
+/// integrity: gzip and bzip2 (a CRC per member or block), zip (a CRC per
+/// entry), and xz whose stream flags name a check. zstd is not among them: its
+/// checksum is optional, and a cache written before blobs could be stored raw
+/// would read a raw zstd blob as one of its own.
+fn self_checked(head: &[u8]) -> bool {
+    match head {
+        // gzip's deflate method; bzip2's level digit and first block's magic.
+        [0x1f, 0x8b, 8, ..]
+        | [b'B', b'Z', b'h', b'1'..=b'9', 0x31, 0x41, 0x59, 0x26]
+        | [b'P', b'K', 3, 4, ..] => true,
+        [0xfd, b'7', b'z', b'X', b'Z', 0, 0, flags, ..] => flags & 0x0f != 0,
+        _ => false,
+    }
+}
+
+/// The sidecar at `path` of `key`'s entry, when the entry is fresh by
+/// `max_age` (any age without one).
+fn sidecar(key: &str, path: &Path, max_age: Option<Duration>) -> Option<CachedMeta> {
+    let meta: CachedMeta = match std::fs::File::open(path) {
+        Ok(sidecar) => match serde_json::from_reader(sidecar.take(MAX_SIDECAR_BYTES)) {
+            Ok(meta) => meta,
+            Err(error) => return rejected(key, "corrupt sidecar", &error),
+        },
+        Err(error) => return rejected(key, "blob without a sidecar", &error),
+    };
+    // A fetch dated in the future (a clock set back, a forged sidecar) has
+    // no age to judge: stale, rather than fresh until that date.
+    let age = now().checked_sub(meta.fetched_at).map(Duration::from_secs);
+    if max_age.is_some_and(|max_age| age.is_none_or(|age| age > max_age)) {
+        return None;
+    }
+    Some(meta)
+}
+
 /// Log why `key`'s entry is not served, and miss.
 fn rejected<T>(key: &str, reason: &'static str, detail: &dyn std::fmt::Display) -> Option<T> {
     tracing::debug!(target: "cache", key, reason, %detail, "cache entry rejected");
@@ -584,7 +732,7 @@ fn rejected<T>(key: &str, reason: &'static str, detail: &dyn std::fmt::Display) 
 /// Bump the mtime of an entry's `paths` to now, recording the access for the
 /// sweep — at most once a day, judged by the blob's `mtime`.
 fn mark_accessed(paths: &[PathBuf], mtime: SystemTime) {
-    const TOUCH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+    const TOUCH_INTERVAL: Duration = Duration::from_hours(24);
     if mtime.elapsed().is_ok_and(|age| age < TOUCH_INTERVAL) {
         return;
     }
@@ -694,15 +842,11 @@ pub(crate) fn metadata_cache_key(url: &str) -> String {
 /// already has the bytes in hand for another reason and would otherwise make
 /// the registry answer twice.
 pub(crate) fn store_metadata(url: &str, fetched: &Fetched, cache: &BlobCache) {
-    let meta = CachedMeta {
-        fetched_at: now(),
-        status: fetched.status,
-        final_url: fetched.final_url.clone(),
-        redirects: fetched.redirects.clone(),
-        headers: fetched.headers.clone(),
-        size: None,
-    };
-    cache.put(&metadata_cache_key(url), &fetched.bytes, &meta);
+    cache.put(
+        &metadata_cache_key(url),
+        &fetched.bytes,
+        &CachedMeta::of(fetched),
+    );
 }
 
 /// [`cached_metadata`], keeping the status of a refusal, and attaching request
@@ -730,6 +874,19 @@ pub(crate) fn cached_metadata_status(
     cached_document(&headed_cache_key(url, headers), url, cache, || {
         net.send(&Request::get(url).with_headers(headers))
     })
+}
+
+/// The SHA-256 of the document [`cached_metadata_status`] would serve for
+/// `url` from cache, read from the entry's sidecar alone: a reader holding a
+/// parse of those very bytes need not read them again. `None` when the
+/// document would not be served from cache, its digest was never recorded,
+/// or the cache records its sources, which takes the bytes.
+pub(crate) fn cached_metadata_digest(url: &str, cache: &BlobCache) -> Option<Digest> {
+    if cache.recorder.is_some() {
+        return None;
+    }
+    let meta = cache.fresh_sidecar(&metadata_cache_key(url), cache.meta_ttl())?;
+    Digest::new(Algorithm::Sha256, meta.sha256.as_deref()?)
 }
 
 /// [`cached_metadata_status`] for a GitHub API URL fletch named itself, sent
@@ -781,41 +938,36 @@ fn cached_document(
     cache: &BlobCache,
     send: impl FnOnce() -> Result<Fetched, FetchError>,
 ) -> Result<Vec<u8>, FetchError> {
-    if let Some((bytes, meta)) = cache.fresh(key, cache.meta_ttl) {
-        crate::metrics::metadata(url, Some(Served::Cache), Some(bytes.len()));
-        cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
-        return Ok(bytes);
-    }
-    let f = match send() {
-        Ok(f) => f,
-        Err(e) => {
+    let (bytes, meta, served) = if let Some((bytes, meta)) = cache.fresh(key, cache.meta_ttl()) {
+        (bytes, meta, Served::Cache)
+    } else {
+        match send() {
+            Ok(f) => {
+                let meta = CachedMeta::of(&f);
+                cache.put(key, &f.bytes, &meta);
+                (f.bytes, meta, Served::Network)
+            }
             // A stale copy stands in for a source that could not be reached,
             // never for one that answered: a package removed (404, 410 — how
             // registries pull malware) or withheld (451, the Go proxy's 403
             // takedown) is the news, and an old copy would hide it.
-            if !is_verdict(url, &e)
-                && let Some((bytes, meta)) = cache.any(key)
-            {
-                crate::metrics::metadata(url, Some(Served::StaleCache), Some(bytes.len()));
-                cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
-                return Ok(bytes);
+            Err(e) => {
+                let stale = if is_verdict(url, &e) {
+                    None
+                } else {
+                    cache.any(key)
+                };
+                let Some((bytes, meta)) = stale else {
+                    crate::metrics::metadata(url, None, None);
+                    return Err(e);
+                };
+                (bytes, meta, Served::StaleCache)
             }
-            crate::metrics::metadata(url, None, None);
-            return Err(e);
         }
     };
-    crate::metrics::metadata(url, Some(Served::Network), Some(f.bytes.len()));
-    let meta = CachedMeta {
-        fetched_at: now(),
-        status: f.status,
-        final_url: f.final_url,
-        redirects: f.redirects,
-        headers: f.headers,
-        size: None,
-    };
-    cache.put(key, &f.bytes, &meta);
-    cache.record(url, meta.status, content_type_of(&meta.headers), &f.bytes);
-    Ok(f.bytes)
+    crate::metrics::metadata(url, Some(served), Some(bytes.len()));
+    cache.record(url, meta.status, content_type_of(&meta.headers), &bytes);
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -1000,6 +1152,54 @@ mod tests {
     }
 
     #[test]
+    fn pinned_metadata_outlives_unpinned_and_honours_the_override() {
+        // A pinned coordinate cannot come back holding different bytes on any
+        // registry we support, so its packument is held for months; a versionless
+        // lookup resolves through mutable dist-tags and keeps a tight bound.
+        let cache = BlobCache::disabled();
+        assert!(cache.meta_ttl_pinned() > cache.meta_ttl_unpinned());
+        assert!(cache.meta_ttl_pinned() >= Duration::from_secs(30 * 86_400));
+
+        // An explicit operator override still wins on both tiers, so asking for
+        // tight revalidation is never silently ignored.
+        let minute = Duration::from_secs(60);
+        let cache = cache.with_registry_ttl(Some(minute));
+        assert_eq!(cache.meta_ttl_pinned(), minute);
+        assert_eq!(cache.meta_ttl_unpinned(), minute);
+    }
+
+    /// A metadata read no registry lookup classified (an artifact
+    /// resolution's "current release" document) may change at any time: it
+    /// is held to the unpinned tier, and an operator's registry TTL applies.
+    #[test]
+    fn an_unclassified_metadata_read_is_held_to_the_unpinned_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://aur.archlinux.org/rpc/v5/info?arg[]=x";
+        let cache = BlobCache::with_dir(dir.path());
+        assert!(cached_metadata(url, &Fixtures::default().with(url, b"old"), &cache).is_some());
+        let path = cache.meta_path(&metadata_cache_key(url));
+        let mut meta: CachedMeta = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        meta.fetched_at -= 2 * 3600;
+        std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let new = Fixtures::default().with(url, b"new");
+        assert_eq!(
+            cached_metadata(url, &new, &cache).as_deref(),
+            Some(&b"new"[..])
+        );
+
+        let patient = cache.with_registry_ttl(Some(Duration::from_secs(365 * 86_400)));
+        let mut meta: CachedMeta = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        meta.fetched_at -= 30 * 86_400;
+        std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert_eq!(
+            cached_metadata(url, &Fixtures::default().with(url, b"newer"), &patient).as_deref(),
+            Some(&b"new"[..]),
+            "the operator's registry TTL governs"
+        );
+    }
+
+    #[test]
     fn a_removal_outranks_a_stale_copy_but_an_outage_does_not() {
         let dir = tempfile::tempdir().unwrap();
         let cache = BlobCache::with_dir(dir.path()).with_meta_ttl(Duration::from_secs(60));
@@ -1092,6 +1292,22 @@ mod tests {
         );
     }
 
+    /// A cached entry streams to its reader without being held whole, and a
+    /// damaged one is reported as missing.
+    #[test]
+    fn load_with_streams_a_cached_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlobCache::with_dir(dir.path());
+        let locator = "oci://docker.io/library/demo:1";
+        let key = sha256_hex(locator.as_bytes());
+        let body = vec![7u8; 100_000];
+        cache.put(&key, &body, &CachedMeta::default());
+        let counted = cache.load_with(locator, |r| std::io::copy(r, &mut std::io::sink()));
+        assert_eq!(counted, Some(100_000));
+        assert_eq!(cache.load(locator), Some(body));
+        assert_eq!(cache.load_with("never-fetched", read_all), None);
+    }
+
     /// A reader that panicked while holding the staged sink leaves whole
     /// records behind; they still reach the caller.
     #[test]
@@ -1100,13 +1316,14 @@ mod tests {
         let (staged, held) = cache.staged();
         staged.record("https://x.test/doc", 200, None, b"{}");
         let poisoner = held.clone().expect("staged sink");
-        let _ = std::thread::spawn(move || {
-            let _guard = poisoner.lock().unwrap();
+        let panicked = std::thread::spawn(move || {
+            let _guard = poisoner.0.lock().unwrap();
             panic!("a reader panics mid-lookup");
         })
         .join();
+        assert!(panicked.is_err());
         cache.commit(held);
-        assert_eq!(sink.lock().unwrap().len(), 1);
+        assert_eq!(sink.take().len(), 1);
     }
 
     #[test]
@@ -1150,6 +1367,123 @@ mod tests {
         let packuments: Vec<_> = sources.iter().filter(|s| s.url == url).collect();
         assert_eq!(packuments.len(), 1);
         assert_eq!(packuments[0].bytes.as_deref(), Some(new.as_bytes()));
+    }
+
+    /// An entry dated in the future is never fresh, though still a fallback.
+    #[test]
+    fn an_entry_from_the_future_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlobCache::with_dir(dir.path());
+        let meta = CachedMeta {
+            fetched_at: now() + 365 * 86_400,
+            ..CachedMeta::default()
+        };
+        cache.put("k", b"x", &meta);
+        assert!(cache.fresh("k", Duration::from_hours(1)).is_none());
+        assert!(cache.any("k").is_some());
+    }
+
+    /// Keys are digests; one that could name a path elsewhere is refused.
+    #[test]
+    fn a_key_that_spells_a_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("refs");
+        let cache = BlobCache::with_dir(&root);
+        for key in ["../escape", "ab/../../escape", "", "a.b"] {
+            cache.put(key, b"x", &CachedMeta::default());
+            assert!(cache.any(key).is_none(), "{key:?}");
+            assert_eq!(
+                cache.spool(key).path().parent(),
+                Some(std::env::temp_dir().as_path())
+            );
+        }
+        assert!(!dir.path().join("escape.zst").exists());
+        assert!(
+            std::fs::read_dir(&root)
+                .map(|d| d.flatten().all(|e| e.file_name() != "escape.zst"))
+                .unwrap_or(true)
+        );
+    }
+
+    /// A body already compressed in a self-checking format is stored as it
+    /// came, read back unchanged, and still a miss when cut short.
+    #[test]
+    fn an_already_compressed_body_is_stored_as_it_came() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlobCache::with_dir(dir.path());
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&b"package bytes ".repeat(1000)).unwrap();
+        let body = gz.finish().unwrap();
+        let key = "abc123";
+        cache.put(key, &body, &CachedMeta::default());
+
+        assert_eq!(std::fs::read(cache.blob_path(key)).unwrap(), body);
+        let (bytes, meta) = cache.any(key).expect("served");
+        assert_eq!((bytes, meta.raw), (body.clone(), true));
+
+        std::fs::write(cache.blob_path(key), &body[..body.len() - 1]).unwrap();
+        assert!(cache.any(key).is_none(), "a truncated raw blob is a miss");
+
+        // Anything else is compressed, as before.
+        cache.put(key, b"{\"json\": true}", &CachedMeta::default());
+        let (bytes, meta) = cache.any(key).expect("served");
+        assert_eq!(
+            (bytes.as_slice(), meta.raw),
+            (&b"{\"json\": true}"[..], false)
+        );
+    }
+
+    #[test]
+    fn only_formats_that_check_themselves_are_kept_raw() {
+        let xz = |check| {
+            let stream = xz2::stream::Stream::new_easy_encoder(1, check).unwrap();
+            let mut out = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+            out.write_all(b"x").unwrap();
+            out.finish().unwrap()
+        };
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(b"x").unwrap();
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("a", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        let zip = zip.finish().unwrap().into_inner();
+        for (name, body, raw) in [
+            ("gzip", gz.finish().unwrap(), true),
+            ("zip", zip, true),
+            ("xz with a CRC64", xz(xz2::stream::Check::Crc64), true),
+            ("xz without a check", xz(xz2::stream::Check::None), false),
+            ("bzip2", b"BZh91AY&SY".to_vec(), true),
+            ("text that starts like bzip2", b"BZh is not".to_vec(), false),
+            ("zstd", zstd::encode_all(&b"x"[..], 3).unwrap(), false),
+            ("json", b"{}".to_vec(), false),
+        ] {
+            assert_eq!(self_checked(&body[..body.len().min(8)]), raw, "{name}");
+        }
+    }
+
+    /// A blob damaged on disk is a miss, not other bytes of the same size.
+    #[test]
+    fn a_damaged_blob_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlobCache::with_dir(dir.path());
+        // Incompressible, so zstd stores it raw and a flipped byte would
+        // otherwise decode as a different byte, not as an error.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let body: Vec<u8> = (0..4096)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        cache.put("k", &body, &CachedMeta::default());
+        assert_eq!(cache.any("k").map(|(b, _)| b), Some(body));
+        let mut blob = std::fs::read(cache.blob_path("k")).unwrap();
+        let middle = blob.len() / 2;
+        blob[middle] ^= 1;
+        std::fs::write(cache.blob_path("k"), blob).unwrap();
+        assert!(cache.any("k").is_none());
     }
 
     #[test]

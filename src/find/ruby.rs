@@ -6,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 
 use filefacts::{Arg, FileType, Symbol};
 
-use super::Discovery;
 use super::shell::tool_name;
 use super::urls::fetch_calls;
+use super::{Discovery, UnresolvedFetchCall};
 
 /// Downloader targets and gaps in a Ruby file's `system`/`exec` calls.
 pub(super) fn discover(symbols: &[Symbol]) -> Discovery {
@@ -82,8 +82,8 @@ pub(super) fn discover(symbols: &[Symbol]) -> Discovery {
 /// What one `system`/`exec` call's arguments fetch, or `None` when the call
 /// runs no downloader.
 fn command(args: &[Arg], offset: Option<u64>) -> Option<Discovery> {
-    match (args.first()?, args.len()) {
-        (Arg::String { value }, 1) => {
+    match args {
+        [Arg::String { value }] => {
             // Ruby's one-string command form permits shell syntax, so it is
             // parsed as shell, as data. A command that never names a
             // downloader cannot fetch anything, and skips the parse.
@@ -96,10 +96,10 @@ fn command(args: &[Arg], offset: Option<u64>) -> Option<Discovery> {
                 .open(value.as_bytes());
             Some(fetch_calls(parsed.symbols().as_slice()))
         }
-        (Arg::String { value }, _) if matches!(tool_name(value), "curl" | "wget") => {
+        [Arg::String { value }, argv @ ..] if matches!(tool_name(value), "curl" | "wget") => {
             // The multi-argument form is argv, not shell source. In
             // particular, a URL supplied to -d or -H is not a target.
-            let argv = args[1..]
+            let argv = argv
                 .iter()
                 .map(|arg| match arg {
                     Arg::String { .. } => arg.clone(),
@@ -113,7 +113,7 @@ fn command(args: &[Arg], offset: Option<u64>) -> Option<Discovery> {
             };
             Some(fetch_calls(&[call]))
         }
-        (Arg::Template { value }, 1) => {
+        [Arg::Template { value }] => {
             // Only the executable spelling is kept when an interpolation
             // follows it. The interpolated text can introduce options; no URL
             // from its remaining bytes is safe to infer.
@@ -130,7 +130,7 @@ fn command(args: &[Arg], offset: Option<u64>) -> Option<Discovery> {
             let head = prefix.split_ascii_whitespace().next().unwrap_or_default();
             let command = tool_name(head);
             matches!(command, "curl" | "wget").then(|| Discovery {
-                unresolved: vec![super::UnresolvedFetchCall {
+                unresolved: vec![UnresolvedFetchCall {
                     command: command.to_owned(),
                     offset,
                 }],

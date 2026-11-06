@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -24,8 +25,10 @@ const MAX_FOREIGN_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The registry hosts fletch names itself, whose documents keep the full
 /// per-fetch ceiling: npm's and PyPI's package documents legitimately run to
-/// tens of megabytes, and distro indexes further. A host missing here only
-/// gets the smaller [`MAX_FOREIGN_DOCUMENT_BYTES`].
+/// tens of megabytes, and distro indexes further. With the hosts of every
+/// type's public registry (`registry::is_public_registry_host`), they are the
+/// hosts fletch chose; any other only gets the smaller
+/// [`MAX_FOREIGN_DOCUMENT_BYTES`].
 const REGISTRY_HOSTS: &[&str] = &[
     "addons.mozilla.org",
     "api.anaconda.org",
@@ -33,47 +36,28 @@ const REGISTRY_HOSTS: &[&str] = &[
     "api.github.com",
     "api.jsr.io",
     "api.npmjs.org",
-    "api.nuget.org",
     "api.snapcraft.io",
     "api.wordpress.org",
     "archive.ubuntu.com",
-    "archlinux.org",
-    "aur.archlinux.org",
     "azuresearch-usnc.nuget.org",
     "cdn.netbsd.org",
     "cdn.openbsd.org",
     "chromewebstore.google.com",
     "clawhub.ai",
-    "clojars.org",
     "crandb.r-pkg.org",
-    "crates.io",
     "deb.debian.org",
     "dl-cdn.alpinelinux.org",
     "download.opensuse.org",
     "download1.rpmfusion.org",
     "fastapi.metacpan.org",
     "formulae.brew.sh",
-    "hex.pm",
     "hub.docker.com",
-    "huggingface.co",
-    "index.crates.io",
     "marketplace.dify.ai",
-    "marketplace.visualstudio.com",
     "mdapi.fedoraproject.org",
-    "open-vsx.org",
-    "packagist.org",
     "packages.wolfi.dev",
     "pkg.freebsd.org",
     "plugins.jetbrains.com",
-    "proxy.golang.org",
-    "pub.dev",
-    "pypi.org",
     "quay.io",
-    "registry.npmjs.org",
-    "registry.terraform.io",
-    "repo.packagist.org",
-    "repo1.maven.org",
-    "rubygems.org",
     "search.maven.org",
     "snapcraft.io",
 ];
@@ -89,7 +73,7 @@ const MAX_BACKOFF_WAIT: Duration = Duration::from_secs(30);
 /// The longest a host is left alone, however long it asks for: a day outlasts
 /// any honest rate-limit window, and the bound keeps `Instant` arithmetic on a
 /// server-chosen number from overflowing.
-const MAX_HOLD: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_HOLD: Duration = Duration::from_hours(24);
 
 /// How many pauses one request waits out before failing.
 const BACKOFF_RETRIES: u32 = 3;
@@ -103,7 +87,8 @@ const CONNECT_RETRIES: u32 = 2;
 /// the size cap.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(600);
 
-/// The longest one send waits for a response to begin.
+/// The longest one send waits for a response to begin, or one body read for
+/// its next bytes.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a [`Request`] does: a GET, which follows redirects, or a POST of a
@@ -163,6 +148,16 @@ pub struct Request<'a> {
     /// registry names; those keep https only. Only the scheme is relaxed: the
     /// SSRF address and port guards apply unchanged.
     pub plain_http: bool,
+    /// Add every response-body byte received to this counter as it arrives,
+    /// whatever the request's outcome — a body abandoned as too large or
+    /// timed out midway still cost its bytes. How a batch charges its byte
+    /// budget. A backend that cannot count leaves it untouched.
+    pub meter: Option<&'a AtomicU64>,
+    /// One request of a container pull. A pull is a single fetch however many
+    /// layers it has, and is bounded by the puller itself (its layer count,
+    /// declared sizes and deadline), so a batch charges its bytes but not its
+    /// request count.
+    pub container_pull: bool,
 }
 
 impl<'a> Request<'a> {
@@ -178,6 +173,8 @@ impl<'a> Request<'a> {
             github_auth: false,
             max_bytes: None,
             plain_http: false,
+            meter: None,
+            container_pull: false,
         }
     }
 
@@ -241,6 +238,26 @@ impl<'a> Request<'a> {
     pub fn plain_http(self) -> Self {
         Self {
             plain_http: true,
+            ..self
+        }
+    }
+
+    /// This request, its body bytes counted into `meter` (see
+    /// [`meter`](Self::meter)).
+    #[must_use]
+    pub fn metered(self, meter: &'a AtomicU64) -> Self {
+        Self {
+            meter: Some(meter),
+            ..self
+        }
+    }
+
+    /// This request, one of a container pull's (see
+    /// [`container_pull`](Self::container_pull)).
+    #[must_use]
+    pub fn container_pull(self) -> Self {
+        Self {
+            container_pull: true,
             ..self
         }
     }
@@ -315,6 +332,19 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    /// The variant's serialized name, as a metric label.
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Refused(_) => "refused",
+            Self::Status(_) => "status",
+            Self::TooLarge => "too_large",
+            Self::Timeout => "timeout",
+            Self::Transport(_) => "transport",
+            Self::Io(_) => "io",
+            Self::Internal(_) => "internal",
+        }
+    }
+
     /// Whether a later fetch pass may succeed without changing the reference.
     /// Policy refusals, ordinary HTTP errors and integrity failures are not
     /// transient. Transport failures remain visible after retries are spent.
@@ -330,13 +360,21 @@ impl FetchError {
     }
 }
 
+/// Why one send failed.
+#[derive(Debug)]
+enum SendFailure {
+    /// Before any response began: the connection failed or timed out.
+    Connecting(FetchError),
+    /// Anything else.
+    Other(FetchError),
+}
+
 /// Send a GET, sending it again — at most [`CONNECT_RETRIES`] more times, and
-/// only before `deadline` — while it fails to connect. `send` returns each
-/// failure classified, with whether it happened before any response began;
-/// nothing else is retried, so an SSRF refusal or an HTTP status never is.
+/// only before `deadline` — while it fails to connect. Nothing else is
+/// retried, so an SSRF refusal or an HTTP status never is.
 fn retry_get_send<T>(
     deadline: Instant,
-    mut send: impl FnMut() -> Result<T, (FetchError, bool)>,
+    mut send: impl FnMut() -> Result<T, SendFailure>,
     mut pause: impl FnMut(Duration),
 ) -> Result<T, FetchError> {
     let mut attempt = 0;
@@ -344,13 +382,15 @@ fn retry_get_send<T>(
         if Instant::now() >= deadline {
             return Err(FetchError::Timeout);
         }
-        let (error, connecting) = match send() {
+        let error = match send() {
             Ok(value) => return Ok(value),
-            Err(failure) => failure,
+            Err(SendFailure::Connecting(error))
+                if error.is_retryable() && attempt < CONNECT_RETRIES =>
+            {
+                error
+            }
+            Err(SendFailure::Connecting(error) | SendFailure::Other(error)) => return Err(error),
         };
-        if !connecting || !error.is_retryable() || attempt == CONNECT_RETRIES {
-            return Err(error);
-        }
         let delay = Duration::from_millis(250 << attempt);
         if deadline.saturating_duration_since(Instant::now()) <= delay {
             return Err(FetchError::Timeout);
@@ -459,41 +499,50 @@ impl HttpFetch {
             guard_host(&current, request.plain_http)?;
             let left_origin = chain.hop(&current);
             let host = current.host_str().unwrap_or_default().to_string();
-            self.backoff.wait(&host, deadline)?;
             let mut req = self.client.get(current.clone());
+            let mut authenticated = has_userinfo(&current);
             for (name, value) in request.headers {
                 if forward_header(name, left_origin) {
+                    authenticated |= is_credential(name);
                     req = req.header(*name, *value);
                 }
             }
             if let Some(token) = self.github_token(request, left_origin) {
+                authenticated = true;
                 req = req.bearer_auth(token);
             }
+            let key = backoff_key(&current, authenticated);
+            self.backoff.wait(&key, deadline)?;
             let resp = retry_get_send(
                 deadline,
                 || {
-                    let request = req.try_clone().ok_or_else(|| {
-                        (
-                            FetchError::Internal("GET request cannot be cloned".into()),
-                            false,
-                        )
+                    let attempt = req.try_clone().ok_or_else(|| {
+                        SendFailure::Other(FetchError::Internal(
+                            "GET request cannot be cloned".into(),
+                        ))
                     })?;
-                    request
-                        .timeout(
-                            deadline
-                                .saturating_duration_since(Instant::now())
-                                .min(SEND_TIMEOUT),
-                        )
-                        .send()
-                        .map_err(|error| {
-                            let connecting = error.is_connect() || error.is_timeout();
-                            (map_send_err(error), connecting)
-                        })
+                    // reqwest makes a per-request timeout a total one that
+                    // bounds the body too, so set one only to stop at the
+                    // deadline; otherwise the client's SEND_TIMEOUT bounds
+                    // each wait and `copy_bounded` bounds the whole body.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let attempt = if remaining < SEND_TIMEOUT {
+                        attempt.timeout(remaining)
+                    } else {
+                        attempt
+                    };
+                    attempt.send().map_err(|error| {
+                        if error.is_connect() || error.is_timeout() {
+                            SendFailure::Connecting(map_send_err(error))
+                        } else {
+                            SendFailure::Other(map_send_err(error))
+                        }
+                    })
                 },
                 std::thread::sleep,
             )?;
             let status = resp.status();
-            if self.wait_out(&host, status, resp.headers(), &mut waits, deadline, true)? {
+            if self.wait_out(&host, &key, &resp, &mut waits, deadline, true)? {
                 continue;
             }
             if status.is_redirection() {
@@ -548,25 +597,23 @@ impl HttpFetch {
         let limit = self.body_limit(request, &target);
         guard_host(&target, request.plain_http)?;
         let host = target.host_str().unwrap_or_default().to_string();
+        let token = self.github_token(request, false);
+        let authenticated = token.is_some()
+            || has_userinfo(&target)
+            || request.headers.iter().any(|(name, _)| is_credential(name));
+        let key = backoff_key(&target, authenticated);
         let mut waits = 0;
         let resp = loop {
-            self.backoff.wait(&host, deadline)?;
+            self.backoff.wait(&key, deadline)?;
             let mut req = self.client.post(target.clone()).body(body.to_vec());
             for (name, value) in request.headers {
                 req = req.header(*name, *value);
             }
-            if let Some(token) = self.github_token(request, false) {
+            if let Some(token) = token {
                 req = req.bearer_auth(token);
             }
             let resp = req.send().map_err(map_send_err)?;
-            if !self.wait_out(
-                &host,
-                resp.status(),
-                resp.headers(),
-                &mut waits,
-                deadline,
-                false,
-            )? {
+            if !self.wait_out(&host, &key, &resp, &mut waits, deadline, false)? {
                 break resp;
             }
         };
@@ -592,9 +639,9 @@ impl HttpFetch {
         let ceiling = request
             .max_bytes
             .map_or(self.max_bytes, |limit| limit.min(self.max_bytes));
-        let chosen = url
-            .host_str()
-            .is_some_and(|host| REGISTRY_HOSTS.contains(&host));
+        let chosen = url.host_str().is_some_and(|host| {
+            REGISTRY_HOSTS.contains(&host) || crate::registry::is_public_registry_host(host)
+        });
         if request.spool.is_some() || chosen {
             ceiling
         } else {
@@ -627,28 +674,31 @@ impl HttpFetch {
         allowed.then_some(token.0.as_str())
     }
 
-    /// Act on a response that asks for a pause ([`pause`]): `Ok(true)` to send
-    /// the request again, `Ok(false)` when it asks for none. A host-wide pause
-    /// is recorded for every request through this client and waited out by
-    /// [`Backoff::wait`] before the next send; a per-request one is slept here.
-    /// Past [`BACKOFF_RETRIES`] pauses, or a pause longer than
+    /// Act on a response from `host` that asks for a pause ([`pause`]):
+    /// `Ok(true)` to send the request again, `Ok(false)` when it asks for
+    /// none. A host-wide pause is recorded under `key` ([`backoff_key`]) for
+    /// every request through this client and waited out by [`Backoff::wait`]
+    /// before the next send; a per-request one is slept here. Past
+    /// [`BACKOFF_RETRIES`] pauses, or a pause longer than
     /// [`MAX_BACKOFF_WAIT`], the response's status is the answer.
     fn wait_out(
         &self,
         host: &str,
-        status: StatusCode,
-        headers: &HeaderMap,
+        key: &str,
+        resp: &reqwest::blocking::Response,
         waits: &mut u32,
         deadline: Instant,
         retry_transient: bool,
     ) -> Result<bool, FetchError> {
-        let Some(pause) = pause(status, headers, *waits, retry_transient) else {
+        let status = resp.status();
+        let Some(pause) = pause(status, resp.headers(), *waits, retry_transient) else {
             return Ok(false);
         };
         let code = status.as_u16();
         let delay = match pause {
             Pause::Host(delay) => {
-                self.backoff.hold(host, delay, code);
+                crate::metrics::backoff(host, code, delay);
+                self.backoff.hold(key, delay, code);
                 delay
             }
             Pause::Request(delay) => delay,
@@ -768,7 +818,7 @@ fn response(
         return Err(FetchError::Status(status.as_u16()));
     }
     let headers = response_headers(&resp);
-    let bytes = read_body_capped(resp, limit, deadline, request.spool)?;
+    let bytes = read_body_capped(resp, limit, deadline, request.spool, request.meter)?;
     Ok(Fetched {
         bytes,
         final_url,
@@ -791,6 +841,7 @@ fn read_body_capped(
     limit: u64,
     deadline: Instant,
     spool: Option<&Path>,
+    meter: Option<&AtomicU64>,
 ) -> Result<Vec<u8>, FetchError> {
     let declared = resp.content_length();
     if let Some(len) = declared
@@ -801,7 +852,7 @@ fn read_body_capped(
     let Some(path) = spool else {
         let capacity = declared.map_or(0, |len| usize::try_from(len.min(limit)).unwrap_or(0));
         let mut bytes = Vec::with_capacity(capacity);
-        copy_bounded(resp, &mut bytes, limit, deadline)?;
+        copy_bounded(resp, &mut bytes, limit, deadline, meter)?;
         return Ok(bytes);
     };
     let spool_error = |e: std::io::Error| {
@@ -810,19 +861,21 @@ fn read_body_capped(
     };
     let file = crate::fetch::cache::create_private(path).map_err(spool_error)?;
     let mut out = std::io::BufWriter::new(file);
-    copy_bounded(resp, &mut out, limit, deadline)?;
+    copy_bounded(resp, &mut out, limit, deadline, meter)?;
     out.flush().map_err(spool_error)?;
     Ok(Vec::new())
 }
 
 /// Copy `r` to its end into `out`, refusing more than `limit` bytes and giving
 /// up once `deadline` passes. The deadline is checked between reads, so it can
-/// be overrun by at most one read's own timeout.
+/// be overrun by at most one read's own timeout. Every byte read is added to
+/// `meter`, including those of a body then refused.
 fn copy_bounded(
     mut r: impl Read,
     out: &mut impl Write,
     limit: u64,
     deadline: Instant,
+    meter: Option<&AtomicU64>,
 ) -> Result<(), FetchError> {
     let mut copied = 0u64;
     let mut chunk = [0u8; 16 * 1024];
@@ -834,8 +887,11 @@ fn copy_bounded(
             Ok(0) => return Ok(()),
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(FetchError::Transport(e.to_string())),
+            Err(e) => return Err(FetchError::Transport(printable(&e.to_string()))),
         };
+        if let Some(meter) = meter {
+            meter.fetch_add(n as u64, Ordering::Relaxed);
+        }
         if copied + n as u64 > limit {
             return Err(FetchError::TooLarge);
         }
@@ -850,10 +906,35 @@ fn copy_bounded(
 /// reqwest's own redirect policy would; everything else (`Accept`,
 /// registry-specific selectors) is kept.
 fn forward_header(name: &str, left_origin: bool) -> bool {
-    !left_origin
-        || !["authorization", "cookie", "proxy-authorization"]
-            .iter()
-            .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+    !left_origin || !is_credential(name)
+}
+
+/// Whether a header named `name` carries a credential.
+fn is_credential(name: &str) -> bool {
+    ["authorization", "cookie", "proxy-authorization"]
+        .iter()
+        .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+}
+
+/// Whether `url` carries userinfo, which reqwest sends as basic auth.
+fn has_userinfo(url: &reqwest::Url) -> bool {
+    !url.username().is_empty() || url.password().is_some()
+}
+
+/// The [`Backoff`] entry a request to `url` waits on and records into: its
+/// origin, and whether it carries a credential. A rate limit binds one server
+/// and one identity, so neither leaks into another: a plain-http answer (which
+/// anyone on the path can forge) never holds the https origin, and an
+/// anonymous request that spends the shared per-address quota — a scanned
+/// file can name dozens of `api.github.com` URLs — never stops the token's
+/// own, separate quota for the rest of the hour.
+fn backoff_key(url: &reqwest::Url, authenticated: bool) -> String {
+    let origin = url.origin().ascii_serialization();
+    if authenticated {
+        origin + " (authenticated)"
+    } else {
+        origin
+    }
 }
 
 /// How a response asks to be retried.
@@ -905,20 +986,21 @@ fn pause(
 }
 
 /// Hosts that asked to be left alone (`429`, `Retry-After`, an exhausted rate
-/// limit): until when, and the status that asked.
+/// limit), keyed by [`backoff_key`]: until when, and the status that asked.
 #[derive(Debug, Default)]
 struct Backoff(Mutex<HashMap<String, (Instant, u16)>>);
 
 impl Backoff {
-    /// Wait until `host` may be asked again — when that is within
-    /// [`MAX_BACKOFF_WAIT`] and before `deadline`; otherwise fail now with the
-    /// status that asked for the pause, leaving the host alone.
-    fn wait(&self, host: &str, deadline: Instant) -> Result<(), FetchError> {
+    /// Wait until the origin under `key` (a [`backoff_key`]) may be asked
+    /// again — when that is within [`MAX_BACKOFF_WAIT`] and before
+    /// `deadline`; otherwise fail now with the status that asked for the
+    /// pause, leaving the origin alone.
+    fn wait(&self, key: &str, deadline: Instant) -> Result<(), FetchError> {
         let held = self
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(host)
+            .get(key)
             .copied();
         let Some((until, status)) = held else {
             return Ok(());
@@ -930,7 +1012,7 @@ impl Backoff {
         if pause > MAX_BACKOFF_WAIT || Instant::now() + pause >= deadline {
             tracing::debug!(
                 target: "transport",
-                host,
+                host = key,
                 status,
                 remaining_ms = pause.as_millis(),
                 "host is backing us off; failing without asking"
@@ -939,7 +1021,7 @@ impl Backoff {
         }
         tracing::debug!(
             target: "transport",
-            host,
+            host = key,
             status,
             delay_ms = pause.as_millis(),
             "waiting out host back-off"
@@ -948,16 +1030,16 @@ impl Backoff {
         Ok(())
     }
 
-    /// Leave `host` alone for `delay`, unless it is already held longer.
-    fn hold(&self, host: &str, delay: Duration, status: u16) {
-        crate::metrics::backoff(host, status, delay);
+    /// Leave the origin under `key` (a [`backoff_key`]) alone for `delay`,
+    /// unless it is already held longer.
+    fn hold(&self, key: &str, delay: Duration, status: u16) {
         let now = Instant::now();
         // A hostile `Retry-After: 18446744073709551615` must not panic the
         // addition; past `MAX_BACKOFF_WAIT` any hold already means "fail now".
         let until = now + delay.min(MAX_HOLD);
         let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         held.retain(|_, (when, _)| *when > now);
-        let entry = held.entry(host.to_string()).or_insert((until, status));
+        let entry = held.entry(key.to_string()).or_insert((until, status));
         if entry.0 < until {
             *entry = (until, status);
         }
@@ -986,14 +1068,19 @@ fn response_headers(resp: &reqwest::blocking::Response) -> Vec<(String, String)>
         .collect()
 }
 
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "used as `map_err(map_send_err)`, which hands over the error by value"
-)]
+/// Classify a send failure. Its message names the host but never the URL: a
+/// query string is often a signature (a CDN or S3 pre-signed link), and the
+/// message reaches records and logs.
 fn map_send_err(e: reqwest::Error) -> FetchError {
-    // reqwest's own message stops at "error sending request for url (…)"; the
-    // cause (the resolver's refusal, a DNS or TLS failure) is in the chain.
-    let mut message = e.to_string();
+    let host = e
+        .url()
+        .and_then(|url| url.host_str())
+        .unwrap_or_default()
+        .to_owned();
+    let e = e.without_url();
+    // reqwest's own message stops at "error sending request"; the cause (the
+    // resolver's refusal, a DNS or TLS failure) is in the chain.
+    let mut message = format!("{host}: {e}");
     let mut refused = false;
     let mut source = std::error::Error::source(&e);
     while let Some(cause) = source {
@@ -1003,12 +1090,35 @@ fn map_send_err(e: reqwest::Error) -> FetchError {
         source = cause.source();
     }
     if refused {
-        FetchError::Refused(message)
+        FetchError::Refused(printable(&message))
     } else if e.is_timeout() {
         FetchError::Timeout
     } else {
-        FetchError::Transport(message)
+        FetchError::Transport(printable(&message))
     }
+}
+
+/// The longest error message kept, in bytes.
+const MAX_ERROR_MESSAGE: usize = 1024;
+
+/// `message` safe to log and record: every control character escaped, and cut
+/// to [`MAX_ERROR_MESSAGE`]. A transport error can quote what the peer chose
+/// — a TLS failure lists every name in the server's certificate, verbatim —
+/// and its text reaches log lines and serialized records.
+fn printable(message: &str) -> String {
+    let mut out = String::with_capacity(message.len().min(MAX_ERROR_MESSAGE));
+    for c in message.chars() {
+        if out.len() >= MAX_ERROR_MESSAGE {
+            out.push('…');
+            break;
+        }
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,10 +1133,9 @@ fn map_send_err(e: reqwest::Error) -> FetchError {
 #[derive(Debug, Default, Clone)]
 pub struct Fixtures {
     responses: HashMap<String, Fetched>,
-    refusals: HashMap<String, u16>,
-    /// Bodies for refusals, served only to an
+    /// Refusals: the status, and the body served only to an
     /// [`any_status`](Request::any_status) request.
-    refusal_bodies: HashMap<String, Vec<u8>>,
+    refusals: HashMap<String, (u16, Vec<u8>)>,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -1041,17 +1150,17 @@ impl Fixtures {
     /// reports one: an error, with no body reaching the caller. A registry's
     /// refusal is sometimes an answer, so a test has to be able to spell one.
     #[must_use]
-    pub fn refusing(mut self, url: &str, status: u16) -> Self {
-        self.refusals.insert(url.to_string(), status);
-        self
+    pub fn refusing(self, url: &str, status: u16) -> Self {
+        self.refusing_with_body(url, status, &[])
     }
+
     /// [`refusing`](Self::refusing), with the body the server sent along —
     /// reachable only by an [`any_status`](Request::any_status) request, the
     /// way a real client exposes it.
     #[must_use]
     pub fn refusing_with_body(mut self, url: &str, status: u16, body: &[u8]) -> Self {
-        self.refusals.insert(url.to_string(), status);
-        self.refusal_bodies.insert(url.to_string(), body.to_vec());
+        self.refusals
+            .insert(url.to_string(), (status, body.to_vec()));
         self
     }
 
@@ -1081,90 +1190,94 @@ impl Fetch for Fixtures {
     /// keyed on its URL like a GET, and headers and body are ignored.
     fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
         let url = request.url;
-        if let Some(&status) = self.refusals.get(url) {
+        if let Some((status, body)) = self.refusals.get(url) {
+            let status = *status;
             if !request.any_status {
                 return Err(FetchError::Status(status));
             }
+            count(request, body);
             return Ok(Fetched {
-                bytes: self.refusal_bodies.get(url).cloned().unwrap_or_default(),
+                bytes: body.clone(),
                 final_url: url.to_string(),
                 status,
                 headers: Vec::new(),
                 redirects: Vec::new(),
             });
         }
-        self.responses
+        let fetched = self
+            .responses
             .get(url)
             .cloned()
-            .ok_or_else(|| FetchError::Transport(format!("no fixture for {url}")))
+            .ok_or_else(|| FetchError::Transport(format!("no fixture for {url}")))?;
+        count(request, &fetched.bytes);
+        Ok(fetched)
+    }
+}
+
+/// Charge a fixture's body to the request's meter, as the real transport does.
+#[cfg(any(test, feature = "test-util"))]
+fn count(request: &Request<'_>, bytes: &[u8]) {
+    if let Some(meter) = request.meter {
+        meter.fetch_add(bytes.len() as u64, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::HeaderValue;
 
+    /// The guards run inside `send`, before any socket opens, so this is
+    /// offline: an internal address is refused over https and over opted-in
+    /// plain http alike, and plain http is refused unless opted into.
     #[test]
-    fn http_refuses_literal_internal_ips_without_network() {
-        // The literal-IP / scheme guards run before any send(), so this is
-        // offline — a regression test for the resolver-bypass via IP URLs.
+    fn internal_addresses_are_refused_before_any_connection() {
         let net = HttpFetch::new().expect("client");
-        for url in [
-            "https://127.0.0.1/x",
-            "https://169.254.169.254/latest/meta-data/",
-            "https://[::1]/x",
-            "https://10.0.0.1/x",
-            "http://example.com/x", // non-https
+        for (url, plain_http) in [
+            ("https://127.0.0.1/x", false),
+            ("https://169.254.169.254/latest/meta-data/", false),
+            ("https://[::1]/x", false),
+            ("https://10.0.0.1/x", false),
+            ("http://example.com/x", false),
+            ("http://127.0.0.1/x", true),
+            ("http://169.254.169.254/latest/meta-data/", true),
+            ("http://[::1]/x", true),
+            ("http://192.168.1.20/js/status.js", true),
+            ("http://example.com:25/", true),
         ] {
-            match net.send(&Request::get(url)) {
+            let request = Request::get(url);
+            let request = if plain_http {
+                request.plain_http()
+            } else {
+                request
+            };
+            match net.send(&request) {
                 Err(FetchError::Refused(_)) => {}
                 other => panic!("{url} should be refused, got {other:?}"),
             }
         }
     }
 
-    #[test]
-    fn plain_http_keeps_the_address_guard_without_network() {
-        // Opting into plain http must not open a path to internal hosts:
-        // every one of these is refused before a socket is opened.
-        let net = HttpFetch::new().expect("client");
-        for url in [
-            "http://127.0.0.1/x",
-            "http://169.254.169.254/latest/meta-data/",
-            "http://[::1]/x",
-            "http://10.0.0.1/x",
-            "http://192.168.1.20/js/status.js",
-            "http://example.com:25/",
-        ] {
-            match net.send(&Request::get(url).plain_http()) {
-                Err(FetchError::Refused(_)) => {}
-                other => panic!("{url} should be refused, got {other:?}"),
-            }
-        }
-        // The resolver guards a plain-http hostname just as an https one.
-        match net.send(&Request::get("http://localhost/x").plain_http()) {
-            Err(FetchError::Refused(why)) => {
-                assert!(why.contains("non-public host: localhost"), "{why}");
-            }
-            other => panic!("localhost should be refused by the resolver, got {other:?}"),
-        }
-    }
-
+    /// `localhost` comes from the hosts file, so this stays offline. The name
+    /// passes the literal-IP guard and is refused by the resolver, whose
+    /// reason must survive reqwest's "error sending request" wrapper — on
+    /// plain http as on https — and never carries the URL.
     #[test]
     fn a_resolver_refusal_says_why() {
-        // `localhost` comes from the hosts file, so this stays offline. The
-        // name passes the literal-IP guard and is refused by the resolver,
-        // whose reason must survive reqwest's "error sending request" wrapper.
         let net = HttpFetch::new().expect("client");
-        match net.send(&Request::get("https://localhost/x")) {
-            Err(FetchError::Refused(why)) => {
-                assert!(why.contains("non-public host: localhost"), "{why}");
+        for request in [
+            Request::get("https://localhost/x?sig=secret"),
+            Request::get("http://localhost/x?sig=secret").plain_http(),
+        ] {
+            match net.send(&request) {
+                Err(FetchError::Refused(why)) => {
+                    assert!(why.contains("non-public host: localhost"), "{why}");
+                    assert!(!why.contains("secret"), "no URL in the reason: {why}");
+                }
+                other => panic!("localhost should be refused by the resolver, got {other:?}"),
             }
-            other => panic!("localhost should be refused by the resolver, got {other:?}"),
         }
     }
-
-    use reqwest::header::HeaderValue;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -1262,6 +1375,60 @@ mod tests {
             backoff.wait("limited.test", deadline),
             Err(FetchError::Status(403))
         );
+    }
+
+    /// A hold binds the origin and identity that asked for it: a forgeable
+    /// plain-http answer cannot hold the https origin, and anonymous requests
+    /// spending the per-address quota cannot stop the token's own.
+    #[test]
+    fn a_rate_limit_binds_one_origin_and_one_identity() {
+        let key = |url: &str, authenticated| {
+            backoff_key(&reqwest::Url::parse(url).unwrap(), authenticated)
+        };
+        let api = key("https://api.github.com/repos/o/r", false);
+        assert_eq!(api, key("https://API.github.com:443/user", false));
+        let token = key("https://api.github.com/repos/o/r", true);
+        let plain = key("http://api.github.com/repos/o/r", false);
+        let port = key("https://api.github.com:8443/repos/o/r", false);
+        for other in [&token, &plain, &port] {
+            assert_ne!(&api, other);
+        }
+        let backoff = Backoff::default();
+        let deadline = Instant::now() + REQUEST_DEADLINE;
+        backoff.hold(&api, Duration::from_secs(3600), 403);
+        backoff.hold(&plain, Duration::from_secs(3600), 429);
+        assert_eq!(backoff.wait(&api, deadline), Err(FetchError::Status(403)));
+        assert_eq!(backoff.wait(&token, deadline), Ok(()));
+        assert_eq!(backoff.wait(&port, deadline), Ok(()));
+        // A request carrying userinfo is sent with basic auth.
+        assert!(has_userinfo(
+            &reqwest::Url::parse("https://u:p@example.test/").unwrap()
+        ));
+        assert!(!has_userinfo(
+            &reqwest::Url::parse("https://example.test/").unwrap()
+        ));
+    }
+
+    /// A transport error quoting what the peer chose (a hostile certificate's
+    /// names) can neither forge a log line nor bloat a record.
+    #[test]
+    fn peer_chosen_error_text_is_escaped_and_bounded() {
+        let forged = "evil.test: invalid peer certificate: certificate is only valid for \
+                      a.test\n2026-01-01T00:00:00Z  INFO fletch: forged\r\x1b[2K\u{85}";
+        let shown = printable(forged);
+        assert!(
+            !shown.chars().any(char::is_control),
+            "control characters survive: {shown:?}"
+        );
+        assert!(shown.contains("a.test\\n2026"), "{shown}");
+        assert_eq!(
+            printable("example.test: error sending request"),
+            "example.test: error sending request"
+        );
+        let long = "é".repeat(4 * MAX_ERROR_MESSAGE);
+        let cut = printable(&long);
+        assert!(cut.len() <= MAX_ERROR_MESSAGE + 8, "{}", cut.len());
+        assert!(cut.ends_with('…'));
     }
 
     #[test]
@@ -1374,7 +1541,7 @@ mod tests {
     /// [`copy_bounded`] into memory.
     fn read_bounded(r: impl Read, limit: u64, deadline: Instant) -> Result<Vec<u8>, FetchError> {
         let mut bytes = Vec::new();
-        copy_bounded(r, &mut bytes, limit, deadline).map(|()| bytes)
+        copy_bounded(r, &mut bytes, limit, deadline, None).map(|()| bytes)
     }
 
     #[test]
@@ -1422,7 +1589,9 @@ mod tests {
             || {
                 attempts += 1;
                 if attempts < 3 {
-                    Err((FetchError::Transport("DNS unavailable".into()), true))
+                    Err(SendFailure::Connecting(FetchError::Transport(
+                        "DNS unavailable".into(),
+                    )))
                 } else {
                     Ok(42)
                 }
@@ -1445,7 +1614,7 @@ mod tests {
             Instant::now() + Duration::from_secs(10),
             || {
                 attempts += 1;
-                Err((error.clone(), true))
+                Err(SendFailure::Connecting(error.clone()))
             },
             |_| {},
         );
@@ -1455,7 +1624,7 @@ mod tests {
 
     #[test]
     fn policy_refusal_and_nonconnection_errors_are_never_retried() {
-        for (error, retry) in [
+        for (error, connecting) in [
             (FetchError::Refused("private address".into()), true),
             (FetchError::TooLarge, true),
             (FetchError::Status(404), true),
@@ -1467,7 +1636,11 @@ mod tests {
                 Instant::now() + Duration::from_secs(10),
                 || {
                     attempts += 1;
-                    Err((error.clone(), retry))
+                    Err(if connecting {
+                        SendFailure::Connecting(error.clone())
+                    } else {
+                        SendFailure::Other(error.clone())
+                    })
                 },
                 |_| panic!("must not sleep"),
             );
@@ -1480,7 +1653,7 @@ mod tests {
     fn retry_wait_cannot_exceed_deadline() {
         let result: Result<(), _> = retry_get_send(
             Instant::now() + Duration::from_millis(20),
-            || Err((FetchError::Timeout, true)),
+            || Err(SendFailure::Connecting(FetchError::Timeout)),
             |_| panic!("must not sleep"),
         );
         assert_eq!(result, Err(FetchError::Timeout));

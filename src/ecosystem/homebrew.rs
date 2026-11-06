@@ -4,7 +4,7 @@ use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::ecosystem::{Coordinates, fetch_json, non_empty};
+use crate::ecosystem::{Coordinates, DEPRECATED, fetch_json, non_empty};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
@@ -14,8 +14,8 @@ use crate::registry::RegistryError;
 const CORE_NAMESPACES: &[&str] = &["homebrew", "homebrew-core", "homebrew/core", "core"];
 
 /// Look up the formula `c` names in homebrew-core: its stable version,
-/// description, license, deprecation, and 30-day install count. Homebrew
-/// records no publish date.
+/// description, license, deprecation or disabling, and 30-day install count.
+/// Homebrew records no publish date.
 pub(crate) fn lookup(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
@@ -28,29 +28,34 @@ pub(crate) fn lookup(
         cache,
     )?;
 
-    let mut registry = Registry::new(
+    let mut record = c.record(
         Ecosystem::Homebrew,
         doc.name.unwrap_or_else(|| c.name().to_string()),
+        doc.versions.and_then(|v| v.stable),
     );
-    registry.version = c
-        .target(doc.versions.and_then(|v| v.stable).as_deref())
-        .to_string();
-    registry.description = doc.desc;
-    registry.homepage = doc.homepage;
-    registry.license = doc.license;
+    record.description = doc.desc;
+    record.homepage = doc.homepage;
+    record.license = doc.license;
     // The 30-day analytics map counts installs per invocation; sum them.
-    registry.downloads_recent = doc
+    record.downloads_recent = doc
         .analytics
         .and_then(|a| a.install)
         .and_then(|i| i.last_30_days)
-        .map(|m| m.values().sum::<u64>());
-    registry.deprecated = doc.deprecated.unwrap_or_default().then(|| {
-        doc.deprecation_reason
-            .unwrap_or_else(|| "deprecated".into())
-    });
-    // A disabled formula can no longer be installed.
-    registry.version_removed = doc.disabled;
-    Ok(registry)
+        .map(|m| m.values().fold(0u64, |sum, &n| sum.saturating_add(n)));
+    // A deprecated formula still installs; a disabled one no longer does.
+    // Both are the formula's standing, not one release's removal.
+    record.deprecated = match (doc.disabled, doc.deprecated) {
+        (Some(true), _) => Some(doc.disable_reason.map_or_else(
+            || "disabled".to_string(),
+            |reason| format!("disabled: {reason}"),
+        )),
+        (_, Some(true)) => Some(
+            doc.deprecation_reason
+                .unwrap_or_else(|| DEPRECATED.to_string()),
+        ),
+        _ => None,
+    };
+    Ok(record)
 }
 
 /// A Homebrew formula document.
@@ -70,6 +75,8 @@ struct Formula {
     #[serde(deserialize_with = "non_empty")]
     deprecation_reason: Option<String>,
     disabled: Option<bool>,
+    #[serde(deserialize_with = "non_empty")]
+    disable_reason: Option<String>,
 }
 
 /// The formula's current versions.
@@ -97,14 +104,10 @@ struct InstallCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
     const WGET: &str = "https://formulae.brew.sh/api/formula/wget.json";
-
-    fn lookup(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
 
     fn wget(deprecated: bool, disabled: bool) -> Fixtures {
         let doc = serde_json::json!({
@@ -112,7 +115,7 @@ mod tests {
             "homepage": "https://www.gnu.org/software/wget/", "license": "GPL-3.0-or-later",
             "versions": {"stable": "1.25.0"},
             "deprecated": deprecated, "deprecation_reason": if deprecated { "repo_archived" } else { "" },
-            "disabled": disabled,
+            "disabled": disabled, "disable_reason": if disabled { "unmaintained" } else { "" },
             "analytics": {"install": {"30d": {"wget": 20_568u64, "wget --HEAD": 26u64}}}
         })
         .to_string();
@@ -121,13 +124,14 @@ mod tests {
 
     #[test]
     fn homebrew_formula_normalizes() {
-        let r = lookup("pkg:brew/wget", &wget(false, false)).expect("registry");
+        let r = look("pkg:brew/wget", &wget(false, false)).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Homebrew);
         assert_eq!(r.version, "1.25.0");
         assert_eq!(r.license.as_deref(), Some("GPL-3.0-or-later"));
         assert_eq!(r.downloads_recent, Some(20_594));
         assert_eq!(r.deprecated, None);
-        assert_eq!(r.version_removed, Some(false));
+        assert_eq!(r.version_removed, None);
+        assert_eq!(r.latest_version.as_deref(), Some("1.25.0"));
     }
 
     #[test]
@@ -141,31 +145,43 @@ mod tests {
             "pkg:brew/core/wget",
         ] {
             assert_eq!(
-                lookup(purl, &net).map(|r| r.ecosystem),
+                look(purl, &net).map(|r| r.ecosystem),
                 Ok(Ecosystem::Homebrew),
                 "{purl}"
             );
         }
         for purl in ["pkg:brew/evil-tap/wget", "pkg:homebrew/evil/tap/wget"] {
-            assert_eq!(
-                lookup(purl, &net),
-                Err(RegistryError::OffRegistry),
-                "{purl}"
-            );
+            assert_eq!(look(purl, &net), Err(RegistryError::OffRegistry), "{purl}");
         }
     }
 
     #[test]
-    fn a_deprecation_carries_its_reason_and_a_disabled_formula_is_removed() {
-        let r = lookup("pkg:brew/wget", &wget(true, true)).expect("registry");
+    fn a_deprecation_or_disabling_carries_its_reason_and_removes_no_release() {
+        let r = look("pkg:brew/wget", &wget(true, false)).expect("registry");
         assert_eq!(r.deprecated.as_deref(), Some("repo_archived"));
-        assert_eq!(r.version_removed, Some(true));
+        assert_eq!(r.version_removed, None);
+        let r = look("pkg:brew/wget", &wget(true, true)).expect("registry");
+        assert_eq!(r.deprecated.as_deref(), Some("disabled: unmaintained"));
+        assert_eq!(
+            r.version_removed, None,
+            "a formula's standing, not a release's"
+        );
+    }
+
+    #[test]
+    fn hostile_install_counts_saturate() {
+        let doc = serde_json::json!({"name": "wget", "analytics": {"install": {"30d":
+            {"wget": u64::MAX, "wget --HEAD": u64::MAX}}}});
+        let net = Fixtures::default().with(WGET, doc.to_string().as_bytes());
+        let r = look("pkg:brew/wget", &net).expect("registry");
+        assert_eq!(r.downloads_recent, Some(u64::MAX));
     }
 
     #[test]
     fn a_requested_version_is_the_records_version() {
-        let r = lookup("pkg:brew/wget@1.21.0", &wget(false, false)).expect("registry");
+        let r = look("pkg:brew/wget@1.21.0", &wget(false, false)).expect("registry");
         assert_eq!(r.version, "1.21.0");
+        assert_eq!(r.latest_version.as_deref(), Some("1.25.0"));
         assert_eq!(r.published_at, None);
     }
 }

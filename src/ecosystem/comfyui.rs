@@ -3,8 +3,10 @@
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
-use crate::ecosystem::{Coordinates, fetch_json, immutable_or_fresh, non_empty, unix_secs};
-use crate::fetch::{BlobCache, Fetch, is_web_scheme, percent_decode, safe_coordinate};
+use crate::ecosystem::{
+    Coordinates, fetch_json, held, immutable_or_fresh, non_empty, release_time, unix_secs,
+};
+use crate::fetch::{BlobCache, Fetch, is_web_scheme};
 use crate::registry::RegistryError;
 
 /// The status the registry gives a node in good standing; a banned or deleted
@@ -16,31 +18,21 @@ const ACTIVE: &str = "NodeStatusActive";
 /// `.tar.gz` as uploaded, so only the install endpoint names it. With
 /// `?version=` it answers that one release; without, the current one. The
 /// answer must name the node and the release asked for, or nothing resolves.
+/// A node id is one global name, so a namespace names a node elsewhere, as
+/// the registry lookup refuses it.
 pub(crate) fn resolve_comfyui(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<(String, String), RegistryError> {
-    let (path, version) = (c.path(), c.encoded_version());
-    // A node id is one global segment: the registry has no namespace.
-    if path.is_empty()
-        || path.contains('/')
-        || !safe_coordinate(path)
-        || version.is_some_and(|v| !safe_coordinate(v))
-    {
-        tracing::debug!(
-            path = %path.escape_debug(),
-            "comfyui artifact refused: not a node id"
-        );
-        return Err(RegistryError::UnsafeCoordinate);
-    }
-    let base = format!("https://api.comfy.org/nodes/{path}/install");
+    let id = c.bare_name(&[])?;
+    let version = c.encoded_version();
+    let base = format!("https://api.comfy.org/nodes/{id}/install");
     let api = match version {
         Some(v) => format!("{base}?version={v}"),
         None => base,
     };
-    let node_id = percent_decode(path);
-    let wanted = version.map(percent_decode);
+    let (node_id, wanted) = (c.name(), c.version());
     let resolve = |cache: &BlobCache| {
         let install: Install = fetch_json(&api, net, cache).inspect_err(|error| {
             tracing::debug!(url = %api, %error, "comfyui artifact unresolved");
@@ -52,8 +44,8 @@ pub(crate) fn resolve_comfyui(
             );
             return Err(RegistryError::NoRecord);
         };
-        if wanted.as_ref().is_some_and(|want| *want != resolved)
-            || install.node_id.as_deref() != Some(node_id.as_str())
+        if wanted.is_some_and(|want| want != resolved)
+            || install.node_id.as_deref() != Some(node_id)
             || !is_web_scheme(&url)
         {
             tracing::debug!(
@@ -94,34 +86,24 @@ pub(crate) fn lookup(
     let id = c.bare_name(&[])?;
     let doc: Node = fetch_json(&format!("https://api.comfy.org/nodes/{id}"), net, cache)?;
     let latest = doc.latest_version.unwrap_or_default();
-    let version = c.target(latest.version.as_deref()).to_string();
-    let security_hold = doc.status.as_deref().map(|status| status != ACTIVE);
-    if let Some(status) = doc.status.as_deref().filter(|s| *s != ACTIVE) {
-        tracing::debug!(
-            node = %c.name().escape_debug(),
-            status = %status.escape_debug(),
-            "comfyui node is not active: security hold"
-        );
-    }
-    let mut registry = Registry::new(
+    let mut record = c.record(
         Ecosystem::Comfyui,
         doc.id.unwrap_or_else(|| c.name().to_string()),
+        latest.version,
     );
-    registry.published_at = latest
-        .created_at
-        .as_deref()
-        .filter(|_| latest.version.as_deref() == Some(version.as_str()))
-        .and_then(unix_secs);
-    registry.first_published_at = doc.created_at.as_deref().and_then(unix_secs);
-    registry.version = version;
-    registry.latest_version = latest.version;
-    registry.title = doc.name;
-    registry.description = doc.description;
-    registry.repository = doc.repository;
-    registry.publisher = doc.publisher.and_then(|p| p.id);
-    registry.downloads_total = doc.downloads;
-    registry.security_hold = security_hold;
-    Ok(registry)
+    record.published_at = release_time(
+        &record,
+        record.latest_version.as_deref(),
+        latest.created_at.as_deref().and_then(unix_secs),
+    );
+    record.first_published_at = doc.created_at.as_deref().and_then(unix_secs);
+    record.title = doc.name;
+    record.description = doc.description;
+    record.repository = doc.repository;
+    record.publisher = doc.publisher.and_then(|p| p.id);
+    record.downloads_total = doc.downloads;
+    record.security_hold = held(doc.status.as_deref(), ACTIVE, c.name());
+    Ok(record)
 }
 
 /// A ComfyUI Registry node document: the listing plus its latest release.
@@ -165,8 +147,7 @@ struct NodeVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::coordinates;
-    use filefacts::RefLocator;
+    use crate::ecosystem::{coordinates, look};
     use std::sync::Mutex;
 
     use crate::fetch::{FetchError, Fetched, Fixtures, Request};
@@ -266,10 +247,6 @@ mod tests {
         )
     }
 
-    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
-
     #[test]
     fn comfyui_node_normalizes() {
         let net = loopstrip(ACTIVE);
@@ -305,6 +282,22 @@ mod tests {
     fn a_namespaced_node_names_no_registry_node() {
         assert_eq!(
             look("pkg:comfyui/pub/comfyui-loopstrip", &Fixtures::default()),
+            Err(RegistryError::OffRegistry)
+        );
+        // The resolver refuses it alike, whatever the node's own id answers.
+        let doc = serde_json::json!({"version": "1.0", "node_id": "n",
+                                     "downloadUrl": "https://cdn.comfy.org/n.zip"})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://api.comfy.org/nodes/n/install?version=1.0",
+            doc.as_bytes(),
+        );
+        assert_eq!(
+            resolve_comfyui(
+                &coordinates("pkg:comfyui/pub/n@1.0"),
+                &net,
+                &BlobCache::disabled()
+            ),
             Err(RegistryError::OffRegistry)
         );
     }

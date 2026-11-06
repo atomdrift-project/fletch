@@ -7,7 +7,7 @@
 //! `Fixtures` (feature `test-util`) is the offline backend for tests. No recognition logic lives
 //! here — references come in, bytes and [`FetchRecord`]s go out.
 //!
-//! - [`resolve`] and [`resolve_artifacts`] map a locator to its artifact URL
+//! - [`resolve()`] and [`resolve_artifacts`] map a locator to its artifact URL
 //!   and the registry's artifact variants, through one per-ecosystem table.
 //! - [`fetch_ref`] fetches, verifies and records one reference.
 //! - [`fetch_references`] fetches a file's references concurrently under a
@@ -22,6 +22,7 @@ mod batch;
 pub(crate) mod cache;
 mod coordinate;
 mod coverage;
+pub(crate) mod digest;
 mod go_hash;
 mod record;
 mod requirement;
@@ -37,8 +38,8 @@ mod tests;
 pub use batch::{FetchBudget, UrlFetches, fetch_references};
 pub use cache::{BlobCache, RawSink, RecordedSource, refs_dir};
 pub(crate) use cache::{
-    CachedMeta, META_TTL_IMMUTABLE, cached_github_api, cached_metadata, cached_metadata_status,
-    cached_post, store_metadata,
+    CachedMeta, META_TTL_IMMUTABLE, cached_github_api, cached_metadata, cached_metadata_digest,
+    cached_metadata_status, cached_post, store_metadata,
 };
 pub(crate) use coordinate::{
     is_crates_io, is_http_url, is_web_scheme, percent_decode, repository_base, safe_coordinate,
@@ -51,7 +52,7 @@ pub(crate) use resolve::deterministic_artifacts;
 pub use resolve::{ResolveError, resolve, resolve_artifacts};
 pub use select::{ArtifactCandidate, ArtifactKind, ArtifactMatrix};
 pub(crate) use select::{
-    artifact_candidate, file_name_from_url, file_name_matches, purl_checksums,
+    artifact_candidate, file_name_from_url, file_name_matches, is_file_name, purl_checksums,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use transport::Fixtures;
@@ -70,7 +71,18 @@ pub(crate) fn locator_str(locator: &RefLocator) -> &str {
 
 /// SHA-256 of `data`, lowercase hex.
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
-    hex::encode(Sha256::digest(data))
+    to_hex(Sha256::digest(data))
+}
+
+/// `bytes` as lowercase hex.
+pub(crate) fn to_hex(bytes: impl AsRef<[u8]>) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .as_ref()
+        .iter()
+        .flat_map(|b| [DIGITS[usize::from(b >> 4)], DIGITS[usize::from(b & 0x0f)]])
+        .map(char::from)
+        .collect()
 }
 
 /// The current Unix time in seconds; 0, logged, on a clock set before 1970.

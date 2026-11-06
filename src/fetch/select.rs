@@ -148,9 +148,21 @@ pub(crate) fn artifact_candidate(url: String, kind: ArtifactKind) -> ArtifactCan
 }
 
 /// The decoded last path segment of `url`, ignoring its query and fragment.
+/// A consumer may save the artifact under this name, so a segment that
+/// decodes to a path (`..%2Fx`) keeps its encoded spelling, and one that is
+/// a path either way names nothing.
 pub(crate) fn file_name_from_url(url: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or(url);
-    percent_decode(path.rsplit('/').next().unwrap_or_default())
+    let segment = path.rsplit('/').next().unwrap_or_default();
+    [percent_decode(segment), segment.to_owned()]
+        .into_iter()
+        .find(|name| is_file_name(name))
+        .unwrap_or_default()
+}
+
+/// Whether `name` is one path component: no separator, NUL, or dot segment.
+pub(crate) fn is_file_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && !name.contains(['/', '\\', '\0'])
 }
 
 /// Whether `actual` satisfies the PURL's `file_name` selector, which names one
@@ -164,22 +176,21 @@ pub(crate) fn file_name_matches(purl: &Purl, actual: &str) -> bool {
 /// Algorithm names are lowercased with `_` spelled `-`; malformed entries are
 /// skipped.
 pub(crate) fn purl_checksums(purl: &Purl) -> BTreeMap<String, String> {
-    purl.qualifier("checksum")
-        .map(|value| {
-            value
-                .split(',')
-                .filter_map(|checksum| {
-                    let (algorithm, digest) = checksum.split_once(':')?;
-                    (!algorithm.is_empty() && !digest.is_empty()).then(|| {
-                        (
-                            algorithm.to_ascii_lowercase().replace('_', "-"),
-                            digest.to_ascii_lowercase(),
-                        )
-                    })
-                })
-                .collect()
+    let Some(value) = purl.qualifier("checksum") else {
+        return BTreeMap::new();
+    };
+    value
+        .split(',')
+        .filter_map(|checksum| {
+            let (algorithm, digest) = checksum.split_once(':')?;
+            (!algorithm.is_empty() && !digest.is_empty()).then(|| {
+                (
+                    algorithm.to_ascii_lowercase().replace('_', "-"),
+                    digest.to_ascii_lowercase(),
+                )
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Apply the PURL's common qualifiers to each candidate: carry its repository
@@ -212,7 +223,7 @@ pub(crate) fn apply_common_candidate_qualifiers(purl: &Purl, candidates: &mut [A
                 .is_some_and(|published| !published.eq_ignore_ascii_case(digest))
             {
                 tracing::debug!(
-                    url = %candidate.url,
+                    url = ?candidate.url,
                     algorithm = %algorithm,
                     "declared checksum disagrees with the registry's; candidate not preferred"
                 );
@@ -334,6 +345,20 @@ mod tests {
             candidates[0].release_purl.as_deref(),
             Some("pkg:npm/pkg@2.0.0")
         );
+    }
+
+    #[test]
+    fn a_file_name_is_never_a_path() {
+        assert_eq!(
+            file_name_from_url("https://x/a/..%2Fevil.whl"),
+            "..%2Fevil.whl"
+        );
+        assert_eq!(file_name_from_url("https://x/a/..%5Cevil"), "..%5Cevil");
+        assert_eq!(file_name_from_url("https://x/a/%2E%2E"), "%2E%2E");
+        assert_eq!(file_name_from_url("https://x/a/.."), "");
+        assert_eq!(file_name_from_url("https://x/a/"), "");
+        assert!(is_file_name("b+c.whl"));
+        assert!(!is_file_name("a/b") && !is_file_name("a\\b") && !is_file_name("a\0"));
     }
 
     #[test]

@@ -6,8 +6,8 @@ use serde::Deserialize;
 use crate::ecosystem::{Coordinates, decode, fetch_json, unix_secs};
 use crate::fetch::{
     ArtifactCandidate, ArtifactKind, BlobCache, CachedMeta, Fetch, FetchError, Request,
-    cached_metadata_status, deterministic_artifacts, now, safe_coordinate, sha256_hex,
-    store_metadata,
+    cached_metadata_status, deterministic_artifacts, now, percent_decode, safe_coordinate,
+    sha256_hex, store_metadata,
 };
 use crate::purl::Purl;
 use crate::registry::RegistryError;
@@ -28,20 +28,20 @@ pub(crate) fn golang_artifacts(
     cache: &BlobCache,
 ) -> Result<Vec<ArtifactCandidate>, RegistryError> {
     let (purl, path, version) = (c.purl(), c.path(), c.encoded_version());
-    let resolved = goproxy_canonical_path(path, version, net, cache);
-    if resolved.path == path {
-        return Ok(deterministic_artifacts(purl, ArtifactKind::Zip));
-    }
+    let respelled = match goproxy_canonical_path(path, version, net, cache) {
+        ProxySpelling::Respelled(respelled) if respelled != path => respelled,
+        _ => return Ok(deterministic_artifacts(purl, ArtifactKind::Zip)),
+    };
     // The canonical string opens with the path as written; anything after it
     // (version, qualifiers, subpath) carries over to the proxy's spelling.
     let canonical = purl.to_string();
     let Some(proxy_spelled) = canonical
         .strip_prefix(&format!("pkg:golang/{path}"))
-        .and_then(|tail| Purl::parse(&format!("pkg:golang/{}{tail}", resolved.path)).ok())
+        .and_then(|tail| Purl::parse(&format!("pkg:golang/{respelled}{tail}")).ok())
     else {
         tracing::debug!(
             path = %path.escape_debug(),
-            canonical = %resolved.path.escape_debug(),
+            canonical = %respelled.escape_debug(),
             "go proxy spelling does not form a PURL; using the path as written"
         );
         return Ok(deterministic_artifacts(purl, ArtifactKind::Zip));
@@ -50,14 +50,17 @@ pub(crate) fn golang_artifacts(
 }
 
 /// What [`goproxy_canonical_path`] learned about a module path.
-pub(crate) struct GoproxyPath {
-    /// The spelling the proxy serves: the path as given, or the case variant
-    /// its refusal named.
-    pub(crate) path: String,
-    /// When `path` is the path as given and the probe was a refusal with no
-    /// alternative in it, that status — so the caller need not ask the same
-    /// question again (each proxy miss costs it a second or more upstream).
-    pub(crate) refused: Option<u16>,
+#[derive(Debug, PartialEq, Eq)]
+enum ProxySpelling {
+    /// The path as given: the proxy serves it, or could not be asked.
+    AsGiven,
+    /// The spelling the proxy serves, as its refusal named it or an earlier
+    /// probe cached it (which may be the path as given).
+    Respelled(String),
+    /// The proxy refused the path as given and named no alternative: that
+    /// status, so the caller need not ask the same question again (each proxy
+    /// miss costs it a second or more upstream).
+    Refused(u16),
 }
 
 /// The spelling of a Go module path that proxy.golang.org will serve.
@@ -79,21 +82,18 @@ pub(crate) struct GoproxyPath {
 /// A successful probe is filed under the `.info` / `@latest` document's
 /// own cache key, so the registry read that follows is a hit, not a second
 /// request.
-pub(crate) fn goproxy_canonical_path(
+fn goproxy_canonical_path(
     path: &str,
     version: Option<&str>,
     net: &dyn Fetch,
     cache: &BlobCache,
-) -> GoproxyPath {
+) -> ProxySpelling {
     let key = sha256_hex(format!("meta:goproxy-canonical:{path}").as_bytes());
-    if let Some((bytes, _)) = cache.fresh(&key, cache.meta_ttl)
+    if let Some((bytes, _)) = cache.fresh(&key, cache.meta_ttl())
         && let Ok(known) = String::from_utf8(bytes)
         && !known.is_empty()
     {
-        return GoproxyPath {
-            path: known,
-            refused: None,
-        };
+        return ProxySpelling::Respelled(known);
     }
     let escaped = goproxy_escape(path);
     let url = match version {
@@ -111,19 +111,13 @@ pub(crate) fn goproxy_canonical_path(
                 %error,
                 "go proxy spelling probe failed; using the path as written"
             );
-            return GoproxyPath {
-                path: path.to_string(),
-                refused: None,
-            };
+            return ProxySpelling::AsGiven;
         }
     };
     if (200..300).contains(&fetched.status) {
         store_metadata(&url, &fetched, cache);
         remember_goproxy_path(&key, path, &url, cache);
-        return GoproxyPath {
-            path: path.to_string(),
-            refused: None,
-        };
+        return ProxySpelling::AsGiven;
     }
     match goproxy_declared_path(path, &String::from_utf8_lossy(&fetched.bytes)) {
         Some(canonical) => {
@@ -133,26 +127,20 @@ pub(crate) fn goproxy_canonical_path(
                 "go proxy refusal names the module's spelling"
             );
             remember_goproxy_path(&key, &canonical, &url, cache);
-            GoproxyPath {
-                path: canonical,
-                refused: None,
-            }
+            ProxySpelling::Respelled(canonical)
         }
-        None => GoproxyPath {
-            path: path.to_string(),
-            refused: Some(fetched.status),
-        },
+        None => ProxySpelling::Refused(fetched.status),
     }
 }
 
+/// File `canonical`, the spelling the proxy serves for the probe `url`, under
+/// `key`, so the next lookup of the module skips the probe.
 fn remember_goproxy_path(key: &str, canonical: &str, url: &str, cache: &BlobCache) {
     let meta = CachedMeta {
         fetched_at: now(),
         status: 200,
         final_url: url.to_string(),
-        redirects: Vec::new(),
-        headers: Vec::new(),
-        size: None,
+        ..CachedMeta::default()
     };
     cache.put(key, canonical.as_bytes(), &meta);
 }
@@ -233,15 +221,21 @@ pub(crate) fn lookup(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let resolved = goproxy_canonical_path(c.path(), c.encoded_version(), net, cache);
-    let path = resolved.path.as_str();
+    let spelling = goproxy_canonical_path(c.path(), c.encoded_version(), net, cache);
+    let path = match &spelling {
+        ProxySpelling::Respelled(path) => path,
+        ProxySpelling::AsGiven | ProxySpelling::Refused(_) => c.path(),
+    };
     let escaped = goproxy_escape(path);
+    // The record is named by the decoded path, in the proxy's spelling, which
+    // may differ from the PURL's by letter case.
+    let name = percent_decode(path);
     let latest_url = format!("https://proxy.golang.org/{escaped}/@latest");
 
     // A versionless lookup asks the proxy what the current release is, so the
     // answer names itself in both fields.
     let (Some(version), Some(encoded_version)) = (c.version(), c.encoded_version()) else {
-        let mut record = golang_record(path, fetch_json(&latest_url, net, cache)?);
+        let mut record = golang_record(&name, fetch_json(&latest_url, net, cache)?);
         record.latest_version = Some(record.version.clone()).filter(|v| !v.is_empty());
         record.version_removed = Some(false);
         record.security_hold = Some(false);
@@ -255,13 +249,15 @@ pub(crate) fn lookup(
     // A refusal is the answer here, so the read keeps its status. When the
     // probe above was refused outright, that refusal is this answer: asking
     // again would cost the proxy another upstream round trip for the same 404.
-    let info = match resolved.refused {
-        Some(status) => Err(FetchError::Status(status)),
-        None => cached_metadata_status(&info_url, &[], net, cache),
+    let info = match spelling {
+        ProxySpelling::Refused(status) => Err(FetchError::Status(status)),
+        ProxySpelling::AsGiven | ProxySpelling::Respelled(_) => {
+            cached_metadata_status(&info_url, &[], net, cache)
+        }
     };
     let refusal = match info {
         Ok(bytes) => {
-            let mut record = golang_record(path, decode(&info_url, &bytes)?);
+            let mut record = golang_record(&name, decode(&info_url, &bytes)?);
             record.version_removed = Some(false);
             record.security_hold = Some(false);
             return Ok(record);
@@ -281,7 +277,7 @@ pub(crate) fn lookup(
         status = refusal,
         "go proxy refused the release; reporting it removed from the module's @latest record"
     );
-    let mut record = golang_record(path, fetch_json(&latest_url, net, cache)?);
+    let mut record = golang_record(&name, fetch_json(&latest_url, net, cache)?);
     record.latest_version = Some(std::mem::take(&mut record.version)).filter(|v| !v.is_empty());
     // The release asked about, not the one the proxy offered instead. Its
     // publish time lives in the record being withheld.
@@ -299,15 +295,16 @@ pub(crate) fn lookup(
 /// malware, as against the 404 it gives for one it simply does not hold.
 const GOPROXY_WITHHELD: u16 = 403;
 
-/// The registry facts one proxy document carries. `version_removed` and
-/// `latest_version` are left to the caller, the only side that knows whether
-/// this document describes the release that was asked about.
-fn golang_record(path: &str, doc: VersionInfo) -> Registry {
-    let mut registry = Registry::new(Ecosystem::Golang, path.to_string());
-    registry.version = doc.version.unwrap_or_default();
-    registry.published_at = doc.time.as_deref().and_then(unix_secs);
-    registry.repository = doc.origin.and_then(|o| o.url);
-    registry
+/// The registry facts one proxy document carries about the module `name`.
+/// `version_removed` and `latest_version` are left to the caller, the only
+/// side that knows whether this document describes the release that was
+/// asked about.
+fn golang_record(name: &str, doc: VersionInfo) -> Registry {
+    let mut record = Registry::new(Ecosystem::Golang, name);
+    record.version = doc.version.unwrap_or_default();
+    record.published_at = doc.time.as_deref().and_then(unix_secs);
+    record.repository = doc.origin.and_then(|o| o.url);
+    record
 }
 
 /// A module proxy `.info` (or `@latest`) document: one version of a module.
@@ -330,14 +327,20 @@ struct Origin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecosystem::look;
     use crate::fetch::resolve;
     use crate::fetch::resolve_artifacts;
     use filefacts::RefLocator;
 
     use crate::fetch::{BlobCache, Fixtures};
 
-    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
+    #[test]
+    fn the_record_is_named_by_the_decoded_module_path() {
+        let info = br#"{"Version":"v1.0.0","Time":"2021-04-23T10:00:00Z"}"#;
+        let net =
+            Fixtures::default().with("https://proxy.golang.org/example.com/a%2Bb/@latest", info);
+        let r = look("pkg:golang/example.com/a%2Bb", &net).expect("registry");
+        assert_eq!(r.name, "example.com/a+b");
     }
 
     #[test]
@@ -441,10 +444,10 @@ mod tests {
             body.as_bytes(),
         );
         let cache = BlobCache::disabled();
-        let resolved =
-            goproxy_canonical_path("gitlab.com/nebulouslabs/sia", Some("v1.5.5"), &net, &cache);
-        assert_eq!(resolved.path, "gitlab.com/NebulousLabs/Sia");
-        assert_eq!(resolved.refused, None);
+        assert_eq!(
+            goproxy_canonical_path("gitlab.com/nebulouslabs/sia", Some("v1.5.5"), &net, &cache),
+            ProxySpelling::Respelled("gitlab.com/NebulousLabs/Sia".to_string())
+        );
         let matrix = resolve_artifacts(
             &RefLocator::Purl("pkg:golang/gitlab.com/nebulouslabs/sia@v1.5.5".into()),
             &net,
@@ -467,14 +470,15 @@ mod tests {
             404,
             b"not found: could not read Username",
         );
-        let resolved = goproxy_canonical_path(
-            "github.com/hatch1fy/errors",
-            Some("v0.2.0"),
-            &net,
-            &BlobCache::disabled(),
+        assert_eq!(
+            goproxy_canonical_path(
+                "github.com/hatch1fy/errors",
+                Some("v0.2.0"),
+                &net,
+                &BlobCache::disabled(),
+            ),
+            ProxySpelling::Refused(404)
         );
-        assert_eq!(resolved.path, "github.com/hatch1fy/errors");
-        assert_eq!(resolved.refused, Some(404));
         let matrix = resolve_artifacts(
             &RefLocator::Purl("pkg:golang/github.com/hatch1fy/errors@v0.2.0".into()),
             &net,

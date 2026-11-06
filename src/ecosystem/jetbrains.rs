@@ -4,7 +4,8 @@ use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
-    Coordinates, fetch_json, five_star, non_empty, null_default, optional, secs_from_millis,
+    Coordinates, Person, fetch_json, five_star, lenient, non_empty, null_default, optional,
+    secs_from_millis,
 };
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
@@ -30,15 +31,16 @@ pub(crate) fn lookup(
             net,
             cache,
         )?;
-        let Some(hit) = search
+        let Some(id) = search
             .plugins
             .iter()
-            .find(|p| p.xml_id.as_deref() == Some(c.name()))
+            .filter(|p| p.xml_id.as_deref() == Some(c.name()))
+            .find_map(|p| p.id)
         else {
             tracing::debug!(xml_id = %c.name().escape_debug(), "no JetBrains plugin has this xmlId");
             return Err(RegistryError::NotFound);
         };
-        hit.id.to_string()
+        id.to_string()
     };
     let doc: Plugin = fetch_json(&format!("{API}/plugins/{id}"), net, cache)?;
     let url = match c.encoded_version() {
@@ -48,36 +50,39 @@ pub(crate) fn lookup(
     let update = optional(fetch_json::<Vec<PluginUpdate>>(&url, net, cache), &url)
         .unwrap_or_default()
         .into_iter()
-        .find(|u| c.version().is_none_or(|v| u.version.as_deref() == Some(v)));
-    if update.is_none() {
-        tracing::debug!(url, "no JetBrains update for this release; undated");
-    }
-    let update = update.unwrap_or_default();
+        .find(|u| c.version().is_none_or(|v| u.version.as_deref() == Some(v)))
+        .unwrap_or_else(|| {
+            tracing::debug!(url, "no JetBrains update for this release; undated");
+            PluginUpdate::default()
+        });
     let urls = doc.urls.unwrap_or_default();
 
-    let mut registry = Registry::new(
+    // Only the versionless query asks for the latest update.
+    let latest = update.version.filter(|_| c.version().is_none());
+    let mut record = c.record(
         Ecosystem::Jetbrains,
         doc.xml_id.unwrap_or_else(|| c.name().to_string()),
+        latest,
     );
-    registry.version = c.target(update.version.as_deref()).to_string();
-    registry.published_at = update
+    record.published_at = update
         .cdate
         .and_then(|cdate| match cdate {
             Millis::Text(s) => s.parse().ok(),
             Millis::Number(n) => Some(n),
         })
         .and_then(secs_from_millis);
-    registry.author = doc.vendor.and_then(|vendor| match vendor {
-        Vendor::Name(name) => Some(name),
-        Vendor::Object { name } => name,
-    });
-    registry.title = doc.name;
-    registry.description = doc.preview;
-    registry.homepage = urls.url;
-    registry.repository = urls.source_code_url;
-    registry.downloads_total = doc.downloads;
-    registry.rating = doc.rating.and_then(|r| five_star(r, 5.0));
-    Ok(registry)
+    record.author = doc
+        .vendor
+        .as_ref()
+        .and_then(Person::name)
+        .map(str::to_string);
+    record.title = doc.name;
+    record.description = doc.preview;
+    record.homepage = urls.url;
+    record.repository = urls.source_code_url;
+    record.downloads_total = doc.downloads;
+    record.rating = doc.rating.and_then(|r| five_star(r, 5.0));
+    Ok(record)
 }
 
 /// The Marketplace's plugin search results.
@@ -87,11 +92,14 @@ struct PluginSearch {
     plugins: Vec<SearchHit>,
 }
 
-/// One plugin in the search results.
-#[derive(Deserialize)]
+/// One plugin in the search results. A hit without a numeric id costs that
+/// hit, never the search.
+#[derive(Default, Deserialize)]
+#[serde(default)]
 struct SearchHit {
-    id: u64,
-    #[serde(rename = "xmlId")]
+    #[serde(deserialize_with = "lenient")]
+    id: Option<u64>,
+    #[serde(rename = "xmlId", deserialize_with = "lenient")]
     xml_id: Option<String>,
 }
 
@@ -104,19 +112,12 @@ struct Plugin {
     name: Option<String>,
     #[serde(deserialize_with = "non_empty")]
     preview: Option<String>,
-    vendor: Option<Vendor>,
+    /// An object with a `name` in the live API, or a bare name.
+    #[serde(deserialize_with = "lenient")]
+    vendor: Option<Person>,
     urls: Option<PluginUrls>,
     downloads: Option<u64>,
     rating: Option<f64>,
-}
-
-/// A plugin's `vendor`: an object with a `name` in the live API, or a bare
-/// name.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Vendor {
-    Name(String),
-    Object { name: Option<String> },
 }
 
 /// A plugin's links.
@@ -148,14 +149,10 @@ enum Millis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
     const PLUGIN: &str = "https://plugins.jetbrains.com/api/plugins/22407";
-
-    fn lookup(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
 
     fn net(updates_url: &str, updates: &serde_json::Value) -> Fixtures {
         let plugin = serde_json::json!({
@@ -173,10 +170,11 @@ mod tests {
     fn jetbrains_plugin_normalizes() {
         let updates = serde_json::json!([{"version": "262.8117.29", "cdate": "1619172000000"}]);
         let net = net(&format!("{PLUGIN}/updates?size=1"), &updates);
-        let r = lookup("pkg:jetbrains/22407", &net).expect("registry");
+        let r = look("pkg:jetbrains/22407", &net).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Jetbrains);
         assert_eq!(r.name, "com.jetbrains.rust");
         assert_eq!(r.version, "262.8117.29");
+        assert_eq!(r.latest_version.as_deref(), Some("262.8117.29"));
         assert_eq!(r.published_at, Some(1_619_172_000));
         assert_eq!(r.author.as_deref(), Some("JetBrains s.r.o."));
         assert_eq!(r.homepage, None);
@@ -193,11 +191,11 @@ mod tests {
         let updates = serde_json::json!([{"version": "232.10056", "cdate": 1_695_898_009_000u64}]);
         let net = net(&format!("{PLUGIN}/updates?version=232.10056"), &updates)
             .with(&format!("{PLUGIN}/updates?version=9.9.9"), b"[]");
-        let r = lookup("pkg:jetbrains/22407@232.10056", &net).expect("registry");
+        let r = look("pkg:jetbrains/22407@232.10056", &net).expect("registry");
         assert_eq!(r.version, "232.10056");
         assert_eq!(r.published_at, Some(1_695_898_009));
 
-        let r = lookup("pkg:jetbrains/22407@9.9.9", &net).expect("registry");
+        let r = look("pkg:jetbrains/22407@9.9.9", &net).expect("registry");
         assert_eq!(r.version, "9.9.9");
         assert_eq!(r.published_at, None);
     }
@@ -205,7 +203,7 @@ mod tests {
     #[test]
     fn a_negative_or_unreachable_update_time_is_unknown() {
         let updates = serde_json::json!([{"version": "1.0", "cdate": "-1000"}]);
-        let r = lookup(
+        let r = look(
             "pkg:jetbrains/22407",
             &net(&format!("{PLUGIN}/updates?size=1"), &updates),
         )
@@ -215,7 +213,7 @@ mod tests {
         // The listing stands without its updates.
         let net = net(&format!("{PLUGIN}/updates?size=1"), &updates)
             .refusing(&format!("{PLUGIN}/updates?size=1"), 503);
-        let r = lookup("pkg:jetbrains/22407", &net).expect("registry");
+        let r = look("pkg:jetbrains/22407", &net).expect("registry");
         assert_eq!(r.version, "");
         assert_eq!(r.published_at, None);
         assert_eq!(r.title.as_deref(), Some("Rust"));
@@ -223,8 +221,11 @@ mod tests {
 
     #[test]
     fn an_xml_id_resolves_through_search() {
+        // A malformed hit costs that hit, not the search.
         let search = serde_json::json!({"plugins": [
+            {"id": "not-a-number", "xmlId": "com.jetbrains.rust"},
             {"id": 1, "xmlId": "com.jetbrains.rust.fake"},
+            {"xmlId": null},
             {"id": 22407, "xmlId": "com.jetbrains.rust"}
         ]});
         let updates = serde_json::json!([]);
@@ -232,14 +233,14 @@ mod tests {
             "https://plugins.jetbrains.com/api/searchPlugins?search=com.jetbrains.rust&max=20",
             search.to_string().as_bytes(),
         );
-        let r = lookup("pkg:jetbrains/com.jetbrains.rust", &net).expect("registry");
+        let r = look("pkg:jetbrains/com.jetbrains.rust", &net).expect("registry");
         assert_eq!(r.title.as_deref(), Some("Rust"));
         let missing = Fixtures::default().with(
             "https://plugins.jetbrains.com/api/searchPlugins?search=nope&max=20",
             br#"{"plugins": []}"#,
         );
         assert_eq!(
-            lookup("pkg:jetbrains/nope", &missing),
+            look("pkg:jetbrains/nope", &missing),
             Err(RegistryError::NotFound)
         );
     }

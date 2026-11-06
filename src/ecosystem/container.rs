@@ -4,9 +4,7 @@
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
-use crate::ecosystem::{
-    Coordinates, fetch_json, last_seg, non_empty, null_default, optional, unix_secs,
-};
+use crate::ecosystem::{Coordinates, fetch_json, non_empty, null_default, optional, unix_secs};
 use crate::fetch::{BlobCache, Fetch, safe_coordinate};
 use crate::purl::Purl;
 use crate::registry::RegistryError;
@@ -146,6 +144,8 @@ impl MetadataApi {
 ///
 /// Both APIs describe the repository, not a release: a requested digest or tag
 /// is the record's version, and the repository's last push does not date it.
+/// The record is named by the whole repository (`docker.io/library/nginx`),
+/// so a namesake under another owner or registry is never mistaken for it.
 pub(crate) fn lookup(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
@@ -154,8 +154,8 @@ pub(crate) fn lookup(
     let repo = oci_repository(c.path(), c.purl().qualifier("repository_url"))?;
     let (host, image) = split_reference(&repo).ok_or(RegistryError::UnsafeCoordinate)?;
     let mut record = match MetadataApi::of(host) {
-        Some(MetadataApi::DockerHub) => docker_hub(image, net, cache)?,
-        Some(MetadataApi::Quay) => quay(image, c.version().is_none(), net, cache)?,
+        Some(MetadataApi::DockerHub) => docker_hub(&repo, image, net, cache)?,
+        Some(MetadataApi::Quay) => quay(&repo, image, c.version().is_none(), net, cache)?,
         None => {
             tracing::debug!(
                 host = %host.escape_debug(),
@@ -171,33 +171,33 @@ pub(crate) fn lookup(
     Ok(record)
 }
 
-/// Docker Hub repository metadata: anonymous JSON with pulls, the publishing
-/// namespace, and registration/update times.
-fn docker_hub(image: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Registry, RegistryError> {
+/// Docker Hub metadata for `repo` (`image` on the Hub): anonymous JSON with
+/// pulls, the publishing namespace, and registration/update times.
+fn docker_hub(
+    repo: &str,
+    image: &str,
+    net: &dyn Fetch,
+    cache: &BlobCache,
+) -> Result<Registry, RegistryError> {
     let doc: HubRepository = fetch_json(
         &format!("https://hub.docker.com/v2/repositories/{image}"),
         net,
         cache,
     )?;
-    let mut registry = Registry::new(
-        Ecosystem::Oci,
-        doc.name.unwrap_or_else(|| last_seg(image).to_string()),
-    );
-    registry.published_at = doc.last_updated.as_deref().and_then(unix_secs);
-    registry.first_published_at = doc.date_registered.as_deref().and_then(unix_secs);
-    registry.author = doc.namespace.or(doc.user);
-    registry.description = doc.description;
-    registry.downloads_total = doc.pull_count;
-    registry.favorites = doc.star_count;
-    Ok(registry)
+    let mut record = Registry::new(Ecosystem::Oci, repo);
+    record.published_at = doc.last_updated.as_deref().and_then(unix_secs);
+    record.first_published_at = doc.date_registered.as_deref().and_then(unix_secs);
+    record.author = doc.namespace.or(doc.user);
+    record.description = doc.description;
+    record.downloads_total = doc.pull_count;
+    record.favorites = doc.star_count;
+    Ok(record)
 }
 
 /// The parts of a Docker Hub repository document the registry record reads.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct HubRepository {
-    #[serde(deserialize_with = "non_empty")]
-    name: Option<String>,
     last_updated: Option<String>,
     date_registered: Option<String>,
     #[serde(deserialize_with = "non_empty")]
@@ -210,11 +210,12 @@ struct HubRepository {
     star_count: Option<u64>,
 }
 
-/// Quay repository metadata: anonymous JSON with the description, the owning
-/// namespace, and (asked for with `includeStats`) the last ~90 days of daily
-/// pulls. The repository document carries no time; when `dated`, its newest
+/// Quay metadata for `repo` (`image` on Quay): anonymous JSON with the
+/// description, the owning namespace, and (asked for with `includeStats`) the
+/// last ~90 days of daily pulls. The repository document carries no time; when `dated`, its newest
 /// active tag — tags list newest first — says when it was last pushed.
 fn quay(
+    repo: &str,
     image: &str,
     dated: bool,
     net: &dyn Fetch,
@@ -225,33 +226,27 @@ fn quay(
         net,
         cache,
     )?;
-    let last_push = if dated {
+    let mut record = Registry::new(Ecosystem::Oci, repo);
+    if dated {
         let url =
             format!("https://quay.io/api/v1/repository/{image}/tag/?limit=1&onlyActiveTags=true");
-        optional(fetch_json::<QuayTags>(&url, net, cache), &url)
-            .and_then(|t| t.tags.into_iter().next()?.start_ts)
-    } else {
-        None
-    };
-    let mut registry = Registry::new(
-        Ecosystem::Oci,
-        doc.name.unwrap_or_else(|| last_seg(image).to_string()),
-    );
-    registry.published_at = last_push;
-    registry.author = doc.namespace;
-    registry.description = doc.description;
-    registry.downloads_recent = doc
-        .stats
-        .map(|days| days.iter().filter_map(|d| d.count).sum());
-    Ok(registry)
+        record.published_at = optional(fetch_json::<QuayTags>(&url, net, cache), &url)
+            .and_then(|t| t.tags.into_iter().next()?.start_ts);
+    }
+    record.author = doc.namespace;
+    record.description = doc.description;
+    record.downloads_recent = doc.stats.map(|days| {
+        days.iter()
+            .filter_map(|d| d.count)
+            .fold(0u64, u64::saturating_add)
+    });
+    Ok(record)
 }
 
 /// The parts of a Quay repository document the registry record reads.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct QuayRepository {
-    #[serde(deserialize_with = "non_empty")]
-    name: Option<String>,
     #[serde(deserialize_with = "non_empty")]
     namespace: Option<String>,
     #[serde(deserialize_with = "non_empty")]
@@ -284,13 +279,8 @@ struct QuayTag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filefacts::RefLocator;
-
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
-
-    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
 
     #[test]
     fn oci_docker_hub_normalizes() {
@@ -314,7 +304,7 @@ mod tests {
         )
         .expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Oci);
-        assert_eq!(r.name, "nginx");
+        assert_eq!(r.name, "docker.io/library/nginx");
         assert_eq!(r.author.as_deref(), Some("library"));
         assert_eq!(r.downloads_total, Some(1_000_000_000));
         // Stars are favorites, not ratings: nothing stands behind a `rating`.
@@ -377,7 +367,7 @@ mod tests {
             .with(repo_url, repo.as_bytes())
             .with(tags_url, tags.as_bytes());
         let r = look(purl, &net).expect("registry");
-        assert_eq!(r.name, "node-exporter");
+        assert_eq!(r.name, "quay.io/prometheus/node-exporter");
         assert_eq!(r.author.as_deref(), Some("prometheus"));
         assert_eq!(r.published_at, Some(1_790_343_232));
         assert_eq!(r.downloads_recent, Some(42));
@@ -389,6 +379,29 @@ mod tests {
         let r = look(purl, &net).expect("registry");
         assert_eq!(r.author.as_deref(), Some("prometheus"));
         assert_eq!(r.published_at, None);
+    }
+
+    #[test]
+    fn a_namesake_under_another_owner_is_named_apart() {
+        let doc = serde_json::json!({"name": "nginx", "namespace": "evilorg"}).to_string();
+        let net = Fixtures::default().with(
+            "https://hub.docker.com/v2/repositories/evilorg/nginx",
+            doc.as_bytes(),
+        );
+        let r = look("pkg:docker/evilorg/nginx", &net).expect("registry");
+        assert_eq!(r.name, "docker.io/evilorg/nginx");
+    }
+
+    #[test]
+    fn hostile_pull_counts_saturate() {
+        let repo = serde_json::json!({"stats": [{"count": u64::MAX}, {"count": u64::MAX}]});
+        let net = Fixtures::default().with(
+            "https://quay.io/api/v1/repository/a/b?includeStats=true",
+            repo.to_string().as_bytes(),
+        );
+        let r =
+            look("pkg:oci/b@sha256:abc?repository_url=quay.io%2Fa%2Fb", &net).expect("registry");
+        assert_eq!(r.downloads_recent, Some(u64::MAX));
     }
 
     /// An organisation's repository has no `namespace` user behind it, and

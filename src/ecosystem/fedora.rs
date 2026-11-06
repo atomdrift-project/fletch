@@ -9,7 +9,8 @@ use crate::registry::RegistryError;
 
 /// Fedora (Rawhide via mdapi): the per-package record carries the current
 /// `version-release`, summary, and homepage. mdapi reports no build time, so
-/// age stays unknown.
+/// age stays unknown. Like a distro index, mdapi knows only the current
+/// build; the dispatcher reconciles a requested version with it.
 pub(crate) fn lookup(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
@@ -27,16 +28,15 @@ pub(crate) fn lookup(
         Some(release) => format!("{v}-{release}"),
         None => v,
     });
-    let mut registry = Registry::new(
+    let mut record = Registry::new(
         Ecosystem::Fedora,
         doc.basename.unwrap_or_else(|| c.name().to_string()),
     );
-    registry.version = c.target(latest.as_deref()).to_string();
-    registry.latest_version = latest;
-    registry.description = doc.summary.or(doc.description);
-    registry.homepage = doc.url;
-    registry.license = doc.license;
-    Ok(registry)
+    record.version = latest.unwrap_or_default();
+    record.description = doc.summary.or(doc.description);
+    record.homepage = doc.url;
+    record.license = doc.license;
+    Ok(record)
 }
 
 /// The parts of an mdapi package record the registry record reads.
@@ -62,8 +62,7 @@ struct Package {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filefacts::RefLocator;
-
+    use crate::ecosystem;
     use crate::fetch::Fixtures;
 
     fn curl() -> Fixtures {
@@ -79,18 +78,13 @@ mod tests {
         )
     }
 
-    fn look(purl: &str) -> Registry {
-        crate::registry::lookup(
-            &RefLocator::Purl(purl.into()),
-            &curl(),
-            &BlobCache::disabled(),
-        )
-        .expect("registry")
+    fn curl_record(purl: &str) -> Registry {
+        ecosystem::look(purl, &curl()).expect("registry")
     }
 
     #[test]
     fn fedora_mdapi_normalizes() {
-        let r = look("pkg:rpm/fedora/curl");
+        let r = curl_record("pkg:rpm/fedora/curl");
         assert_eq!(r.ecosystem, Ecosystem::Fedora);
         assert_eq!(r.version, "8.21.0-3.fc45");
         assert_eq!(r.latest_version.as_deref(), Some("8.21.0-3.fc45"));
@@ -101,8 +95,9 @@ mod tests {
 
     #[test]
     fn a_requested_version_is_the_record_version() {
-        let r = look("pkg:rpm/fedora/curl@8.0.0-1.fc40");
+        let r = curl_record("pkg:rpm/fedora/curl@8.0.0-1.fc40");
         assert_eq!(r.version, "8.0.0-1.fc40");
         assert_eq!(r.latest_version.as_deref(), Some("8.21.0-3.fc45"));
+        assert_eq!(r.published_at, None);
     }
 }

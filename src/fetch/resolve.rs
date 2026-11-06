@@ -82,13 +82,17 @@ type ApiFn =
 enum Artifact {
     /// A container image, pulled by the OCI puller from its `oci://` URL.
     Oci,
+    /// An artifact URL derived from the coordinates alone.
+    Derived(DeriveFn),
+    /// Only the registry's listing names the artifacts.
+    Listed(ListFn),
     /// An artifact URL `derive`d from the coordinates, and the registry's
-    /// listing, which decides instead whenever `listed` says the coordinates
-    /// alone cannot (no version, a tag, a case-sensitive proxy, a URL only
-    /// the registry knows).
-    Derived {
-        derive: Option<DeriveFn>,
-        list: Option<ListFn>,
+    /// listing, which decides instead, online, whenever `listed` says the
+    /// coordinates alone cannot (no version, a tag, a case-sensitive proxy, a
+    /// URL only the registry knows).
+    Either {
+        derive: DeriveFn,
+        list: ListFn,
         listed: fn(&Coordinates<'_>) -> bool,
     },
     /// Only the registry's API names the artifact.
@@ -108,18 +112,14 @@ pub(super) struct Rules {
 /// The single per-ecosystem table: every resolver dispatches on a PURL type
 /// here, and nowhere else.
 pub(super) fn rules(typ: &str) -> Rules {
-    let derived = |derive: DeriveFn| Artifact::Derived {
-        derive: Some(derive),
-        list: None,
-        listed: |_| false,
-    };
+    let derived = Artifact::Derived;
     let (requirement, artifact) = match typ {
         "oci" | "docker" => (None, Artifact::Oci),
         "npm" => (
             Some(Grammar::Npm),
-            Artifact::Derived {
-                derive: Some(npm_url),
-                list: Some(|c, net, cache| npm_artifacts(c, net, cache)),
+            Artifact::Either {
+                derive: npm_url,
+                list: |c, net, cache| npm_artifacts(c, net, cache),
                 listed: |c| {
                     c.encoded_version()
                         .is_none_or(|v| !npm_version_is_concrete(v))
@@ -128,25 +128,21 @@ pub(super) fn rules(typ: &str) -> Rules {
         ),
         "pypi" => (
             Some(Grammar::Pep440),
-            Artifact::Derived {
-                derive: None,
-                list: Some(|c, net, cache| pypi_artifacts(c, net, cache)),
-                listed: |_| true,
-            },
+            Artifact::Listed(|c, net, cache| pypi_artifacts(c, net, cache)),
         ),
         "cargo" => (
             Some(Grammar::Cargo),
-            Artifact::Derived {
-                derive: Some(crate_url),
-                list: Some(|c, net, cache| cargo_artifacts(c, net, cache)),
+            Artifact::Either {
+                derive: crate_url,
+                list: |c, net, cache| cargo_artifacts(c, net, cache),
                 listed: |c| !on_crates_io(c.purl()),
             },
         ),
         "gem" => (
             None,
-            Artifact::Derived {
-                derive: Some(gem_url),
-                list: Some(|c, net, cache| gem_artifacts(c, net, cache)),
+            Artifact::Either {
+                derive: gem_url,
+                list: |c, net, cache| gem_artifacts(c, net, cache),
                 listed: |c| c.encoded_version().is_none(),
             },
         ),
@@ -154,20 +150,16 @@ pub(super) fn rules(typ: &str) -> Rules {
         // it which spelling it serves.
         "golang" => (
             None,
-            Artifact::Derived {
-                derive: Some(golang_url),
-                list: Some(|c, net, cache| golang_artifacts(c, net, cache)),
+            Artifact::Either {
+                derive: golang_url,
+                list: |c, net, cache| golang_artifacts(c, net, cache),
                 listed: |_| true,
             },
         ),
         // The zip's URL and sha256 exist only in the registry's download API.
         "terraform" => (
             None,
-            Artifact::Derived {
-                derive: None,
-                list: Some(|c, net, cache| terraform_artifact(c, net, cache).map(|a| vec![a])),
-                listed: |_| true,
-            },
+            Artifact::Listed(|c, net, cache| terraform_artifact(c, net, cache).map(|a| vec![a])),
         ),
         "github" => (
             None,
@@ -203,7 +195,7 @@ pub(super) fn rules(typ: &str) -> Rules {
                 ))
             }),
         ),
-        "clawhub" => (None, derived(clawhub_url)),
+        "clawhub" => (None, derived(|c| Some(clawhub_url(c)))),
         // Open VSX and the VS Code Marketplace publish the exact `.vsix` URL
         // (and the latest version) only through their APIs; the ratified
         // `vscode-extension` type covers both, Open VSX named by its
@@ -229,7 +221,10 @@ pub(super) fn rules(typ: &str) -> Rules {
             None,
             Artifact::Api(|c, net, cache| refined(resolve_dify(c, net, cache))),
         ),
-        "aur" => (None, Artifact::Api(aur)),
+        "aur" => (
+            None,
+            Artifact::Api(|c, net, cache| Ok((None, aur_snapshot(c, net, cache)))),
+        ),
         "alpm" => (None, Artifact::Api(alpm)),
         "composer" => (None, Artifact::Api(composer)),
         _ => (None, Artifact::Unsupported),
@@ -327,11 +322,7 @@ fn maven_url(c: &Coordinates<'_>) -> Option<String> {
 
 /// ClawHub's download API takes the slug, plus the owner handle when the
 /// PURL carries one (slugs are not unique across publishers).
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "shaped to fit the resolution table"
-)]
-fn clawhub_url(c: &Coordinates<'_>) -> Option<String> {
+fn clawhub_url(c: &Coordinates<'_>) -> String {
     let (owner, slug) = c.path().split_once('/').unwrap_or(("", c.path()));
     let mut url = format!("https://clawhub.ai/api/v1/download?slug={slug}");
     if !owner.is_empty() {
@@ -342,7 +333,7 @@ fn clawhub_url(c: &Coordinates<'_>) -> Option<String> {
         url.push_str("&version=");
         url.push_str(v);
     }
-    Some(url)
+    url
 }
 
 fn vscode(
@@ -362,17 +353,9 @@ fn vscode(
 /// The AUR serves one artifact per package: the current PKGBUILD-tree
 /// snapshot, addressed by *pkgbase*, which the RPC names exactly. Snapshots
 /// track HEAD only, so a pinned version cannot select an older release.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "shaped to fit the resolution table"
-)]
-fn aur(
-    c: &Coordinates<'_>,
-    net: &dyn Fetch,
-    cache: &BlobCache,
-) -> Result<(Option<String>, String), ResolveError> {
+fn aur_snapshot(c: &Coordinates<'_>, net: &dyn Fetch, cache: &BlobCache) -> String {
     let name = c.path().rsplit('/').next().unwrap_or(c.path());
-    Ok((None, resolve_aur(name, net, cache)))
+    resolve_aur(name, net, cache)
 }
 
 /// `pkg:alpm`: an AUR package (`aur/<name>`, or the spec's `arch/<name>` with
@@ -388,7 +371,7 @@ fn alpm(
             .qualifier("repository_url")
             .is_some_and(|url| url_host_is(url, "aur.archlinux.org"))
     {
-        return aur(c, net, cache);
+        return Ok((None, aur_snapshot(c, net, cache)));
     }
     match (c.path().strip_prefix("arch/"), c.encoded_version()) {
         (Some(name), None) => unrefined(resolve_arch_current(name, net, cache)),
@@ -435,6 +418,39 @@ pub(super) fn parse(raw: &str) -> Result<Purl, Unresolved> {
         tracing::debug!(locator = raw, error = %e, "locator is not a valid PURL");
         Unresolved::InvalidPurl
     })
+}
+
+/// The PURL's `download_url` qualifier, which selects the artifact over the
+/// ecosystem's own source. It is held to https like every URL a registry
+/// names: only a URL a scanned file writes verbatim may be plain http.
+fn download_url(purl: &Purl) -> Result<Option<&str>, ResolveError> {
+    let Some(url) = purl.qualifier("download_url") else {
+        return Ok(None);
+    };
+    if !url::Url::parse(url).is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some()) {
+        return Err(refused(
+            purl,
+            "download_url",
+            Unresolved::Unsupported,
+            "download_url is not an https URL",
+        ));
+    }
+    Ok(Some(url))
+}
+
+/// The PURL's vetted registry coordinates; refused when one would
+/// restructure a registry URL.
+fn coordinates(purl: &Purl) -> Result<Coordinates<'_>, ResolveError> {
+    match Coordinates::new(purl) {
+        Ok(coordinates) => Ok(coordinates),
+        // `Coordinates::new` has one refusal: an unsafe coordinate.
+        Err(_) => Err(refused(
+            purl,
+            "coordinates",
+            Unresolved::UnsafeCoordinate,
+            "coordinate would restructure a registry URL",
+        )),
+    }
 }
 
 /// Log why `purl` resolved to nothing on the `branch` resolution took, and
@@ -490,15 +506,7 @@ fn locate(purl: &Purl, online: Online<'_>) -> Result<Located, ResolveError> {
     {
         return locate(&exact, online);
     }
-    let located = if let Some(url) = purl.qualifier("download_url") {
-        if !is_web_scheme(url) {
-            return Err(refused(
-                purl,
-                "download_url",
-                Unresolved::Unsupported,
-                "download_url is not a web URL",
-            ));
-        }
+    let located = if let Some(url) = download_url(purl)? {
         Located::at(purl.clone(), url.to_owned())
     } else if purl.qualifier("vers").is_some() {
         return Err(refused(
@@ -508,16 +516,7 @@ fn locate(purl: &Purl, online: Online<'_>) -> Result<Located, ResolveError> {
             "a vers range names no one release",
         ));
     } else {
-        // Its one refusal is an unsafe coordinate.
-        let coordinates = Coordinates::new(purl).ok().ok_or_else(|| {
-            refused(
-                purl,
-                "coordinates",
-                Unresolved::UnsafeCoordinate,
-                "coordinate would restructure a registry URL",
-            )
-        })?;
-        locate_artifact(&coordinates, online)?
+        locate_artifact(&coordinates(purl)?, online)?
     };
     if !file_name_matches(purl, &located.file_name) {
         return Err(refused(
@@ -529,7 +528,7 @@ fn locate(purl: &Purl, online: Online<'_>) -> Result<Located, ResolveError> {
     }
     tracing::debug!(
         locator = %located.purl,
-        url = %located.url,
+        url = ?located.url,
         online = online.is_some(),
         "resolved"
     );
@@ -539,25 +538,22 @@ fn locate(purl: &Purl, online: Online<'_>) -> Result<Located, ResolveError> {
 /// [`locate`] through the ecosystem's [`rules`].
 fn locate_artifact(c: &Coordinates<'_>, online: Online<'_>) -> Result<Located, ResolveError> {
     let purl = c.purl();
-    match (rules(purl.typ()).artifact, online) {
+    match (&rules(purl.typ()).artifact, online) {
         (Artifact::Oci, _) => resolve_oci_ref(purl)
             .map(|url| Located::at(purl.clone(), url))
-            .ok_or(ResolveError::Unresolved(Unresolved::UnsafeCoordinate)),
-        (
-            Artifact::Derived {
-                list: Some(list),
-                listed,
-                ..
-            },
-            Some((net, cache)),
-        ) if listed(c) => listed_artifact(c, list, net, cache),
-        (
-            Artifact::Derived {
-                derive: Some(derive),
-                ..
-            },
-            _,
-        ) => derive(c)
+            .ok_or_else(|| {
+                refused(
+                    purl,
+                    "oci",
+                    Unresolved::UnsafeCoordinate,
+                    "no safe image reference",
+                )
+            }),
+        (&Artifact::Listed(list), Some((net, cache))) => listed_artifact(c, list, net, cache),
+        (&Artifact::Either { list, listed, .. }, Some((net, cache))) if listed(c) => {
+            listed_artifact(c, list, net, cache)
+        }
+        (&(Artifact::Derived(derive) | Artifact::Either { derive, .. }), _) => derive(c)
             .map(|url| Located::at(purl.clone(), url))
             .ok_or_else(|| {
                 refused(
@@ -633,7 +629,7 @@ fn listed_artifact(
             "registry artifact identity does not parse",
         )
     })?;
-    tracing::debug!(locator = %exact, url = %candidate.url, "registry listing chose the artifact");
+    tracing::debug!(locator = %exact, url = ?candidate.url, "registry listing chose the artifact");
     Ok(Located {
         purl: exact,
         url: candidate.url,
@@ -773,43 +769,23 @@ fn purl_artifacts(
     if let Some(exact) = resolve_requirement(purl, net, cache)? {
         return purl_artifacts(&exact, net, cache);
     }
-    let candidates = if let Some(url) = purl.qualifier("download_url") {
-        if !is_web_scheme(url) {
-            return Err(refused(
-                purl,
-                "download_url",
-                Unresolved::Unsupported,
-                "download_url is not a web URL",
-            ));
-        }
+    let candidates = if let Some(url) = download_url(purl)? {
         let mut candidate = artifact_candidate(url.to_owned(), ArtifactKind::Download);
         candidate.preferred = file_name_matches(purl, &candidate.file_name);
         vec![candidate]
     } else if purl.qualifier("vers").is_some() {
         Vec::new()
     } else {
-        // Its one refusal is an unsafe coordinate.
-        let coordinates = Coordinates::new(purl).ok().ok_or_else(|| {
-            refused(
+        let (Artifact::Listed(list) | Artifact::Either { list, .. }) = rules(purl.typ()).artifact
+        else {
+            return Err(refused(
                 purl,
-                "coordinates",
-                Unresolved::UnsafeCoordinate,
-                "coordinate would restructure a registry URL",
-            )
-        })?;
-        match rules(purl.typ()).artifact {
-            Artifact::Derived {
-                list: Some(list), ..
-            } => listed(&coordinates, list, net, cache)?,
-            _ => {
-                return Err(refused(
-                    purl,
-                    "unsupported",
-                    Unresolved::Unsupported,
-                    "no registry listing",
-                ));
-            }
-        }
+                "unsupported",
+                Unresolved::Unsupported,
+                "no registry listing",
+            ));
+        };
+        listed(&coordinates(purl)?, list, net, cache)?
     };
     Ok(listing(purl, candidates))
 }
@@ -820,10 +796,7 @@ pub(crate) fn deterministic_artifacts(purl: &Purl, kind: ArtifactKind) -> Vec<Ar
     let url = Coordinates::new(purl)
         .ok()
         .and_then(|c| match rules(purl.typ()).artifact {
-            Artifact::Derived {
-                derive: Some(derive),
-                ..
-            } => derive(&c),
+            Artifact::Derived(derive) | Artifact::Either { derive, .. } => derive(&c),
             _ => None,
         });
     let Some(url) = url else {
@@ -852,11 +825,26 @@ pub(super) mod tests {
             .map(|target| (target.locator, target.url))
     }
 
+    /// Why resolving `raw` online was refused; `None` when it resolved or a
+    /// registry read failed instead. A test that expects a refusal asserts
+    /// this, so a missing fixture (a failed read) never passes for one.
+    pub(in crate::fetch) fn refusal(
+        raw: &str,
+        net: &dyn Fetch,
+        cache: &BlobCache,
+    ) -> Option<Unresolved> {
+        match target(&RefLocator::Purl(raw.into()), net, cache) {
+            Err(ResolveError::Unresolved(why)) => Some(why),
+            _ => None,
+        }
+    }
+
     fn offline(raw: &str) -> Option<String> {
         resolve(&RefLocator::Purl(raw.into()))
     }
 
-    fn matrix(raw: &str, net: &dyn Fetch) -> ArtifactMatrix {
+    /// `raw`'s artifact matrix, asked of `net`.
+    pub(in crate::fetch) fn matrix(raw: &str, net: &dyn Fetch) -> ArtifactMatrix {
         resolve_artifacts(&RefLocator::Purl(raw.into()), net, &BlobCache::disabled())
             .expect("matrix")
     }
@@ -975,9 +963,13 @@ pub(super) mod tests {
         ] {
             assert_eq!(resolve(&RefLocator::Url(url.to_string())), None, "{url}");
         }
-        // The web schemes still resolve — `http` so it can be refused at
-        // connect with the more specific reason.
-        for url in ["https://example.com/x.tgz", "HTTPS://example.com/x.tgz"] {
+        // The web schemes resolve: a URL the scanned file names verbatim may
+        // be plain http (the transport still applies its address guards).
+        for url in [
+            "https://example.com/x.tgz",
+            "HTTPS://example.com/x.tgz",
+            "http://example.com/x.tgz",
+        ] {
             assert_eq!(
                 resolve(&RefLocator::Url(url.to_string())),
                 Some(url.to_string())
@@ -1039,9 +1031,8 @@ pub(super) mod tests {
                 format!("{purl}?file_name=other.bin")
             };
             assert_eq!(offline(&wrong), None, "{wrong}");
-            assert_eq!(
-                resolved(&wrong, &Fixtures::default(), &BlobCache::disabled()),
-                None,
+            assert!(
+                refusal(&wrong, &Fixtures::default(), &BlobCache::disabled()).is_some(),
                 "{wrong}"
             );
         }
@@ -1083,14 +1074,33 @@ pub(super) mod tests {
             ))
         );
         let wrong_file = "pkg:npm/native-addon?download_url=https:%2F%2Fmirror.test%2Fnative.tgz&file_name=other.tgz";
-        assert_eq!(
-            resolved(wrong_file, &Fixtures::default(), &BlobCache::disabled()),
-            None
-        );
+        assert!(refusal(wrong_file, &Fixtures::default(), &BlobCache::disabled()).is_some());
         let override_matrix = matrix(wrong_file, &Fixtures::default());
         assert_eq!(override_matrix.candidates.len(), 1);
         assert_eq!(override_matrix.candidates[0].kind, ArtifactKind::Download);
         assert!(override_matrix.preferred().is_none());
+
+        // A PURL's download_url is fetched like a registry-named URL, https
+        // only, so a plain-http one is refused here rather than resolved to
+        // a URL the transport would then refuse.
+        let plain = "pkg:npm/a@1.0.0?download_url=http:%2F%2Fmirror.test%2Fa.tgz";
+        assert_eq!(offline(plain), None);
+        assert!(matches!(
+            target(
+                &RefLocator::Purl(plain.into()),
+                &Fixtures::default(),
+                &BlobCache::disabled()
+            ),
+            Err(ResolveError::Unresolved(Unresolved::Unsupported))
+        ));
+        assert!(
+            resolve_artifacts(
+                &RefLocator::Purl(plain.into()),
+                &Fixtures::default(),
+                &BlobCache::disabled()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1148,7 +1158,10 @@ pub(super) mod tests {
 
         let range = "pkg:npm/pkg?vers=vers:npm%2F%3E%3D1.0.0";
         assert!(matrix(range, &net).candidates.is_empty());
-        assert_eq!(resolved(range, &net, &BlobCache::disabled()), None);
+        assert_eq!(
+            refusal(range, &net, &BlobCache::disabled()),
+            Some(Unresolved::Unsupported)
+        );
     }
 
     /// The matrix reports the locator canonicalized, whichever form the

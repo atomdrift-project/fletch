@@ -32,16 +32,25 @@ impl Purl {
     /// (`codeload.github.com`).
     #[must_use]
     pub fn from_url(url: &str) -> Option<Self> {
-        let (host, path) = split_host_path(url)?;
-        match host.as_str() {
-            "registry.npmjs.org" | "registry.yarnpkg.com" => npm(&path),
-            "static.crates.io" | "crates.io" => cargo(&path),
-            "files.pythonhosted.org" => pypi(&path),
-            "rubygems.org" => gem(&path),
-            "proxy.golang.org" => golang(&path),
-            "api.nuget.org" => nuget(&path),
-            "repo1.maven.org" | "repo.maven.apache.org" => maven(&path),
-            "codeload.github.com" => github(&path),
+        let url = Url::parse(url).ok()?;
+        // Userinfo could make a look-alike authority read as a registry host.
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return None;
+        }
+        // The parser lowercases an http(s) host.
+        let path = url.path().trim_start_matches('/');
+        match url.host_str()? {
+            "registry.npmjs.org" | "registry.yarnpkg.com" => npm(path),
+            "static.crates.io" | "crates.io" => cargo(path),
+            "files.pythonhosted.org" => pypi(path),
+            "rubygems.org" => gem(path),
+            "proxy.golang.org" => golang(path),
+            "api.nuget.org" => nuget(path),
+            "repo1.maven.org" | "repo.maven.apache.org" => maven(path),
+            "codeload.github.com" => github(path),
             _ => None,
         }
     }
@@ -52,23 +61,6 @@ impl Purl {
 #[must_use]
 pub fn url_to_purl(url: &str) -> Option<String> {
     Purl::from_url(url).map(|purl| purl.to_string())
-}
-
-/// Split an `http(s)` URL into its lowercase host and its path without the
-/// leading slash. `None` for any other scheme, or a URL with userinfo, which
-/// could make a look-alike authority read as a registry host.
-fn split_host_path(url: &str) -> Option<(String, String)> {
-    let parsed = Url::parse(url).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return None;
-    }
-    Some((
-        parsed.host_str()?.to_ascii_lowercase(),
-        parsed.path().trim_start_matches('/').to_owned(),
-    ))
 }
 
 /// The PURL of `typ` at `path` (`/`-separated, the name last) and `version`,
@@ -171,7 +163,10 @@ fn gem(path: &str) -> Option<Purl> {
     }
 }
 
+/// Whether a gem filename's tail names a platform (`x86_64-linux`,
+/// `java`, `universal-darwin`), compared without regard to case.
 fn looks_like_gem_platform(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
     [
         "ruby",
         "java",
@@ -187,7 +182,7 @@ fn looks_like_gem_platform(value: &str) -> bool {
         "wasm",
     ]
     .iter()
-    .any(|marker| value.eq_ignore_ascii_case(marker) || value.contains(marker))
+    .any(|marker| value.contains(marker))
 }
 
 /// Go module proxy: `{module}/@v/{version}.zip`, both fields `!`-escaped for

@@ -36,12 +36,12 @@ enum Range {
     },
 }
 
-/// One release a registry document lists.
-struct Release {
-    version: String,
+/// One release a registry document lists, borrowed from the document.
+struct Release<'a> {
+    version: &'a str,
     yanked: bool,
     /// The release's sha256, when the registry publishes one.
-    checksum: Option<String>,
+    checksum: Option<&'a str>,
 }
 
 impl Grammar {
@@ -74,9 +74,9 @@ impl Grammar {
 
     /// The releases `doc` lists. A PyPI release is yanked when every one of
     /// its files is.
-    fn releases(self, doc: &serde_json::Value) -> Vec<Release> {
-        let unchecked = |version: &String| Release {
-            version: version.clone(),
+    fn releases<'a>(self, doc: &'a serde_json::Value) -> Vec<Release<'a>> {
+        let unchecked = |version: &'a str| Release {
+            version,
             yanked: false,
             checksum: None,
         };
@@ -87,7 +87,7 @@ impl Grammar {
             Self::Npm => doc
                 .get("versions")
                 .and_then(serde_json::Value::as_object)
-                .map(|versions| versions.keys().map(unchecked).collect())
+                .map(|versions| versions.keys().map(|v| unchecked(v)).collect())
                 .unwrap_or_default(),
             Self::Cargo => doc
                 .get("versions")
@@ -96,12 +96,9 @@ impl Grammar {
                     rows.iter()
                         .filter_map(|row| {
                             Some(Release {
-                                version: row.get("num")?.as_str()?.to_owned(),
+                                version: row.get("num")?.as_str()?,
                                 yanked: yanked(row),
-                                checksum: row
-                                    .get("checksum")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_owned),
+                                checksum: row.get("checksum").and_then(serde_json::Value::as_str),
                             })
                         })
                         .collect()
@@ -146,12 +143,12 @@ impl Range {
     }
 
     /// The highest release that satisfies the requirement and is not yanked.
-    fn best<'a>(&self, releases: &'a [Release]) -> Option<&'a Release> {
+    fn best<'r, 'a>(&self, releases: &'r [Release<'a>]) -> Option<&'r Release<'a>> {
         let admitted = releases
             .iter()
-            .filter(|r| !r.yanked && self.matches(&r.version));
+            .filter(|r| !r.yanked && self.matches(r.version));
         match self {
-            Self::Npm(_) => admitted.max_by_key(|r| node_semver::Version::parse(&r.version).ok()),
+            Self::Npm(_) => admitted.max_by_key(|r| node_semver::Version::parse(r.version).ok()),
             Self::Cargo(_) => admitted.max_by_key(|r| r.version.parse::<semver::Version>().ok()),
             Self::Pep440 { .. } => {
                 admitted.max_by_key(|r| r.version.parse::<pep440_rs::Version>().ok())
@@ -240,21 +237,20 @@ pub(super) fn resolve_requirement(
             let release = range
                 .best(&releases)
                 .ok_or_else(|| refused(Unresolved::NoRelease, "no release satisfies it"))?;
-            (release.version.clone(), release.checksum.clone())
+            (release.version, release.checksum)
         }
         // An npm requirement that is not a range is a dist-tag.
         None => (
             doc.get("dist-tags")
                 .and_then(|tags| tags.get(requirement))
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| refused(Unresolved::NoRelease, "no such dist-tag"))?
-                .to_owned(),
+                .ok_or_else(|| refused(Unresolved::NoRelease, "no such dist-tag"))?,
             None,
         ),
     };
     let mut exact = purl
         .with_qualifier("version_requirement", None)
-        .and_then(|declared| declared.with_version(&version))
+        .and_then(|declared| declared.with_version(version))
         .ok_or_else(|| refused(Unresolved::NoRelease, "registry named an unusable version"))?;
     if let Some(checksum) =
         checksum.filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))

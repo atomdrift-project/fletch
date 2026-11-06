@@ -1,20 +1,9 @@
 # Clippy thresholds for fletch. `too_many_lines` and `cognitive_complexity` are
 # enabled in Cargo.toml's [lints.clippy], so the thresholds below apply.
 
-# Cognitive complexity threshold - warn if a function is too complex
 cognitive-complexity-threshold = 30
-
-# Maximum number of lines for a function before warning
 too-many-lines-threshold = 150
-
-# Warn on functions with many arguments
 too-many-arguments-threshold = 8
-
-# Type complexity threshold
-type-complexity-threshold = 500
-
-# Warn on single character variable names (except common ones like i, j, x, y)
-single-char-binding-names-threshold = 4
 
 # Tests may unwrap, expect and panic: a failed test should stop loudly. This
 # covers #[test] fns and everything in #[cfg(test)] modules; helper fns in the
@@ -22,9 +11,3 @@ single-char-binding-names-threshold = 4
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
-
-# Disallowed methods - methods that should never be used. Keep minimal.
-disallowed-methods = []
-
-# Disallowed types - types that should not be used. Keep minimal.
-disallowed-types = []

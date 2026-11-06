@@ -7,13 +7,14 @@ use serde::de::IgnoredAny;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ecosystem::{
-    Coordinates, decode, email_domain, fetch_json, for_version, last_seg, lenient, non_empty,
-    null_default, optional, set_timeline, unix_secs,
+    Coordinates, DEPRECATED, Person, count, decode, email_domain, fetch_json, for_version,
+    last_seg, lenient, non_empty, null_default, optional, set_timeline, unix_secs,
 };
 use crate::fetch::{
     ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, cached_post,
     file_name_matches, percent_decode, repository_base,
 };
+use crate::purl::encode_component;
 use crate::registry::RegistryError;
 
 /// The public registry, the base for a PURL with no `repository_url`.
@@ -47,57 +48,64 @@ pub(crate) fn npm_artifacts(
         return Ok(Vec::new());
     };
     let api = format!("{repository}/{name}");
-    let doc: Packument = fetch_json(&api, net, &for_version(cache, requested_version))
+    let mut doc: Packument = fetch_json(&api, net, &for_version(cache, requested_version))
         .inspect_err(|error| {
-            tracing::debug!(url = %api, %error, "npm artifacts unresolved: packument unreadable");
+            tracing::debug!(url = %api.escape_debug(), %error, "npm artifacts unresolved: packument unreadable");
         })?;
     let resolved = match purl.version() {
         Some(version) if doc.versions.contains_key(version) => Some(version),
         Some(tag) => doc.tag(tag),
         None => doc.tag("latest"),
     };
-    let Some(version) = resolved else {
+    let Some(version) = resolved.map(str::to_string) else {
         tracing::debug!(
-            url = %api,
+            url = %api.escape_debug(),
             requested = ?purl.version(),
             "npm artifacts unresolved: no such version or dist-tag"
         );
         return Ok(Vec::new());
     };
-    let release = doc.versions.get(version);
-    let dist = release.and_then(|r| r.dist.as_ref());
-    let url = dist
-        .and_then(|d| d.tarball.clone())
-        .unwrap_or_else(|| format!("{repository}/{name}/-/{}-{version}.tgz", last_seg(&name)));
+    // A dist-tag may name a release the packument does not list: its
+    // tarball is then the registry's conventional path, unconstrained. The
+    // version is the registry's text there, so it is encoded: it can only
+    // ever fill its one file-name segment.
+    let Release {
+        dist,
+        os,
+        cpu,
+        libc,
+        engines,
+        ..
+    } = doc.versions.remove(&version).unwrap_or_default();
+    let dist = dist.unwrap_or_default();
+    let url = dist.tarball.unwrap_or_else(|| {
+        let base = last_seg(&name);
+        format!(
+            "{repository}/{name}/-/{base}-{}.tgz",
+            encode_component(&version)
+        )
+    });
     let mut candidate = artifact_candidate(url, ArtifactKind::Tgz);
-    candidate.version = Some(version.to_string());
-    if let Some(release) = release {
-        for (key, platforms) in [
-            ("os", &release.os),
-            ("cpu", &release.cpu),
-            ("libc", &release.libc),
-        ] {
-            // A list is recorded comma-joined; an empty one is no constraint.
-            let value = match platforms {
-                Some(Platforms::One(value)) => value.clone(),
-                Some(Platforms::Many(values)) if !values.is_empty() => values.join(","),
-                _ => continue,
-            };
-            candidate.attributes.insert(key.to_string(), value);
-        }
-        if let Some(node) = release.engines.as_ref().and_then(|e| e.node.clone()) {
-            candidate.attributes.insert("node".into(), node);
-        }
+    for (key, platforms) in [("os", os), ("cpu", cpu), ("libc", libc)] {
+        // A list is recorded comma-joined; an empty one is no constraint.
+        let value = match platforms {
+            Some(Platforms::One(value)) => value,
+            Some(Platforms::Many(values)) if !values.is_empty() => values.join(","),
+            _ => continue,
+        };
+        candidate.attributes.insert(key.to_string(), value);
     }
-    if let Some(integrity) = dist.and_then(|d| d.integrity.as_deref()) {
-        candidate
-            .attributes
-            .insert("integrity".into(), integrity.to_string());
-        add_sri_checksums(integrity, &mut candidate.checksums);
+    if let Some(node) = engines.and_then(|e| e.node) {
+        candidate.attributes.insert("node".into(), node);
     }
-    if let Some(sha1) = dist.and_then(|d| d.shasum.clone()) {
+    if let Some(integrity) = dist.integrity {
+        add_sri_checksums(&integrity, &mut candidate.checksums);
+        candidate.attributes.insert("integrity".into(), integrity);
+    }
+    if let Some(sha1) = dist.shasum {
         candidate.checksums.insert("sha1".into(), sha1);
     }
+    candidate.version = Some(version);
     candidate.preferred = file_name_matches(purl, &candidate.file_name);
     Ok(vec![candidate])
 }
@@ -121,7 +129,7 @@ fn add_sri_checksums(integrity: &str, checksums: &mut BTreeMap<String, String>) 
         };
         checksums
             .entry(algorithm.to_ascii_lowercase())
-            .or_insert_with(|| hex::encode(bytes));
+            .or_insert_with(|| crate::fetch::to_hex(bytes));
     }
 }
 
@@ -177,80 +185,70 @@ pub(crate) fn lookup(
         return Err(RegistryError::UnsafeCoordinate);
     }
     let name = npm_registry_name(c.path());
-    let doc: Packument = fetch_json(&format!("{REGISTRY}/{name}"), net, cache)?;
+    let mut doc: Packument = fetch_json(&format!("{REGISTRY}/{name}"), net, cache)?;
 
-    let latest = doc.tag("latest");
-    let version = c.target(latest);
-    let release = doc.versions.get(version);
+    let latest = doc.tag("latest").map(str::to_string);
+    let version = c.target(latest.as_deref()).to_string();
+    let mut record = c.record(Ecosystem::Npm, c.full_name(), latest);
+    let release = doc.versions.remove(&version);
     let published = |key: &str| doc.time.get(key).and_then(TimeEntry::secs);
 
-    let mut p = Registry::new(Ecosystem::Npm, c.full_name());
-    p.version = version.to_string();
-    p.published_at = published(version);
+    record.published_at = published(&version);
     // `created` dates the package itself, before any version's entry.
-    p.first_published_at = published("created");
-    p.latest_version = latest.map(str::to_string);
-    // The version's own manifest field, else the package root's: npm
-    // packuments carry both, and the version's copy is authoritative.
-    p.author = release
-        .and_then(|r| r.author.as_ref())
-        .or(doc.author.as_ref())
-        .and_then(Person::name)
-        .or_else(|| doc.maintainers.as_deref()?.first()?.name())
-        .map(str::to_string);
-    p.description = release
-        .and_then(|r| r.description.clone())
-        .or_else(|| doc.description.clone());
-    p.homepage = release
-        .and_then(|r| r.homepage.clone())
-        .or_else(|| doc.homepage.clone());
-    p.repository = release
-        .and_then(|r| r.repository.as_ref())
-        .or(doc.repository.as_ref())
-        .and_then(|r| r.url.clone());
-    p.license = release
-        .and_then(|r| r.license.clone())
-        .or_else(|| doc.license.clone());
-    p.deprecated = release
-        .and_then(|r| r.deprecated.as_ref())
-        .and_then(Deprecated::reason);
-    // A live package always lists at least one maintainer, so a missing,
-    // null, or empty list is itself the anomaly: zero, not unknown.
-    p.maintainers = Some(
-        doc.maintainers
-            .as_ref()
-            .map_or(0, |m| u32::try_from(m.len()).unwrap_or(u32::MAX)),
-    );
-    // An unpublished version keeps its `time` entry but leaves `versions`;
-    // a live version is in both.
-    let removed = release.is_none() && doc.time.contains_key(version);
-    p.version_removed = Some(removed);
+    record.first_published_at = published("created");
+    // A live version is in `versions`; an unpublished one leaves it but keeps
+    // its `time` entry. A version in neither (a typo, a dist-tag) is one npm
+    // says nothing about.
+    record.version_removed = match (&release, doc.time.contains_key(&version)) {
+        (Some(_), _) => Some(false),
+        (None, true) => Some(true),
+        (None, false) => None,
+    };
     // npm replaces a taken-down malicious package with a stub whose
     // description is exactly this: the registry's own verdict. A single
     // malicious version is deleted instead, leaving no stub; only then is the
     // audit endpoint worth a request, and a malware advisory on that exact
     // version is the same verdict.
-    p.security_hold = Some(
+    record.security_hold = Some(
         doc.description.as_deref() == Some("security holding package")
-            || (removed && has_malware_advisory(&name, version, net, cache)),
+            || (record.version_removed == Some(true)
+                && has_malware_advisory(&c.full_name(), &version, net, cache)),
     );
     // Every `time` entry but the `created`/`modified` bookkeeping is a
     // version's publish time.
     set_timeline(
-        &mut p,
+        &mut record,
         doc.time
             .iter()
             .filter(|(key, _)| !matches!(key.as_str(), "created" | "modified"))
             .filter_map(|(_, time)| time.secs()),
     );
-    if let Some(release) = release {
-        record_release(&mut p, release, doc.maintainers.as_deref());
+    // A live package always lists at least one maintainer, so a missing,
+    // null, or empty list is itself the anomaly: zero, not unknown.
+    record.maintainers = Some(doc.maintainers.as_ref().map_or(0, |m| count(m.len())));
+    if let Some(release) = &release {
+        record_release(&mut record, release, doc.maintainers.as_deref());
     }
+    // The version's own manifest field, else the package root's: npm
+    // packuments carry both, and the version's copy is authoritative.
+    let release = release.unwrap_or_default();
+    record.author = release
+        .author
+        .as_ref()
+        .or(doc.author.as_ref())
+        .and_then(Person::name)
+        .or_else(|| doc.maintainers.as_deref()?.first()?.name())
+        .map(str::to_string);
+    record.description = release.description.or(doc.description);
+    record.homepage = release.homepage.or(doc.homepage);
+    record.repository = release.repository.or(doc.repository).and_then(|r| r.url);
+    record.license = release.license.or(doc.license);
+    record.deprecated = release.deprecated.and_then(Deprecated::reason);
 
     let downloads = format!("https://api.npmjs.org/downloads/point/last-month/{name}");
-    p.downloads_recent = optional(fetch_json::<Downloads>(&downloads, net, cache), &downloads)
+    record.downloads_recent = optional(fetch_json::<Downloads>(&downloads, net, cache), &downloads)
         .and_then(|d| d.downloads);
-    Ok(p)
+    Ok(record)
 }
 
 /// Whether npm's audit endpoint holds a malware advisory (CWE-506) for this
@@ -281,24 +279,22 @@ fn has_malware_advisory(name: &str, version: &str, net: &dyn Fetch, cache: &Blob
 /// (`_npmUser`) and whether it is a listed maintainer — a publisher outside
 /// that set is the account-takeover tell — then the artifact's shape and its
 /// install hooks.
-fn record_release(p: &mut Registry, release: &Release, maintainers: Option<&[Person]>) {
+fn record_release(record: &mut Registry, release: &Release, maintainers: Option<&[Person]>) {
     let publisher = release.npm_user.as_ref().and_then(|u| u.name.as_deref());
-    p.publisher = publisher.map(str::to_string);
-    p.publisher_email_domain = release
+    record.publisher = publisher.map(str::to_string);
+    record.publisher_email_domain = release
         .npm_user
         .as_ref()
         .and_then(|u| u.email.as_deref())
         .and_then(email_domain);
     if let Some(publisher) = publisher {
-        p.publisher_in_maintainers =
+        record.publisher_in_maintainers =
             maintainers.map(|ms| ms.iter().any(|m| m.name() == Some(publisher)));
     }
     let dist = release.dist.as_ref();
-    p.unpacked_size = dist.and_then(|d| d.unpacked_size);
-    p.file_count = dist
-        .and_then(|d| d.file_count)
-        .and_then(|n| u32::try_from(n).ok());
-    p.has_install_script = Some(
+    record.unpacked_size = dist.and_then(|d| d.unpacked_size);
+    record.file_count = dist.and_then(|d| d.file_count).map(count);
+    record.has_install_script = Some(
         release.has_install_script.unwrap_or(false)
             || release.scripts.as_ref().is_some_and(|scripts| {
                 ["install", "preinstall", "postinstall"]
@@ -392,23 +388,6 @@ impl TimeEntry {
     }
 }
 
-/// An `author` or maintainer: a bare string, or an object with a `name`.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Person {
-    Name(String),
-    Object { name: Option<String> },
-}
-
-impl Person {
-    fn name(&self) -> Option<&str> {
-        match self {
-            Self::Name(name) => Some(name),
-            Self::Object { name } => name.as_deref(),
-        }
-    }
-}
-
 /// `repository` read in its object form (`{type, url}`).
 #[derive(Deserialize)]
 struct Repository {
@@ -425,11 +404,12 @@ enum Deprecated {
 }
 
 impl Deprecated {
-    fn reason(&self) -> Option<String> {
+    /// The deprecation notice, unless the version is not deprecated.
+    fn reason(self) -> Option<String> {
         match self {
             Self::Reason(reason) if reason.trim().is_empty() => None,
-            Self::Reason(reason) => Some(reason.clone()),
-            Self::Flag(true) => Some("deprecated".to_string()),
+            Self::Reason(reason) => Some(reason),
+            Self::Flag(true) => Some(DEPRECATED.to_string()),
             Self::Flag(false) => None,
         }
     }
@@ -497,14 +477,10 @@ struct Downloads {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::coordinates;
+    use crate::ecosystem::{coordinates, look};
 
     use crate::fetch::{Fixtures, resolve_artifacts};
     use filefacts::RefLocator;
-
-    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
 
     #[test]
     fn npm_packument_normalizes() {
@@ -658,6 +634,26 @@ mod tests {
     }
 
     #[test]
+    fn a_version_npm_never_listed_is_not_known_removed() {
+        // In neither `versions` nor `time`: a typo or a dist-tag, about which
+        // the packument says nothing — and the audit endpoint is not asked.
+        let doc = br#"{"dist-tags":{"latest":"1.0.0"},
+            "time":{"1.0.0":"2025-01-01T00:00:00.000Z"},"versions":{"1.0.0":{}}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/p", doc);
+        for purl in ["pkg:npm/p@9.9.9", "pkg:npm/p@next"] {
+            let p = look(purl, &net).expect("record");
+            assert_eq!(p.version_removed, None, "{purl}");
+            assert_eq!(p.security_hold, Some(false), "{purl}");
+        }
+        assert_eq!(
+            look("pkg:npm/p@1.0.0", &net)
+                .expect("record")
+                .version_removed,
+            Some(false)
+        );
+    }
+
+    #[test]
     fn a_removed_version_under_a_malware_advisory_is_a_security_hold() {
         // color@5.0.1: deleted by npm with no holder package left behind,
         // its `time` entry the only trace; the audit endpoint names it.
@@ -681,6 +677,36 @@ mod tests {
         // A listed version is never put to the endpoint, whatever it would say.
         let listed = look("pkg:npm/color@5.0.0", &net).expect("record");
         assert_eq!(listed.security_hold, Some(false));
+    }
+
+    /// The audit endpoint answers by package name as npm spells it, so a
+    /// legacy name with a character the PURL percent-encodes must be asked
+    /// for decoded, or its malware advisory is never matched.
+    #[test]
+    fn a_malware_advisory_is_matched_by_the_decoded_name() {
+        let doc = br#"{"time":{"1.0.0":"2025-01-01T00:00:00.000Z"},"versions":{}}"#;
+        let malware = br#"{"foo!bar":[{"cwe":["CWE-506"]}]}"#;
+        let net = Fixtures::default()
+            .with("https://registry.npmjs.org/foo%21bar", doc)
+            .with(ADVISORIES, malware);
+        let removed = look("pkg:npm/foo%21bar@1.0.0", &net).expect("record");
+        assert_eq!(removed.name, "foo!bar");
+        assert_eq!(removed.security_hold, Some(true));
+    }
+
+    /// A dist-tag naming a release the packument does not list leaves the
+    /// tarball at the conventional path, built from the registry's text: it
+    /// fills one file-name segment and never climbs to another package.
+    #[test]
+    fn a_dist_tag_cannot_climb_out_of_the_conventional_tarball_path() {
+        let doc = br#"{"dist-tags":{"latest":"x/../../../evil/-/evil-1.0.0"},"versions":{}}"#;
+        let net = Fixtures::default().with("https://registry.npmjs.org/p", doc);
+        let artifacts = npm_artifacts(&coordinates("pkg:npm/p"), &net, &BlobCache::disabled())
+            .expect("listing");
+        assert_eq!(
+            artifacts[0].url,
+            "https://registry.npmjs.org/p/-/p-x%2F..%2F..%2F..%2Fevil%2F-%2Fevil-1.0.0.tgz"
+        );
     }
 
     #[test]

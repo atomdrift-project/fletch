@@ -44,7 +44,7 @@ impl Default for FetchBudget {
             max_bytes: 5 * 1024 * 1024 * 1024,
             requests_per_fetch: 8,
             // An hour covers a full dependency closure, container pulls included.
-            deadline: Duration::from_secs(60 * 60),
+            deadline: Duration::from_hours(1),
         }
     }
 }
@@ -74,7 +74,10 @@ pub enum UrlFetches {
 /// served without one, even once the budget is spent — a warm re-run is never
 /// throttled. Which references win a contested cap is not guaranteed. Every
 /// network request the batch makes, registry metadata included, is charged
-/// to `max_bytes`, `requests_per_fetch` and `deadline`; a reference the spent
+/// to `max_bytes` (every body byte received, even of a failed request),
+/// `requests_per_fetch` (a request's redirects and transient retries count
+/// once; a container pull's requests are bounded by the puller instead) and
+/// `deadline`; a reference the spent
 /// budget cut off mid-resolution or mid-pull is recorded as
 /// [`Outcome::BudgetExceeded`], while one that reached a verdict keeps it.
 ///
@@ -193,13 +196,14 @@ impl Batch<'_> {
             && matches!(rec.outcome, Outcome::Failed(_) | Outcome::Unresolved(_))
         {
             tracing::debug!(
-                locator = %rec.locator,
+                locator = ?rec.locator,
                 outcome = ?rec.outcome,
                 "run budget cut the reference off mid-resolution or mid-pull; recorded as over budget"
             );
-            let resolved_url = rec.resolved_url.take();
-            rec = FetchRecord::terminal(std::mem::take(&mut rec.locator), Outcome::BudgetExceeded);
-            rec.resolved_url = resolved_url;
+            rec = FetchRecord {
+                resolved_url: rec.resolved_url,
+                ..FetchRecord::terminal(rec.locator, Outcome::BudgetExceeded)
+            };
         }
         rec.stamp(r);
         rec.source_sha256 = self.source_sha256.map(str::to_owned);
@@ -212,6 +216,9 @@ impl Batch<'_> {
 /// What a batch has spent of its [`FetchBudget`], shared by every worker.
 struct Run {
     budget: FetchBudget,
+    /// Counted network requests allowed: `requests_per_fetch` for each of
+    /// `max_count + 1` fetches.
+    max_requests: usize,
     started: Instant,
     /// Network bytes retrieved so far.
     bytes: AtomicU64,
@@ -225,6 +232,10 @@ impl Run {
     fn new(budget: FetchBudget) -> Self {
         Self {
             budget,
+            max_requests: budget
+                .max_count
+                .saturating_add(1)
+                .saturating_mul(budget.requests_per_fetch),
             started: Instant::now(),
             bytes: AtomicU64::new(0),
             requests: AtomicUsize::new(0),
@@ -232,17 +243,10 @@ impl Run {
         }
     }
 
-    fn max_requests(&self) -> usize {
-        self.budget
-            .max_count
-            .saturating_add(1)
-            .saturating_mul(self.budget.requests_per_fetch)
-    }
-
     /// Whether the run's bytes, requests or time are used up.
     fn spent(&self) -> bool {
         self.bytes.load(Ordering::Relaxed) >= self.budget.max_bytes
-            || self.requests.load(Ordering::Relaxed) >= self.max_requests()
+            || self.requests.load(Ordering::Relaxed) >= self.max_requests
             || self.started.elapsed() >= self.budget.deadline
     }
 
@@ -272,29 +276,37 @@ struct Metered<'a> {
 
 impl Fetch for Metered<'_> {
     fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
-        // A request that names its own ceiling is a container pull's
-        // size-declared blob read from an allowlisted registry — a pull is one
-        // fetch slot however many layers it has — so it is charged by its
+        // A container pull is one fetch slot however many layers it has, and
+        // the puller bounds its own requests, so they are charged by their
         // bytes alone, not counted against the request cap.
         let run = self.run;
         let admitted = !run.spent()
-            && (request.max_bytes.is_some()
-                || run.requests.fetch_add(1, Ordering::Relaxed) < run.max_requests());
+            && (request.container_pull
+                || run.requests.fetch_add(1, Ordering::Relaxed) < run.max_requests);
         if !admitted {
             tracing::debug!(url = request.url, "run budget spent; request refused");
             self.refused.store(true, Ordering::Relaxed);
             return Err(FetchError::Refused("run budget spent".into()));
         }
-        let fetched = self.inner.send(request)?;
-        // A spooling backend hands back no bytes; what it wrote is the spool.
-        let bytes = match request.spool {
-            Some(spool) if fetched.bytes.is_empty() => {
-                std::fs::metadata(spool).map_or(0, |m| m.len())
-            }
-            _ => fetched.bytes.len() as u64,
-        };
+        // The transport meters every body byte it receives, so a body it
+        // abandoned (too large, timed out) is charged too.
+        let received = AtomicU64::new(0);
+        let result = self.inner.send(&request.metered(&received));
+        let mut bytes = received.into_inner();
+        if bytes == 0
+            && let Ok(fetched) = &result
+        {
+            // A backend that does not meter: charge what it handed back, or
+            // what it wrote to the spool.
+            bytes = match request.spool {
+                Some(spool) if fetched.bytes.is_empty() => {
+                    std::fs::metadata(spool).map_or(0, |m| m.len())
+                }
+                _ => fetched.bytes.len() as u64,
+            };
+        }
         run.bytes.fetch_add(bytes, Ordering::Relaxed);
-        Ok(fetched)
+        result
     }
 
     fn allows_oci(&self) -> bool {
@@ -672,6 +684,42 @@ mod tests {
             assert_eq!(batch.fetch(&refs[1]).outcome, Outcome::Ok);
             assert_eq!(run.bytes.load(Ordering::Relaxed), 8);
         }
+    }
+
+    /// A body the transport abandoned still cost the bytes it received: a
+    /// host that streams to the size cap and is refused as too large, over
+    /// and over, must spend the batch's byte budget, not slip past it.
+    #[test]
+    fn bytes_of_a_failed_request_are_charged() {
+        struct Abandoning;
+        impl Fetch for Abandoning {
+            fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
+                if let Some(meter) = request.meter {
+                    meter.fetch_add(1000, Ordering::Relaxed);
+                }
+                Err(FetchError::TooLarge)
+            }
+        }
+        let (_, refs) = numbered_npm_refs(2);
+        let run = Run::new(FetchBudget {
+            max_bytes: 1000,
+            ..FetchBudget::default()
+        });
+        let batch = Batch {
+            targets: &[],
+            cursor: AtomicUsize::new(0),
+            source_sha256: None,
+            net: &Abandoning,
+            cache: &BlobCache::disabled(),
+            run: &run,
+            on_fetched: &|_, _| {},
+        };
+        assert_eq!(
+            batch.fetch(&refs[0]).outcome,
+            Outcome::Failed(FetchError::TooLarge)
+        );
+        assert_eq!(run.bytes.load(Ordering::Relaxed), 1000);
+        assert_eq!(batch.fetch(&refs[1]).outcome, Outcome::BudgetExceeded);
     }
 
     /// A verdict reached as the budget runs out stands: a pin mismatch is a

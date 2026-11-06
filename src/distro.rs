@@ -10,7 +10,7 @@
 //! cache window), streamed through a decompressor entry by entry — never
 //! holding the whole decompressed index — and reduced to a compact listing of
 //! every package, so the next lookup against the same index is a map read
-//! (see [`PARSED`]).
+//! (see [`ParsedIndices`]).
 //!
 //! An unreachable mirror, an absent package, and an index that does not read
 //! as its format are distinct errors: an index that yields no listings is
@@ -20,15 +20,17 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::fmt;
 use std::io::{BufRead, BufReader, Cursor, Read};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
-use sha2::{Digest as _, Sha512};
 
-use crate::ecosystem::{strip_email, unix_secs};
-use crate::fetch::{BlobCache, Fetch, cached_metadata_status, sha256_hex};
+use crate::ecosystem::{decode_entities, strip_email, unix_secs};
+use crate::fetch::cache::Capped;
+use crate::fetch::digest::{Algorithm, Digest};
+use crate::fetch::{BlobCache, Fetch, Served, cached_metadata_digest, cached_metadata_status};
 use crate::registry::RegistryError;
 
 // Ceilings on each index's *decompressed* size. The per-fetch download cap
@@ -328,22 +330,50 @@ impl Tally {
     }
 }
 
-/// Every index this process has parsed, with the checksum of the bytes
-/// parsed, by a name that stays put: the index URL, or for an RPM repository
-/// its base URL, since its primary index is renamed whenever it changes. A
-/// burst of lookups against one index — a Dockerfile's `apt-get install` line —
-/// decompresses and parses it once, and an index the cache has refreshed is
-/// parsed afresh. All are kept: there are a dozen, a parsed Debian or Ubuntu
-/// `universe` index the largest at some 17 MB.
-static PARSED: LazyLock<Mutex<HashMap<String, Arc<Slot>>>> = LazyLock::new(Mutex::default);
+/// Every index a [`BlobCache`] and its clones have parsed, with the checksum
+/// of the bytes parsed, by a name that stays put: the index URL, or for an RPM
+/// repository its base URL, since its primary index is renamed whenever it
+/// changes. A burst of lookups against one index — a Dockerfile's `apt-get
+/// install` line — decompresses and parses it once, and an index the cache has
+/// refreshed is parsed afresh; one that failed to parse is not retried until
+/// its bytes change. Bounded by the indices fletch knows (a dozen), a parsed
+/// Debian or Ubuntu `universe` index the largest at some 17 MB, and released
+/// with the last clone of the cache that holds it.
+#[derive(Clone, Default)]
+pub(crate) struct ParsedIndices(Arc<Mutex<HashMap<String, Arc<Slot>>>>);
+
+impl ParsedIndices {
+    /// The slot of the index named `name`, created empty on first use.
+    fn slot(&self, name: &str) -> Arc<Slot> {
+        Arc::clone(
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(name.to_string())
+                .or_default(),
+        )
+    }
+}
+
+impl fmt::Debug for ParsedIndices {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).len();
+        f.debug_struct("ParsedIndices")
+            .field("held", &held)
+            .finish()
+    }
+}
 
 /// One index's parse, behind its own lock: lookups racing on an index wait for
 /// a single parse of it, while lookups on the others go on.
 type Slot = Mutex<Option<Parsed>>;
 
 struct Parsed {
-    checksum: Checksum,
-    listings: Arc<Listings>,
+    /// SHA-256 of the bytes parsed, which names them in the cache.
+    sha256: Digest,
+    /// The checksum `repomd.xml` published for them, when it did.
+    published: Option<Digest>,
+    listings: Result<Arc<Listings>, RegistryError>,
 }
 
 /// Package `name`'s record from the index at `url`, read by `parse`.
@@ -377,57 +407,69 @@ fn find(
         .ok_or_else(|| not_found(url, name))
 }
 
-/// The listings of the index at `url`, kept as [`PARSED`]`[slot]` — refused
-/// when its digest is not the `expected` one its repository published.
+/// The listings of the index at `url`, kept in the cache's
+/// [`ParsedIndices`] under `slot` — refused when its digest is not the
+/// `expected` one its repository published.
 fn listings(
     slot: &str,
     url: &str,
-    expected: Option<&Checksum>,
+    expected: Option<&Digest>,
     parse: Parser,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Arc<Listings>, RegistryError> {
-    // Read on every lookup, parsed only when its content changes: the read is
-    // what keeps the index fresh and records it among the lookup's sources.
-    let bytes = index(url, net, cache)?;
-    let checksum = match expected {
-        Some(want) => {
-            let got = want.algorithm.digest(&bytes);
-            if got != *want {
-                return Err(unreadable(
-                    url,
-                    format_args!("{} checksum differs from repomd.xml", want.algorithm.name()),
-                ));
-            }
-            tracing::debug!(
-                url,
-                algorithm = want.algorithm.name(),
-                "index matches the checksum repomd.xml publishes"
-            );
-            got
-        }
-        None => Algorithm::Sha256.digest(&bytes),
-    };
-    let slot = Arc::clone(
-        PARSED
+    let slot = cache.parsed_indices.slot(slot);
+    // An index the cache still holds as the bytes parsed is not read again:
+    // reading and hashing a Debian index costs more than the lookup itself.
+    // A repository's published checksum must still name what was parsed.
+    if let Some(stored) = cached_metadata_digest(url, cache)
+        && let Some(current) = slot
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .entry(slot.to_string())
-            .or_default(),
-    );
+            .as_ref()
+            .filter(|p| {
+                p.sha256 == stored && expected.is_none_or(|w| p.published.as_ref() == Some(w))
+            })
+    {
+        tracing::debug!(url, "index unchanged in the cache; reusing its parse");
+        crate::metrics::metadata(url, Some(Served::Cache), None);
+        return current.listings.clone();
+    }
+    // Otherwise it is read, which refreshes it and records it among the
+    // lookup's sources, and parsed only when its content changed.
+    let bytes = index(url, net, cache)?;
+    let sha256 = Algorithm::Sha256.digest(&bytes);
+    if let Some(want) = expected {
+        let got = match want.algorithm {
+            Algorithm::Sha256 => sha256.clone(),
+            other => other.digest(&bytes),
+        };
+        if got != *want {
+            return Err(unreadable(
+                url,
+                format_args!("{} checksum differs from repomd.xml", want.algorithm.name()),
+            ));
+        }
+        tracing::debug!(
+            url,
+            algorithm = want.algorithm.name(),
+            "index matches the checksum repomd.xml publishes"
+        );
+    }
     let mut parsed = slot.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(current) = parsed.as_ref().filter(|p| p.checksum == checksum) {
-        tracing::debug!(url, "index unchanged; reusing its parsed listings");
-        return Ok(Arc::clone(&current.listings));
+    if let Some(current) = parsed.as_ref().filter(|p| p.sha256 == sha256) {
+        tracing::debug!(url, "index unchanged; reusing its parse");
+        return current.listings.clone();
     }
     tracing::debug!(url, bytes = bytes.len(), "parsing index");
-    let listings = Arc::new(parse(url, bytes)?);
+    let listings = parse(url, bytes).map(Arc::new);
     *parsed = Some(Parsed {
-        checksum,
-        listings: Arc::clone(&listings),
+        sha256,
+        published: expected.cloned(),
+        listings: listings.clone(),
     });
     drop(parsed);
-    Ok(listings)
+    listings
 }
 
 /// Every listing in the stanzas of `reader`.
@@ -456,20 +498,26 @@ fn parse_apkindex(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> 
 
 /// One `APKINDEX` stanza (single-letter `K:value` lines).
 fn apkindex_listing(stanza: &str) -> Option<(Box<str>, Listing)> {
-    let name = field(stanza, "P:")?;
+    let [
+        name,
+        version,
+        built,
+        maintainer,
+        description,
+        homepage,
+        license,
+    ] = fields(stanza, ':', ["P", "V", "t", "m", "T", "U", "L"]);
     Some((
-        name.into(),
+        name?.into(),
         Listing {
-            version: field(stanza, "V:")?.into(),
+            version: version?.into(),
             // `t:0` is a "build time unset" marker (reproducible builds), not
             // a 1970 publish — treat it as unknown.
-            published_at: field(stanza, "t:")
-                .and_then(|t| t.parse::<u64>().ok())
-                .filter(|&t| t > 0),
-            author: field(stanza, "m:").map(|m| strip_email(&m).into()),
-            description: field(stanza, "T:").map(Into::into),
-            homepage: field(stanza, "U:").map(Into::into),
-            license: field(stanza, "L:").map(Into::into),
+            published_at: built.and_then(|t| t.parse::<u64>().ok()).filter(|&t| t > 0),
+            author: maintainer.map(|m| strip_email(m).into()),
+            description: description.map(Into::into),
+            homepage: homepage.map(Into::into),
+            license: license.map(Into::into),
         },
     ))
 }
@@ -485,16 +533,27 @@ fn parse_packages(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> 
 /// One Debian control stanza (`Key: value`, with folded continuation lines
 /// for multi-line descriptions).
 fn deb_listing(stanza: &str) -> Option<(Box<str>, Listing)> {
-    let name = field(stanza, "Package:")?;
+    let [name, version, maintainer, description, homepage] = fields(
+        stanza,
+        ':',
+        [
+            "Package",
+            "Version",
+            "Maintainer",
+            "Description",
+            "Homepage",
+        ],
+    );
     Some((
-        name.into(),
+        name?.into(),
         Listing {
-            version: field(stanza, "Version:")?.into(),
+            version: version?.into(),
             published_at: None,
-            author: field(stanza, "Maintainer:").map(|m| strip_email(&m).into()),
-            // The control `Description` is a one-line synopsis then folded lines.
-            description: field(stanza, "Description:").map(Into::into),
-            homepage: field(stanza, "Homepage:").map(Into::into),
+            author: maintainer.map(|m| strip_email(m).into()),
+            // The control `Description` is a one-line synopsis then folded
+            // lines; the synopsis is the field's own line.
+            description: description.map(Into::into),
+            homepage: homepage.map(Into::into),
             license: None,
         },
     ))
@@ -516,7 +575,8 @@ fn rpm_repo_lookup(
     let repomd = std::str::from_utf8(&repomd).map_err(|e| unreadable(&repomd_url, e))?;
     let primary =
         primary_data(repomd).ok_or_else(|| unreadable(&repomd_url, "no primary index"))?;
-    let href = primary_href(primary)
+    // `<location href="…primary.xml.*"/>`
+    let href = attr(primary, "href")
         .ok_or_else(|| unreadable(&repomd_url, "no primary index location"))?;
     // `primary.xml` is served from third-party mirrors (openSUSE's
     // MirrorCache redirects), `repomd.xml` from the origin: hold the mirror to
@@ -551,115 +611,48 @@ fn parse_primary(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
     tally.finish(url)
 }
 
-/// A digest algorithm `repomd.xml` may publish that is strong enough to hold
-/// a mirror to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Algorithm {
-    Sha256,
-    Sha512,
-}
-
-impl Algorithm {
-    /// The algorithm `repomd.xml` spells `name`, if it is one held here.
-    fn parse(name: &str) -> Option<Self> {
-        match name {
-            "sha256" => Some(Self::Sha256),
-            "sha512" => Some(Self::Sha512),
-            _ => None,
-        }
-    }
-
-    /// The name `repomd.xml` spells this algorithm with.
-    fn name(self) -> &'static str {
-        match self {
-            Self::Sha256 => "sha256",
-            Self::Sha512 => "sha512",
-        }
-    }
-
-    /// The length of this algorithm's digest in hex.
-    fn hex_len(self) -> usize {
-        match self {
-            Self::Sha256 => 64,
-            Self::Sha512 => 128,
-        }
-    }
-
-    /// This algorithm's digest of `bytes`.
-    fn digest(self, bytes: &[u8]) -> Checksum {
-        let hex = match self {
-            Self::Sha256 => sha256_hex(bytes),
-            Self::Sha512 => hex::encode(Sha512::digest(bytes)),
-        };
-        Checksum {
-            algorithm: self,
-            hex,
-        }
-    }
-}
-
-/// A digest of an index: its algorithm and lowercase hex.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Checksum {
-    algorithm: Algorithm,
-    hex: String,
-}
-
 /// The `<data type="primary">` element of `repomd.xml`.
 fn primary_data(xml: &str) -> Option<&str> {
     let data = xml
         .split("<data ")
         .find(|d| d.starts_with("type=\"primary\""))?;
-    Some(data.split("</data>").next().unwrap_or(data))
+    Some(data.split_once("</data>").map_or(data, |(data, _)| data))
 }
 
 /// The checksum the `<data type="primary">` element publishes for the
 /// compressed `primary.xml` (`<checksum>`, not the decompressed
 /// `<open-checksum>`), or why it publishes none that can be held to.
-fn primary_checksum(data: &str) -> Result<Checksum, String> {
-    const OPEN: &str = "<checksum";
-    let start = data.find(OPEN).ok_or("no primary index checksum")?;
-    let element = &data[start..];
-    let kind = attr(element, OPEN, "type").ok_or("primary index checksum has no type")?;
-    let algorithm = Algorithm::parse(&kind)
+fn primary_checksum(data: &str) -> Result<Digest, String> {
+    const UNTYPED: &str = "primary index checksum has no type";
+    let (_, element) = data
+        .split_once("<checksum")
+        .ok_or("no primary index checksum")?;
+    let (attributes, body) = element.split_once('>').ok_or(UNTYPED)?;
+    let kind = attr(attributes, "type").ok_or(UNTYPED)?;
+    let algorithm = Algorithm::parse(kind)
         .ok_or_else(|| format!("unsupported primary index checksum type {kind:?}"))?;
-    let hex = element
-        .split_once('>')
-        .and_then(|(_, rest)| rest.split_once('<'))
-        .map(|(text, _)| text.trim())
-        .filter(|hex| {
-            hex.len() == algorithm.hex_len() && hex.bytes().all(|b| b.is_ascii_hexdigit())
-        })
-        .ok_or_else(|| format!("malformed {} primary index checksum", algorithm.name()))?;
-    Ok(Checksum {
-        algorithm,
-        hex: hex.to_ascii_lowercase(),
-    })
-}
-
-/// The `<location href="…primary.xml.*"/>` of the `<data type="primary">`
-/// element.
-fn primary_href(data: &str) -> Option<&str> {
-    let anchor = "href=\"";
-    let rest = &data[data.find(anchor)? + anchor.len()..];
-    Some(&rest[..rest.find('"')?])
+    body.split_once('<')
+        .and_then(|(text, _)| Digest::new(algorithm, text.trim()))
+        .ok_or_else(|| format!("malformed {} primary index checksum", algorithm.name()))
 }
 
 /// One `<package>` element of `primary.xml`.
 fn rpm_listing(pkg: &str) -> Option<(Box<str>, Listing)> {
     let name = tag_text(pkg, "name")?;
     // `<version epoch="0" ver="8.5.0" rel="1.2"/>`
-    let ver = attr(pkg, "<version", "ver").filter(|v| !v.is_empty())?;
-    let version = match attr(pkg, "<version", "rel") {
+    let version = open_tag(pkg, "<version")?;
+    let ver = attr(version, "ver").filter(|v| !v.is_empty())?;
+    let version = match attr(version, "rel") {
         Some(rel) => format!("{ver}-{rel}"),
-        None => ver,
+        None => ver.to_owned(),
     };
     Some((
         name.into(),
         Listing {
             version: version.into(),
             // `<time file="…" build="…"/>` — build is Unix seconds (0 = unset).
-            published_at: attr(pkg, "<time", "build")
+            published_at: open_tag(pkg, "<time")
+                .and_then(|time| attr(time, "build"))
                 .and_then(|b| b.parse::<u64>().ok())
                 .filter(|&t| t > 0),
             author: tag_text(pkg, "rpm:vendor")
@@ -685,19 +678,30 @@ fn parse_pkg_summary(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryErro
 /// after the *last* one. Splitting there rather than after `name-` keeps `git`
 /// from matching `git-base-2.45.2`.
 fn pkg_summary_listing(stanza: &str) -> Option<(Box<str>, Listing)> {
-    let pkgname = field(stanza, "PKGNAME=")?;
-    let (name, version) = pkgname
+    let [pkgname, built, maintainer, comment, homepage, license] = fields(
+        stanza,
+        '=',
+        [
+            "PKGNAME",
+            "BUILD_DATE",
+            "MAINTAINER",
+            "COMMENT",
+            "HOMEPAGE",
+            "LICENSE",
+        ],
+    );
+    let (name, version) = pkgname?
         .rsplit_once('-')
         .filter(|(name, version)| !name.is_empty() && !version.is_empty())?;
     Some((
         name.into(),
         Listing {
             version: version.into(),
-            published_at: field(stanza, "BUILD_DATE=").and_then(|d| unix_secs(&d)),
-            author: field(stanza, "MAINTAINER=").map(|m| strip_email(&m).into()),
-            description: field(stanza, "COMMENT=").map(Into::into),
-            homepage: field(stanza, "HOMEPAGE=").map(Into::into),
-            license: field(stanza, "LICENSE=").map(Into::into),
+            published_at: built.and_then(unix_secs),
+            author: maintainer.map(|m| strip_email(m).into()),
+            description: comment.map(Into::into),
+            homepage: homepage.map(Into::into),
+            license: license.map(Into::into),
         },
     ))
 }
@@ -757,10 +761,12 @@ fn packagesite_listing(p: Packagesite) -> Option<(Box<str>, Listing)> {
 /// The version of `name` from an OpenBSD packages `index.txt` (ls-style lines
 /// ending in `<name>-<version>.tgz`).
 fn openbsd_version(listing: &str, name: &str) -> Option<String> {
-    let prefix = format!("{name}-");
     listing.split_whitespace().find_map(|tok| {
         let file = tok.rsplit('/').next().unwrap_or(tok);
-        let stem = file.strip_suffix(".tgz")?.strip_prefix(&prefix)?;
+        let stem = file
+            .strip_suffix(".tgz")?
+            .strip_prefix(name)?
+            .strip_prefix('-')?;
         // A version starts with a digit, so `foo-2.0` matches but `foo-bar` (a
         // different package sharing the prefix) does not.
         stem.starts_with(|c: char| c.is_ascii_digit())
@@ -774,44 +780,6 @@ fn openbsd_version(listing: &str, name: &str) -> Option<String> {
 /// surfaces as a read error when the scanner pulls from it.
 fn gunzip(bytes: Vec<u8>) -> flate2::read::MultiGzDecoder<Cursor<Vec<u8>>> {
     flate2::read::MultiGzDecoder::new(Cursor::new(bytes))
-}
-
-/// A decompressed stream that fails once more than `cap` bytes have come out
-/// of it, rather than ending there: one byte past the cap is read, so the cap
-/// itself is still allowed, and every read after the cap fails too.
-struct Capped<'a, R> {
-    inner: std::io::Take<R>,
-    cap: u64,
-    url: &'a str,
-}
-
-impl<'a, R: Read> Capped<'a, R> {
-    /// `inner`, the decompressed index at `url`, held to `cap` bytes.
-    fn new(inner: R, cap: u64, url: &'a str) -> Self {
-        Self {
-            inner: inner.take(cap.saturating_add(1)),
-            cap,
-            url,
-        }
-    }
-}
-
-impl<R: Read> Read for Capped<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if self.inner.limit() == 0 {
-            tracing::warn!(
-                url = self.url,
-                cap = self.cap,
-                "index exceeds its decompression cap"
-            );
-            return Err(std::io::Error::other(format!(
-                "decompressed index exceeds {} bytes",
-                self.cap
-            )));
-        }
-        Ok(n)
-    }
 }
 
 /// [`BufRead::read_until`] a newline, refusing a line past [`MAX_ELEMENT`].
@@ -862,7 +830,7 @@ fn index(url: &str, net: &dyn Fetch, cache: &BlobCache) -> Result<Vec<u8>, Regis
 }
 
 /// The index at `url` arrived but could not be read as one.
-fn unreadable(url: &str, reason: impl std::fmt::Display) -> RegistryError {
+fn unreadable(url: &str, reason: impl fmt::Display) -> RegistryError {
     let reason = reason.to_string();
     tracing::warn!(url, reason = %reason.escape_debug(), "index unreadable");
     RegistryError::Malformed {
@@ -986,54 +954,54 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 // --- field extraction -------------------------------------------------------
 
-/// The value of the first line beginning `prefix` (`Package:`, `P:`, `KEY=`),
-/// trimmed; `None` when absent or empty. A folded/continuation line (the only
-/// other place the prefix could reappear) starts with whitespace, so it never
-/// shadows the real field.
-fn field(stanza: &str, prefix: &str) -> Option<String> {
-    stanza
-        .lines()
-        .find_map(|l| l.strip_prefix(prefix))
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+/// The first value of each of `keys` among a stanza's `key<separator>value`
+/// lines (`Package: curl`, `P:curl`, `PKGNAME=curl-8`), trimmed; `None` when
+/// absent or empty. One pass over the stanza, whatever the number of keys. A
+/// folded continuation line starts with whitespace, so its key never matches
+/// and it never shadows the real field.
+fn fields<'a, const N: usize>(
+    stanza: &'a str,
+    separator: char,
+    keys: [&str; N],
+) -> [Option<&'a str>; N] {
+    let mut values = [None; N];
+    for (key, value) in stanza.lines().filter_map(|line| line.split_once(separator)) {
+        if let Some((_, slot)) = keys.iter().zip(&mut values).find(|(k, _)| **k == key) {
+            slot.get_or_insert(value.trim());
+        }
+    }
+    values.map(|value| value.filter(|v| !v.is_empty()))
 }
 
 /// The text of the first `<tag>…</tag>` (no attributes assumed on the open
-/// tag); `None` when absent or empty.
+/// tag), its entities decoded; `None` when absent or empty.
 fn tag_text(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let rest = &xml[start..];
-    let end = rest.find(&format!("</{tag}>"))?;
-    // The five predefined XML entities a primary.xml summary may carry.
-    Some(
-        rest[..end]
-            .trim()
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&"),
-    )
-    .filter(|text| !text.is_empty())
+    let (_, rest) = xml.split_once(&format!("<{tag}>"))?;
+    let (text, _) = rest.split_once(&format!("</{tag}>"))?;
+    // A primary.xml summary may carry the predefined XML entities and
+    // numeric character references.
+    Some(decode_entities(text.trim())).filter(|text| !text.is_empty())
 }
 
-/// The value of attribute `attr` on the element opening with `open` (e.g.
-/// `attr(pkg, "<version", "ver")`).
-fn attr(xml: &str, open: &str, attr: &str) -> Option<String> {
-    let tag_start = xml.find(open)?;
-    let tag = &xml[tag_start..xml[tag_start..].find('>')? + tag_start];
-    let anchor = format!("{attr}=\"");
-    let start = tag.find(&anchor)? + anchor.len();
-    let rest = &tag[start..];
-    Some(rest[..rest.find('"')?].to_string())
+/// The attributes of the first element opening with `open` (`<version`): its
+/// text up to the `>`.
+fn open_tag<'a>(xml: &'a str, open: &str) -> Option<&'a str> {
+    let (_, rest) = xml.split_once(open)?;
+    rest.split_once('>').map(|(attributes, _)| attributes)
+}
+
+/// The value of attribute `name` among an element's `attributes`.
+fn attr<'a>(attributes: &'a str, name: &str) -> Option<&'a str> {
+    let (_, rest) = attributes.split_once(&format!("{name}=\""))?;
+    rest.split_once('"').map(|(value, _)| value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fetch::Fixtures;
+    use crate::fetch::{Fixtures, sha256_hex};
     use filefacts::RefLocator;
+    use sha2::Digest as _;
     use std::io::Write as _;
 
     const DEBIAN: &str = "https://deb.debian.org/debian/dists/stable/main/binary-amd64/Packages.gz";
@@ -1120,6 +1088,22 @@ mod tests {
         assert_eq!(r.published_at, None);
     }
 
+    /// The first line of a key decides it, even when empty, and a folded
+    /// continuation line never stands in for a field.
+    #[test]
+    fn a_stanza_field_is_its_first_line() {
+        let stanza =
+            "Package: a\nDescription: one\n Version: 9\nPackage: b\nVersion:\nVersion: 2\n";
+        assert_eq!(
+            fields(
+                stanza,
+                ':',
+                ["Package", "Version", "Description", "Homepage"]
+            ),
+            [Some("a"), None, Some("one"), None]
+        );
+    }
+
     #[test]
     fn an_entry_without_a_version_is_not_a_listing() {
         assert!(deb_listing("Package: nginx\n").is_none());
@@ -1152,7 +1136,7 @@ mod tests {
         let xml = r#"<repomd><data type="filelists"><location href="repodata/a-filelists.xml.gz"/></data>
             <data type="primary"><location href="repodata/b-primary.xml.zst"/></data></repomd>"#;
         assert_eq!(
-            primary_data(xml).and_then(primary_href),
+            primary_data(xml).and_then(|data| attr(data, "href")),
             Some("repodata/b-primary.xml.zst")
         );
     }
@@ -1225,7 +1209,8 @@ mod tests {
         let text = b"Package: a\nVersion: 1\n\nPackage: b\nDescription: caf\xe9\n\n\nPackage: c\n";
         let mut seen = Vec::new();
         stanzas(BufReader::new(Cursor::new(&text[..])), |s| {
-            seen.push(field(s, "Package:"));
+            let [name] = fields(s, ':', ["Package"]);
+            seen.push(name.map(str::to_owned));
             Ok(())
         })
         .expect("read");
@@ -1270,6 +1255,60 @@ mod tests {
         })
         .expect("read");
         assert_eq!(names, [Some("a".into())]);
+    }
+
+    /// An index the disk cache still holds as the bytes parsed is not read
+    /// again, except by a cache that records its sources; one the cache has
+    /// refreshed with other bytes is parsed afresh.
+    #[test]
+    fn an_unchanged_cached_index_is_not_read_again() {
+        use crate::fetch::CachedMeta;
+        use crate::fetch::cache::metadata_cache_key;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static PARSES: AtomicUsize = AtomicUsize::new(0);
+        fn counted(url: &str, bytes: Vec<u8>) -> Result<Listings, RegistryError> {
+            PARSES.fetch_add(1, Ordering::SeqCst);
+            stanza_listings(url, Cursor::new(bytes), deb_listing)
+        }
+        let url = "https://distro.test/unchanged/Packages";
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlobCache::with_dir(dir.path());
+        let net = Fixtures::default().with(url, b"Package: a\nVersion: 1\n");
+        let version = |cache: &BlobCache| {
+            lookup(url, counted, "a", Ecosystem::Debian, &net, cache).map(|r| r.version)
+        };
+        assert_eq!(version(&cache), Ok("1".into()));
+
+        // A lookup that read the garbled blob would miss it and fetch again.
+        let key = metadata_cache_key(url);
+        std::fs::write(cache.blob_path(&key), b"garbled").unwrap();
+        let unread = Fixtures::default();
+        assert_eq!(
+            lookup(url, counted, "a", Ecosystem::Debian, &unread, &cache).map(|r| r.version),
+            Ok("1".into())
+        );
+        assert_eq!(PARSES.load(Ordering::SeqCst), 1);
+
+        // Recording takes the bytes, so the index is read (here, fetched
+        // again past the garbled blob) and recorded, and its parse reused.
+        let (recording, sink) = cache.recording();
+        assert_eq!(version(&recording), Ok("1".into()));
+        assert_eq!(
+            sink.take()
+                .iter()
+                .map(|s| s.url.as_str())
+                .collect::<Vec<_>>(),
+            [url]
+        );
+        assert_eq!(PARSES.load(Ordering::SeqCst), 1);
+
+        let meta = CachedMeta {
+            fetched_at: crate::fetch::now(),
+            ..CachedMeta::default()
+        };
+        cache.put(&key, b"Package: a\nVersion: 2\n", &meta);
+        assert_eq!(version(&cache), Ok("2".into()));
+        assert_eq!(PARSES.load(Ordering::SeqCst), 2);
     }
 
     /// An index is parsed once for any number of lookups, and again only when
@@ -1496,7 +1535,7 @@ mod tests {
         };
         let element =
             |kind: &str, hex: &str| format!(r#"<checksum type="{kind}">{hex}</checksum>"#);
-        let sha512 = hex::encode(Sha512::digest(&primary));
+        let sha512 = crate::fetch::to_hex(sha2::Sha512::digest(&primary));
         let verified = [
             (
                 "https://sum-256.test",
@@ -1556,15 +1595,19 @@ mod tests {
     }
 
     #[test]
+    fn element_text_decodes_named_and_numeric_references() {
+        let pkg = "<summary> Tom &amp; Jerry&#39;s &lt;tool&gt; &#x2014; ok </summary><url></url>";
+        assert_eq!(
+            tag_text(pkg, "summary").as_deref(),
+            Some("Tom & Jerry's <tool> \u{2014} ok")
+        );
+        assert_eq!(tag_text(pkg, "url"), None, "empty");
+        assert_eq!(tag_text(pkg, "license"), None, "absent");
+    }
+
+    #[test]
     fn a_decompressed_index_past_the_cap_is_an_error_not_a_prefix() {
         let url = "https://distro.test/capped";
-        let read = |cap: u64| {
-            let mut out = Vec::new();
-            Capped::new(Cursor::new([0u8; 10]), cap, url).read_to_end(&mut out)
-        };
-        assert_eq!(read(10).ok(), Some(10));
-        assert!(read(9).is_err());
-
         let index = b"Package: a\nVersion: 1\n\nPackage: b\nVersion: 2\n";
         let capped = Capped::new(Cursor::new(index), 30, url);
         let got = stanza_listings(url, BufReader::new(capped), deb_listing);

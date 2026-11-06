@@ -5,7 +5,8 @@
 //! ```text
 //! <root>/.last-sweep           sweep marker
 //! <root>/<ab>/                 shard: the first two hex digits of the key
-//! <root>/<ab>/<key>.zst        the body, zstd-compressed
+//! <root>/<ab>/<key>.zst        the body, zstd-compressed unless already
+//!                              compressed (the sidecar's `raw`)
 //! <root>/<ab>/<key>.json       its provenance sidecar
 //! <root>/<ab>/<key>.part.…     a spool, while a fetch is written out
 //! <root>/<ab>/<key>.tmp.…      a write in progress, renamed into place
@@ -67,9 +68,23 @@ pub(crate) fn entry_stem(path: &Path) -> PathBuf {
     path.with_extension("")
 }
 
+/// Whether `path` is a spool or a write still in progress (`<key>.part.…`,
+/// `<key>.tmp.…`), not yet an entry.
+pub(crate) fn in_progress(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".part.") || name.contains(".tmp."))
+}
+
 /// Whether `name` is a shard directory's: two lowercase hex digits.
 pub(crate) fn is_shard_name(name: &OsStr) -> bool {
     name.to_str().is_some_and(|n| n.len() == 2 && is_hex(n))
+}
+
+/// Whether `key` can name cache files: a non-empty run of ASCII letters and
+/// digits (in practice a hex digest), so never a path separator or `..`.
+pub(crate) fn is_key(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 fn is_hex(s: &str) -> bool {
@@ -142,8 +157,9 @@ pub(crate) struct Trusted {
 }
 
 /// Hold the existing directory `root` to the cache's trust rule (see the
-/// module docs), making it owner-only when others can read it. The root may be reached through a symlink (a relocated
-/// `~/.cache`); the directories beneath it may not.
+/// module docs), making it owner-only when others can read it. The root may
+/// be reached through a symlink (a relocated `~/.cache`); the directories
+/// beneath it may not.
 ///
 /// std cannot name this process's user, so it is learned as the owner of a
 /// throwaway file created in `root` — which also proves the directory is
@@ -163,10 +179,13 @@ pub(crate) fn trust_root(root: &Path) -> Result<Trusted, Distrust> {
         let owner = create_private(&probe)
             .and_then(|file| file.metadata())
             .map(|m| m.uid());
-        let _ = fs::remove_file(&probe);
+        if let Err(error) = fs::remove_file(&probe) {
+            tracing::debug!(probe = %probe.display(), %error, "cannot remove the ownership probe");
+        }
         let trusted = Trusted {
             uid: owner.map_err(Distrust::ReadOnly)?,
         };
+        hold_path(root, trusted.uid)?;
         hold(root, &meta, trusted.uid)?;
         Ok(trusted)
     }
@@ -188,6 +207,82 @@ impl Trusted {
             Err(Distrust::NotADirectory)
         };
     }
+}
+
+/// Hold the way to `root` to the rule that no other user can redirect it:
+/// every directory on it, and every symlink followed, must belong to `uid`
+/// or to the superuser, and a directory others can write must be sticky
+/// (`/tmp`), so they cannot rename what is in it.
+///
+/// Without this a root's own trust says nothing. Another user who can write
+/// along the way — a cache under a shared `/tmp`, or an `XDG_CACHE_HOME`
+/// there — plants a symlink at the root's path aimed at a directory of this
+/// user's (`~`, `~/.ssh`): it passes [`hold`], is made owner-only, has entries
+/// written into it, and the sweep deletes its files. Or they swap the path
+/// after it was trusted, which is the same thing, later.
+///
+/// The path is resolved by hand, one component at a time, so each symlink is
+/// judged before it is followed; `..` steps back through what was resolved,
+/// as the kernel does.
+#[cfg(unix)]
+fn hold_path(root: &Path, uid: u32) -> Result<(), Distrust> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+    /// Symlinks followed before the path is refused, as Linux's `MAXSYMLINKS`.
+    const MAX_LINKS: usize = 40;
+    // Queue `path`'s components to resolve next: `pending` is a stack, so
+    // they go on last first. No name can be `/` or `..`, so those spell the
+    // root and a step back.
+    let push = |pending: &mut Vec<std::ffi::OsString>, path: &Path| {
+        pending.extend(path.components().rev().filter_map(|c| match c {
+            Component::RootDir => Some("/".into()),
+            Component::ParentDir => Some("..".into()),
+            Component::Normal(name) => Some(name.to_os_string()),
+            Component::CurDir | Component::Prefix(_) => None,
+        }));
+    };
+    let mut pending = Vec::new();
+    push(
+        &mut pending,
+        &std::path::absolute(root).map_err(Distrust::Unreadable)?,
+    );
+    let mut at = PathBuf::from("/");
+    let mut links = 0;
+    let check = |path: &Path| -> Result<fs::Metadata, Distrust> {
+        let meta = fs::symlink_metadata(path).map_err(Distrust::Unreadable)?;
+        if meta.uid() != uid && meta.uid() != 0 {
+            return Err(Distrust::ForeignOwner);
+        }
+        if meta.is_dir() && meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0 {
+            return Err(Distrust::Writable);
+        }
+        Ok(meta)
+    };
+    check(&at)?;
+    while let Some(part) = pending.pop() {
+        if part == "/" {
+            at = PathBuf::from("/");
+            continue;
+        }
+        if part == ".." {
+            at.pop();
+            continue;
+        }
+        let next = at.join(&part);
+        if check(&next)?.is_symlink() {
+            links += 1;
+            if links > MAX_LINKS {
+                return Err(Distrust::Unreadable(io::Error::other(
+                    "too many levels of symbolic links",
+                )));
+            }
+            let target = fs::read_link(&next).map_err(Distrust::Unreadable)?;
+            push(&mut pending, &target);
+        } else {
+            at = next;
+        }
+    }
+    Ok(())
 }
 
 /// The trust rule for one directory whose metadata is `meta`.
@@ -270,6 +365,42 @@ pub(crate) fn write_replacing(
     landed
 }
 
+/// A reader — a decompressor, typically — that fails once more than `cap`
+/// bytes have come out of it, rather than ending there as [`Read::take`]
+/// would: so a body past its cap is an error, never a silently truncated
+/// prefix. One byte past the cap is read, so the cap itself is allowed, and
+/// every read after the cap fails too. `what` names the stream in the log.
+#[derive(Debug)]
+pub(crate) struct Capped<'a, R> {
+    inner: io::Take<R>,
+    cap: u64,
+    what: &'a str,
+}
+
+impl<'a, R: Read> Capped<'a, R> {
+    pub(crate) fn new(inner: R, cap: u64, what: &'a str) -> Self {
+        Self {
+            inner: inner.take(cap.saturating_add(1)),
+            cap,
+            what,
+        }
+    }
+}
+
+impl<R: Read> Read for Capped<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if self.inner.limit() == 0 {
+            tracing::warn!(what = self.what, cap = self.cap, "stream exceeds its cap");
+            return Err(io::Error::other(format!(
+                "{} exceeds {} bytes",
+                self.what, self.cap
+            )));
+        }
+        Ok(n)
+    }
+}
+
 /// A reader that tallies the bytes passing through it into `count`, which
 /// outlives the reader — so a caller can still learn how far a consumer got
 /// after handing the reader away or seeing it fail.
@@ -296,6 +427,16 @@ impl<R: Read> Read for Counted<'_, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_past_its_cap_is_an_error_not_a_prefix() {
+        let read = |cap: u64| {
+            let mut out = Vec::new();
+            Capped::new(io::Cursor::new([0u8; 10]), cap, "test").read_to_end(&mut out)
+        };
+        assert_eq!(read(10).ok(), Some(10));
+        assert!(read(9).is_err());
+    }
 
     #[test]
     fn only_a_directory_of_cache_names_is_a_blob_cache() {
@@ -388,6 +529,60 @@ mod tests {
             trusted.admit(&shard).is_err(),
             "a symlinked shard is refused"
         );
+    }
+
+    /// A root reached through a directory others can write, but not through
+    /// a sticky one, could be swapped for a symlink to any directory of this
+    /// user's after it was trusted: it is refused, and left as found.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_others_could_redirect_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: &Path, m| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let root = shared.join("refs");
+        fs::create_dir_all(&root).unwrap();
+        set(&root, 0o755);
+
+        set(&shared, 0o777);
+        assert!(matches!(trust_root(&root), Err(Distrust::Writable)));
+        assert_eq!(mode(&root), 0o755, "a refused root is not touched");
+
+        set(&shared, 0o1777);
+        assert!(
+            trust_root(&root).is_ok(),
+            "a sticky /tmp-like parent is fine"
+        );
+        set(&shared, 0o700);
+    }
+
+    /// Every directory and symlink on the way to a root must be this user's
+    /// or the superuser's: one of anyone else's could be pointed elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn every_step_to_a_root_belongs_to_this_user_or_root() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink("./real/../real", &link).unwrap();
+        let uid = fs::metadata(&real).unwrap().uid();
+
+        assert!(hold_path(&link, uid).is_ok(), "this user's own symlink");
+        // As the superuser everything on the way is trusted, as it should be.
+        if uid != 0 {
+            assert!(
+                matches!(hold_path(&link, uid + 1), Err(Distrust::ForeignOwner)),
+                "the same path, judged for another user"
+            );
+        }
+
+        let looped = dir.path().join("loop");
+        std::os::unix::fs::symlink("loop", &looped).unwrap();
+        assert!(hold_path(&looped, uid).is_err(), "a symlink loop ends");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "fletch"
-version = "3.0.0"
+version = "3.0.0-beta.1"
 edition = "2024"
 # Build on any rustc within ~2 releases of current stable; edition 2024 implies
 # the MSRV-aware resolver, so this also caps dependency versions.
@@ -13,54 +13,39 @@ repository = "https://github.com/atomdrift-project/fletch"
 publish = false
 
 [lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
+unsafe_code = "forbid"
 rust_2018_idioms = { level = "deny", priority = -1 }
-unused_must_use = "deny"
-unused_imports = "deny"
-unused_mut = "deny"
-dead_code = "warn"
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
 missing_docs = "warn"
 noop_method_call = "warn"
 
+# Every default clippy group is denied; the lints below add what a hostile-
+# input library most needs from the pedantic, nursery and restriction sets.
 [lints.clippy]
 all = { level = "deny", priority = -1 }
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "deny", priority = -1 }
-style = { level = "warn", priority = -1 }
-complexity = { level = "warn", priority = -1 }
-perf = { level = "warn", priority = -1 }
+type_complexity = "allow"
+# Fallible code returns a Result; tests opt out in clippy.toml.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 unimplemented = "deny"
 todo = "deny"
 unreachable = "deny"
-result_unit_err = "deny"
-result_large_err = "deny"
-missing_safety_doc = "warn"
+dbg_macro = "deny"
+map_err_ignore = "warn"
 must_use_candidate = "warn"
 needless_pass_by_value = "warn"
 unnecessary_wraps = "warn"
 match_same_arms = "warn"
 redundant_closure_for_method_calls = "warn"
 manual_let_else = "warn"
-dbg_macro = "deny"
 large_futures = "warn"
-map_err_ignore = "warn"
 wildcard_imports = "warn"
 significant_drop_in_scrutinee = "warn"
 significant_drop_tightening = "warn"
-too_many_arguments = "warn"
 too_many_lines = "warn"
 cognitive_complexity = "warn"
-type_complexity = "allow"
-module_name_repetitions = "allow"
-similar_names = "allow"
-single_match_else = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
 
 [dependencies]
 # The reference vocabulary (Reference/RefLocator/PinnedHash) and the parsed
@@ -83,7 +68,6 @@ sha2 = "0.11"
 # Legacy npm `integrity` pins (`sha1-…`) — every entry in a yarn v1 lockfile.
 sha1 = "0.11"
 base64 = "0.22"
-hex = "0.4"
 zstd = "0.14"
 # gzip for OS-distro package indices (Alpine APKINDEX, Debian Packages,
 # openSUSE primary.xml, BSD catalogs); zstd (above) and xz2 (below) cover the
@@ -92,9 +76,6 @@ flate2 = "1"
 roxmltree = "0.21"
 thiserror = "2"
 tracing = "0.1"
-# The CLI's stderr log; the library only emits events.
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
-anyhow = "1"
 dirs = "6"
 # `rt` backs `spawn_blocking` in the SSRF resolver: getaddrinfo blocks, so
 # it runs off reqwest's runtime thread.
@@ -107,10 +88,22 @@ semver = "1"
 # Go module zips: read-only, deflate via the flate2 already in the graph.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
+# The `fletch` binary's own dependency, behind the `cli` feature so a library
+# consumer never compiles it. The library only emits `tracing` events; the CLI
+# writes them to stderr.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"], optional = true }
+
 [features]
+# The `fletch` command-line binary: `cargo install --features cli`.
+cli = ["dep:tracing-subscriber"]
 # The offline `fetch::Fixtures` backend, for tests in this crate and its
 # dependents.
 test-util = []
+
+[[bin]]
+name = "fletch"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -122,10 +115,11 @@ fletch = { path = ".", features = ["test-util"] }
 # not predefine __illumos__). filefacts requires tree-sitter ^0.28, which is not
 # on crates.io, so this block is also what makes the graph resolve. Both
 # tree-sitter crates must come from one source (`links = "tree-sitter-language"`
-# allows a single copy). Keep these bare fork URLs in sync across sibling
-# roots; Cargo.lock records revisions. Drop once an upstream release carries the fix.
+# allows a single copy). [patch] applies only in the root being built, so every
+# atomdrift crate that builds filefacts repeats this block with the same bare
+# URLs (one source each); Cargo.lock pins the revisions. Drop it once an
+# upstream tree-sitter release carries the illumos fix.
 [patch.crates-io]
-# Inherited from a sibling by update-deps: [patch] applies only in the root.
 tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }

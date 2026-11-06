@@ -4,7 +4,7 @@ use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
-    Coordinates, fetch_json, flag, non_empty, null_default, optional, unix_secs,
+    Coordinates, DEPRECATED, fetch_json, flag, non_empty, null_default, optional, unix_secs,
 };
 use crate::fetch::{BlobCache, Fetch};
 use crate::purl::encode_component;
@@ -31,7 +31,7 @@ pub(crate) fn lookup(
                 purl = %c.purl().to_string().escape_debug(),
                 "CPAN lookup refused: more than one author segment"
             );
-            return Err(RegistryError::OffRegistry);
+            return Err(RegistryError::UnsafeCoordinate);
         }
     };
     let dist = c.encoded_name();
@@ -53,58 +53,54 @@ pub(crate) fn lookup(
     // An older release lives under `{author}/{dist}-{version}`. It counts
     // only if it is this distribution at the version asked for; otherwise the
     // record describes the version undated, from the latest's facts.
-    let older;
-    let release = match (c.version(), latest.author.as_deref()) {
-        (Some(want), Some(author)) if latest.version.as_deref() != Some(want) => {
+    let older_wanted = c
+        .version()
+        .filter(|want| latest.version.as_deref() != Some(*want));
+    let older = older_wanted
+        .zip(latest.author.as_deref())
+        .and_then(|(want, author)| {
             let url = format!(
                 "{METACPAN}/{}/{dist}-{}",
                 encode_component(author),
                 encode_component(want)
             );
-            older = optional(fetch_json::<ReleaseDocument>(&url, net, cache), &url)
+            optional(fetch_json::<ReleaseDocument>(&url, net, cache), &url)
                 .map(|d| d.release)
                 .filter(|r| {
                     r.version.as_deref() == Some(want) && r.distribution == latest.distribution
-                });
-            older.as_ref()
-        }
-        (Some(want), None) if latest.version.as_deref() != Some(want) => None,
-        _ => Some(&latest),
-    };
-    if release.is_none() {
+                })
+        });
+    let dated = older_wanted.is_none() || older.is_some();
+
+    let mut record = c.record(
+        Ecosystem::Cpan,
+        latest
+            .distribution
+            .clone()
+            .unwrap_or_else(|| c.name().to_string()),
+        latest.version.clone(),
+    );
+    let facts = older.unwrap_or(latest);
+    if dated {
+        // MetaCPAN dates are naive ISO (no zone), which is UTC.
+        record.published_at = facts.date.as_deref().and_then(unix_secs);
+        // A BackPAN release was deleted from CPAN and survives only in the
+        // archive.
+        record.version_removed = facts.status.as_deref().map(|s| s == "backpan");
+    } else {
         tracing::debug!(
             dist = %c.name().escape_debug(),
             version = %c.target(None).escape_debug(),
             "CPAN release not found; describing it undated from the latest"
         );
     }
-    let facts = release.unwrap_or(&latest);
-
-    let mut registry = Registry::new(
-        Ecosystem::Cpan,
-        latest
-            .distribution
-            .clone()
-            .unwrap_or_else(|| c.name().to_string()),
-    );
-    registry.version = c.target(latest.version.as_deref()).to_string();
-    // MetaCPAN dates are naive ISO (no zone), which is UTC.
-    registry.published_at = release.and_then(|r| r.date.as_deref()).and_then(unix_secs);
-    registry.latest_version = latest.version.clone();
-    registry.author = facts.author.clone();
-    registry.description = facts.r#abstract.clone();
-    registry.homepage = facts.resources.homepage.clone();
-    registry.repository = facts
-        .resources
-        .repository
-        .as_ref()
-        .and_then(|r| r.url.clone());
-    registry.license = facts.license.first().cloned();
-    registry.deprecated = flag(facts.deprecated, "deprecated");
-    // A BackPAN release was deleted from CPAN and survives only in the
-    // archive.
-    registry.version_removed = release.and_then(|r| r.status.as_deref().map(|s| s == "backpan"));
-    Ok(registry)
+    record.author = facts.author;
+    record.description = facts.r#abstract;
+    record.homepage = facts.resources.homepage;
+    record.repository = facts.resources.repository.and_then(|r| r.url);
+    record.license = facts.license.into_iter().next();
+    record.deprecated = flag(facts.deprecated, DEPRECATED);
+    Ok(record)
 }
 
 /// The per-release endpoint's envelope.
@@ -152,13 +148,10 @@ struct Repository {
 
 #[cfg(test)]
 mod tests {
-    use crate::fetch::{BlobCache, Fixtures};
-    use crate::registry::{RegistryError, lookup};
-    use filefacts::{Ecosystem, RefLocator, Registry};
-
-    fn look(net: &Fixtures, purl: &str) -> Result<Registry, RegistryError> {
-        lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
+    use crate::ecosystem::look;
+    use crate::fetch::Fixtures;
+    use crate::registry::RegistryError;
+    use filefacts::Ecosystem;
 
     fn moose() -> Fixtures {
         let latest = serde_json::json!({
@@ -188,7 +181,7 @@ mod tests {
 
     #[test]
     fn cpan_release_normalizes() {
-        let r = look(&moose(), "pkg:cpan/Moose").expect("registry");
+        let r = look("pkg:cpan/Moose", &moose()).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Cpan);
         assert_eq!(r.version, "2.4000");
         assert_eq!(r.latest_version.as_deref(), Some("2.4000"));
@@ -206,7 +199,7 @@ mod tests {
     #[test]
     fn a_requested_release_is_dated_by_its_own_document_or_not_at_all() {
         let net = moose();
-        let r = look(&net, "pkg:cpan/Moose@2.2015").expect("registry");
+        let r = look("pkg:cpan/Moose@2.2015", &net).expect("registry");
         assert_eq!(r.version, "2.2015");
         assert_eq!(r.published_at, Some(1_617_153_099)); // 2021-03-31T01:11:39Z
         assert_eq!(r.latest_version.as_deref(), Some("2.4000"));
@@ -215,7 +208,7 @@ mod tests {
         assert_eq!(r.version_removed, Some(true), "a BackPAN release");
 
         // MetaCPAN has no such release: the version stands, undated.
-        let r = look(&net, "pkg:cpan/Moose@0.1").expect("registry");
+        let r = look("pkg:cpan/Moose@0.1", &net).expect("registry");
         assert_eq!(r.version, "0.1");
         assert_eq!(r.published_at, None);
         assert_eq!(r.version_removed, None);
@@ -225,10 +218,16 @@ mod tests {
     #[test]
     fn a_cpan_author_namespace_must_be_the_releasing_author() {
         let net = moose();
-        assert!(look(&net, "pkg:cpan/ETHER/Moose").is_ok());
-        assert!(look(&net, "pkg:cpan/ether/Moose").is_ok());
-        for purl in ["pkg:cpan/EVIL/Moose", "pkg:cpan/A/B/Moose"] {
-            assert_eq!(look(&net, purl), Err(RegistryError::OffRegistry), "{purl}");
-        }
+        assert!(look("pkg:cpan/ETHER/Moose", &net).is_ok());
+        assert!(look("pkg:cpan/ether/Moose", &net).is_ok());
+        assert_eq!(
+            look("pkg:cpan/EVIL/Moose", &net),
+            Err(RegistryError::OffRegistry)
+        );
+        // No PAUSE id has two segments: a shape CPAN does not use.
+        assert_eq!(
+            look("pkg:cpan/A/B/Moose", &net),
+            Err(RegistryError::UnsafeCoordinate)
+        );
     }
 }

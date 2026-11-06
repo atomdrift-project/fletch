@@ -1,7 +1,7 @@
 //! Per-type rules: the purl-spec type definitions this crate enforces, and the
 //! fold of its accepted non-spec spellings onto spec form.
 
-use super::{Purl, PurlError};
+use super::{Purl, PurlError, TypeError};
 
 /// Whether a type's PURLs carry a namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +84,9 @@ const LOWER_PATH: TypeRules = TypeRules {
     ..BASE
 };
 
-/// Every type this crate knows: the purl-spec registered types, and the
-/// non-spec types its registries answer for. Any other type is valid with
-/// [`BASE`] rules.
+/// Every type this crate knows, sorted for [`entry`]'s binary search: the
+/// purl-spec registered types, and the non-spec types its registries answer
+/// for. Any other type is valid with [`BASE`] rules.
 ///
 /// Two departures from the spec. `golang`'s namespace is optional: the spec
 /// requires it, which leaves no spelling for a module whose path is a single
@@ -355,7 +355,10 @@ static TYPES: &[(&str, TypeRules)] = &[
 ];
 
 fn entry(typ: &str) -> Option<&'static (&'static str, TypeRules)> {
-    TYPES.iter().find(|(known, _)| *known == typ)
+    let index = TYPES
+        .binary_search_by(|(known, _)| (*known).cmp(typ))
+        .ok()?;
+    TYPES.get(index)
 }
 
 fn rules(typ: &str) -> &'static TypeRules {
@@ -431,9 +434,8 @@ pub(super) fn fold_legacy(purl: &mut Purl) {
         // `distro=<vendor>-<release>`; a bare codename (`jessie`) names no
         // vendor and recovers nothing.
         let vendor = distro
-            .split('-')
-            .next()
-            .unwrap_or(distro)
+            .split_once('-')
+            .map_or(distro.as_str(), |(vendor, _)| vendor)
             .to_ascii_lowercase();
         if distro_vendor(&vendor).is_some_and(|(spec, _)| spec == purl.typ) {
             tracing::debug!(%vendor, "recovered a distro namespace from the distro qualifier");
@@ -470,17 +472,17 @@ pub(super) fn apply(purl: &mut Purl) -> Result<(), PurlError> {
     let rules = rules(&purl.typ);
     match rules.namespace {
         Namespace::Required if purl.namespace.is_empty() => {
-            return Err(PurlError::Type("namespace is required"));
+            return Err(PurlError::Type(TypeError::NamespaceRequired));
         }
         Namespace::Prohibited if !purl.namespace.is_empty() => {
-            return Err(PurlError::Type("namespace is not allowed"));
+            return Err(PurlError::Type(TypeError::NamespaceNotAllowed));
         }
         _ => {}
     }
     if let Some(required) = rules.required_qualifier
         && !purl.qualifiers.contains_key(required)
     {
-        return Err(PurlError::Type("a required qualifier is missing"));
+        return Err(PurlError::Type(TypeError::MissingQualifier));
     }
     for segment in &mut purl.namespace {
         rules.namespace_case.apply(segment);
@@ -498,7 +500,7 @@ pub(super) fn apply(purl: &mut Purl) -> Result<(), PurlError> {
 fn type_specific(purl: &mut Purl) -> Result<(), PurlError> {
     match purl.typ.as_str() {
         "cpan" if purl.name.contains("::") => {
-            return Err(PurlError::Type("cpan name is a distribution, not a module"));
+            return Err(PurlError::Type(TypeError::CpanDistributionName));
         }
         "chrome-extension" => chrome_extension(purl)?,
         "swid" => swid(purl)?,
@@ -539,22 +541,21 @@ fn type_specific(purl: &mut Purl) -> Result<(), PurlError> {
 /// dot-separated integers.
 fn chrome_extension(purl: &Purl) -> Result<(), PurlError> {
     if purl.name.len() != 32 || !purl.name.bytes().all(|byte| matches!(byte, b'a'..=b'p')) {
-        return Err(PurlError::Type("chrome-extension id is not 32 letters a-p"));
+        return Err(PurlError::Type(TypeError::ChromeExtensionId));
     }
-    let valid_version = |version: &str| {
-        version.split('.').count() <= 4
-            && version.split('.').all(|segment| {
+    let valid_version =
+        |version: &str| {
+            let mut segments = version.split('.');
+            segments.by_ref().take(4).all(|segment| {
                 !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
-            })
-    };
+            }) && segments.next().is_none()
+        };
     if purl
         .version
         .as_deref()
         .is_some_and(|version| !valid_version(version))
     {
-        return Err(PurlError::Type(
-            "chrome-extension version is not 1-4 integers",
-        ));
+        return Err(PurlError::Type(TypeError::ChromeExtensionVersion));
     }
     Ok(())
 }
@@ -563,21 +564,21 @@ fn chrome_extension(purl: &Purl) -> Result<(), PurlError> {
 /// a GUID `tag_id` in lowercase.
 fn swid(purl: &mut Purl) -> Result<(), PurlError> {
     if purl.namespace.len() > 2 {
-        return Err(PurlError::Type("swid namespace has more than two segments"));
+        return Err(PurlError::Type(TypeError::SwidNamespace));
     }
     if purl
         .qualifiers
         .get("tag_version")
         .is_some_and(|value| value.parse::<u64>().is_err())
     {
-        return Err(PurlError::Type("swid tag_version is not an integer"));
+        return Err(PurlError::Type(TypeError::SwidTagVersion));
     }
     if purl
         .qualifiers
         .get("patch")
         .is_some_and(|value| !matches!(value.as_str(), "true" | "false"))
     {
-        return Err(PurlError::Type("swid patch is not a boolean"));
+        return Err(PurlError::Type(TypeError::SwidPatch));
     }
     if let Some(tag_id) = purl.qualifiers.get_mut("tag_id")
         && is_guid(tag_id)
@@ -638,14 +639,14 @@ fn normalize_pypi(name: &str) -> String {
 /// is a well-formed version range.
 fn canonical_qualifiers(purl: &mut Purl) -> Result<(), PurlError> {
     if purl.version.is_some() && purl.qualifiers.contains_key("vers") {
-        return Err(PurlError::Type("version and vers range are exclusive"));
+        return Err(PurlError::Type(TypeError::VersionWithVers));
     }
     if let Some(checksum) = purl.qualifiers.get_mut("checksum") {
         *checksum = checksum
             .split(',')
             .map(canonical_checksum)
             .collect::<Option<Vec<_>>>()
-            .ok_or(PurlError::Type("checksum is not a list of algorithm:hex"))?
+            .ok_or(PurlError::Type(TypeError::InvalidChecksum))?
             .join(",");
     }
     if purl
@@ -653,7 +654,7 @@ fn canonical_qualifiers(purl: &mut Purl) -> Result<(), PurlError> {
         .get("vers")
         .is_some_and(|range| !valid_version_range(range))
     {
-        return Err(PurlError::Type("vers is not a version range"));
+        return Err(PurlError::Type(TypeError::InvalidVers));
     }
     Ok(())
 }
@@ -714,17 +715,15 @@ fn valid_version_range(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Purl, PurlError, identity, normalize};
+    use super::super::tests::norm;
+    use super::super::{Purl, PurlError, TypeError, identity, normalize};
 
-    fn norm(raw: &str) -> String {
-        normalize(raw).unwrap_or_else(|| panic!("{raw} must normalize"))
-    }
-
+    /// Strictly sorted: what the binary search needs, and one entry per type.
     #[test]
-    fn type_table_has_one_entry_per_type() {
-        let mut seen = std::collections::BTreeSet::new();
+    fn type_table_is_sorted_with_one_entry_per_type() {
+        assert!(super::TYPES.is_sorted_by(|(left, _), (right, _)| left < right));
         for (typ, _) in super::TYPES {
-            assert!(seen.insert(typ), "{typ} listed twice");
+            assert_eq!(super::known_type(typ), Some(*typ));
         }
         assert_eq!(super::known_type("npm"), Some("npm"));
         assert_eq!(super::known_type("evil"), None);
@@ -819,7 +818,7 @@ mod tests {
         assert_eq!(purl.name(), "dockerd");
         assert_eq!(
             Purl::parse("pkg:terraform/docker@1"),
-            Err(PurlError::Type("namespace is required"))
+            Err(PurlError::Type(TypeError::NamespaceRequired))
         );
     }
 

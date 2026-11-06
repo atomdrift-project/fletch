@@ -3,7 +3,7 @@
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
-use crate::ecosystem::{Coordinates, fetch_json, non_empty, secs_from_millis};
+use crate::ecosystem::{Coordinates, count, fetch_json, non_empty, release_time, secs_from_millis};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
@@ -11,7 +11,8 @@ use crate::registry::RegistryError;
 /// skill (404 for an unknown slug). Slugs are not unique across publishers, so
 /// the coordinate is `[owner/]slug` and the owner handle picks the publisher;
 /// a slug several publishers share, asked for without one, is refused (409,
-/// naming the owners). The skill document describes its latest release only.
+/// naming the owners), and the record is named `[owner/]slug` to match. The
+/// skill document describes its latest release only.
 pub(crate) fn lookup(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
@@ -24,23 +25,24 @@ pub(crate) fn lookup(
         format!("https://clawhub.ai/api/v1/skills/{slug}?ownerHandle={owner}")
     };
     let skill = fetch_json::<SkillDocument>(&url, net, cache)?.skill;
-    let latest = skill.tags.and_then(|t| t.latest);
-    let version = c.target(latest.as_deref()).to_string();
     let stats = skill.stats.unwrap_or_default();
-    let mut registry = Registry::new(Ecosystem::Clawhub, c.name().to_string());
-    registry.published_at = skill
-        .updated_at
-        .filter(|_| latest.as_deref() == Some(version.as_str()))
-        .and_then(secs_from_millis);
-    registry.first_published_at = skill.created_at.and_then(secs_from_millis);
-    registry.version = version;
-    registry.latest_version = latest;
-    registry.title = skill.display_name;
-    registry.description = skill.summary;
-    registry.downloads_total = stats.downloads;
-    registry.favorites = stats.stars;
-    registry.release_count = stats.versions.and_then(|v| u32::try_from(v).ok());
-    Ok(registry)
+    let mut record = c.record(
+        Ecosystem::Clawhub,
+        c.full_name(),
+        skill.tags.and_then(|t| t.latest),
+    );
+    record.published_at = release_time(
+        &record,
+        record.latest_version.as_deref(),
+        skill.updated_at.and_then(secs_from_millis),
+    );
+    record.first_published_at = skill.created_at.and_then(secs_from_millis);
+    record.title = skill.display_name;
+    record.description = skill.summary;
+    record.downloads_total = stats.downloads;
+    record.favorites = stats.stars;
+    record.release_count = stats.versions.map(count);
+    Ok(record)
 }
 
 /// A ClawHub skill document: the one skill under `skill`.
@@ -84,13 +86,8 @@ struct SkillStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filefacts::RefLocator;
-
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
-
-    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
 
     fn cool_skill(created_at: f64) -> Fixtures {
         let doc = serde_json::json!({"skill": {
@@ -151,7 +148,7 @@ mod tests {
                 doc.as_bytes(),
             );
         let r = look("pkg:clawhub/acme/web-search", &net).expect("registry");
-        assert_eq!(r.name, "web-search");
+        assert_eq!(r.name, "acme/web-search", "the owner is part of the name");
         assert_eq!(r.version, "2.0.0");
         assert!(look("pkg:clawhub/web-search", &net).is_err());
     }

@@ -10,8 +10,9 @@ use filefacts::{RefKind, RefLocator, Reference};
 use super::cache::{self, CachedMeta, Spool, TTL_PINNED, TTL_UNPINNED};
 use super::coverage::Coverage;
 use super::resolve::{ResolveError, Target, target};
+use super::to_hex;
 use super::transport::{Fetch, FetchError, Fetched, Request};
-use super::verify::{self, Digests, Pins, verify_pin, verify_purl_checksum};
+use super::verify::{self, Digests, Pins, Verdict, verify_pin, verify_purl_checksum};
 use super::{BlobCache, locator_str, now, sha256_hex};
 
 /// The terminal result of trying to fetch one reference.
@@ -67,6 +68,44 @@ pub enum Served {
     /// A cache entry past its TTL, served because the source was unreachable,
     /// so the content may be outdated.
     StaleCache,
+}
+
+// Metric labels: each the variant's serialized name, so a dashboard and a
+// stored record spell an outcome the same way.
+
+impl Outcome {
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::PinMismatch => "pin_mismatch",
+            Self::UnverifiablePin => "unverifiable_pin",
+            Self::Unresolved(_) => "unresolved",
+            Self::Skipped => "skipped",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+
+impl Unresolved {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::InvalidPurl => "invalid_purl",
+            Self::UnsafeCoordinate => "unsafe_coordinate",
+            Self::NoRelease => "no_release",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl Served {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Cache => "cache",
+            Self::StaleCache => "stale_cache",
+        }
+    }
 }
 
 /// A fetch edge + provenance for one reference. `source_sha256 → content_sha256`
@@ -199,10 +238,6 @@ fn undefined_kind() -> RefKind {
 }
 
 /// `skip_serializing_if` helper: an unclassified kind carries no information.
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde's `skip_serializing_if` passes a reference"
-)]
 fn kind_is_undefined(k: &RefKind) -> bool {
     *k == RefKind::Undefined
 }
@@ -272,9 +307,10 @@ fn fetch_and_record(
         }
         Err(ResolveError::Failed(e)) => {
             tracing::debug!(locator = written, error = %e, "registry read for resolution failed");
-            let mut rec = FetchRecord::terminal(written.to_owned(), Outcome::Failed(e));
-            rec.fetched_at = Some(now());
-            return rec;
+            return FetchRecord {
+                fetched_at: Some(now()),
+                ..FetchRecord::terminal(written.to_owned(), Outcome::Failed(e))
+            };
         }
     };
     // Registry JSON (an npm `dist.tarball`, a PyPI `url`) is as attacker-
@@ -286,25 +322,33 @@ fn fetch_and_record(
             .as_ref()
             .is_some_and(|p| matches!(p.typ(), "oci" | "docker"))
     {
-        tracing::debug!(locator = %locator, url = %url, "registry named the container transport; refused");
+        tracing::debug!(locator = ?locator, url = ?url, "registry named the container transport; refused");
         return FetchRecord::terminal(locator, Outcome::Unresolved(Unresolved::Unsupported));
     }
     let pins = Pins::new(r.pinned_hash.as_ref(), purl.as_ref());
     let key = sha256_hex(locator.as_bytes());
-    let max_age = if r.pinned_hash.is_some() {
+    // Any integrity requirement — a manifest pin or a registry checksum the
+    // resolver refined into the locator — makes the artifact immutable.
+    let max_age = if pins.requires_integrity() {
         TTL_PINNED
     } else {
         TTL_UNPINNED
     };
-    if let Some((examined, meta)) = examine_cached(&pins, &key, Some(max_age), cache) {
-        tracing::debug!(locator = %locator, "served from cache");
-        return record(&pins, locator, url, &examined, Served::Cache, &meta);
+    // A cached body that fails its pin may have been written by an unpinned
+    // fetch of a mutable URL; fetch it fresh rather than report a stale
+    // mismatch.
+    if let Some((examined, meta)) = examine_cached(&pins, &key, Some(max_age), cache)
+        .filter(|(examined, _)| examined.verdict != Verdict::Mismatch)
+    {
+        tracing::debug!(locator = ?locator, "served from cache");
+        return record(&pins, locator, url, &examined, Served::Cache, meta);
     }
     if !claim_fetch() {
-        tracing::debug!(locator = %locator, url = %url, "fetch budget spent; not fetched");
-        let mut rec = FetchRecord::terminal(locator, Outcome::BudgetExceeded);
-        rec.resolved_url = Some(url);
-        return rec;
+        tracing::debug!(locator = ?locator, url = ?url, "fetch budget spent; not fetched");
+        return FetchRecord {
+            resolved_url: Some(url),
+            ..FetchRecord::terminal(locator, Outcome::BudgetExceeded)
+        };
     }
     // An artifact is spooled to disk as it arrives, judged and cached from
     // there, and never held in memory whole.
@@ -313,44 +357,44 @@ fn fetch_and_record(
     // registry names (any PURL target) stays https only.
     let plain_http = matches!(r.locator, RefLocator::Url(_));
     let landed = retrieve(&url, &spool, net, plain_http).and_then(|f| {
-        let meta = CachedMeta {
-            fetched_at: now(),
-            status: f.status,
-            final_url: f.final_url,
-            redirects: f.redirects,
-            headers: f.headers,
-            size: None,
-        };
+        let meta = CachedMeta::of(&f);
         land(&pins, &key, &spool, &f.bytes, &meta, cache)
             .map(|examined| (examined, meta))
             .map_err(|e| FetchError::Io(format!("spool: {e}")))
     });
-    match landed {
-        Ok((examined, meta)) => record(&pins, locator, url, &examined, Served::Network, &meta),
-        // The source is unreachable. Fall back to any cached copy, however
-        // old — a stale answer beats none — and mark it stale. Only a genuine
-        // cache miss is a failure.
-        Err(e) => match examine_cached(&pins, &key, None, cache) {
-            Some((examined, meta)) => {
-                tracing::warn!(locator = %locator, error = %e, "fetch failed; serving stale cache");
-                record(&pins, locator, url, &examined, Served::StaleCache, &meta)
-            }
-            None => {
-                tracing::debug!(locator = %locator, url = %url, error = %e, "fetch failed; nothing cached");
-                // A refused status *did* reach the network, and the code is the
-                // whole of what the server said: keep it in the field consumers
-                // read as well as in the failure.
-                let status = match e {
-                    FetchError::Status(status) => Some(status),
-                    _ => None,
-                };
-                let mut rec = FetchRecord::terminal(locator, Outcome::Failed(e));
-                rec.resolved_url = Some(url);
-                rec.fetched_at = Some(now());
-                rec.status = status;
-                rec
-            }
-        },
+    let e = match landed {
+        Ok((examined, meta)) => {
+            return record(&pins, locator, url, &examined, Served::Network, meta);
+        }
+        Err(e) => e,
+    };
+    // The source is unreachable for now (a timeout, a dropped connection, a
+    // transient status). Fall back to any cached copy, however old — a stale
+    // answer beats none — and mark it stale. A definite answer (a 404 or 410
+    // for a taken-down artifact, a refusal, an oversize body) is the record,
+    // never masked by an older copy.
+    let stale = if e.is_retryable() {
+        examine_cached(&pins, &key, None, cache)
+    } else {
+        None
+    };
+    if let Some((examined, meta)) = stale {
+        tracing::warn!(locator = ?locator, error = %e, "fetch failed; serving stale cache");
+        return record(&pins, locator, url, &examined, Served::StaleCache, meta);
+    }
+    tracing::debug!(locator = ?locator, url = ?url, error = %e, "fetch failed; no cached copy served");
+    // A refused status *did* reach the network, and the code is the whole of
+    // what the server said: keep it in the field consumers read as well as in
+    // the failure.
+    let status = match e {
+        FetchError::Status(status) => Some(status),
+        _ => None,
+    };
+    FetchRecord {
+        resolved_url: Some(url),
+        fetched_at: Some(now()),
+        status,
+        ..FetchRecord::terminal(locator, Outcome::Failed(e))
     }
 }
 
@@ -398,11 +442,10 @@ fn retrieve(
     })
 }
 
-/// What one read of a body tells: its digests, and how its pins compare
-/// (`None` when no pin could be checked).
+/// What one read of a body tells: its digests, and how its pins compare.
 struct Examined {
     digests: Digests,
-    verdict: Option<bool>,
+    verdict: Verdict,
 }
 
 /// Read `body` once and judge it against the reference's pins. Two
@@ -421,9 +464,9 @@ fn examine(
         verify_pin(pins, &digests, zip),
         verify_purl_checksum(pins, &digests),
     ) {
-        (Some(false), _) | (_, Some(false)) => Some(false),
-        (Some(true), _) | (_, Some(true)) => Some(true),
-        (None, None) => None,
+        (Verdict::Mismatch, _) | (_, Verdict::Mismatch) => Verdict::Mismatch,
+        (Verdict::Match, _) | (_, Verdict::Match) => Verdict::Match,
+        (Verdict::Unchecked, Verdict::Unchecked) => Verdict::Unchecked,
     };
     Ok(Examined { digests, verdict })
 }
@@ -440,14 +483,12 @@ fn examine_cached(
     if pins.is_go_tree() {
         let (spool, meta) = cache.unpack(key, max_age)?;
         let examined = std::fs::File::open(spool.path())
-            .and_then(|body| examine(pins, body, Some(spool.path())));
-        return match examined {
-            Ok(examined) => Some((examined, meta)),
-            Err(e) => {
+            .and_then(|body| examine(pins, body, Some(spool.path())))
+            .inspect_err(|e| {
                 tracing::warn!(key, error = %e, "cached body unreadable; treated as a miss");
-                None
-            }
-        };
+            })
+            .ok()?;
+        return Some((examined, meta));
     }
     cache.read_with(key, max_age, |body| examine(pins, body, None))
 }
@@ -487,27 +528,27 @@ fn record(
     resolved_url: String,
     examined: &Examined,
     served: Served,
-    meta: &CachedMeta,
+    meta: CachedMeta,
 ) -> FetchRecord {
     // A declared pin is an integrity requirement: bytes no pin could be
     // checked against (an uncomputable algorithm, a malformed or over-budget
     // module archive) stay explicitly unverified.
     let outcome = match examined.verdict {
-        Some(false) => Outcome::PinMismatch,
-        None if pins.declared() => Outcome::UnverifiablePin,
-        _ => Outcome::Ok,
+        Verdict::Mismatch => Outcome::PinMismatch,
+        Verdict::Unchecked if pins.requires_integrity() => Outcome::UnverifiablePin,
+        Verdict::Match | Verdict::Unchecked => Outcome::Ok,
     };
     if outcome != Outcome::Ok {
-        tracing::debug!(locator = %locator, outcome = ?outcome, "pin verdict");
+        tracing::debug!(locator = ?locator, outcome = ?outcome, "pin verdict");
     }
     FetchRecord {
         resolved_url: Some(resolved_url),
-        final_url: Some(meta.final_url.clone()),
-        redirects: meta.redirects.clone(),
+        final_url: Some(meta.final_url),
+        redirects: meta.redirects,
         status: Some(meta.status),
-        headers: meta.headers.clone(),
+        headers: meta.headers,
         fetched_at: Some(meta.fetched_at),
-        content_sha256: Some(examined.digests.sha256_hex()),
+        content_sha256: Some(to_hex(examined.digests.sha256)),
         size: Some(examined.digests.size),
         served: Some(served),
         ..FetchRecord::terminal(locator, outcome)
@@ -706,6 +747,39 @@ pub(super) mod tests {
         let rec = fetch_ref(&r, &Fixtures::default(), &empty);
         assert!(matches!(rec.outcome, Outcome::Failed(_)));
         assert_eq!(rec.served, None);
+
+        // A definite answer — the registry took the artifact down — is the
+        // record; the stale copy never masks it.
+        let gone = Fixtures::default().refusing(url, 404);
+        let rec = fetch_ref(&r, &gone, &cache);
+        assert_eq!(rec.outcome, Outcome::Failed(FetchError::Status(404)));
+        assert_eq!(rec.status, Some(404));
+        assert_eq!(rec.served, None);
+    }
+
+    /// A cached body that fails the pin may be a mutable URL's earlier
+    /// content, cached by an unpinned fetch: the pinned reader fetches it
+    /// fresh rather than report a stale mismatch.
+    #[test]
+    fn a_cached_pin_mismatch_is_fetched_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path().to_path_buf());
+        let url = "https://example.test/tool.tgz";
+        let unpinned = dep(RefLocator::Url(url.into()), None);
+        let old = Fixtures::default().with(url, b"OLD");
+        assert_eq!(fetch_ref(&unpinned, &old, &cache).outcome, Outcome::Ok);
+
+        let pinned = dep(
+            RefLocator::Url(url.into()),
+            Some(PinnedHash {
+                algo: HashAlgo::Sha256,
+                value: sha256_hex(b"NEW"),
+            }),
+        );
+        let new = Fixtures::default().with(url, b"NEW");
+        let rec = fetch_ref(&pinned, &new, &cache);
+        assert_eq!(rec.outcome, Outcome::Ok, "{rec:?}");
+        assert_eq!(rec.served, Some(Served::Network));
     }
 
     /// A backend that streams the body to the requested spool, as `HttpFetch`
@@ -893,11 +967,11 @@ pub(super) mod tests {
             Outcome::Ok
         );
         assert_eq!(
-            outcome(hex::encode(Sha1::digest(bytes)).to_ascii_uppercase()),
+            outcome(to_hex(Sha1::digest(bytes)).to_ascii_uppercase()),
             Outcome::Ok
         );
         assert_eq!(
-            outcome(hex::encode(Sha1::digest(b"other bytes"))),
+            outcome(to_hex(Sha1::digest(b"other bytes"))),
             Outcome::PinMismatch
         );
     }
@@ -937,7 +1011,7 @@ pub(super) mod tests {
             Outcome::PinMismatch
         );
         assert_eq!(
-            outcome(format!("sha1:{}", hex::encode(Sha1::digest(bytes)))),
+            outcome(format!("sha1:{}", to_hex(Sha1::digest(bytes)))),
             Outcome::Ok
         );
     }

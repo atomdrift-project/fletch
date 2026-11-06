@@ -4,14 +4,16 @@ use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-use crate::ecosystem::{Coordinates, fetch_json, non_empty, null_default, unix_secs};
+use crate::ecosystem::{
+    Coordinates, DEPRECATED, fetch_json, listed, non_empty, null_default, set_timeline, unix_secs,
+};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
 /// hex.pm's package document: downloads and links, every release with its own
-/// `inserted_at` publish time, and the retired releases keyed by version. A
-/// namespace other than `hexpm` names a private organization's repository,
-/// which the public document does not describe.
+/// `inserted_at` publish time (the release timeline), and the retired
+/// releases keyed by version. A namespace other than `hexpm` names a private
+/// organization's repository, which the public document does not describe.
 pub(crate) fn lookup(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
@@ -28,66 +30,56 @@ pub(crate) fn lookup(
     let version = c.target(latest);
     // A version the releases list lacks gets no date rather than the newest
     // release's; the package's own `inserted_at` is its first release.
-    let release = doc
-        .releases
-        .iter()
-        .find(|r| r.version.as_deref() == Some(version));
-    if release.is_none() {
-        tracing::debug!(
-            package = %c.name().escape_debug(),
-            version = %version.escape_debug(),
-            "hex release not listed; leaving it undated"
-        );
-    }
+    let release = listed(
+        doc.releases
+            .iter()
+            .find(|r| r.version.as_deref() == Some(version)),
+        c.name(),
+        version,
+    );
     let retirement = doc.retirements.as_ref().and_then(|r| r.get(version));
-    // Only a listed release in a document that reports retirements is known
-    // to be live.
-    let version_removed = match (retirement, release, &doc.retirements) {
-        (Some(_), _, _) => Some(true),
-        (None, Some(_), Some(_)) => Some(false),
-        _ => None,
-    };
-    let deprecated = retirement
-        .filter(|r| r.reason.as_deref() == Some("deprecated"))
-        .map(|r| {
-            r.message
-                .clone()
-                .unwrap_or_else(|| "deprecated".to_string())
-        });
 
-    let mut registry = Registry::new(Ecosystem::Hex, c.name().to_string());
-    registry.version = version.to_string();
-    registry.published_at = release
+    let mut record = c.record(Ecosystem::Hex, c.name(), latest.map(str::to_string));
+    record.published_at = release
         .and_then(|r| r.inserted_at.as_deref())
         .and_then(unix_secs);
-    registry.first_published_at = doc.inserted_at.as_deref().and_then(unix_secs);
-    registry.latest_version = latest.map(str::to_string);
-    registry.description = doc.meta.description;
-    registry.license = doc.meta.licenses.into_iter().next();
-    registry.repository = links_repo(&doc.meta.links);
-    registry.downloads_total = doc.downloads.all;
-    registry.downloads_recent = doc.downloads.recent;
-    registry.deprecated = deprecated;
-    registry.version_removed = version_removed;
-    Ok(registry)
-}
-
-/// The source repository in a package's free-form `links` map: the first
-/// forge or repository link by its conventional key. `None` when there is
-/// none — any other link (docs, a changelog, a sponsor page) is not the
-/// source.
-fn links_repo(links: &BTreeMap<String, String>) -> Option<String> {
-    [
+    record.first_published_at = doc.inserted_at.as_deref().and_then(unix_secs);
+    record.description = doc.meta.description;
+    record.license = doc.meta.licenses.into_iter().next();
+    // `links` is free-form: the source is the first forge or repository link
+    // by its conventional key, and any other link (docs, a changelog, a
+    // sponsor page) is not it.
+    let source_keys = [
         "GitHub",
         "Github",
         "github",
         "GitLab",
         "Repository",
         "Source",
-    ]
-    .iter()
-    .find_map(|key| links.get(*key))
-    .cloned()
+    ];
+    record.repository = source_keys
+        .iter()
+        .find_map(|key| doc.meta.links.get(*key))
+        .cloned();
+    record.downloads_total = doc.downloads.all;
+    record.downloads_recent = doc.downloads.recent;
+    record.deprecated = retirement
+        .filter(|r| r.reason.as_deref() == Some("deprecated"))
+        .map(|r| r.message.clone().unwrap_or_else(|| DEPRECATED.to_string()));
+    // Only a listed release in a document that reports retirements is known
+    // to be live.
+    record.version_removed = match (retirement, release, &doc.retirements) {
+        (Some(_), _, _) => Some(true),
+        (None, Some(_), Some(_)) => Some(false),
+        _ => None,
+    };
+    set_timeline(
+        &mut record,
+        doc.releases
+            .iter()
+            .filter_map(|r| r.inserted_at.as_deref().and_then(unix_secs)),
+    );
+    Ok(record)
 }
 
 /// The parts of a hex.pm package document the registry record reads.
@@ -147,13 +139,10 @@ struct Downloads {
 
 #[cfg(test)]
 mod tests {
-    use crate::fetch::{BlobCache, Fixtures};
-    use crate::registry::{RegistryError, lookup};
-    use filefacts::{Ecosystem, RefLocator, Registry};
-
-    fn look(net: &Fixtures, purl: &str) -> Result<Registry, RegistryError> {
-        lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
+    use crate::ecosystem::{look, unix_secs};
+    use crate::fetch::Fixtures;
+    use crate::registry::RegistryError;
+    use filefacts::Ecosystem;
 
     fn package(doc: &serde_json::Value) -> Fixtures {
         Fixtures::default().with(
@@ -172,7 +161,7 @@ mod tests {
             "releases": [{"version": "1.20.1", "inserted_at": "2021-04-23T10:00:00.000000Z"}],
             "retirements": {}
         }));
-        let r = look(&net, "pkg:hex/plug").expect("registry");
+        let r = look("pkg:hex/plug", &net).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Hex);
         assert_eq!(r.version, "1.20.1");
         assert_eq!(r.published_at, Some(1_619_172_000));
@@ -202,18 +191,22 @@ mod tests {
                 "0.9.0": {"reason": "deprecated", "message": null}
             }
         }));
-        let r = look(&net, "pkg:hex/plug@1.20.1").expect("registry");
+        let r = look("pkg:hex/plug@1.20.1", &net).expect("registry");
         assert_eq!(r.version_removed, Some(true));
         assert_eq!(r.deprecated, None, "a retirement that is not a deprecation");
 
-        let r = look(&net, "pkg:hex/plug@1.0.0").expect("registry");
+        let r = look("pkg:hex/plug@1.0.0", &net).expect("registry");
         assert_eq!(r.version_removed, Some(true));
         assert_eq!(r.deprecated.as_deref(), Some("Use 1.20 instead"));
+        // Every release dates the timeline.
+        assert_eq!(r.release_count, Some(4));
+        assert_eq!(r.first_published_at, unix_secs("2015-06-01T00:00:00Z"));
+        assert_eq!(r.previous_published_at, unix_secs("2015-06-01T00:00:00Z"));
 
-        let r = look(&net, "pkg:hex/plug@0.9.0").expect("registry");
+        let r = look("pkg:hex/plug@0.9.0", &net).expect("registry");
         assert_eq!(r.deprecated.as_deref(), Some("deprecated"));
 
-        let r = look(&net, "pkg:hex/plug").expect("registry");
+        let r = look("pkg:hex/plug", &net).expect("registry");
         assert_eq!(r.version, "1.20.3");
         assert_eq!(r.version_removed, Some(false));
     }
@@ -226,7 +219,7 @@ mod tests {
                                "Docs": "https://example.test/docs"}}
         }));
         assert_eq!(
-            look(&net, "pkg:hex/plug").expect("registry").repository,
+            look("pkg:hex/plug", &net).expect("registry").repository,
             None
         );
     }
@@ -235,9 +228,9 @@ mod tests {
     fn a_private_organization_is_not_the_public_package() {
         let net = package(&serde_json::json!({"latest_stable_version": "1.0.0"}));
         assert_eq!(
-            look(&net, "pkg:hex/acme/plug"),
+            look("pkg:hex/acme/plug", &net),
             Err(RegistryError::OffRegistry)
         );
-        assert!(look(&net, "pkg:hex/hexpm/plug").is_ok());
+        assert!(look("pkg:hex/hexpm/plug", &net).is_ok());
     }
 }

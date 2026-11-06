@@ -9,9 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use filefacts::tree_sitter::Node;
-use filefacts::{ParsedFile, RefKind, RefLocator};
+use filefacts::{ParsedFile, RefKind, Reference};
 
-use super::Lang;
 use super::found::{Found, clip};
 use super::purl_token::Eco;
 use super::shell::{Place, commands};
@@ -21,21 +20,26 @@ use super::source::{
     run_spans,
 };
 use super::urls::{git_refs, url_locator, urls};
+use super::{Lang, STRING_SOURCE};
 use crate::fetch::is_http_url;
 
 /// The longest text a resolved value may hold.
 const VALUE_LIMIT: usize = 16_384;
 /// How many bindings, members and operands one value may pass through.
 const MAX_VALUE_DEPTH: usize = 12;
-/// Scopes nested deeper than any real program: past this, every name lookup
-/// would walk a long chain, so the file resolves nothing.
-const MAX_SCOPE_DEPTH: usize = 256;
 /// [`Resolver::value`] steps one call site may take. Depth alone does not
 /// bound the work: a template can name the same binding thousands of times at
 /// every level, which multiplies.
 const CALL_FUEL: u32 = 4_096;
 /// [`Resolver::value`] steps the whole file may take.
 const FILE_FUEL: u32 = 1_000_000;
+/// The resolved text one file may build, per byte of the file. Fuel counts
+/// steps, not bytes: every call site naming one long constant would rebuild
+/// and rescan its whole text, so the text resolution copies is bounded
+/// separately, in proportion to the file.
+const TEXT_PER_FILE_BYTE: usize = 4;
+/// The resolved text any file may build, however small.
+const MIN_TEXT_BUDGET: usize = 1 << 20;
 
 /// The [`RefKind::Command`] source of a VS Code `ShellExecution` command.
 const SHELL_EXECUTION: &str = "vscode-shell-execution";
@@ -62,8 +66,22 @@ enum Init<'a> {
     Member(Node<'a>, &'a str),
 }
 
-/// A scope node, the index of the scope enclosing it, and its nesting depth.
-type Scope<'a> = (Node<'a>, Option<usize>, usize);
+/// A scope the walk recorded.
+#[derive(Debug, Clone, Copy)]
+struct Scope {
+    depth: usize,
+    /// The index of the nearest function-level scope around it, itself
+    /// included: where a `var` or a parameter declared in it binds.
+    function: usize,
+}
+
+/// What the walk met, in its order: a scope it entered, or a name used in
+/// one (by the identifier's node id and the index of its innermost scope).
+#[derive(Debug, Clone, Copy)]
+enum Visit<'a> {
+    Scope(usize),
+    Name(usize, usize, &'a str),
+}
 
 /// The calls and comments the walk collects besides the bindings.
 #[derive(Debug, Default)]
@@ -72,34 +90,33 @@ struct Sites<'a> {
     comments: Vec<Range<usize>>,
 }
 
-/// What reading the calls collects for after the walk.
+/// What reading the calls collects, to recognize once every call is read.
 #[derive(Debug, Default)]
 struct Calls<'a> {
     spans: Vec<CallSpan>,
-    /// Resolved commands: the call, whether it is a `ShellExecution`, and the
-    /// command text.
-    commands: Vec<(Node<'a>, bool, String)>,
+    /// Resolved commands: the call, the source to label its references
+    /// with, and the command text.
+    commands: Vec<(Node<'a>, &'static str, String)>,
+    /// The command texts in `commands`.
     seen: HashSet<String>,
-    /// PAC URLs cited by their API call.
-    pac: HashSet<RefLocator>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Resolver<'a> {
     text: &'a str,
-    /// Each name bound in a scope (by the scope node's id) and its
+    /// Each name bound in a scope (by the scope's index) and its
     /// initializer; `None` when unknown, ambiguous, or written.
     bindings: HashMap<(usize, &'a str), Option<Init<'a>>>,
-    /// Every scope in the file, recorded by the walk so a lookup climbs scopes
-    /// rather than calling `Node::parent`, which itself walks from the root.
-    scopes: Vec<Scope<'a>>,
-    /// The innermost scope around each identifier, by node id.
-    scope_of: HashMap<usize, usize>,
+    /// Every scope in the file, in the order the walk entered them.
+    scopes: Vec<Scope>,
+    /// The binding each identifier names, by its node id: resolved once for
+    /// the whole file, so a lookup never climbs a chain of scopes.
+    keys: HashMap<usize, (usize, &'a str)>,
     /// Module-level ESM import bindings: local name → the API it names
     /// (`exec` → `node:child_process.exec`, `cp` → `child_process`). Imports
     /// are immutable and hoisted, so one consulted only when no local binding
-    /// shadows the name stays exact. Empty when the name is imported twice.
-    imports: HashMap<&'a str, String>,
+    /// shadows the name stays exact. `None` when the name is imported twice.
+    imports: HashMap<&'a str, Option<String>>,
     /// Identifiers inside a `with` body, which may name any property of its
     /// object: they resolve to nothing.
     opaque: HashSet<usize>,
@@ -107,12 +124,15 @@ struct Resolver<'a> {
     written_roots: HashSet<&'a str>,
     /// [`Resolver::value`] steps left.
     fuel: Cell<u32>,
+    /// Bytes of resolved text left to build in the file (see
+    /// [`TEXT_PER_FILE_BYTE`]). Never reaches zero except by running out.
+    text_left: Cell<usize>,
 }
 
-/// Whether `node` opens a scope.
-fn is_scope(node: Node<'_>) -> bool {
+/// Whether a node of `kind` opens a scope.
+fn is_scope(kind: &str) -> bool {
     matches!(
-        node.kind(),
+        kind,
         "program"
             | "statement_block"
             | "function_declaration"
@@ -129,51 +149,49 @@ fn is_scope(node: Node<'_>) -> bool {
 /// Scan a JavaScript or TypeScript file.
 pub(super) fn scan(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
     let label = Lang::JavaScript.label();
-    let Some(ast) = parsed.source_ast() else {
-        if let Some(text) = out.text {
-            git_refs(text, label, out);
-            urls(text, label, out);
+    let mut text = out.text();
+    if let Some(ast) = parsed.source_ast() {
+        let source = ast.source;
+        let mut resolver = Resolver {
+            text: source,
+            text_left: Cell::new(
+                source
+                    .len()
+                    .saturating_mul(TEXT_PER_FILE_BYTE)
+                    .max(MIN_TEXT_BUDGET),
+            ),
+            ..Resolver::default()
+        };
+        // A partial binding table could mistake a later write for a constant,
+        // so a walk cut short resolves no calls at all.
+        match resolver.walk(ast.tree.root_node()) {
+            Ok(sites) => read_calls(&resolver, sites, out),
+            Err(limit) => out.cut_off(label, limit),
         }
-        return;
-    };
-    let text = ast.source;
-    let mut resolver = Resolver::new(text);
-    // A partial binding table could mistake a later write for a constant, so
-    // a walk cut short resolves no calls at all.
-    let pac = match resolver.walk(ast.tree.root_node()) {
-        Ok(sites) => read_calls(&resolver, sites, out),
-        Err(limit) => {
-            out.cut_off(label, limit);
-            HashSet::new()
-        }
-    };
+        text = text.or(Some(source));
+    }
     // The text scans read the file's own text, so each line is placed where
-    // it sits rather than searched for.
-    let text = out.text.unwrap_or(text);
-    git_refs(text, label, out);
-    urls(text, label, out);
-    // A PAC URL is cited by its API call, not by the plain string or text
-    // scans that also see it; declared references keep priority.
-    if !pac.is_empty() {
-        out.refs.retain(|r| {
-            !(matches!(r.source.as_str(), "string" | "javascript") && pac.contains(&r.locator))
-        });
+    // it sits rather than searched for. They run after the calls, so a PAC
+    // URL's API citation is already in place and their sighting of it is a
+    // duplicate.
+    if let Some(text) = text {
+        git_refs(text, label, out);
+        urls(text, label, out);
     }
 }
 
-/// Read every call the walk found, within the file's resolution fuel, and
-/// recognize the commands they run. Returns the PAC URLs cited.
-fn read_calls<'a>(
-    resolver: &Resolver<'a>,
-    mut sites: Sites<'a>,
-    out: &mut Found<'_>,
-) -> HashSet<RefLocator> {
+/// Read every call the walk found, within the file's resolution fuel and
+/// text budget, and recognize the commands they run.
+fn read_calls<'a>(resolver: &Resolver<'a>, mut sites: Sites<'a>, out: &mut Found<'_>) {
     let label = Lang::JavaScript.label();
     sites.calls.sort_by_key(Node::start_byte);
     let mut found = Calls::default();
     let mut fuel = FILE_FUEL;
     let mut starved = 0;
     for node in sites.calls {
+        if out.is_full() {
+            return;
+        }
         if fuel == 0 {
             out.cut_off(label, "resolution fuel");
             break;
@@ -192,6 +210,9 @@ fn read_calls<'a>(
             "js resolution: per-call fuel spent; those calls stay unresolved"
         );
     }
+    if resolver.text_left.get() == 0 {
+        out.cut_off(label, "resolved text budget");
+    }
     run_spans(
         resolver.text,
         found.spans,
@@ -199,21 +220,14 @@ fn read_calls<'a>(
         Lang::JavaScript,
         out,
     );
-    for (node, shell, command) in found.commands {
-        let source = if shell {
-            SHELL_EXECUTION
-        } else {
-            RESOLVED_COMMAND
-        };
-        let start = out.refs.len();
-        let at = Place::At(node.start_byte() as u64);
-        commands(&command, at, Lang::JavaScript, source, out);
-        let evidence = clip(resolver.raw(node).unwrap_or(&command));
-        for reference in &mut out.refs[start..] {
-            evidence.clone_into(&mut reference.evidence);
+    for (node, source, command) in found.commands {
+        if out.is_full() {
+            return;
         }
+        let call = clip(resolver.raw(node).unwrap_or(&command));
+        let place = Place::Call(node.start_byte() as u64, call);
+        commands(&command, place, Lang::JavaScript, source, out);
     }
-    found.pac
 }
 
 /// Read one call or `new` expression.
@@ -229,45 +243,40 @@ fn read_call<'a>(
     else {
         return;
     };
-    let api = match resolver.value(callee, 0) {
-        Some(Value::Api(api)) => Some(api),
-        _ => None,
-    };
+    let api = resolver.api(callee, 0);
     if node.kind() == "call_expression"
         && let Some(arguments) = node.child_by_field_name("arguments")
     {
         dynamic_import(resolver, node, callee, arguments, out);
         // A callee the resolver cannot follow is matched by its spelling.
-        let name = api.clone().or_else(|| {
-            resolver
+        let span = match &api {
+            Some(api) => call_span(Lang::JavaScript, api, node, arguments),
+            None => resolver
                 .raw(callee)
                 .filter(|c| c.len() <= MAX_CALLEE_BYTES)
-                .map(compact)
-        });
-        if let Some(span) =
-            name.and_then(|name| call_span(Lang::JavaScript, &name, node, arguments))
-        {
-            found.spans.push(span);
-        }
+                .and_then(|raw| call_span(Lang::JavaScript, &compact(raw), node, arguments)),
+        };
+        found.spans.extend(span);
+        // A PAC URL is cited by its API call, not by the plain string scan
+        // that also saw it; a declared reference keeps its place.
         if let Some(url) = proxy_pac_url(resolver, node) {
-            let locator = url_locator(&url);
-            found.pac.insert(locator.clone());
-            out.push_at(
-                locator,
+            let mut reference = Reference::new(
+                url_locator(&url),
                 RefKind::UrlFetch,
                 PAC_URL,
-                resolver.raw(node).unwrap_or(&url),
-                Some(node.start_byte() as u64),
+                clip(resolver.raw(node).unwrap_or(&url)),
             );
+            reference.offset = Some(node.start_byte() as u64);
+            out.supersede(reference, &[STRING_SOURCE, Lang::JavaScript.label()]);
         }
     }
     // A command repeated at another call site yields the same references,
-    // which the final dedup would drop: don't pay to scan it again.
+    // which would be dropped as duplicates: don't pay to scan it again.
     if let Some(api) = api
-        && let Some((shell, command)) = resolved_command(resolver, node, &api)
+        && let Some((source, command)) = resolved_command(resolver, node, &api)
         && found.seen.insert(command.clone())
     {
-        found.commands.push((node, shell, command));
+        found.commands.push((node, source, command));
     }
 }
 
@@ -284,7 +293,7 @@ fn dynamic_import<'a>(
         "import" => true,
         "identifier" => {
             resolver.raw(function) == Some("require")
-                && resolver.key(function, "require").is_none()
+                && resolver.key(function).is_none()
                 && !resolver.opaque.contains(&function.id())
         }
         _ => false,
@@ -304,45 +313,52 @@ fn dynamic_import<'a>(
 }
 
 /// The shell command a process-execution call runs, when its first argument
-/// resolves, and whether the call is a VS Code `ShellExecution`. An argument
-/// vector is not one command, so argv APIs are left to the call's span.
+/// resolves, and the source its references carry: a VS Code `ShellExecution`
+/// or another resolved process command. An argument vector is not one
+/// command, so argv APIs are left to the call's span.
 fn resolved_command<'a>(
     resolver: &Resolver<'a>,
     node: Node<'a>,
     api: &str,
-) -> Option<(bool, String)> {
-    let shell = api == "vscode.ShellExecution";
-    if !shell && (!execution_call(Lang::JavaScript, api) || ARGV_METHODS.contains(&method(api))) {
-        return None;
-    }
-    let argument = node.child_by_field_name("arguments")?.named_child(0)?;
-    let Value::Text(command) = resolver.value(argument, 0)? else {
+) -> Option<(&'static str, String)> {
+    let source = if api == "vscode.ShellExecution" {
+        SHELL_EXECUTION
+    } else if execution_call(Lang::JavaScript, api) && !ARGV_METHODS.contains(&method(api)) {
+        RESOLVED_COMMAND
+    } else {
         return None;
     };
-    Some((shell, command))
+    let argument = node.child_by_field_name("arguments")?.named_child(0)?;
+    Some((source, resolver.string(argument, 0)?))
 }
 
 impl<'a> Resolver<'a> {
-    fn new(text: &'a str) -> Self {
-        Self {
-            text,
-            bindings: HashMap::new(),
-            scopes: Vec::new(),
-            scope_of: HashMap::new(),
-            imports: HashMap::new(),
-            opaque: HashSet::new(),
-            written_roots: HashSet::new(),
-            fuel: Cell::new(0),
+    /// Charge `bytes` of built text to the file's budget; `None` once it is
+    /// spent.
+    fn spend(&self, bytes: usize) -> Option<()> {
+        let left = self.text_left.get();
+        if bytes >= left {
+            if left > 0 {
+                tracing::debug!(
+                    file_bytes = self.text.len(),
+                    "js resolution: resolved text budget spent; later values stay unresolved"
+                );
+            }
+            self.text_left.set(0);
+            return None;
         }
+        self.text_left.set(left - bytes);
+        Some(())
     }
 
+    /// The source text of `node`.
     fn raw(&self, node: Node<'a>) -> Option<&'a str> {
         self.text.get(node.byte_range())
     }
 
-    /// Walk the tree once: bind every declared name in its scope, then unbind
-    /// every name a write reaches. Returns the calls and comments, or the
-    /// limit the walk stopped at.
+    /// Walk the tree once: bind every declared name in its scope, resolve
+    /// every name to its binding, then unbind every name a write reaches.
+    /// Returns the calls and comments, or the limit the walk stopped at.
     fn walk(&mut self, root: Node<'a>) -> Result<Sites<'a>, &'static str> {
         // Each node with its innermost enclosing scope, its parent's kind, and
         // whether it sits in a `with` body.
@@ -350,75 +366,93 @@ impl<'a> Resolver<'a> {
             vec![(root, None, "", false)];
         let mut sites = Sites::default();
         let mut writes = Vec::new();
+        let mut visits = Vec::new();
         let mut visited = 0;
+        // One cursor serves every node: `named_children` resets it, and a
+        // fresh one per node is an allocation per node.
+        let mut cursor = root.walk();
         while let Some((node, outer, parent, in_with)) = stack.pop() {
             visited += 1;
             if visited > AST_NODE_BUDGET {
                 return Err("AST node budget");
             }
-            let inner = if is_scope(node) {
-                Some(self.enter(node, outer)?)
+            // `kind` copies and validates the grammar's name, so it is read
+            // once per node.
+            let kind = node.kind();
+            let inner = if is_scope(kind) {
+                let scope = self.enter(kind, outer);
+                visits.push(Visit::Scope(scope));
+                Some(scope)
             } else {
                 outer
             };
-            self.declare(node, outer, inner, parent, in_with, &mut writes);
-            let kind = node.kind();
             match kind {
+                "identifier" | "shorthand_property_identifier_pattern" => {
+                    if in_with {
+                        self.opaque.insert(node.id());
+                    } else if let Some(scope) = outer
+                        && let Some(name) = self.raw(node)
+                    {
+                        visits.push(Visit::Name(node.id(), scope, name));
+                    }
+                }
                 "comment" => sites.comments.push(node.byte_range()),
                 "new_expression" | "call_expression" => sites.calls.push(node),
-                _ => {}
+                _ => self.declare(node, kind, outer, inner, parent, &mut writes),
             }
             // A `with` statement's object is evaluated normally; its body is not.
-            let with_body = (kind == "with_statement")
-                .then(|| node.child_by_field_name("body"))
-                .flatten();
-            let mut cursor = node.walk();
+            let with_body = if kind == "with_statement" {
+                node.child_by_field_name("body")
+            } else {
+                None
+            };
             stack.extend(
                 node.named_children(&mut cursor)
                     .map(|child| (child, inner, kind, in_with || with_body == Some(child))),
             );
         }
+        self.resolve_names(visits);
         self.invalidate(writes);
         Ok(sites)
     }
 
     /// Record a scope opened inside `outer`, returning its index.
-    fn enter(&mut self, node: Node<'a>, outer: Option<usize>) -> Result<usize, &'static str> {
-        let depth = outer
-            .and_then(|o| self.scopes.get(o))
-            .map_or(0, |&(_, _, depth)| depth + 1);
-        if depth > MAX_SCOPE_DEPTH {
-            return Err("scope depth");
-        }
-        self.scopes.push((node, outer, depth));
-        Ok(self.scopes.len() - 1)
+    fn enter(&mut self, kind: &str, outer: Option<usize>) -> usize {
+        let index = self.scopes.len();
+        let parent = outer.and_then(|o| self.scopes.get(o));
+        // A block-like scope holds no `var`: one declared in it binds in the
+        // nearest function-level scope, or the outermost when there is none.
+        let block = matches!(
+            kind,
+            "statement_block" | "catch_clause" | "for_statement" | "for_in_statement"
+        );
+        let function = match parent {
+            Some(parent) if block => parent.function,
+            _ => index,
+        };
+        let depth = parent.map_or(0, |parent| parent.depth + 1);
+        self.scopes.push(Scope { depth, function });
+        index
     }
 
     /// Record what `node` declares, and any write it makes.
     fn declare(
         &mut self,
         node: Node<'a>,
+        kind: &str,
         outer: Option<usize>,
         inner: Option<usize>,
         parent: &str,
-        in_with: bool,
         writes: &mut Vec<Node<'a>>,
     ) {
-        match node.kind() {
-            "identifier" | "shorthand_property_identifier_pattern" => {
-                if in_with {
-                    self.opaque.insert(node.id());
-                } else if let Some(scope) = outer {
-                    self.scope_of.insert(node.id(), scope);
-                }
-            }
+        match kind {
             "import_statement" => self.import(node),
             // Declared names shadow like any other binding; their values are
             // never commands.
             "function_declaration" | "generator_function_declaration" | "class_declaration" => {
-                let function_scoped = node.kind() != "class_declaration";
+                let function_scoped = kind != "class_declaration";
                 if let Some(name) = node.child_by_field_name("name")
-                    && let Some(owner) = outer.and_then(|o| self.owner(o, function_scoped))
+                    && let Some(owner) = self.owner(outer, function_scoped)
                 {
                     self.bind(name, None, owner);
                 }
@@ -428,10 +462,9 @@ impl<'a> Resolver<'a> {
             "for_in_statement" => {
                 if let Some(left) = node.child_by_field_name("left") {
                     match node.child_by_field_name("kind") {
-                        Some(kind) => {
-                            let function_scoped = self.raw(kind) == Some("var");
-                            if let Some(owner) = inner.and_then(|i| self.owner(i, function_scoped))
-                            {
+                        Some(declaration) => {
+                            let function_scoped = self.raw(declaration) == Some("var");
+                            if let Some(owner) = self.owner(inner, function_scoped) {
                                 self.bind(left, None, owner);
                             }
                         }
@@ -441,20 +474,22 @@ impl<'a> Resolver<'a> {
             }
             "variable_declarator" => {
                 if let Some(name) = node.child_by_field_name("name")
-                    && let Some(owner) =
-                        outer.and_then(|o| self.owner(o, parent == "variable_declaration"))
+                    && let Some(owner) = self.owner(outer, parent == "variable_declaration")
                 {
                     self.bind(name, node.child_by_field_name("value"), owner);
                 }
             }
             "formal_parameters" => {
-                if let Some(owner) = outer.and_then(|o| self.owner(o, true)) {
+                if let Some(owner) = self.owner(outer, true) {
                     self.bind(node, None, owner);
                 }
             }
+            // The parameter binds in the function or clause itself.
             "arrow_function" | "catch_clause" => {
-                if let Some(parameter) = node.child_by_field_name("parameter") {
-                    self.bind(parameter, None, node);
+                if let Some(parameter) = node.child_by_field_name("parameter")
+                    && let Some(owner) = inner
+                {
+                    self.bind(parameter, None, owner);
                 }
             }
             "assignment_expression" | "augmented_assignment_expression" => {
@@ -465,41 +500,73 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// The scope a declaration inside `scope` binds into: the scope itself,
-    /// or for a `var` or parameter the nearest function-level one.
-    fn owner(&self, mut scope: usize, function_scoped: bool) -> Option<Node<'a>> {
-        loop {
-            let &(node, parent, _) = self.scopes.get(scope)?;
-            match parent {
-                Some(parent)
-                    if function_scoped
-                        && matches!(
-                            node.kind(),
-                            "statement_block"
-                                | "catch_clause"
-                                | "for_statement"
-                                | "for_in_statement"
-                        ) =>
-                {
-                    scope = parent;
+    /// The index of the scope a declaration inside `scope` binds into: the
+    /// scope itself, or for a `var` or parameter the nearest function-level
+    /// one.
+    fn owner(&self, scope: Option<usize>, function_scoped: bool) -> Option<usize> {
+        let scope = scope?;
+        let found = self.scopes.get(scope)?;
+        Some(if function_scoped {
+            found.function
+        } else {
+            scope
+        })
+    }
+
+    /// Resolve each name the walk met to the binding it refers to: the
+    /// innermost enclosing scope that binds it. The walk met scopes and names
+    /// in preorder, so replaying that order with, per name, a stack of the
+    /// scopes binding it that are still open costs time linear in the file,
+    /// however deep its scopes nest.
+    fn resolve_names(&mut self, visits: Vec<Visit<'a>>) {
+        let mut bound: Vec<(usize, &'a str)> = self.bindings.keys().copied().collect();
+        bound.sort_unstable();
+        let names = |scope: usize| {
+            let start = bound.partition_point(|&(s, _)| s < scope);
+            bound
+                .get(start..)
+                .unwrap_or_default()
+                .iter()
+                .take_while(move |&&(s, _)| s == scope)
+                .map(|&(_, name)| name)
+        };
+        let depth = |scope: usize| self.scopes.get(scope).map_or(0, |s| s.depth);
+        let mut in_force: HashMap<&'a str, Vec<usize>> = HashMap::new();
+        let mut open: Vec<usize> = Vec::new();
+        for visit in visits {
+            // Close the scopes the walk has left: every open one at least as
+            // deep as a scope entered, or deeper than a name's own.
+            let (scope, deepest) = match visit {
+                Visit::Scope(scope) => (scope, depth(scope)),
+                Visit::Name(_, scope, _) => (scope, depth(scope) + 1),
+            };
+            while let Some(&top) = open.last()
+                && depth(top) >= deepest
+            {
+                open.pop();
+                for name in names(top) {
+                    in_force.get_mut(name).and_then(Vec::pop);
                 }
-                _ => return Some(node),
+            }
+            match visit {
+                Visit::Scope(_) => {
+                    open.push(scope);
+                    for name in names(scope) {
+                        in_force.entry(name).or_default().push(scope);
+                    }
+                }
+                Visit::Name(id, _, name) => {
+                    if let Some(&owner) = in_force.get(name).and_then(|scopes| scopes.last()) {
+                        self.keys.insert(id, (owner, name));
+                    }
+                }
             }
         }
     }
 
-    /// The binding `name` refers to at identifier `node`.
-    fn key(&self, node: Node<'a>, name: &'a str) -> Option<(usize, &'a str)> {
-        let mut scope = self.scope_of.get(&node.id()).copied();
-        while let Some(index) = scope {
-            let &(owner, parent, _) = self.scopes.get(index)?;
-            let key = (owner.id(), name);
-            if self.bindings.contains_key(&key) {
-                return Some(key);
-            }
-            scope = parent;
-        }
-        None
+    /// The binding identifier `node` refers to.
+    fn key(&self, node: Node<'a>) -> Option<(usize, &'a str)> {
+        self.keys.get(&node.id()).copied()
     }
 
     /// Record an `import_statement`'s bindings: a default or namespace import
@@ -528,7 +595,6 @@ impl<'a> Resolver<'a> {
                     Some((self.raw(local)?, format!("{module}.{}", self.raw(name)?)))
                 }),
                 _ => {
-                    let mut cursor = node.walk();
                     nodes.extend(node.named_children(&mut cursor));
                     None
                 }
@@ -537,8 +603,8 @@ impl<'a> Resolver<'a> {
                 // A name imported twice is ambiguous: resolve neither.
                 self.imports
                     .entry(local)
-                    .and_modify(String::clear)
-                    .or_insert(api);
+                    .and_modify(|api| *api = None)
+                    .or_insert(Some(api));
             }
         }
     }
@@ -546,14 +612,14 @@ impl<'a> Resolver<'a> {
     /// Bind the names in the pattern `name` into `owner`, initialized by
     /// `value`. A name bound twice in one scope is ambiguous and resolves to
     /// nothing.
-    fn bind(&mut self, name: Node<'a>, value: Option<Node<'a>>, owner: Node<'a>) {
+    fn bind(&mut self, name: Node<'a>, value: Option<Node<'a>>, owner: usize) {
         let mut nodes = vec![(name, value.map(Init::Value))];
         while let Some((node, init)) = nodes.pop() {
             match node.kind() {
                 "identifier" | "shorthand_property_identifier_pattern" => {
                     if let Some(raw) = self.raw(node) {
                         self.bindings
-                            .entry((owner.id(), raw))
+                            .entry((owner, raw))
                             .and_modify(|old| *old = None)
                             .or_insert(init);
                     }
@@ -612,8 +678,7 @@ impl<'a> Resolver<'a> {
     /// Unbind every name a write can reach — destructuring included — since
     /// it is no longer a constant. A member target writes a property, not a
     /// binding, but its root is no longer a trusted global.
-    fn invalidate(&mut self, writes: Vec<Node<'a>>) {
-        let mut targets = writes;
+    fn invalidate(&mut self, mut targets: Vec<Node<'a>>) {
         while let Some(node) = targets.pop() {
             let mut root = node;
             while matches!(root.kind(), "member_expression" | "subscript_expression") {
@@ -629,9 +694,7 @@ impl<'a> Resolver<'a> {
             }
             match node.kind() {
                 "identifier" | "shorthand_property_identifier_pattern" => {
-                    if let Some(name) = self.raw(node)
-                        && let Some(key) = self.key(node, name)
-                    {
+                    if let Some(key) = self.key(node) {
                         self.bindings.insert(key, None);
                     }
                 }
@@ -659,54 +722,59 @@ impl<'a> Resolver<'a> {
             "string" => {
                 let raw = self.raw(node)?;
                 let content = raw.get(1..raw.len().checked_sub(1)?)?;
+                self.spend(content.len())?;
                 Some(Value::Text(
                     decode_escapes(content).unwrap_or_else(|| content.to_owned()),
                 ))
             }
             "template_string" => self.template_value(node, depth),
             "binary_expression" if self.raw(node.child_by_field_name("operator")?)? == "+" => {
-                let Value::Text(mut left) =
-                    self.value(node.child_by_field_name("left")?, depth + 1)?
-                else {
-                    return None;
-                };
-                let Value::Text(right) =
-                    self.value(node.child_by_field_name("right")?, depth + 1)?
-                else {
-                    return None;
-                };
+                let mut left = self.string(node.child_by_field_name("left")?, depth + 1)?;
+                let right = self.string(node.child_by_field_name("right")?, depth + 1)?;
                 if left.len() + right.len() > VALUE_LIMIT {
                     return None;
                 }
+                self.spend(left.len() + right.len())?;
                 left.push_str(&right);
                 Some(Value::Text(left))
             }
             "call_expression" => {
                 let function = node.child_by_field_name("function")?;
-                if self.raw(function)? != "require" || self.key(function, "require").is_some() {
+                if self.raw(function)? != "require" || self.key(function).is_some() {
                     return None;
                 }
-                let Value::Text(module) = self.value(
-                    node.child_by_field_name("arguments")?.named_child(0)?,
-                    depth + 1,
-                )?
-                else {
-                    return None;
-                };
-                Some(Value::Api(module))
+                let module = node.child_by_field_name("arguments")?.named_child(0)?;
+                Some(Value::Api(self.string(module, depth + 1)?))
             }
             "member_expression" => {
-                let Value::Api(module) =
-                    self.value(node.child_by_field_name("object")?, depth + 1)?
-                else {
-                    return None;
-                };
-                let property = self.raw(node.child_by_field_name("property")?)?;
-                Some(Value::Api(format!("{module}.{property}")))
+                let module = self.api(node.child_by_field_name("object")?, depth + 1)?;
+                self.member(&module, self.raw(node.child_by_field_name("property")?)?)
             }
             "parenthesized_expression" => self.value(node.named_child(0)?, depth + 1),
             _ => None,
         }
+    }
+
+    /// What `node` evaluates to, when that is known text.
+    fn string(&self, node: Node<'a>, depth: usize) -> Option<String> {
+        match self.value(node, depth)? {
+            Value::Text(text) => Some(text),
+            Value::Api(_) => None,
+        }
+    }
+
+    /// The API `node` names, when it names one.
+    fn api(&self, node: Node<'a>, depth: usize) -> Option<String> {
+        match self.value(node, depth)? {
+            Value::Api(api) => Some(api),
+            Value::Text(_) => None,
+        }
+    }
+
+    /// The member `property` of the API `module`.
+    fn member(&self, module: &str, property: &str) -> Option<Value> {
+        self.spend(module.len() + property.len())?;
+        Some(Value::Api(format!("{module}.{property}")))
     }
 
     /// What the binding an identifier names holds; an unbound name is an
@@ -715,14 +783,10 @@ impl<'a> Resolver<'a> {
         if self.opaque.contains(&node.id()) {
             return None;
         }
-        let name = self.raw(node)?;
-        let Some(key) = self.key(node, name) else {
-            return self
-                .imports
-                .get(name)
-                .filter(|api| !api.is_empty())
-                .cloned()
-                .map(Value::Api);
+        let Some(key) = self.key(node) else {
+            let api = self.imports.get(self.raw(node)?)?.as_ref()?;
+            self.spend(api.len())?;
+            return Some(Value::Api(api.clone()));
         };
         let init = (*self.bindings.get(&key)?)?;
         let (Init::Value(source) | Init::Member(source, _)) = init;
@@ -732,12 +796,7 @@ impl<'a> Resolver<'a> {
         }
         match init {
             Init::Value(value) => self.value(value, depth + 1),
-            Init::Member(object, property) => {
-                let Value::Api(module) = self.value(object, depth + 1)? else {
-                    return None;
-                };
-                Some(Value::Api(format!("{module}.{property}")))
-            }
+            Init::Member(object, property) => self.member(&self.api(object, depth + 1)?, property),
         }
     }
 
@@ -752,10 +811,7 @@ impl<'a> Resolver<'a> {
                     value.push_str(&decode_escapes(raw).unwrap_or_else(|| raw.to_owned()));
                 }
                 "template_substitution" => {
-                    let Value::Text(part) = self.value(child.named_child(0)?, depth + 1)? else {
-                        return None;
-                    };
-                    value.push_str(&part);
+                    value.push_str(&self.string(child.named_child(0)?, depth + 1)?);
                 }
                 _ => return None,
             }
@@ -763,6 +819,7 @@ impl<'a> Resolver<'a> {
                 return None;
             }
         }
+        self.spend(value.len())?;
         Some(Value::Text(value))
     }
 }
@@ -786,18 +843,14 @@ fn object_field<'a>(resolver: &Resolver<'a>, object: Node<'a>, wanted: &str) -> 
         let key = pair.child_by_field_name("key")?;
         let key = match key.kind() {
             "property_identifier" => resolver.raw(key)?.to_owned(),
-            "string" => {
-                let Value::Text(key) = resolver.value(key, 0)? else {
-                    return None;
-                };
-                key
-            }
+            "string" => resolver.string(key, 0)?,
             _ => return None,
         };
-        if !names.insert(key.clone()) {
+        let is_wanted = key == wanted;
+        if !names.insert(key) {
             return None;
         }
-        if key == wanted {
+        if is_wanted {
             found = pair.child_by_field_name("value");
         }
     }
@@ -809,20 +862,25 @@ fn object_field<'a>(resolver: &Resolver<'a>, object: Node<'a>, wanted: &str) -> 
 /// and a bounded resolved URL. Documentation, POST sinks and saved settings
 /// do not supply code dependencies. This does not execute or trust the PAC.
 fn proxy_pac_url<'a>(resolver: &Resolver<'a>, call: Node<'a>) -> Option<String> {
-    let mut callee = call.child_by_field_name("function")?;
+    let function = call.child_by_field_name("function")?;
+    let mut callee = function;
     for name in ["set", "settings", "proxy"] {
         if callee.kind() != "member_expression"
             || resolver.raw(callee.child_by_field_name("property")?)? != name
-            || resolver.raw(callee)?.contains("?.")
         {
             return None;
         }
         callee = callee.child_by_field_name("object")?;
     }
     let root = resolver.raw(callee)?;
+    // The optional-chaining test reads the callee's whole text, so it waits
+    // until the callee is known to be the short `<root>.proxy.settings.set`
+    // path: reading it at every `.set` of a long `x.set().set()…` chain
+    // would cost time quadratic in the chain.
     if callee.kind() != "identifier"
         || !matches!(root, "browser" | "chrome")
-        || resolver.key(callee, root).is_some()
+        || resolver.raw(function)?.contains("?.")
+        || resolver.key(callee).is_some()
         || resolver.imports.contains_key(root)
         || resolver.opaque.contains(&callee.id())
         || resolver.written_roots.contains(root)
@@ -840,9 +898,7 @@ fn proxy_pac_url<'a>(resolver: &Resolver<'a>, call: Node<'a>) -> Option<String> 
     } else {
         "mode"
     };
-    let Value::Text(mode) = resolver.value(object_field(resolver, value, mode_key)?, 0)? else {
-        return None;
-    };
+    let mode = resolver.string(object_field(resolver, value, mode_key)?, 0)?;
     let url = match (root, mode.as_str()) {
         ("browser", "autoConfig") => object_field(resolver, value, "autoConfigUrl")?,
         ("chrome", "pac_script") => {
@@ -850,9 +906,7 @@ fn proxy_pac_url<'a>(resolver: &Resolver<'a>, call: Node<'a>) -> Option<String> 
         }
         _ => return None,
     };
-    let Value::Text(url) = resolver.value(url, 0)? else {
-        return None;
-    };
+    let url = resolver.string(url, 0)?;
     is_http_url(&url).then_some(url)
 }
 
@@ -1003,6 +1057,34 @@ mod tests {
             shell_executions(source)[0].locator,
             RefLocator::Purl("pkg:github/elsewhere/renamed@fedcba".into())
         );
+    }
+
+    /// A name resolves to its innermost enclosing binding: never one in a
+    /// sibling block, and a `var` binds in its function however deep the
+    /// block it is written in.
+    #[test]
+    fn names_resolve_through_enclosing_scopes_only() {
+        let prelude = "const cp=require('child_process');";
+        for (body, want) in [
+            (
+                "const c='npm i real';{const c='npm i decoy';}cp.execSync(c);",
+                "pkg:npm/real",
+            ),
+            (
+                "const c='npm i outer';{{{const c='npm i inner';{{cp.execSync(c);}}}}}",
+                "pkg:npm/inner",
+            ),
+            (
+                "function f(){{{{var c='npm i hoisted';}}}cp.execSync(c);}",
+                "pkg:npm/hoisted",
+            ),
+            (
+                "const c='npm i real';const g=(c)=>0;try{}catch(c){}cp.execSync(c);",
+                "pkg:npm/real",
+            ),
+        ] {
+            assert_eq!(resolved(&format!("{prelude}{body}")), [want], "{body}");
+        }
     }
 
     #[test]

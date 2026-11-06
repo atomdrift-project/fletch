@@ -29,13 +29,13 @@ help: ## Show this help
 	@echo "  clean              - Remove build artifacts"
 
 build:
-	$(CARGO) build
+	$(CARGO) build --features cli
 
 release:
-	$(CARGO) build --release
+	$(CARGO) build --release --features cli
 
 test:
-	$(CARGO) test
+	$(CARGO) test --all-features
 
 test-purl-spec:
 	test -n "$(PURL_SPEC_DIR)"
@@ -48,7 +48,7 @@ lint:
 # Auto-fix what clippy and rustfmt can fix on their own. Run fmt last so it
 # tidies any code clippy rewrote. Mirrors what `lint` checks.
 fix:
-	$(CARGO) clippy --fix --all-targets --allow-dirty --allow-staged
+	$(CARGO) clippy --fix --all-targets --all-features --allow-dirty --allow-staged
 	$(CARGO) fmt
 
 fmt:

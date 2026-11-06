@@ -57,27 +57,27 @@ pub(crate) fn lookup(
         return Err(RegistryError::NoRecord);
     }
 
-    let mut registry = Registry::new(Ecosystem::Github, c.full_name());
-    registry.version = c.target(None).to_string();
+    // A repository has no releases of its own to call latest.
+    let mut record = c.record(Ecosystem::Github, c.full_name(), None);
     // `pushed_at` (last code change) is the supply-chain-relevant recency;
     // it dates the default branch, not a requested ref.
-    registry.published_at = if c.version().is_none() {
+    record.published_at = if c.version().is_none() {
         doc.pushed_at.as_deref().and_then(unix_secs)
     } else {
         None
     };
-    registry.author = doc.owner.and_then(|o| o.login);
-    registry.title = doc.full_name;
-    registry.description = doc.description;
-    registry.homepage = doc.homepage;
-    registry.repository = doc.html_url;
-    registry.license = doc
+    record.author = doc.owner.and_then(|o| o.login);
+    record.title = doc.full_name;
+    record.description = doc.description;
+    record.homepage = doc.homepage;
+    record.repository = doc.html_url;
+    record.license = doc
         .license
         .and_then(|l| l.spdx_id)
         .filter(|s| s != "NOASSERTION");
-    registry.favorites = doc.stargazers_count;
-    registry.deprecated = flag(doc.archived, "archived");
-    Ok(registry)
+    record.favorites = doc.stargazers_count;
+    record.deprecated = flag(doc.archived, "archived");
+    Ok(record)
 }
 
 /// The GitHub REST repository document (`/repos/{owner}/{repo}`).
@@ -91,6 +91,7 @@ struct Repo {
     description: Option<String>,
     #[serde(deserialize_with = "non_empty")]
     homepage: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     html_url: Option<String>,
     license: Option<License>,
     archived: Option<bool>,
@@ -102,6 +103,7 @@ struct Repo {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Owner {
+    #[serde(deserialize_with = "non_empty")]
     login: Option<String>,
 }
 
@@ -115,15 +117,10 @@ struct License {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filefacts::RefLocator;
-
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
 
     const GIN: &str = "https://api.github.com/repos/gin-gonic/gin";
-
-    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
 
     fn gin(extra: &serde_json::Value) -> Fixtures {
         let mut repo = serde_json::json!({
@@ -151,6 +148,17 @@ mod tests {
         assert_eq!(r.favorites, Some(88_739));
         assert_eq!(r.rating_count, None);
         assert_eq!(r.deprecated, None);
+    }
+
+    #[test]
+    fn blank_links_are_unknown() {
+        let r = look(
+            "pkg:github/gin-gonic/gin",
+            &gin(&serde_json::json!({"html_url": "", "owner": {"login": ""}})),
+        )
+        .expect("registry");
+        assert_eq!(r.repository, None);
+        assert_eq!(r.author, None);
     }
 
     #[test]

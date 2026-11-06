@@ -5,30 +5,30 @@
 use filefacts::values::BatchCommandSite;
 use filefacts::{RefKind, RefLocator, Reference, Values};
 
-use super::Discovery;
-use super::UnresolvedFetchCall;
+use super::{Discovery, UnresolvedFetchCall};
 use crate::fetch::is_http_url;
 
-/// The most command sites filefacts records for one file.
+/// The most command sites read from one file. filefacts records no more than
+/// this itself; the bound holds for `Values` rebuilt from retained JSON or
+/// built elsewhere, which carry whatever they were given.
 const MAX_SITES: usize = 128;
-/// The longest command site filefacts records.
+/// The longest command site read, matching filefacts' own limit for the same
+/// reason.
 const MAX_SITE_BYTES: usize = 65_536;
 
-/// A command word's program name, lower-cased: `C:\Windows\mshta.exe` runs
-/// `mshta.exe`.
-fn tool(name: &str) -> String {
-    name.rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(name)
-        .to_ascii_lowercase()
+/// `input` after a `javascript:` scheme, matched case-insensitively.
+fn after_javascript_scheme(input: &str) -> Option<&str> {
+    const SCHEME: &str = "javascript:";
+    let (scheme, rest) = input.split_at_checked(SCHEME.len())?;
+    scheme.eq_ignore_ascii_case(SCHEME).then_some(rest)
 }
 
+/// The text of a `"…"` string that starts `input`, and what follows it.
 fn quoted(input: &str) -> Option<(&str, &str)> {
-    let input = input.strip_prefix('"')?;
-    let end = input.find('"')?;
-    Some((&input[..end], &input[end + 1..]))
+    input.strip_prefix('"')?.split_once('"')
 }
 
+/// The first argument of a command line, quoted or bare.
 fn first_argument(input: &str) -> Option<&str> {
     let input = input.trim_start();
     if input.starts_with('"') {
@@ -46,13 +46,8 @@ fn moniker(input: &str) -> Option<&str> {
         .trim_start()
         .strip_prefix('(')?
         .trim_start();
-    let quote = rest.chars().next()?;
-    if !matches!(quote, '\'' | '"') {
-        return None;
-    }
-    let inside = &rest[1..];
-    let end = inside.find(quote)?;
-    let (literal, rest) = (&inside[..end], &inside[end + 1..]);
+    let quote = rest.chars().next().filter(|&q| matches!(q, '\'' | '"'))?;
+    let (literal, rest) = rest[1..].split_once(quote)?;
     if !matches!(rest.trim(), ")" | ");") {
         return None;
     }
@@ -63,16 +58,11 @@ fn moniker(input: &str) -> Option<&str> {
 /// The script a `rundll32 javascript:"\..\mshtml,RunHTMLApplication";…`
 /// scriptlet loads.
 fn scriptlet(input: &str) -> Option<&str> {
-    let input = input.trim_start();
-    if !input.get(..11)?.eq_ignore_ascii_case("javascript:") {
-        return None;
-    }
-    let (bridge, rest) = quoted(&input[11..])?;
+    let (bridge, rest) = quoted(after_javascript_scheme(input.trim_start())?)?;
     let bridge = bridge.to_ascii_lowercase();
-    if bridge.contains(['%', '!', '^']) || !bridge.ends_with("mshtml,runhtmlapplication") {
-        return None;
-    }
-    let prefix = &bridge[..bridge.len() - "mshtml,runhtmlapplication".len()];
+    // Only path separators and dots may lead to the DLL, which also rules out
+    // a CMD expansion there.
+    let prefix = bridge.strip_suffix("mshtml,runhtmlapplication")?;
     if !prefix.chars().all(|c| matches!(c, '\\' | '/' | '.')) {
         return None;
     }
@@ -135,7 +125,12 @@ fn site_targets(site: &BatchCommandSite<'_>, out: &mut Discovery) {
     let Some(tail) = text.get(end..) else {
         return;
     };
-    let program = tool(name);
+    // `C:\Windows\mshta.exe` runs `mshta.exe`.
+    let program = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
     let target = match program.as_str() {
         "mshta" | "mshta.exe" => first_argument(tail),
         "rundll32" | "rundll32.exe" => scriptlet(tail),
@@ -159,10 +154,7 @@ fn site_targets(site: &BatchCommandSite<'_>, out: &mut Discovery) {
     }
     let candidate = tail.trim_start();
     if candidate.contains(['%', '!', '^'])
-        || candidate
-            .get(..11)
-            .is_some_and(|p| p.eq_ignore_ascii_case("javascript:"))
-            && candidate.contains("GetObject(")
+        || after_javascript_scheme(candidate).is_some() && candidate.contains("GetObject(")
     {
         out.unresolved.push(UnresolvedFetchCall {
             command: program,

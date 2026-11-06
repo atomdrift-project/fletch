@@ -2,56 +2,60 @@
 
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
-use crate::ecosystem::{Coordinates, fetch_json, non_empty, null_default, unix_secs};
+use crate::ecosystem::{
+    Coordinates, fetch_json, listed, non_empty, null_default, set_timeline, unix_secs,
+};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
 /// Anaconda.org's package document for the PURL's `channel` (conda-forge by
 /// default): every file with its upload time, and lifetime downloads. A
-/// channel has no per-version record, so the earliest upload of the version
-/// is its publish time.
+/// channel has no per-version record, so the earliest upload of a version is
+/// its publish time, and those times are the release timeline.
 pub(crate) fn lookup(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let name = c.bare_name(&[])?;
+    let name = c.encoded_name();
     let owner = anaconda_owner(c.purl().qualifier("channel"))?;
     let doc: Package = fetch_json(
         &format!("https://api.anaconda.org/package/{owner}/{name}"),
         net,
         cache,
     )?;
-    let latest = doc.latest_version.as_deref();
-    let version = c.target(latest);
-    // A version with no files gets no date; the package's `created_at` is its
-    // first upload, not this version's.
-    let published_at = doc
-        .files
-        .iter()
-        .filter(|f| f.version.as_deref() == Some(version))
-        .filter_map(|f| f.upload_time.as_deref().and_then(unix_secs))
-        .min();
-    if published_at.is_none() {
-        tracing::debug!(
-            package = %c.name().escape_debug(),
-            version = %version.escape_debug(),
-            "no dated conda file for this version; leaving it undated"
-        );
+    // One file per build; a version was released with its first upload.
+    let mut released: BTreeMap<&str, u64> = BTreeMap::new();
+    for file in &doc.files {
+        if let (Some(version), Some(at)) = (
+            file.version.as_deref(),
+            file.upload_time.as_deref().and_then(unix_secs),
+        ) {
+            released
+                .entry(version)
+                .and_modify(|first| *first = (*first).min(at))
+                .or_insert(at);
+        }
     }
 
-    let mut registry = Registry::new(Ecosystem::Conda, c.name().to_string());
-    registry.version = version.to_string();
-    registry.published_at = published_at;
-    registry.first_published_at = doc.created_at.as_deref().and_then(unix_secs);
-    registry.latest_version = latest.map(str::to_string);
-    registry.description = doc.summary;
-    registry.homepage = doc.home;
-    registry.repository = doc.source_git_url.or(doc.dev_url);
-    registry.license = doc.license;
-    registry.downloads_total = doc.ndownloads;
-    Ok(registry)
+    let mut record = c.record(Ecosystem::Conda, c.name(), doc.latest_version);
+    // A version with no files gets no date; the package's `created_at` is its
+    // first upload, not this version's.
+    record.published_at = listed(
+        released.get(record.version.as_str()).copied(),
+        c.name(),
+        &record.version,
+    );
+    record.first_published_at = doc.created_at.as_deref().and_then(unix_secs);
+    record.description = doc.summary;
+    record.homepage = doc.home;
+    record.repository = doc.source_git_url.or(doc.dev_url);
+    record.license = doc.license;
+    record.downloads_total = doc.ndownloads;
+    set_timeline(&mut record, released.into_values());
+    Ok(record)
 }
 
 /// The parts of an Anaconda.org package document the registry record reads.
@@ -114,8 +118,8 @@ fn anaconda_owner(channel: Option<&str>) -> Result<&str, RegistryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
     #[test]
     fn conda_anaconda_normalizes() {
@@ -124,7 +128,9 @@ mod tests {
             "license": "BSD-3-Clause", "home": "https://numpy.org",
             "dev_url": "https://github.com/numpy/numpy", "source_git_url": "",
             "ndownloads": 138_106_777u64,
-            "files": [{"version": "1.9.3", "upload_time": "2021-04-23T10:00:00.000Z"}]
+            "files": [{"version": "1.9.3", "upload_time": "2021-04-23T10:00:00.000Z"},
+                      {"version": "1.9.3", "upload_time": "2021-04-23T11:00:00.000Z"},
+                      {"version": "1.9.2", "upload_time": "2021-01-01T00:00:00.000Z"}]
         })
         .to_string();
         let net = Fixtures::default()
@@ -136,13 +142,14 @@ mod tests {
                 "https://api.anaconda.org/package/anaconda/numpy",
                 br#"{"latest_version": "1.0.0"}"#,
             );
-        let look = |purl: &str| {
-            crate::registry::lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled())
-        };
+        let look = |purl: &str| look(purl, &net);
         let r = look("pkg:conda/numpy").expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Conda);
         assert_eq!(r.version, "1.9.3");
         assert_eq!(r.published_at, Some(1_619_172_000));
+        // One release per version, dated by its first upload.
+        assert_eq!(r.release_count, Some(2));
+        assert_eq!(r.previous_published_at, Some(1_609_459_200)); // 2021-01-01
         assert_eq!(
             r.repository.as_deref(),
             Some("https://github.com/numpy/numpy"),

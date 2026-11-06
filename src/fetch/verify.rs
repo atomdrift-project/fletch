@@ -12,12 +12,14 @@ use sha2::{Digest, Sha256, Sha512};
 
 use crate::fetch::go_hash;
 use crate::fetch::select::purl_checksums;
+use crate::fetch::to_hex;
 use crate::purl::Purl;
 
 /// Every digest one reference declares for its bytes: the manifest's pin and
 /// the checksums its PURL carries.
 pub(crate) struct Pins<'a> {
-    declared: Option<&'a PinnedHash>,
+    /// The manifest's pin.
+    manifest: Option<&'a PinnedHash>,
     checksums: BTreeMap<String, String>,
     /// Whether the PURL has a `checksum` qualifier at all, even one too
     /// malformed to yield a digest.
@@ -25,10 +27,11 @@ pub(crate) struct Pins<'a> {
 }
 
 impl<'a> Pins<'a> {
-    /// The pins of a reference declaring `declared`, fetched as `purl`.
-    pub(crate) fn new(declared: Option<&'a PinnedHash>, purl: Option<&Purl>) -> Self {
+    /// The pins of a reference whose manifest pins it to `manifest`, fetched
+    /// as `purl`.
+    pub(crate) fn new(manifest: Option<&'a PinnedHash>, purl: Option<&Purl>) -> Self {
         Self {
-            declared,
+            manifest,
             checksums: purl.map(purl_checksums).unwrap_or_default(),
             checksum_qualifier: purl.is_some_and(|p| p.qualifier("checksum").is_some()),
         }
@@ -36,37 +39,30 @@ impl<'a> Pins<'a> {
 
     /// Whether the reference declares any integrity requirement, so bytes no
     /// pin could be checked against are unverified rather than plain.
-    pub(crate) fn declared(&self) -> bool {
-        self.declared.is_some() || self.checksum_qualifier
+    pub(crate) fn requires_integrity(&self) -> bool {
+        self.manifest.is_some() || self.checksum_qualifier
     }
 
     /// Whether a manifest pin is a Go module-tree hash, read from the
     /// archive at random rather than streamed.
     pub(crate) fn is_go_tree(&self) -> bool {
-        self.declared
+        self.manifest
             .is_some_and(|pin| pin.algo == HashAlgo::GoModH1)
     }
 
     /// Whether either pin calls for `algo`, named `name` in a PURL checksum.
     fn wants(&self, algo: HashAlgo, name: &str) -> bool {
-        self.declared.is_some_and(|p| p.algo == algo) || self.checksums.contains_key(name)
+        self.manifest.is_some_and(|p| p.algo == algo) || self.checksums.contains_key(name)
     }
 }
 
 /// What one pass over a body tells about it: its SHA-256 and size, and the
 /// other digests its pins name (computed only when they do).
 pub(crate) struct Digests {
-    sha256: [u8; 32],
+    pub(crate) sha256: [u8; 32],
     pub(crate) size: u64,
     sha1: Option<[u8; 20]>,
     sha512: Option<[u8; 64]>,
-}
-
-impl Digests {
-    /// The body's SHA-256, lowercase hex.
-    pub(crate) fn sha256_hex(&self) -> String {
-        hex::encode(self.sha256)
-    }
 }
 
 /// Read `body` to its end once, taking its SHA-256 and size, and its SHA-1
@@ -105,36 +101,65 @@ pub(crate) fn digest(mut body: impl Read, pins: &Pins<'_>) -> std::io::Result<Di
 /// Lockfiles use both: npm `integrity` is SRI base64 (`sha256-…`, `sha1-…`,
 /// `sha512-…`), a Cargo.lock `checksum` or a yarn `resolved` fragment is hex.
 fn spells(declared: &str, digest: &[u8]) -> bool {
-    hex::encode(digest).eq_ignore_ascii_case(declared)
+    to_hex(digest).eq_ignore_ascii_case(declared)
         || base64::engine::general_purpose::STANDARD.encode(digest) == declared
 }
 
+/// How a body compares with the digests declared for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// A declared digest agrees with the bytes.
+    Match,
+    /// A declared digest disagrees with the bytes.
+    Mismatch,
+    /// No declared digest could be checked: none was declared, or its
+    /// algorithm is unsupported, or its check failed or ran over budget.
+    Unchecked,
+}
+
 /// Verify a body, by its `digests`, against the manifest's pin. A Go
-/// module-tree pin reads the body's zip at `zip`. `None` when there is no pin
-/// or verification is unsupported, malformed, or exceeds its budget.
+/// module-tree pin reads the body's zip at `zip`.
 ///
 /// SHA-1 is collision-weak, but a declared SHA-1 that matches the delivered
 /// bytes is still evidence they are the bytes the lockfile named, and it is
 /// all a yarn v1 lockfile pins.
-pub(crate) fn verify_pin(pins: &Pins<'_>, digests: &Digests, zip: Option<&Path>) -> Option<bool> {
-    let pin = pins.declared?;
-    match pin.algo {
+pub(crate) fn verify_pin(pins: &Pins<'_>, digests: &Digests, zip: Option<&Path>) -> Verdict {
+    let Some(pin) = pins.manifest else {
+        return Verdict::Unchecked;
+    };
+    let matched = match pin.algo {
         HashAlgo::Sha256 => Some(spells(&pin.value, &digests.sha256)),
-        HashAlgo::Sha512 => Some(spells(&pin.value, digests.sha512.as_ref()?)),
-        HashAlgo::Sha1 => Some(spells(&pin.value, digests.sha1.as_ref()?)),
-        HashAlgo::GoModH1 => go_hash::zip_h1(std::fs::File::open(zip?).ok()?)
-            .map(|actual| actual == pin.value.trim_start_matches("h1:")),
+        HashAlgo::Sha512 => digests.sha512.map(|d| spells(&pin.value, &d)),
+        HashAlgo::Sha1 => digests.sha1.map(|d| spells(&pin.value, &d)),
+        HashAlgo::GoModH1 => zip.and_then(|zip| {
+            let archive = std::fs::File::open(zip)
+                .inspect_err(|e| {
+                    tracing::debug!(error = %e, "go module zip unreadable; pin unverified");
+                })
+                .ok()?;
+            let actual = go_hash::zip_h1(archive);
+            if actual.is_none() {
+                tracing::debug!("go module zip malformed or over budget; pin unverified");
+            }
+            let want = pin.value.strip_prefix("h1:").unwrap_or(&pin.value);
+            actual.map(|actual| actual == want)
+        }),
         _ => None,
+    };
+    match matched {
+        Some(true) => Verdict::Match,
+        Some(false) => Verdict::Mismatch,
+        None => Verdict::Unchecked,
     }
 }
 
-/// Verify a body, by its `digests`, against the checksums its PURL carries.
-/// `Some(false)` when any computable checksum disagrees, `Some(true)` when at
-/// least one agrees and none disagrees, `None` when none can be computed. An
-/// algorithm fletch does not compute (`blake2b-256`, `md5`) is no evidence
-/// either way, so it neither verifies the bytes nor vetoes a match.
-pub(crate) fn verify_purl_checksum(pins: &Pins<'_>, digests: &Digests) -> Option<bool> {
-    let mut verified = false;
+/// Verify a body, by its `digests`, against the checksums its PURL carries:
+/// a mismatch when any computable checksum disagrees, a match when at least
+/// one agrees and none disagrees. An algorithm fletch does not compute
+/// (`blake2b-256`, `md5`) is no evidence either way, so it neither verifies
+/// the bytes nor vetoes a match.
+pub(crate) fn verify_purl_checksum(pins: &Pins<'_>, digests: &Digests) -> Verdict {
+    let mut verdict = Verdict::Unchecked;
     for (algorithm, expected) in &pins.checksums {
         let actual: Option<&[u8]> = match algorithm.as_str() {
             "sha256" => Some(&digests.sha256),
@@ -142,12 +167,12 @@ pub(crate) fn verify_purl_checksum(pins: &Pins<'_>, digests: &Digests) -> Option
             "sha1" => digests.sha1.as_ref().map(<[u8; 20]>::as_slice),
             _ => continue,
         };
-        if !actual.is_some_and(|actual| hex::encode(actual).eq_ignore_ascii_case(expected)) {
-            return Some(false);
+        if !actual.is_some_and(|actual| to_hex(actual).eq_ignore_ascii_case(expected)) {
+            return Verdict::Mismatch;
         }
-        verified = true;
+        verdict = Verdict::Match;
     }
-    verified.then_some(true)
+    verdict
 }
 
 #[cfg(test)]
@@ -158,7 +183,7 @@ mod tests {
         PinnedHash { algo, value }
     }
 
-    fn judged(pin: &PinnedHash, body: &[u8]) -> Option<bool> {
+    fn judged(pin: &PinnedHash, body: &[u8]) -> Verdict {
         let pins = Pins::new(Some(pin), None);
         let digests = digest(body, &pins).unwrap();
         verify_pin(&pins, &digests, None)
@@ -177,18 +202,18 @@ mod tests {
             (HashAlgo::Sha1, sha1.as_slice()),
         ] {
             for spelling in [
-                hex::encode(digest),
-                hex::encode(digest).to_ascii_uppercase(),
+                to_hex(digest),
+                to_hex(digest).to_ascii_uppercase(),
                 b64(digest),
             ] {
                 assert_eq!(
                     judged(&pinned(algo, spelling.clone()), body),
-                    Some(true),
+                    Verdict::Match,
                     "{algo:?} {spelling}"
                 );
                 assert_eq!(
                     judged(&pinned(algo, spelling.clone()), b"other bytes"),
-                    Some(false),
+                    Verdict::Mismatch,
                     "{algo:?} {spelling} over other bytes"
                 );
             }
@@ -201,7 +226,7 @@ mod tests {
     fn an_sri_sha256_integrity_pin_verifies() {
         let body = b"package";
         let sri = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
-        assert_eq!(judged(&pinned(HashAlgo::Sha256, sri), body), Some(true));
+        assert_eq!(judged(&pinned(HashAlgo::Sha256, sri), body), Verdict::Match);
     }
 
     #[test]
@@ -215,14 +240,17 @@ mod tests {
             let digests = digest(&body[..], &pins).unwrap();
             verify_purl_checksum(&pins, &digests)
         };
-        let good = hex::encode(Sha256::digest(body));
+        let good = to_hex(Sha256::digest(body));
         assert_eq!(
             verdict(&purl(&format!("blake2b-256:ab,sha256:{good}"))),
-            Some(true)
+            Verdict::Match
         );
-        assert_eq!(verdict(&purl("blake2b-256:ab,sha256:00")), Some(false));
-        assert_eq!(verdict(&purl("md5:0123")), None);
-        let sha1 = hex::encode(Sha1::digest(body));
-        assert_eq!(verdict(&purl(&format!("sha1:{sha1}"))), Some(true));
+        assert_eq!(
+            verdict(&purl("blake2b-256:ab,sha256:00")),
+            Verdict::Mismatch
+        );
+        assert_eq!(verdict(&purl("md5:0123")), Verdict::Unchecked);
+        let sha1 = to_hex(Sha1::digest(body));
+        assert_eq!(verdict(&purl(&format!("sha1:{sha1}"))), Verdict::Match);
     }
 }

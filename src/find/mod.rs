@@ -24,6 +24,7 @@ mod shell;
 mod source;
 mod urls;
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use filefacts::{FileType, ParsedFile, RefKind, RefLocator, Reference, Symbol, Values};
@@ -83,12 +84,6 @@ impl Lang {
             Self::PowerShell => "powershell",
         }
     }
-
-    /// Source code, whose commands are string literals inside calls rather
-    /// than the text itself.
-    const fn is_source(self) -> bool {
-        matches!(self, Self::JavaScript | Self::Python)
-    }
 }
 
 /// All external references a file points at: filefacts' declared
@@ -111,12 +106,27 @@ pub fn references(parsed: &ParsedFile<'_>) -> Discovery {
     }
     strings(parsed, &mut found);
     match file_type {
-        FileType::Shell => shell::scan(Lang::Shell, &mut found),
-        FileType::Dockerfile => shell::scan(Lang::Dockerfile, &mut found),
+        FileType::Shell | FileType::Dockerfile => {
+            let lang = if file_type == FileType::Shell {
+                Lang::Shell
+            } else {
+                Lang::Dockerfile
+            };
+            shell::scan(lang, &mut found);
+            // A parsed shell script's `curl`/`wget` targets come from its
+            // call facts (see `facts`), which know a comment or a printed
+            // string from a command; reading the text as well would report
+            // those. The text pass stands in where there are no such facts.
+            if (lang == Lang::Dockerfile || parsed.source_ast().is_none())
+                && let Some(text) = found.text()
+            {
+                urls::bare_fetch_urls(text, lang, &mut found);
+            }
+        }
         FileType::JavaScript | FileType::TypeScript => js::scan(parsed, &mut found),
         FileType::Python if !python_stub => source::scan_python(parsed, &mut found),
         FileType::PowerShell => {
-            if let Some(text) = found.text {
+            if let Some(text) = found.text() {
                 // An explicit URL keeps its whole command line as evidence, so
                 // the fetch boundary sees `irm https://… | iex` as one edge.
                 urls::urls(text, Lang::PowerShell.label(), &mut found);
@@ -176,7 +186,7 @@ fn facts(file_type: FileType, values: &Values, symbols: &[Symbol], out: &mut Fou
 /// A UTF-16 script (Windows tools save PowerShell that way) is decoded first,
 /// or it would never be scanned at all. Its references' offsets are then
 /// positions in the decoded text, so only approximate in the file.
-fn scan_text(bytes: &[u8], file_type: FileType) -> Option<std::borrow::Cow<'_, str>> {
+fn scan_text(bytes: &[u8], file_type: FileType) -> Option<Cow<'_, str>> {
     if matches!(
         file_type,
         FileType::Shell | FileType::Dockerfile | FileType::PowerShell
@@ -213,32 +223,28 @@ fn scan_text(bytes: &[u8], file_type: FileType) -> Option<std::borrow::Cow<'_, s
 /// opening run zero, as ASCII text encodes). Unpaired surrogates become
 /// U+FFFD.
 fn utf16_text(bytes: &[u8], sniff: bool) -> Option<String> {
-    let (body, little) = match bytes {
-        [0xFF, 0xFE, rest @ ..] => (rest, true),
-        [0xFE, 0xFF, rest @ ..] => (rest, false),
+    let (body, unit): (_, fn([u8; 2]) -> u16) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => (rest, u16::from_be_bytes),
         [first, ..]
             if sniff
                 && bytes.len() >= 4
                 && *first != 0
                 && bytes.iter().take(256).skip(1).step_by(2).all(|&b| b == 0) =>
         {
-            (bytes, true)
+            (bytes, u16::from_le_bytes)
         }
         _ => return None,
     };
-    let units = body.as_chunks::<2>().0.iter().map(|&pair| {
-        if little {
-            u16::from_le_bytes(pair)
-        } else {
-            u16::from_be_bytes(pair)
-        }
-    });
     Some(
-        char::decode_utf16(units)
+        char::decode_utf16(body.as_chunks::<2>().0.iter().copied().map(unit))
             .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
             .collect(),
     )
 }
+
+/// The [`Reference::source`] of a URL in the file's extracted strings.
+const STRING_SOURCE: &str = "string";
 
 /// URLs in the file's extracted strings, including ones recovered from an
 /// encoding (base64, XOR) that the raw bytes never show in the clear. Each
@@ -250,7 +256,7 @@ fn strings(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
             out.push_at(
                 urls::url_locator(url),
                 RefKind::UrlFetch,
-                "string",
+                STRING_SOURCE,
                 &s.value,
                 Some(s.data_offset),
             );
@@ -274,7 +280,7 @@ fn strings(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
 /// a single slice; a per-file call cannot see the manifest's declarations.
 #[must_use]
 pub fn undeclared_packages(refs: &[Reference]) -> Vec<&Reference> {
-    let declared: std::collections::HashSet<PackageKey> = refs
+    let declared: std::collections::HashSet<PackageKey<'_>> = refs
         .iter()
         .filter(|r| r.kind == RefKind::Dependency)
         .filter_map(|r| PackageKey::of(&r.locator))
@@ -287,37 +293,36 @@ pub fn undeclared_packages(refs: &[Reference]) -> Vec<&Reference> {
 
 /// Which package a PURL locator names, independent of how it is spelled.
 #[derive(Debug, PartialEq, Eq, Hash)]
-struct PackageKey {
-    typ: String,
-    namespace: Vec<String>,
-    name: String,
+enum PackageKey<'a> {
+    /// A PURL's canonical type, namespace and name.
+    Parsed {
+        typ: String,
+        namespace: Vec<String>,
+        name: String,
+    },
+    /// A PURL that won't parse, by its text before any version, so it can
+    /// still match itself.
+    Unparsed(&'a str),
 }
 
-impl PackageKey {
+impl<'a> PackageKey<'a> {
     /// The key of a PURL locator, parsed and canonicalized, so a declared
     /// `pkg:pypi/typing-extensions@4.9.0` and a hunted
     /// `pkg:pypi/typing_extensions` (PEP 503), or a literal and an encoded npm
-    /// `@scope`, are the same package. A PURL that won't parse is keyed by its
-    /// text before any version, so it can still match itself. `None` for a
-    /// non-PURL locator.
-    fn of(locator: &RefLocator) -> Option<Self> {
+    /// `@scope`, are the same package. `None` for a non-PURL locator.
+    fn of(locator: &'a RefLocator) -> Option<Self> {
         let RefLocator::Purl(p) = locator else {
             return None;
         };
         Some(match crate::purl::Purl::parse(p) {
-            Ok(purl) => Self {
+            Ok(purl) => Self::Parsed {
                 typ: purl.typ().to_owned(),
                 namespace: purl.namespace().to_vec(),
                 name: purl.name().to_owned(),
             },
             Err(_) => {
                 let base = p.split(['?', '#']).next().unwrap_or(p);
-                let base = base.rsplit_once('@').map_or(base, |(b, _)| b);
-                Self {
-                    typ: String::new(),
-                    namespace: Vec::new(),
-                    name: base.to_owned(),
-                }
+                Self::Unparsed(base.rsplit_once('@').map_or(base, |(b, _)| b))
             }
         })
     }
@@ -566,6 +571,22 @@ mod tests {
         found
     }
 
+    /// [`within_bound`] for the recognizers alone: filefacts' own parse and
+    /// extraction run first, untimed, since on inputs this large they cost
+    /// more than the bound in a debug build however linear the scan is.
+    fn scan_within_bound(bytes: &[u8], name: &str) -> Discovery {
+        let parsed = filefacts::OpenOptions::new()
+            .path(Path::new(name))
+            .open(bytes);
+        let _ = (parsed.source_ast(), parsed.symbols(), parsed.values());
+        let _ = (parsed.text(), parsed.references());
+        let start = std::time::Instant::now();
+        let found = references(&parsed);
+        let elapsed = start.elapsed();
+        assert!(elapsed < HOSTILE_BOUND, "{name}: {elapsed:?}");
+        found
+    }
+
     /// An npm manifest whose `postinstall` hook is `command`.
     fn hook(command: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -588,14 +609,94 @@ mod tests {
 
     #[test]
     fn a_run_of_option_words_costs_linear_time() {
-        for command in [
-            "-/npm ".repeat(200_000),
-            "npm --registry npm ".repeat(100_000),
-            format!("npm {}install evil", "-x ".repeat(200_000)),
+        for (command, want) in [
+            ("-/npm ".repeat(200_000), None),
+            ("npm --registry npm ".repeat(100_000), None),
+            (
+                format!("npm {}install evil", "-x ".repeat(200_000)),
+                Some("pkg:npm/evil"),
+            ),
         ] {
             let found = within_bound(&hook(&command), "package.json");
-            assert!(found.references.is_empty(), "{:?}", found.references);
+            assert_eq!(
+                locators(&found.references),
+                Vec::from_iter(want),
+                "{:?}",
+                found.references
+            );
+            assert!(!found.truncated);
         }
+    }
+
+    #[test]
+    fn resolved_text_cannot_amplify_a_long_constant() {
+        let constant = format!("npm i {}", "zz ".repeat(5_400));
+        let mut js = format!(
+            "const cp=require('child_process');cp.exec('npm i early');const a='{constant}';\n"
+        );
+        for i in 0..2_000 {
+            js.push_str(&format!("cp.exec(a+'{i}');\n"));
+        }
+        let found = within_bound(js.as_bytes(), "x.js");
+        let all = locators(&found.references);
+        assert!(all.contains(&"pkg:npm/early"), "{all:?}");
+        assert!(all.contains(&"pkg:npm/zz"), "{all:?}");
+        // Rebuilding the constant at every call outspends the file's budget,
+        // which stops resolution after a bounded number of calls.
+        assert!(found.truncated);
+        assert!(found.references.len() < 100, "{}", found.references.len());
+        // A file of ordinary size resolves every call.
+        let small = "const cp=require('child_process');const a='npm i zz ';cp.exec(a+'one');cp.exec(a+'two');";
+        let found = references_in_bytes(small.as_bytes(), "x.js");
+        assert!(!found.truncated);
+        assert!(locators(&found.references).contains(&"pkg:npm/two"));
+    }
+
+    #[test]
+    fn an_npm_hook_naming_one_url_many_times_costs_linear_time() {
+        let command = "curl http://a.test/x ".repeat(50_000);
+        let found = scan_within_bound(&hook(&command), "package.json");
+        assert_eq!(locators(&found.references), ["http://a.test/x"]);
+    }
+
+    #[test]
+    fn a_long_chain_of_set_calls_costs_linear_time() {
+        let js = format!("x{};require('evil-pkg');", ".set()".repeat(100_000));
+        let found = scan_within_bound(js.as_bytes(), "x.js");
+        assert!(locators(&found.references).contains(&"pkg:npm/evil-pkg"));
+    }
+
+    /// Name lookups never climb the scope chain, so names used and written
+    /// deep inside nested blocks cost linear time.
+    #[test]
+    fn writes_deep_in_nested_scopes_cost_linear_time() {
+        for body in ["a=1;", "var v=1;", "f(b);"] {
+            let js = format!(
+                "{}{}{}",
+                "{".repeat(250),
+                body.repeat(100_000),
+                "}".repeat(250)
+            );
+            let found = scan_within_bound(js.as_bytes(), "x.js");
+            assert!(!found.truncated, "{body}");
+        }
+    }
+
+    /// However deeply a file nests its blocks, its calls are still read: a
+    /// few hundred braces must not switch the JavaScript recognizer off.
+    #[test]
+    fn deeply_nested_scopes_do_not_hide_a_files_calls() {
+        let depth = 5_000;
+        let js = format!(
+            "const cp=require('child_process');const c='npm i evil-cmd';{}require('evil-pkg');cp.execSync(c);{}",
+            "{".repeat(depth),
+            "}".repeat(depth)
+        );
+        let found = within_bound(js.as_bytes(), "x.js");
+        let all = locators(&found.references);
+        assert!(all.contains(&"pkg:npm/evil-pkg"), "{all:?}");
+        assert!(all.contains(&"pkg:npm/evil-cmd"), "{all:?}");
+        assert!(!found.truncated);
     }
 
     #[test]

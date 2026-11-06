@@ -5,7 +5,7 @@ use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
-use crate::ecosystem::{Coordinates, fetch_json, flag, null_default, unix_secs};
+use crate::ecosystem::{Coordinates, count, fetch_json, flag, non_empty, null_default, unix_secs};
 use crate::fetch::{BlobCache, Fetch, cached_metadata, safe_coordinate};
 use crate::registry::RegistryError;
 
@@ -132,7 +132,8 @@ fn aur_info_url(name: &str) -> String {
 /// one its namespace names, or any of them for the `arch` vendor namespace,
 /// stable repositories first. Recency comes from `last_update`; an
 /// out-of-date flag is the deprecation analogue. AUR-only packages aren't
-/// here, so they are `NotFound`.
+/// here, so they are `NotFound`. The record is the current build; the
+/// dispatcher reconciles a requested version with it.
 pub(crate) fn official(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
@@ -157,36 +158,33 @@ pub(crate) fn official(
         return Err(RegistryError::NotFound);
     };
     tracing::debug!(name = %c.name().escape_debug(), repo, "arch lookup matched");
-    let version = match (r.pkgver.as_deref(), r.pkgrel.as_deref()) {
+
+    let mut record = Registry::new(Ecosystem::Arch, c.name());
+    record.version = match (r.pkgver.as_deref(), r.pkgrel.as_deref()) {
         (Some(v), Some(rel)) => format!("{v}-{rel}"),
         (Some(v), None) => v.to_string(),
         _ => String::new(),
     };
-
-    let mut registry = Registry::new(Ecosystem::Arch, c.name().to_string());
-    registry.version = version;
-    registry.published_at = r
+    record.published_at = r
         .last_update
         .as_deref()
         .or(r.build_date.as_deref())
         .and_then(unix_secs);
-    registry.author = r.packager.clone();
-    registry.description = r.pkgdesc.clone();
-    registry.homepage = r.url.clone();
-    registry.license = r.licenses.first().cloned();
-    registry.maintainers = r
-        .maintainers
-        .as_ref()
-        .and_then(|m| u32::try_from(m.len()).ok());
-    registry.deprecated = flag(Some(r.flag_date.is_some()), "flagged out-of-date");
-    Ok(registry)
+    record.author = r.packager.clone();
+    record.description = r.pkgdesc.clone();
+    record.homepage = r.url.clone();
+    record.license = r.licenses.first().cloned();
+    record.maintainers = r.maintainers.as_ref().map(|m| count(m.len()));
+    record.deprecated = flag(Some(r.flag_date.is_some()), "flagged out-of-date");
+    Ok(record)
 }
 
 /// Look up the package `c` names in the AUR through the RPC `info` endpoint.
 /// The AUR has no downloads; its custody signal is the maintainer set, and
 /// `LastModified` (when the PKGBUILD last changed) is the supply-chain
 /// "age". Official repo packages aren't in the AUR, so they return an empty
-/// result → `NotFound`.
+/// result → `NotFound`. The record is the current PKGBUILD's version; the
+/// dispatcher reconciles a requested version with it.
 pub(crate) fn user(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
@@ -199,36 +197,33 @@ pub(crate) fn user(
         .next()
         .ok_or(RegistryError::NotFound)?;
 
-    let mut registry = Registry::new(
+    let mut record = Registry::new(
         Ecosystem::Aur,
         r.name.clone().unwrap_or_else(|| c.name().to_string()),
     );
-    registry.version = r.version.unwrap_or_default();
+    record.version = r.version.unwrap_or_default();
     // LastModified is a Unix-seconds integer already.
-    registry.published_at = r.last_modified;
+    record.published_at = r.last_modified;
     // FirstSubmitted is the package's birth; the gap to LastModified is the
     // dormancy a revived abandoned package would show.
-    registry.first_published_at = r.first_submitted;
+    record.first_published_at = r.first_submitted;
     // The primary maintainer plus any co-maintainers — the custody set.
-    registry.maintainers = Some(
-        u32::try_from(r.co_maintainers.len())
-            .unwrap_or(u32::MAX)
-            .saturating_add(u32::from(r.maintainer.is_some())),
-    );
-    registry.author = r.maintainer.clone();
-    registry.publisher = r.maintainer;
-    registry.title = r.name;
-    registry.description = r.description;
-    registry.homepage = r.url;
-    registry.deprecated = flag(r.out_of_date.map(|t| t > 0), "flagged out-of-date");
+    record.maintainers =
+        Some(count(r.co_maintainers.len()).saturating_add(u32::from(r.maintainer.is_some())));
+    record.author = r.maintainer.clone();
+    record.publisher = r.maintainer;
+    record.title = r.name;
+    record.description = r.description;
+    record.homepage = r.url;
+    record.deprecated = flag(r.out_of_date.map(|t| t > 0), "flagged out-of-date");
     // The AUR's popularity score (votes decayed by age) and the votes
     // behind it: the AUR case `Registry::rating` names.
-    registry.rating = r
+    record.rating = r
         .popularity
         .filter(|p| p.is_finite() && *p >= 0.0)
         .map(|p| p as f32);
-    registry.rating_count = r.num_votes;
-    Ok(registry)
+    record.rating_count = r.num_votes;
+    Ok(record)
 }
 
 /// An AUR RPC `info` response.
@@ -241,17 +236,21 @@ struct AurInfo {
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 struct AurPackage {
+    #[serde(deserialize_with = "non_empty")]
     name: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     version: Option<String>,
     last_modified: Option<u64>,
     first_submitted: Option<u64>,
+    #[serde(deserialize_with = "non_empty")]
     maintainer: Option<String>,
     #[serde(deserialize_with = "null_default")]
     co_maintainers: Vec<IgnoredAny>,
+    #[serde(deserialize_with = "non_empty")]
     description: Option<String>,
-    #[serde(rename = "URL")]
+    #[serde(rename = "URL", deserialize_with = "non_empty")]
     url: Option<String>,
-    #[serde(rename = "URLPath")]
+    #[serde(rename = "URLPath", deserialize_with = "non_empty")]
     url_path: Option<String>,
     out_of_date: Option<u64>,
     popularity: Option<f64>,
@@ -268,31 +267,105 @@ struct ArchSearch {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct ArchPackage {
+    #[serde(deserialize_with = "non_empty")]
     pkgname: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     repo: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     arch: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     pkgver: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     pkgrel: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     last_update: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     build_date: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     packager: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     pkgdesc: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     url: Option<String>,
     #[serde(deserialize_with = "null_default")]
     licenses: Vec<String>,
     maintainers: Option<Vec<IgnoredAny>>,
+    #[serde(deserialize_with = "non_empty")]
     flag_date: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
-    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
+    fn pacman() -> Fixtures {
+        let doc = serde_json::json!({"results": [{
+            "pkgname": "pacman", "repo": "core", "pkgver": "7.1.0", "pkgrel": "2",
+            "last_update": "2021-04-23T10:00:00.379Z"
+        }]})
+        .to_string();
+        Fixtures::default().with(
+            "https://archlinux.org/packages/search/json/?name=pacman",
+            doc.as_bytes(),
+        )
+    }
+
+    fn yay() -> Fixtures {
+        let rpc = br#"{"results":[{"Name":"yay","Version":"12.0.0-1","LastModified":1619172000}]}"#;
+        Fixtures::default().with("https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=yay", rpc)
+    }
+
+    #[test]
+    fn a_requested_version_is_described_undated_beside_the_current_build() {
+        for (purl, net, current) in [
+            ("pkg:alpm/arch/pacman@5.0", pacman(), "7.1.0-2"),
+            ("pkg:alpm/aur/yay@11.0.0-1", yay(), "12.0.0-1"),
+        ] {
+            let r = look(purl, &net).expect("record");
+            assert_eq!(
+                r.version,
+                purl.rsplit('@').next().unwrap_or_default(),
+                "{purl}"
+            );
+            assert_eq!(r.latest_version.as_deref(), Some(current), "{purl}");
+            assert_eq!(r.published_at, None, "{purl}: the current build's date");
+        }
+        // Unversioned, the current build is both the version and the latest.
+        let r = look("pkg:alpm/arch/pacman", &pacman()).expect("record");
+        assert_eq!(r.version, "7.1.0-2");
+        assert_eq!(r.latest_version.as_deref(), Some("7.1.0-2"));
+        assert_eq!(r.published_at, Some(1_619_172_000));
+    }
+
+    #[test]
+    fn blank_package_fields_are_unknown() {
+        let doc = serde_json::json!({"results": [{
+            "pkgname": "pacman", "repo": "core", "pkgver": "7", "pkgrel": "",
+            "packager": "", "pkgdesc": " ", "url": "", "flag_date": ""
+        }]})
+        .to_string();
+        let net = Fixtures::default().with(
+            "https://archlinux.org/packages/search/json/?name=pacman",
+            doc.as_bytes(),
+        );
+        let r = look("pkg:alpm/core/pacman", &net).expect("record");
+        assert_eq!(r.version, "7");
+        assert_eq!(r.author, None);
+        assert_eq!(r.description, None);
+        assert_eq!(r.homepage, None);
+        assert_eq!(r.deprecated, None, "a blank flag date is no flag");
+
+        let rpc = br#"{"results":[{"Name":"","Version":"1-1","Maintainer":"","Description":"","URL":""}]}"#;
+        let net =
+            Fixtures::default().with("https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=yay", rpc);
+        let r = look("pkg:alpm/aur/yay", &net).expect("record");
+        assert_eq!(r.name, "yay");
+        assert_eq!(r.author, None);
+        assert_eq!(r.maintainers, Some(0));
+        assert_eq!(r.description, None);
+        assert_eq!(r.homepage, None);
     }
 
     #[test]

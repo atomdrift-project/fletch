@@ -18,14 +18,17 @@
 //! when the argument is not a package URL or the registry has no record for
 //! it (stdout empty, the reason on stderr).
 
-use std::io::Write;
+use std::io::{BufRead, Read, Write};
 use std::process::ExitCode;
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde::Serialize;
 
-use fletch::fetch::{BlobCache, HttpFetch, RecordedSource};
+use fletch::fetch::{
+    BlobCache, Fetch, FetchError, Fetched, HttpFetch, RecordedSource, Request, fetch_ref,
+};
 use fletch::purl::Purl;
 use fletch::{RefKind, RefLocator, Reference, Registry, registry};
 
@@ -38,6 +41,13 @@ usage: fletch registry <purl>
 Diagnostics go to stderr at the level FLETCH_LOG names
 (error, warn, info, debug, trace; default warn).
 ";
+
+/// A command's failure: an I/O or encoding error, reported and exited on.
+type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// Exit status for an argument that is not a package URL, or a package with
+/// no registry record.
+const NO_RECORD: u8 = 2;
 
 /// Send the library's `tracing` events to stderr at the level `FLETCH_LOG`
 /// names, `warn` when unset or unrecognized; stdout stays the JSON channel.
@@ -55,10 +65,6 @@ fn init_logging() {
         .with_max_level(level)
         .init();
 }
-
-/// Exit status for an argument that is not a package URL, or a package with
-/// no registry record.
-const NO_RECORD: u8 = 2;
 
 fn main() -> ExitCode {
     init_logging();
@@ -82,7 +88,7 @@ fn main() -> ExitCode {
         }
     };
     outcome.unwrap_or_else(|error| {
-        eprintln!("fletch: {error:#}");
+        eprintln!("fletch: {error}");
         ExitCode::FAILURE
     })
 }
@@ -100,7 +106,7 @@ struct Envelope {
 /// it verbatim when it parses as JSON (the common case — npm, PyPI, crates, …);
 /// otherwise `body_b64` holds the bytes (an HTML listing, a compressed index).
 /// A document over the cache's source limit carries neither, and `truncated`.
-#[derive(Serialize, Clone)]
+#[derive(Serialize)]
 struct Source {
     url: String,
     status: u16,
@@ -115,28 +121,29 @@ struct Source {
     truncated: bool,
 }
 
-/// Map a recorded raw document onto the CLI's [`Source`] shape: a JSON body
-/// inline, anything else base64 in `body_b64`, and no body at all for a
-/// document whose bytes were not kept.
-fn source_from_recorded(s: RecordedSource) -> Source {
-    let (body, body_b64) = match &s.bytes {
-        None => (None, None),
-        Some(bytes) => match serde_json::from_slice::<serde_json::Value>(bytes) {
-            Ok(v) => (Some(v), None),
-            Err(_) => (
-                None,
-                Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
-            ),
-        },
-    };
-    Source {
-        truncated: s.bytes.is_none(),
-        url: s.url,
-        status: s.status,
-        content_type: s.content_type,
-        size: s.size,
-        body,
-        body_b64,
+impl From<RecordedSource> for Source {
+    /// A JSON body inline, anything else base64 in `body_b64`, and no body at
+    /// all for a document whose bytes were not kept.
+    fn from(s: RecordedSource) -> Self {
+        let (body, body_b64) = match &s.bytes {
+            None => (None, None),
+            Some(bytes) => match serde_json::from_slice::<serde_json::Value>(bytes) {
+                Ok(v) => (Some(v), None),
+                Err(_) => (
+                    None,
+                    Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                ),
+            },
+        };
+        Self {
+            truncated: s.bytes.is_none(),
+            url: s.url,
+            status: s.status,
+            content_type: s.content_type,
+            size: s.size,
+            body,
+            body_b64,
+        }
     }
 }
 
@@ -165,56 +172,82 @@ struct PurlProbe {
     download_url: Option<String>,
 }
 
-/// A [`fletch::fetch::Fetch`] backend that records every URL it is asked for
-/// and refuses it, so the probe can observe routing without touching the
-/// network.
+/// A [`Fetch`] backend that records every URL it is asked for and refuses
+/// it, so the probe can observe routing without touching the network.
 #[derive(Default)]
-struct ProbeNet(std::sync::Mutex<Vec<String>>);
+struct ProbeNet(Mutex<Vec<String>>);
 
-impl fletch::fetch::Fetch for ProbeNet {
-    fn send(
-        &self,
-        request: &fletch::fetch::Request<'_>,
-    ) -> Result<fletch::fetch::Fetched, fletch::fetch::FetchError> {
+impl Fetch for ProbeNet {
+    fn send(&self, request: &Request<'_>) -> Result<Fetched, FetchError> {
         self.0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(PoisonError::into_inner)
             .push(request.url.to_string());
-        Err(fletch::fetch::FetchError::Refused("probe".into()))
+        Err(FetchError::Refused("probe".into()))
     }
+}
+
+/// `<purl>: <why>` for stderr, both escaped: the PURL is often feed data and
+/// the reason can quote what a registry answered, and either may carry
+/// terminal control sequences.
+fn diagnostic(purl: &str, why: &dyn std::fmt::Display) -> String {
+    format!(
+        "{}: {}",
+        purl.escape_debug(),
+        why.to_string().escape_debug()
+    )
 }
 
 /// `purl <purl>`: print the probe for one PURL, or exit `2` with the reason
 /// when it is not a package URL.
-fn run_purl(purl: &str) -> anyhow::Result<ExitCode> {
+fn run_purl(purl: &str) -> CliResult<ExitCode> {
     if let Err(error) = Purl::parse(purl) {
-        // Escaped: the PURL is often feed data, and may carry terminal
-        // control sequences.
-        eprintln!("fletch: {}: {error}", purl.escape_debug());
+        eprintln!("fletch: {}", diagnostic(purl, &error));
         return Ok(ExitCode::from(NO_RECORD));
     }
     print_json(&probe_purl(purl))?;
     Ok(ExitCode::SUCCESS)
 }
 
+/// Longest stdin line `purl -` reads as a PURL; the rest of a longer line is
+/// skipped. No registry coordinate comes near it.
+const MAX_LINE_BYTES: usize = 64 * 1024;
+
 /// Batch form of [`run_purl`]: one PURL per stdin line, one JSON probe per
 /// stdout line, in order. A line that doesn't parse still emits a probe (just
 /// the `purl` field) rather than aborting, so a differential sweep can push
-/// thousands of adversarial inputs through a single process.
-fn run_purl_batch() -> anyhow::Result<ExitCode> {
-    let stdin = std::io::stdin().lock();
+/// thousands of adversarial inputs through a single process: invalid UTF-8 is
+/// read lossily, and a line past [`MAX_LINE_BYTES`] is probed as empty.
+fn run_purl_batch() -> CliResult<ExitCode> {
+    let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
-    for line in std::io::BufRead::lines(stdin) {
-        serde_json::to_writer(&mut stdout, &probe_purl(&line?))?;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let limit = MAX_LINE_BYTES as u64 + 1;
+        if (&mut stdin).take(limit).read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.ends_with(b"\n") {
+            line.pop();
+        } else if line.len() > MAX_LINE_BYTES {
+            stdin.skip_until(b'\n')?;
+            eprintln!("fletch: line over {MAX_LINE_BYTES} bytes; probed as empty");
+            line.clear();
+        }
+        let text = String::from_utf8_lossy(&line);
+        let purl = text.strip_suffix('\r').unwrap_or(&text);
+        serde_json::to_writer(&mut stdout, &probe_purl(purl))?;
         stdout.write_all(b"\n")?;
     }
+    drop(stdin);
     stdout.flush()?;
     Ok(ExitCode::SUCCESS)
 }
 
 /// Write one JSON document as a line on stdout — the shape both subcommands
 /// answer in.
-fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
+fn print_json(value: &impl Serialize) -> CliResult<()> {
     let mut stdout = std::io::stdout().lock();
     serde_json::to_writer(&mut stdout, value)?;
     stdout.write_all(b"\n")?;
@@ -226,8 +259,10 @@ fn print_json(value: &impl Serialize) -> anyhow::Result<()> {
 /// absent when the corresponding read fails, so batch callers see one probe
 /// per input no matter how malformed the input is.
 fn probe_purl(purl: &str) -> PurlProbe {
-    let (typ, path, version) = Purl::parse(purl)
-        .map(|p| (p.typ().to_string(), p.encoded_path(), p.encoded_version()))
+    let parsed = Purl::parse(purl).ok();
+    let (typ, path, version) = parsed
+        .as_ref()
+        .map(|p| (p.typ().to_owned(), p.encoded_path(), p.encoded_version()))
         .unwrap_or_default();
     let cache = BlobCache::disabled();
     let locator = RefLocator::Purl(purl.to_string());
@@ -240,7 +275,7 @@ fn probe_purl(purl: &str) -> PurlProbe {
     let registry_url = probe
         .0
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
         .into_iter()
         .next();
 
@@ -248,16 +283,16 @@ fn probe_purl(purl: &str) -> PurlProbe {
     // A resolvable PURL surfaces its download URL on the (expectedly failed)
     // record; `Unresolved` means the fetcher has no artifact mapping.
     let reference = Reference::new(locator, RefKind::Dependency, "cli", "");
-    let download_url =
-        fletch::fetch::fetch_ref(&reference, &ProbeNet::default(), &cache).resolved_url;
+    let download_url = fetch_ref(&reference, &ProbeNet::default(), &cache).resolved_url;
 
     PurlProbe {
         purl: purl.to_string(),
         typ,
         path,
         version,
-        normalized: fletch::purl::normalize(purl),
-        identity: fletch::purl::identity(purl),
+        // `purl::normalize` and `purl::identity`, from the one parse.
+        normalized: parsed.as_ref().map(Purl::to_string),
+        identity: parsed.map(|p| p.identity().to_string()),
         registry_url,
         download_url,
     }
@@ -265,7 +300,7 @@ fn probe_purl(purl: &str) -> PurlProbe {
 
 /// `registry <purl>`: print the record envelope, or exit `2` with the reason
 /// there is none.
-fn run_registry(purl: &str) -> anyhow::Result<ExitCode> {
+fn run_registry(purl: &str) -> CliResult<ExitCode> {
     let net = HttpFetch::new()?.with_github_token(std::env::var("GITHUB_TOKEN").ok());
     // A disabled cache fetches and records every document fresh, so the
     // snapshot is current rather than a stale prior run's.
@@ -276,10 +311,7 @@ fn run_registry(purl: &str) -> anyhow::Result<ExitCode> {
     let record = match record {
         Ok(record) => record,
         Err(why) => {
-            eprintln!(
-                "fletch: no registry record for {}: {why}",
-                purl.escape_debug()
-            );
+            eprintln!("fletch: no registry record for {}", diagnostic(purl, &why));
             return Ok(ExitCode::from(NO_RECORD));
         }
     };
@@ -289,20 +321,26 @@ fn run_registry(purl: &str) -> anyhow::Result<ExitCode> {
     // consumer can still re-derive plain age from `published_at` later.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| anyhow::anyhow!("system clock before unix epoch: {e}"))?
+        .map_err(|e| format!("system clock before unix epoch: {e}"))?
         .as_secs();
 
     print_json(&Envelope {
         record: record.with_age(now),
-        sources: sources.into_iter().map(source_from_recorded).collect(),
+        sources: sources.into_iter().map(Source::from).collect(),
     })?;
     Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::source_from_recorded;
+    use super::{Source, diagnostic};
     use fletch::fetch::RecordedSource;
+
+    #[test]
+    fn diagnostics_cannot_drive_the_terminal() {
+        let line = diagnostic("pkg:npm/\u{1b}[2J", &"bad \u{1b}]0;owned\u{7} reply");
+        assert!(!line.chars().any(char::is_control), "{line}");
+    }
 
     fn recorded(content_type: &str, bytes: Option<&[u8]>) -> RecordedSource {
         RecordedSource {
@@ -316,8 +354,7 @@ mod tests {
 
     #[test]
     fn maps_json_source_inline() {
-        let source =
-            source_from_recorded(recorded("application/json", Some(br#"{"hello":"world"}"#)));
+        let source = Source::from(recorded("application/json", Some(br#"{"hello":"world"}"#)));
         assert_eq!(source.url, "https://registry.example/pkg");
         assert_eq!(source.status, 200);
         assert_eq!(source.content_type.as_deref(), Some("application/json"));
@@ -329,7 +366,7 @@ mod tests {
 
     #[test]
     fn maps_non_json_source_to_base64() {
-        let source = source_from_recorded(recorded("text/html", Some(b"<html>a listing</html>")));
+        let source = Source::from(recorded("text/html", Some(b"<html>a listing</html>")));
         // Non-JSON bytes fall back to base64 so nothing is lost or corrupted.
         assert!(source.body.is_none());
         assert!(source.body_b64.is_some());
@@ -338,7 +375,7 @@ mod tests {
 
     #[test]
     fn an_unkept_source_is_truncated_not_empty() {
-        let source = source_from_recorded(recorded("application/json", None));
+        let source = Source::from(recorded("application/json", None));
         assert!(source.truncated);
         let json = serde_json::to_value(&source).unwrap();
         assert!(json.get("body").is_none());

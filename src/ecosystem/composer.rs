@@ -5,25 +5,25 @@ use serde::Deserialize;
 use serde::de::IgnoredAny;
 use std::collections::BTreeMap;
 
-use crate::ecosystem::{Coordinates, fetch_json, for_version, lenient, non_empty, unix_secs};
+use crate::ecosystem::{
+    Coordinates, count, fetch_json, for_version, lenient, listed, non_empty, set_timeline,
+    unix_secs,
+};
 use crate::fetch::{BlobCache, Fetch};
-use crate::purl::encode_component;
 use crate::registry::RegistryError;
 
-/// The `dist.url` of `name`'s release `version` — the exact archive Composer
-/// would install — from Packagist's v2 release list, which, unlike the package
-/// document, carries every release's dist. `name` is the percent-encoded
-/// `vendor/package` and `version` the percent-encoded version, as a PURL
-/// spells them; a leading `v` on either side of the comparison is ignored.
+/// The `dist.url` of the release `c` names — the exact archive Composer would
+/// install — from Packagist's v2 release list, which, unlike the package
+/// document, carries every release's dist. The release is matched by its
+/// decoded version, a leading `v` on either side ignored. A package is
+/// exactly `vendor/package`, as the registry lookup requires.
 pub(crate) fn resolve_composer(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<String, RegistryError> {
-    let (name, version) = (
-        c.path(),
-        c.encoded_version().ok_or(RegistryError::NoRecord)?,
-    );
+    c.pair()?;
+    let (name, version) = (c.path(), c.version().ok_or(RegistryError::NoRecord)?);
     let url = format!("https://repo.packagist.org/p2/{name}.json");
     let mut doc: ReleaseList = fetch_json(&url, net, &for_version(cache, Some(version)))
         .inspect_err(|error| tracing::debug!(url, %error, "Packagist release list unavailable"))?;
@@ -36,7 +36,7 @@ pub(crate) fn resolve_composer(
         .find(|v| {
             v.version
                 .as_deref()
-                .is_some_and(|s| encode_component(s.trim_start_matches('v')) == want)
+                .is_some_and(|s| s.trim_start_matches('v') == want)
         })
         .and_then(|v| v.dist)
         .and_then(|d| d.url);
@@ -51,94 +51,96 @@ pub(crate) fn resolve_composer(
 }
 
 /// Packagist's package document: lifetime downloads alongside every
-/// version's time, authors, and license. A Composer package is always
-/// `vendor/package`.
+/// version's time (the release timeline), authors, and license. A Composer
+/// package is always `vendor/package`.
 pub(crate) fn lookup(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
     let (vendor, package) = c.pair()?;
-    let doc: PackageDocument = fetch_json(
+    let pkg = fetch_json::<PackageDocument>(
         &format!("https://packagist.org/packages/{vendor}/{package}.json"),
         net,
         cache,
-    )?;
-    let pkg = &doc.package;
+    )?
+    .package;
     let versions = pkg.versions.as_ref();
-    let latest = versions.and_then(composer_latest);
+    // The latest release is the highest stable `version_normalized`, else the
+    // highest pre-release; the map's key order says nothing about recency.
+    let latest = versions.and_then(|vs| {
+        vs.values()
+            .filter_map(|v| Some((release_order(v)?, v)))
+            .max_by(|(a, _), (b, _)| a.cmp(b))
+            .map(|(_, v)| v)
+    });
     let release = match c.version() {
         Some(want) => {
-            let want = want.trim_start_matches('v');
-            versions.and_then(|vs| {
+            let bare = want.trim_start_matches('v');
+            let found = versions.and_then(|vs| {
                 vs.iter()
-                    .find(|(k, _)| k.trim_start_matches('v') == want)
+                    .find(|(k, _)| k.trim_start_matches('v') == bare)
                     .map(|(_, v)| v)
-            })
+            });
+            listed(found, &c.full_name(), want)
         }
         None => latest,
     };
-    if release.is_none() {
-        tracing::debug!(
-            package = %c.full_name().escape_debug(),
-            version = ?c.version(),
-            "Packagist lists no such release; leaving it undated"
-        );
-    }
-    let latest_version = latest.and_then(|v| v.version.as_deref());
 
-    let mut registry = Registry::new(Ecosystem::Composer, c.full_name());
-    registry.version = release
-        .and_then(|v| v.version.as_deref())
-        .unwrap_or_else(|| c.target(latest_version))
-        .to_string();
-    registry.latest_version = latest_version.map(str::to_string);
-    registry.published_at = release.and_then(|v| v.time.as_deref()).and_then(unix_secs);
-    registry.author = release
+    let mut record = c.record(
+        Ecosystem::Composer,
+        c.full_name(),
+        latest.and_then(|v| v.version.clone()),
+    );
+    // The release in Packagist's own spelling (`v1.0.0` for `1.0.0`).
+    if let Some(version) = release.and_then(|v| v.version.as_deref()) {
+        record.version = version.to_string();
+    }
+    record.published_at = release.and_then(|v| v.time.as_deref()).and_then(unix_secs);
+    record.author = release
         .and_then(|v| v.authors.as_ref()?.first())
         .and_then(|a| a.name.clone());
-    registry.description = pkg.description.clone();
-    registry.repository = pkg.repository.clone();
-    registry.license = release.and_then(|v| v.license.as_ref()?.first()).cloned();
-    registry.downloads_total = pkg.downloads.as_ref().and_then(|d| d.total);
-    registry.downloads_recent = pkg.downloads.as_ref().and_then(|d| d.monthly);
-    registry.favorites = pkg.favers;
-    registry.maintainers = pkg
-        .maintainers
-        .as_ref()
-        .and_then(|m| u32::try_from(m.len()).ok());
-    Ok(registry)
+    record.description = pkg.description;
+    record.repository = pkg.repository;
+    record.license = release.and_then(|v| v.license.as_ref()?.first()).cloned();
+    record.downloads_total = pkg.downloads.as_ref().and_then(|d| d.total);
+    record.downloads_recent = pkg.downloads.as_ref().and_then(|d| d.monthly);
+    record.favorites = pkg.favers;
+    record.maintainers = pkg.maintainers.as_ref().map(|m| count(m.len()));
+    // Branches are not releases, so their times are no part of the timeline.
+    set_timeline(
+        &mut record,
+        versions
+            .into_iter()
+            .flat_map(BTreeMap::values)
+            .filter(|v| release_order(v).is_some())
+            .filter_map(|v| v.time.as_deref().and_then(unix_secs)),
+    );
+    Ok(record)
 }
 
-/// Packagist's latest release: the highest stable `version_normalized`, which
-/// Packagist pads to four numeric parts (`2.10.0.0` beats `2.9.1.0`), else the
-/// highest pre-release (`3.0.0.0-beta1`). Branches (`dev-main`,
-/// `1.x-dev` → `1.9999999.9999999.9999999-dev`) never count. The `versions`
-/// map is keyed by version string, and its key order says nothing about
-/// recency.
-fn composer_latest(versions: &BTreeMap<String, Release>) -> Option<&Release> {
-    versions
-        .values()
-        .filter_map(|v| {
-            let norm = v
-                .version_normalized
-                .as_deref()
-                .or(v.version.as_deref())?
-                .trim_start_matches('v');
-            let (numbers, suffix) = norm
-                .split_once('-')
-                .map_or((norm, None), |(n, s)| (n, Some(s)));
-            if suffix.is_some_and(|s| s.contains("dev")) {
-                return None;
-            }
-            let numbers: Vec<u64> = numbers
-                .split('.')
-                .map(|n| n.parse().ok())
-                .collect::<Option<_>>()?;
-            Some(((suffix.is_none(), numbers), v))
-        })
-        .max_by(|(a, _), (b, _)| a.cmp(b))
-        .map(|(_, v)| v)
+/// A release's place in Packagist's order: stable above pre-release, then by
+/// its `version_normalized` numbers, which Packagist pads to four parts
+/// (`2.10.0.0` beats `2.9.1.0`). `None` for a branch (`dev-main`, `1.x-dev` →
+/// `1.9999999.9999999.9999999-dev`), or a version that does not normalize to
+/// numbers.
+fn release_order(v: &Release) -> Option<(bool, Vec<u64>)> {
+    let norm = v
+        .version_normalized
+        .as_deref()
+        .or(v.version.as_deref())?
+        .trim_start_matches('v');
+    let (numbers, suffix) = norm
+        .split_once('-')
+        .map_or((norm, None), |(n, s)| (n, Some(s)));
+    if suffix.is_some_and(|s| s.contains("dev")) {
+        return None;
+    }
+    let numbers: Vec<u64> = numbers
+        .split('.')
+        .map(|n| n.parse().ok())
+        .collect::<Option<_>>()?;
+    Some((suffix.is_none(), numbers))
 }
 
 /// The Packagist package document (`/packages/{vendor}/{name}.json`).
@@ -218,9 +220,8 @@ struct Downloads {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::coordinates;
+    use crate::ecosystem::{coordinates, look};
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
     const MONOLOG: &str = "https://repo.packagist.org/p2/monolog/monolog.json";
 
@@ -298,7 +299,7 @@ mod tests {
         // As map keys these sort `1.0.0` < `10.0.0` < `11…` < `9.0.0` <
         // `dev-main`, an order that says nothing about recency.
         let doc = serde_json::json!({"package": {"favers": 4242, "versions": {
-            "dev-main": {"version": "dev-main", "version_normalized": "9999999-dev"},
+            "dev-main": {"version": "dev-main", "version_normalized": "9999999-dev", "time": "2022-01-01T00:00:00+00:00"},
             "1.0.0": {"version": "1.0.0", "version_normalized": "1.0.0.0", "time": "2012-01-01T00:00:00+00:00"},
             "9.0.0": {"version": "9.0.0", "version_normalized": "9.0.0.0", "time": "2020-01-01T00:00:00+00:00"},
             "10.0.0": {"version": "10.0.0", "version_normalized": "10.0.0.0", "time": "2021-01-01T00:00:00+00:00"},
@@ -309,15 +310,17 @@ mod tests {
             "https://packagist.org/packages/acme/lib.json",
             doc.as_bytes(),
         );
-        let look = |purl: &str| {
-            crate::registry::lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled())
-        };
+        let look = |purl: &str| look(purl, &net);
 
         let r = look("pkg:composer/acme/lib").expect("record");
         assert_eq!(r.name, "acme/lib");
         assert_eq!(r.version, "10.0.0");
         assert_eq!(r.latest_version.as_deref(), Some("10.0.0"));
         assert_eq!(r.published_at, Some(1_609_459_200)); // 2021-01-01
+        // The dated releases are the timeline; the branch is not a release.
+        assert_eq!(r.release_count, Some(3));
+        assert_eq!(r.first_published_at, Some(1_325_376_000)); // 2012-01-01
+        assert_eq!(r.previous_published_at, Some(1_577_836_800)); // 2020-01-01
         // Favers are favorites with no rating behind them.
         assert_eq!(r.favorites, Some(4242));
         assert_eq!(r.rating_count, None);
@@ -331,6 +334,20 @@ mod tests {
         // A package is exactly `vendor/package`.
         assert_eq!(
             look("pkg:composer/acme/lib/extra"),
+            Err(RegistryError::UnsafeCoordinate)
+        );
+    }
+
+    #[test]
+    fn the_resolver_takes_only_vendor_and_package() {
+        let body = br#"{"packages":{"a/b/c":[{"version":"1.0.0","dist":{"url":"https://example.test/x.zip"}}]}}"#;
+        let net = Fixtures::default().with("https://repo.packagist.org/p2/a/b/c.json", body);
+        assert_eq!(
+            resolve_composer(
+                &coordinates("pkg:composer/a/b/c@1.0.0"),
+                &net,
+                &BlobCache::disabled()
+            ),
             Err(RegistryError::UnsafeCoordinate)
         );
     }

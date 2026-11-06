@@ -7,8 +7,8 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use crate::ecosystem::{
-    Coordinates, decode, fetch_json, five_star, flag, for_version, non_empty, null_default,
-    set_timeline, unix_secs,
+    Coordinates, DEPRECATED, decode, fetch_json, five_star, flag, for_version, listed, non_empty,
+    null_default, release_time, set_timeline, unix_secs,
 };
 use crate::fetch::{BlobCache, Fetch, cached_post};
 use crate::purl::encode_component;
@@ -86,11 +86,11 @@ pub(crate) fn resolve_vscode(
             let id = extension_id(c);
             let ext = marketplace_extension(&id, net, &for_version(cache, None)).inspect_err(
                 |error| {
-                    tracing::debug!(%id, %error, "VS Code artifact unresolved");
+                    tracing::debug!(id = %id.escape_debug(), %error, "VS Code artifact unresolved");
                 },
             )?;
             let Some(latest) = ext.versions.into_iter().next().and_then(|v| v.version) else {
-                tracing::debug!(%id, "VS Code artifact unresolved: no version listed");
+                tracing::debug!(id = %id.escape_debug(), "VS Code artifact unresolved: no version listed");
                 return Err(RegistryError::NoRecord);
             };
             // The registry's version goes into a URL path: encoded, it can
@@ -106,7 +106,8 @@ pub(crate) fn resolve_vscode(
 /// Look up the extension `c` names on Open VSX: one document per release, with
 /// the extension's rating, downloads, and publisher beside it. A requested
 /// version the store does not list is read from the latest release's
-/// document, and only its package-wide facts are kept.
+/// document, and only its package-wide facts are kept. Only the latest
+/// release's document names the latest version.
 pub(crate) fn open_vsx(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
@@ -114,50 +115,51 @@ pub(crate) fn open_vsx(
 ) -> Result<Registry, RegistryError> {
     let (namespace, name) = c.pair()?;
     let latest_url = format!("{OPEN_VSX_API}/{namespace}/{name}");
-    let doc: OpenVsxExtension = match c.encoded_version() {
+    let (doc, is_latest): (OpenVsxExtension, bool) = match c.encoded_version() {
         Some(v) => match fetch_json(&format!("{latest_url}/{v}"), net, cache) {
             Err(RegistryError::NotFound) => {
                 tracing::debug!(
                     url = latest_url,
                     "requested version not on Open VSX; reading the extension's latest document"
                 );
-                fetch_json(&latest_url, net, cache)?
+                (fetch_json(&latest_url, net, cache)?, true)
             }
-            doc => doc?,
+            doc => (doc?, false),
         },
-        None => fetch_json(&latest_url, net, cache)?,
+        None => (fetch_json(&latest_url, net, cache)?, true),
     };
-    let version = c.target(doc.version.as_deref()).to_string();
+    let mut record = c.record(
+        Ecosystem::Openvsx,
+        extension_id(c),
+        doc.version.clone().filter(|_| is_latest),
+    );
     // A release's own facts (its time, publisher, license) belong on the
     // record only when the document is that release.
-    let this_release = doc.version.as_deref() == Some(version.as_str());
+    let this_release = doc.version.as_deref() == Some(record.version.as_str());
     let publisher = doc
         .published_by
         .and_then(|user| user.login_name)
         .filter(|_| this_release);
-
-    let mut registry = Registry::new(Ecosystem::Openvsx, extension_id(c));
-    registry.version = version;
-    registry.published_at = doc
-        .timestamp
-        .as_deref()
-        .and_then(unix_secs)
-        .filter(|_| this_release);
-    registry.author = publisher.clone();
-    registry.publisher = publisher;
+    record.published_at = release_time(
+        &record,
+        doc.version.as_deref(),
+        doc.timestamp.as_deref().and_then(unix_secs),
+    );
+    record.author = publisher.clone();
+    record.publisher = publisher;
     // Whether the release was published by a verified member of the
     // namespace, rather than by anyone with an account.
-    registry.publisher_verified = doc.verified.filter(|_| this_release);
-    registry.title = doc.display_name;
-    registry.description = doc.description;
-    registry.homepage = doc.homepage;
-    registry.repository = doc.repository;
-    registry.license = doc.license.filter(|_| this_release);
-    registry.downloads_total = doc.download_count;
-    registry.rating = doc.average_rating.and_then(|r| five_star(r, 5.0));
-    registry.rating_count = doc.review_count;
-    registry.deprecated = flag(doc.deprecated, "deprecated");
-    Ok(registry)
+    record.publisher_verified = doc.verified.filter(|_| this_release);
+    record.title = doc.display_name;
+    record.description = doc.description;
+    record.homepage = doc.homepage;
+    record.repository = doc.repository;
+    record.license = doc.license.filter(|_| this_release);
+    record.downloads_total = doc.download_count;
+    record.rating = doc.average_rating.and_then(|r| five_star(r, 5.0));
+    record.rating_count = doc.review_count;
+    record.deprecated = flag(doc.deprecated, DEPRECATED);
+    Ok(record)
 }
 
 /// Look up the extension `c` names on the VS Code Marketplace: one query
@@ -187,12 +189,6 @@ pub(crate) fn marketplace(
                 .or_insert(time);
         }
     }
-    // The newest version is listed first.
-    let version = c.target(ext.versions.first().and_then(|v| v.version.as_deref()));
-    let published_at = releases.get(version).copied();
-    if published_at.is_none() {
-        tracing::debug!(%id, version = %version.escape_debug(), "release not listed on the Marketplace; undated");
-    }
     let stat = |name: &str| {
         ext.statistics
             .iter()
@@ -201,9 +197,14 @@ pub(crate) fn marketplace(
     };
     let publisher = ext.publisher.unwrap_or_default();
 
-    let mut record = Registry::new(Ecosystem::Vscode, id);
-    record.version = version.to_string();
-    record.published_at = published_at;
+    // The newest version is listed first.
+    let latest = ext.versions.first().and_then(|v| v.version.clone());
+    let mut record = c.record(Ecosystem::Vscode, id, latest);
+    record.published_at = listed(
+        releases.get(record.version.as_str()).copied(),
+        &record.name,
+        &record.version,
+    );
     // `publishedDate` is the extension's first listing.
     record.first_published_at = ext.published_date.as_deref().and_then(unix_secs);
     record.author = publisher.display_name;
@@ -370,13 +371,9 @@ struct Statistic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecosystem::look;
     use crate::fetch::{FetchError, Fetched, Fixtures, Method, Request};
-    use filefacts::RefLocator;
     use serde_json::Value;
-
-    fn lookup(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
 
     fn marketplace_answer() -> String {
         serde_json::json!({
@@ -409,7 +406,7 @@ mod tests {
 
     #[test]
     fn vscode_marketplace_query_normalizes() {
-        let r = lookup(
+        let r = look(
             "pkg:vscode-extension/redhat/java",
             &marketplace_net(&marketplace_answer()),
         )
@@ -435,7 +432,7 @@ mod tests {
 
     #[test]
     fn a_version_built_for_many_platforms_is_one_release() {
-        let r = lookup(
+        let r = look(
             "pkg:vscode-extension/redhat/java",
             &marketplace_net(&marketplace_answer()),
         )
@@ -447,15 +444,16 @@ mod tests {
     #[test]
     fn the_marketplace_dates_the_requested_version_or_nothing() {
         let net = marketplace_net(&marketplace_answer());
-        let r = lookup("pkg:vscode-extension/redhat/java@1.54.0", &net).expect("registry");
+        let r = look("pkg:vscode-extension/redhat/java@1.54.0", &net).expect("registry");
         assert_eq!(r.version, "1.54.0");
+        assert_eq!(r.latest_version.as_deref(), Some("1.55.0"));
         assert_eq!(r.published_at, unix_secs("2026-06-20T09:30:32.957Z"));
         assert_eq!(
             r.previous_published_at,
             unix_secs("2026-05-01T09:30:32.957Z")
         );
 
-        let r = lookup("pkg:vscode-extension/redhat/java@9.9.9", &net).expect("registry");
+        let r = look("pkg:vscode-extension/redhat/java@9.9.9", &net).expect("registry");
         assert_eq!(r.version, "9.9.9");
         assert_eq!(r.published_at, None);
         // Package-wide facts still hold.
@@ -475,7 +473,7 @@ mod tests {
             }]}]
         })
         .to_string();
-        let r = lookup("pkg:vscode-extension/a/b", &marketplace_net(&answer)).expect("registry");
+        let r = look("pkg:vscode-extension/a/b", &marketplace_net(&answer)).expect("registry");
         assert_eq!(r.downloads_total, None);
         assert_eq!(r.rating, None);
         assert_eq!(r.rating_count, None);
@@ -485,7 +483,7 @@ mod tests {
     fn an_empty_answer_is_not_found() {
         let answer = r#"{"results": [{"extensions": []}]}"#;
         assert_eq!(
-            lookup("pkg:vscode-extension/a/b", &marketplace_net(answer)),
+            look("pkg:vscode-extension/a/b", &marketplace_net(answer)),
             Err(RegistryError::NotFound)
         );
     }
@@ -498,7 +496,7 @@ mod tests {
             "pkg:vscode-extension/a/b/c?repository_url=https://open-vsx.org",
         ] {
             assert_eq!(
-                lookup(purl, &net),
+                look(purl, &net),
                 Err(RegistryError::UnsafeCoordinate),
                 "{purl}"
             );
@@ -527,10 +525,11 @@ mod tests {
             open_vsx_doc("1.55.0", "2026-06-23T09:16:36.442135Z").as_bytes(),
         );
         let r =
-            lookup(&format!("pkg:vscode-extension/redhat/java{OPEN_VSX}"), &net).expect("registry");
+            look(&format!("pkg:vscode-extension/redhat/java{OPEN_VSX}"), &net).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Openvsx);
         assert_eq!(r.name, "redhat.java");
         assert_eq!(r.version, "1.55.0");
+        assert_eq!(r.latest_version.as_deref(), Some("1.55.0"));
         assert_eq!(r.published_at, Some(1_782_206_196));
         assert_eq!(r.author.as_deref(), Some("rhdevelopers-ci"));
         assert_eq!(r.publisher_verified, Some(true));
@@ -552,22 +551,27 @@ mod tests {
                 "https://open-vsx.org/api/redhat/java",
                 open_vsx_doc("1.55.0", "2026-06-23T00:00:00Z").as_bytes(),
             );
-        let r = lookup(
+        let r = look(
             &format!("pkg:vscode-extension/redhat/java@1.54.0{OPEN_VSX}"),
             &net,
         )
         .expect("registry");
         assert_eq!(r.version, "1.54.0");
         assert_eq!(r.published_at, unix_secs("2026-06-20T00:00:00Z"));
+        assert_eq!(
+            r.latest_version, None,
+            "a release's document names no latest"
+        );
 
         // Unlisted: the record is still that version, undated, and carries
         // none of the latest release's own facts.
-        let r = lookup(
+        let r = look(
             &format!("pkg:vscode-extension/redhat/java@9.9.9{OPEN_VSX}"),
             &net,
         )
         .expect("registry");
         assert_eq!(r.version, "9.9.9");
+        assert_eq!(r.latest_version.as_deref(), Some("1.55.0"));
         assert_eq!(r.published_at, None);
         assert_eq!(r.publisher, None);
         assert_eq!(r.license, None);
@@ -578,7 +582,7 @@ mod tests {
     fn a_deprecated_open_vsx_extension_says_so() {
         let doc = serde_json::json!({"version": "1.0.0", "deprecated": true}).to_string();
         let net = Fixtures::default().with("https://open-vsx.org/api/a/b", doc.as_bytes());
-        let r = lookup(&format!("pkg:vscode-extension/a/b{OPEN_VSX}"), &net).expect("registry");
+        let r = look(&format!("pkg:vscode-extension/a/b{OPEN_VSX}"), &net).expect("registry");
         assert_eq!(r.deprecated.as_deref(), Some("deprecated"));
     }
 

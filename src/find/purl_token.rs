@@ -1,6 +1,8 @@
 //! Package ecosystems a command can install from, and the PURL a command-line
 //! token names in each.
 
+use std::borrow::Cow;
+
 use filefacts::RefLocator;
 
 /// A package ecosystem an install command or import names.
@@ -178,21 +180,30 @@ fn npm_github_locator(token: &str) -> Option<RefLocator> {
     }))
 }
 
-/// `pkg:<eco>/<name>` for an OS-package token: strips an apt architecture
-/// qualifier (`libc6:amd64`) and keeps only a clean `name=version` pin (apt,
-/// apk); a range constraint (`>=`, `<`, `~`) keeps just the name.
+/// `pkg:<eco>/<name>[@<version>]` for an OS-package token: `name[:arch]`
+/// with an optional `=version` pin (apt, apk). The architecture qualifier
+/// (`libc6:amd64`) is dropped from the name; a version keeps its epoch
+/// (`1:2.30-1`). A range constraint (`>=`, `<`, `~`) or a wildcard version
+/// (`=1.2*`) keeps just the name.
 fn distro_purl_token(eco: Eco, tok: &str) -> Option<String> {
     let eco = eco.label();
-    let tok = tok.split(':').next().unwrap_or(tok);
-    if let Some((name, ver)) = tok.split_once('=')
-        && !name.is_empty()
-        && !name.ends_with(['<', '>', '~', '!'])
-        && ver.starts_with(|c: char| c.is_ascii_digit())
-    {
-        return Some(format!("pkg:{eco}/{name}@{ver}"));
+    let (spec, version) = tok
+        .split_once('=')
+        .map_or((tok, None), |(spec, version)| (spec, Some(version)));
+    let name = spec.split([':', '<', '>', '~', '!']).next().unwrap_or(spec);
+    if name.is_empty() {
+        return None;
     }
-    let name = tok.split(['=', '<', '>', '~']).next().unwrap_or(tok);
-    (!name.is_empty()).then(|| format!("pkg:{eco}/{name}"))
+    match version {
+        Some(version)
+            if !spec.contains(['<', '>', '~', '!'])
+                && version.starts_with(|c: char| c.is_ascii_digit())
+                && !version.contains('*') =>
+        {
+            Some(format!("pkg:{eco}/{name}@{version}"))
+        }
+        _ => Some(format!("pkg:{eco}/{name}")),
+    }
 }
 
 /// `pkg:<eco>/<name>`, or `None` for an empty name.
@@ -209,13 +220,17 @@ fn looks_like_package(eco: Eco, tok: &str) -> bool {
     const FILE_EXT: &[&str] = &[
         ".txt", ".whl", ".toml", ".lock", ".cfg", ".tar", ".gz", ".zip", ".py", ".js",
     ];
-    let first = tok.chars().next().unwrap_or(' ');
-    if !(first.is_ascii_alphanumeric() || first == '@') || tok.contains("://") {
+    if !tok.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '@') || tok.contains("://") {
         return false;
     }
     if tok.contains('/') {
         let slash_ok = match eco {
-            Eco::Npm => tok.starts_with('@') && tok.matches('/').count() == 1,
+            // A scope's slash, in the package or the one an alias installs
+            // (`alias@npm:@scope/name`).
+            Eco::Npm => {
+                let spec = tok.split_once("@npm:").map_or(tok, |(_, target)| target);
+                spec.starts_with('@') && spec.matches('/').count() == 1
+            }
             // Deno `jsr:@scope/name` and `npm:@scope/pkg` specifiers carry a
             // slash; URL specifiers are rejected above.
             Eco::Golang | Eco::Composer | Eco::Deno => true,
@@ -304,33 +319,60 @@ fn jsr_purl_token(spec: &str) -> Option<String> {
     })
 }
 
-/// `pkg:npm/...` from a command-line token (`foo`, `foo@1.2`, `@s/n`,
-/// `@s/n@1.2`). `None` if the name is empty.
+/// `pkg:npm/...` from a command-line token (`foo`, `foo@1.2.3`, `@s/n`,
+/// `@s/n@1.2.3`). An alias (`foo@npm:bar@1.0.0`) installs its target, `bar`.
+/// Only an exact version is kept: a range or tag (`^1.2`, `latest`) is
+/// resolved by the registry at install time, so it pins nothing. `None` for
+/// an empty name or a scope without one (`@scope`).
 pub(super) fn npm_purl_token(tok: &str) -> Option<String> {
-    let (name, ver) = match tok.rfind('@') {
-        Some(0) | None => (tok, None), // leading scope `@`, or no version
-        Some(i) => (&tok[..i], Some(&tok[i + 1..])),
-    };
-    if name.is_empty() {
-        return None;
+    // The name ends at the first `@` past a leading scope `@`.
+    fn split(spec: &str) -> (&str, Option<&str>) {
+        match spec.get(1..).and_then(|rest| rest.find('@')) {
+            Some(i) => (&spec[..=i], spec.get(i + 2..)),
+            None => (spec, None),
+        }
     }
-    let base = match name.strip_prefix('@').and_then(|s| s.split_once('/')) {
-        Some((scope, pkg)) => format!("pkg:npm/%40{scope}/{pkg}"),
-        None => format!("pkg:npm/{name}"),
+    let (mut name, mut version) = split(tok);
+    if let Some(target) = version.and_then(|v| v.strip_prefix("npm:")) {
+        (name, version) = split(target);
+    }
+    let base = match name.strip_prefix('@') {
+        Some(scoped) => {
+            let (scope, pkg) = scoped.split_once('/')?;
+            if scope.is_empty() || pkg.is_empty() {
+                return None;
+            }
+            format!("pkg:npm/%40{scope}/{pkg}")
+        }
+        None if !name.is_empty() => format!("pkg:npm/{name}"),
+        None => return None,
     };
-    Some(match ver {
-        Some(v) if !v.is_empty() => format!("{base}@{v}"),
-        _ => base,
+    Some(match version.filter(|v| is_exact_version(v)) {
+        Some(version) => format!("{base}@{version}"),
+        None => base,
     })
 }
 
+/// Whether `version` names one release (`1.2.3`, `2.0`, `1.0.0-rc.1`)
+/// rather than a range, wildcard or tag.
+fn is_exact_version(version: &str) -> bool {
+    version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        && !version
+            .split('.')
+            .any(|part| part.eq_ignore_ascii_case("x"))
+}
+
 /// `pkg:pypi/...` from a command-line token, stripping extras (`pkg[x]`) and
-/// version constraints (only an `==` pin becomes a PURL version).
+/// version constraints: only an `==` (or `===`) pin of one version, not a
+/// wildcard (`==1.*`), becomes a PURL version.
 pub(super) fn pypi_purl_token(tok: &str) -> Option<String> {
     // Strip an `[extras]` span anywhere, keeping any trailing version.
-    let base = match (tok.find('['), tok.find(']')) {
-        (Some(o), Some(c)) if c > o => format!("{}{}", &tok[..o], &tok[c + 1..]),
-        _ => tok.to_owned(),
+    let base: Cow<'_, str> = match (tok.find('['), tok.find(']')) {
+        (Some(o), Some(c)) if c > o => format!("{}{}", &tok[..o], &tok[c + 1..]).into(),
+        _ => tok.into(),
     };
     let name = base
         .split(['=', '>', '<', '~', '!', ';', ',', ' '])
@@ -342,8 +384,11 @@ pub(super) fn pypi_purl_token(tok: &str) -> Option<String> {
     }
     let ver = base
         .split_once("==")
-        .map(|(_, v)| v.split([',', ';', ' ']).next().unwrap_or(v))
-        .filter(|v| !v.is_empty());
+        .map(|(_, v)| {
+            let v = v.strip_prefix('=').unwrap_or(v);
+            v.split([',', ';', ' ']).next().unwrap_or(v)
+        })
+        .filter(|v| !v.is_empty() && !v.contains('*'));
     Some(match ver {
         Some(v) => format!("pkg:pypi/{name}@{v}"),
         None => format!("pkg:pypi/{name}"),
@@ -369,6 +414,53 @@ mod tests {
             pypi_purl_token("requests[security]==2.1").as_deref(),
             Some("pkg:pypi/requests@2.1")
         );
+    }
+
+    #[test]
+    fn npm_aliases_install_their_target_and_ranges_pin_nothing() {
+        for (tok, want) in [
+            ("foo@npm:evil-pkg@1.0.0", Some("pkg:npm/evil-pkg@1.0.0")),
+            ("foo@npm:@evil/pkg", Some("pkg:npm/%40evil/pkg")),
+            ("foo@^1.2.3", Some("pkg:npm/foo")),
+            ("foo@~1.2", Some("pkg:npm/foo")),
+            ("foo@1.x", Some("pkg:npm/foo")),
+            ("foo@latest", Some("pkg:npm/foo")),
+            ("foo@>=1", Some("pkg:npm/foo")),
+            ("foo@1.0.0-rc.1", Some("pkg:npm/foo@1.0.0-rc.1")),
+            ("@scope/n@2.0.0", Some("pkg:npm/%40scope/n@2.0.0")),
+            ("@scope", None),
+            ("@scope/", None),
+            ("@/n", None),
+        ] {
+            assert_eq!(
+                pm_token_locator(Eco::Npm, tok),
+                want.map(|p| RefLocator::Purl(p.into())),
+                "{tok}"
+            );
+        }
+    }
+
+    #[test]
+    fn versions_keep_their_epoch_and_drop_wildcards() {
+        for (eco, tok, want) in [
+            (Eco::Debian, "libfoo=1:2.30-1", "pkg:debian/libfoo@1:2.30-1"),
+            (Eco::Debian, "libc6:amd64=2.31-0", "pkg:debian/libc6@2.31-0"),
+            (Eco::Debian, "libc6:amd64", "pkg:debian/libc6"),
+            (Eco::Debian, "nginx=1.18*", "pkg:debian/nginx"),
+            (Eco::Alpine, "curl>=7.0", "pkg:alpine/curl"),
+            (Eco::Alpine, "curl~7.0", "pkg:alpine/curl"),
+            (Eco::Alpine, "curl=7.0-r0", "pkg:alpine/curl@7.0-r0"),
+            (Eco::Pypi, "foo==1.*", "pkg:pypi/foo"),
+            (Eco::Pypi, "foo===1.0", "pkg:pypi/foo@1.0"),
+            (Eco::Pypi, "foo==1.0", "pkg:pypi/foo@1.0"),
+        ] {
+            assert_eq!(
+                pm_token_locator(eco, tok),
+                Some(RefLocator::Purl(want.into())),
+                "{tok}"
+            );
+            assert!(crate::purl::Purl::parse(want).is_ok(), "{want}");
+        }
     }
 
     #[test]

@@ -34,20 +34,15 @@ pub(crate) fn lookup(
     };
     // An artifact with only snapshots has a `null` latest release; its newest
     // snapshot is then the version there is.
-    let latest = doc
-        .latest_release
-        .as_deref()
-        .or(doc.latest_version.as_deref());
+    let latest = doc.latest_release.or(doc.latest_version);
 
-    let mut registry = Registry::new(Ecosystem::Clojars, name);
-    registry.version = c.target(latest).to_string();
-    registry.latest_version = doc.latest_version.clone();
-    registry.description = doc.description;
-    registry.homepage = doc.homepage;
-    registry.repository = doc.scm.and_then(|scm| scm.url);
-    registry.license = doc.licenses.into_iter().find_map(|l| l.name);
-    registry.downloads_total = doc.downloads;
-    Ok(registry)
+    let mut record = c.record(Ecosystem::Clojars, name, latest);
+    record.description = doc.description;
+    record.homepage = doc.homepage;
+    record.repository = doc.scm.and_then(|scm| scm.url);
+    record.license = doc.licenses.into_iter().find_map(|l| l.name);
+    record.downloads_total = doc.downloads;
+    Ok(record)
 }
 
 /// The parts of a Clojars artifact document the registry record reads.
@@ -86,19 +81,16 @@ struct License {
 
 #[cfg(test)]
 mod tests {
-    use crate::fetch::{BlobCache, Fixtures};
-    use crate::registry::{RegistryError, lookup};
-    use filefacts::{Ecosystem, RefLocator, Registry};
-
-    fn look(net: &Fixtures, purl: &str) -> Result<Registry, RegistryError> {
-        lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
+    use crate::ecosystem::look;
+    use crate::fetch::Fixtures;
+    use crate::registry::RegistryError;
+    use filefacts::Ecosystem;
 
     #[test]
     fn clojars_artifacts_normalizes() {
         let doc = serde_json::json!({
             "group_name": "ring", "jar_name": "ring", "latest_release": "1.15.5",
-            "latest_version": "1.15.5", "description": "A Clojure web library",
+            "latest_version": "1.16.0-SNAPSHOT", "description": "A Clojure web library",
             "homepage": "https://github.com/ring-clojure/ring", "downloads": 11_285_905u64,
             "scm": {"url": "https://github.com/ring-clojure/ring"},
             "licenses": [{"name": "The MIT License"}]
@@ -110,7 +102,7 @@ mod tests {
                 "https://clojars.org/api/artifacts/ring/ring",
                 doc.as_bytes(),
             );
-        let r = look(&net, "pkg:clojars/ring").expect("registry");
+        let r = look("pkg:clojars/ring", &net).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Clojars);
         assert_eq!(r.name, "ring");
         assert_eq!(r.version, "1.15.5");
@@ -120,7 +112,8 @@ mod tests {
 
         // A requested release is the one described, undated: the API has no
         // per-release dates.
-        let r = look(&net, "pkg:clojars/ring/ring@1.9.0").expect("registry");
+        let r = look("pkg:clojars/ring/ring@1.9.0", &net).expect("registry");
+        // A snapshot is not the latest release.
         assert_eq!(r.version, "1.9.0");
         assert_eq!(r.latest_version.as_deref(), Some("1.15.5"));
         assert_eq!(r.published_at, None);
@@ -130,7 +123,7 @@ mod tests {
     fn an_artifact_is_group_and_name_or_a_bare_name() {
         let net = Fixtures::default();
         assert_eq!(
-            look(&net, "pkg:clojars/a/b/c"),
+            look("pkg:clojars/a/b/c", &net),
             Err(RegistryError::UnsafeCoordinate)
         );
     }

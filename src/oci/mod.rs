@@ -1,10 +1,12 @@
 //! Pull an OCI image and flatten it to a single rootfs tarball: an
-//! xz-compressed tar of the merged filesystem, as go-containerregistry's
+//! xz-compressed tar of the merged filesystem an overlay container runtime
+//! builds from it ([`flatten`]), much as go-containerregistry's
 //! [`crane export`](https://github.com/google/go-containerregistry/blob/main/cmd/crane/doc/crane_export.md)
-//! produces for the same image. The bytes are not guaranteed identical to
-//! another exporter's (tar header and xz encoder details differ); an image's
-//! identity across implementations is its manifest digest, which [`export`]
-//! returns and the fetch layer records.
+//! does, though not identically: entries land where the runtime puts them
+//! (through their layer's symlinks), and the last copy of a path in a layer
+//! wins. The bytes differ from any other exporter's too (tar header and xz
+//! encoder details); an image's identity across implementations is its
+//! manifest digest, which [`export`] returns and the fetch layer records.
 //!
 //! The distribution protocol ([`registry`]) is spoken over the caller's
 //! [`Fetch`] backend — a token handshake, then manifest and blob GETs — so
@@ -42,11 +44,11 @@ const MAX_EXPORT_BYTES: u64 = 2 << 30;
 const _: () = assert!(MAX_EXPORT_BYTES + MAX_EXPORT_BYTES / 64 <= MAX_ENTRY_BYTES);
 
 /// Pull `reference` (`host/path:tag` or `host/path@sha256:…`, as produced by
-/// `resolve_purl`'s `oci://` pseudo-URL) through `net` and write the flattened
-/// rootfs into `out`, as an xz-compressed tar. `out` must not exist yet; the
-/// layers are spooled beside it and removed before this returns. Returns the
-/// image's manifest digest — the content-addressed identity that is stable
-/// across implementations.
+/// `container::resolve_oci_ref`'s `oci://` pseudo-URL) through `net` and write
+/// the flattened rootfs into `out`, as an xz-compressed tar. `out` must not
+/// exist yet; the layers are spooled beside it and removed before this
+/// returns. Returns the image's manifest digest — the content-addressed
+/// identity that is stable across implementations.
 pub(crate) fn export(reference: &str, net: &dyn Fetch, out: &Spool) -> Result<String, FetchError> {
     let exported = pull_and_flatten(reference, net, out);
     match &exported {
@@ -100,20 +102,35 @@ mod tests {
     pub(super) fn hostile_layer(entries: &[(&str, &str)]) -> Vec<u8> {
         let mut out = Vec::new();
         for (path, content) in entries {
-            let mut h = tar::Header::new_gnu();
-            h.set_size(content.len() as u64);
-            h.set_mode(0o644);
-            h.set_entry_type(tar::EntryType::Regular);
-            let name = path.as_bytes();
-            assert!(name.len() <= 100, "fixture name must fit the ustar field");
-            h.as_old_mut().name[..name.len()].copy_from_slice(name);
-            h.set_cksum();
-            out.extend_from_slice(h.as_bytes());
+            out.extend(raw_header(
+                path,
+                tar::EntryType::Regular,
+                content.len() as u64,
+                "",
+            ));
             out.extend_from_slice(content.as_bytes());
             out.resize(out.len().div_ceil(512) * 512, 0); // pad to a block
         }
         out.extend_from_slice(&[0u8; 1024]); // end-of-archive
         out
+    }
+
+    /// A raw 512-byte header block, written field by field so it may hold
+    /// what `tar::Builder` refuses: `name`, `kind`, a declared `size`, and a
+    /// link `target` (empty for none).
+    pub(super) fn raw_header(name: &str, kind: tar::EntryType, size: u64, target: &str) -> Vec<u8> {
+        assert!(
+            name.len() <= 100 && target.len() <= 100,
+            "fixture names fit the header"
+        );
+        let mut h = tar::Header::new_gnu();
+        h.set_size(size);
+        h.set_mode(0o644);
+        h.set_entry_type(kind);
+        h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.as_old_mut().linkname[..target.len()].copy_from_slice(target.as_bytes());
+        h.set_cksum();
+        h.as_bytes().to_vec()
     }
 
     /// Decode a flattened .tar.xz back to (path, content) pairs, in order.

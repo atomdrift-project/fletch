@@ -3,55 +3,57 @@
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
-use crate::ecosystem::{Coordinates, fetch_json, non_empty, null_default, unix_secs};
+use crate::ecosystem::{
+    Coordinates, fetch_json, listed, non_empty, null_default, set_timeline, unix_secs,
+};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
 /// pub.dev's package document: the latest release inline and every version
 /// under `versions[]`, each with its `published` time, its `retracted` flag,
-/// and its pubspec.
+/// and its pubspec: the release timeline.
 pub(crate) fn lookup(
     c: &Coordinates<'_>,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let name = c.bare_name(&[])?;
+    let name = c.encoded_name();
     let doc: Package = fetch_json(&format!("https://pub.dev/api/packages/{name}"), net, cache)?;
     let latest = doc.latest.as_ref().and_then(|l| l.version.as_deref());
     // A version the list lacks describes no release: it gets no date rather
     // than latest's, though its identity text still comes from latest's
     // pubspec.
     let release = match c.version() {
-        Some(want) => doc
-            .versions
-            .iter()
-            .find(|v| v.version.as_deref() == Some(want)),
+        Some(want) => listed(
+            doc.versions
+                .iter()
+                .find(|v| v.version.as_deref() == Some(want)),
+            c.name(),
+            want,
+        ),
         None => doc.latest.as_ref(),
     };
-    if release.is_none() {
-        tracing::debug!(
-            package = %c.name().escape_debug(),
-            version = %c.target(latest).escape_debug(),
-            "pub.dev version not listed; leaving it undated"
-        );
-    }
     let spec = release
         .or(doc.latest.as_ref())
         .and_then(|r| r.pubspec.as_ref());
 
-    let mut registry = Registry::new(Ecosystem::Pub, c.name().to_string());
-    registry.version = c.target(latest).to_string();
-    registry.published_at = release
+    let mut record = c.record(Ecosystem::Pub, c.name(), latest.map(str::to_string));
+    record.published_at = release
         .and_then(|r| r.published.as_deref())
         .and_then(unix_secs);
-    registry.latest_version = latest.map(str::to_string);
-    registry.description = spec.and_then(|s| s.description.clone());
-    registry.homepage = spec.and_then(|s| s.homepage.clone());
-    registry.repository = spec.and_then(|s| s.repository.clone());
+    record.description = spec.and_then(|s| s.description.clone());
+    record.homepage = spec.and_then(|s| s.homepage.clone());
+    record.repository = spec.and_then(|s| s.repository.clone());
     // pub.dev sends `retracted` only for a retracted version, so a listed
     // version without it is live.
-    registry.version_removed = release.map(|r| r.retracted);
-    Ok(registry)
+    record.version_removed = release.map(|r| r.retracted);
+    set_timeline(
+        &mut record,
+        doc.versions
+            .iter()
+            .filter_map(|v| v.published.as_deref().and_then(unix_secs)),
+    );
+    Ok(record)
 }
 
 /// The parts of a pub.dev package document the registry record reads.
@@ -88,9 +90,9 @@ struct Pubspec {
 
 #[cfg(test)]
 mod tests {
-    use crate::fetch::{BlobCache, Fixtures};
-    use crate::registry::lookup;
-    use filefacts::{Ecosystem, RefLocator};
+    use crate::ecosystem::look;
+    use crate::fetch::Fixtures;
+    use filefacts::Ecosystem;
 
     #[test]
     fn pub_dev_normalizes() {
@@ -108,9 +110,7 @@ mod tests {
         })
         .to_string();
         let net = Fixtures::default().with("https://pub.dev/api/packages/http", doc.as_bytes());
-        let look = |purl: &str| {
-            lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled()).expect("registry")
-        };
+        let look = |purl: &str| look(purl, &net).expect("registry");
         let r = look("pkg:pub/http");
         assert_eq!(r.ecosystem, Ecosystem::Pub);
         assert_eq!(r.version, "1.6.0");
@@ -121,6 +121,10 @@ mod tests {
         );
         assert_eq!(r.homepage, None, "an empty homepage is unknown");
         assert_eq!(r.version_removed, Some(false));
+        // Every version dates the timeline.
+        assert_eq!(r.release_count, Some(2));
+        assert_eq!(r.first_published_at, Some(1_577_836_800)); // 2020-01-01
+        assert_eq!(r.previous_published_at, Some(1_577_836_800));
 
         let r = look("pkg:pub/http@1.5.0");
         assert_eq!(r.version, "1.5.0");

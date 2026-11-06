@@ -13,15 +13,13 @@
 //! cheap thing to do *first*: learn a dependency's age before deciding whether
 //! the expensive fetch and analysis of its bytes is worth it.
 
-use std::sync::{Arc, PoisonError};
-
 use crate::distro;
 use crate::ecosystem::{
     Coordinates, arch, cargo, chrome, clawhub, clojars, comfyui, composer, conda, container, cpan,
     cran, dify, fedora, firefox, for_version, gem, github, golang, hex, homebrew, huggingface,
     jetbrains, jsr, maven, npm, nuget, pub_dev, pypi, snap, terraform, vscode, wordpress,
 };
-use crate::fetch::{BlobCache, Fetch, FetchError, RecordedSource, is_http_url, url_host_is};
+use crate::fetch::{BlobCache, Fetch, FetchError, RecordedSource, url_host_is};
 use crate::purl::{Purl, PurlError};
 use filefacts::{RefLocator, Registry};
 
@@ -50,7 +48,7 @@ pub enum RegistryError {
     Unavailable(FetchError),
     /// The registry's answer was not the document fletch reads: a schema
     /// change upstream, or not JSON at all.
-    #[error("unreadable registry document {url}: {reason}")]
+    #[error("unreadable registry document {}: {}", .url.escape_debug(), .reason.escape_debug())]
     Malformed {
         /// The document that could not be read.
         url: String,
@@ -66,6 +64,23 @@ pub enum RegistryError {
     /// would describe another artifact.
     #[error("package is not served by the registry fletch reads")]
     OffRegistry,
+}
+
+impl RegistryError {
+    /// The variant's name in snake case, as a metric label.
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::NotAPackage => "not_a_package",
+            Self::InvalidPurl(_) => "invalid_purl",
+            Self::UnsafeCoordinate => "unsafe_coordinate",
+            Self::Unsupported(_) => "unsupported",
+            Self::NotFound => "not_found",
+            Self::Unavailable(_) => "unavailable",
+            Self::Malformed { .. } => "malformed",
+            Self::NoRecord => "no_record",
+            Self::OffRegistry => "off_registry",
+        }
+    }
 }
 
 impl From<FetchError> for RegistryError {
@@ -99,7 +114,7 @@ pub fn lookup(
         Ok(record) => tracing::debug!(
             locator = %raw.escape_debug(),
             ecosystem = %record.ecosystem,
-            version = %record.version,
+            version = %record.version.escape_debug(),
             "registry record"
         ),
         Err(error) => tracing::debug!(
@@ -125,14 +140,7 @@ pub fn lookup_recorded(
 ) -> (Result<Registry, RegistryError>, Vec<RecordedSource>) {
     let (recording, sink) = cache.recording();
     let record = lookup(locator, net, &recording);
-    drop(recording);
-    // A lookup that panicked mid-read poisons the sink; what it recorded
-    // before then is still the provenance of whatever it returned.
-    let sources = match Arc::try_unwrap(sink) {
-        Ok(mutex) => mutex.into_inner().unwrap_or_else(PoisonError::into_inner),
-        Err(shared) => std::mem::take(&mut *shared.lock().unwrap_or_else(PoisonError::into_inner)),
-    };
-    (record, sources)
+    (record, sink.take())
 }
 
 /// [`lookup`]'s work: parse and vet the coordinate, refuse off-registry
@@ -150,7 +158,11 @@ fn resolve(
     // The fetcher honours these qualifiers, so without this a file could name
     // `pkg:npm/lodash@4.17.21?repository_url=https://evil.test` and have
     // evil.test's bytes judged by lodash's age and popularity.
-    if off_registry(&purl) {
+    if purl.qualifier("download_url").is_some()
+        || purl
+            .qualifier("repository_url")
+            .is_some_and(|url| !repository_is_public(purl.typ(), url))
+    {
         tracing::debug!(
             purl = %raw.escape_debug(),
             "registry lookup refused: the PURL's bytes are not the public registry's"
@@ -166,7 +178,7 @@ fn resolve(
     // so. A hijacked account's new release is exactly this case, and its
     // publish time, publisher and install hooks are what would flag it.
     if c.version().is_some()
-        && DATES_EVERY_VERSION.contains(&purl.typ())
+        && public_registry(purl.typ()).is_some_and(|registry| registry.dates_every_version)
         && record.as_ref().is_ok_and(|r| r.published_at.is_none())
     {
         tracing::debug!(
@@ -179,30 +191,113 @@ fn resolve(
     record
 }
 
-/// Ecosystems whose package document carries a publish time for every version
-/// it lists — so a requested version with none is one the document lacks.
-const DATES_EVERY_VERSION: &[&str] = &[
-    "npm",
-    "cargo",
-    "pypi",
-    "composer",
-    "gem",
-    "hex",
-    "pub",
-    "conda",
-    "jsr",
-    "cran",
-    "terraform",
+/// What fletch knows of one type's public registry.
+struct PublicRegistry {
+    typ: &'static str,
+    /// The hosts a `repository_url` may name for the type and still mean
+    /// this registry.
+    hosts: &'static [&'static str],
+    /// The paths on those hosts, besides the root, that a `repository_url`
+    /// may name as the registry itself: its documented index URL
+    /// (`https://pypi.org/simple`), never a document on it.
+    paths: &'static [&'static str],
+    /// Whether the package document carries a publish time for every
+    /// version it lists — so a requested version with none is one the
+    /// document lacks.
+    dates_every_version: bool,
+}
+
+/// The types fletch reads from a public registry, one row each. A type
+/// absent here has no public `repository_url` fletch recognizes.
+const PUBLIC_REGISTRIES: &[PublicRegistry] = &[
+    public("npm", &["registry.npmjs.org"], &[], true),
+    public(
+        "pypi",
+        &["pypi.org", "files.pythonhosted.org"],
+        &["/simple"],
+        true,
+    ),
+    public(
+        "cargo",
+        &["crates.io", "index.crates.io", "static.crates.io"],
+        &[],
+        true,
+    ),
+    public("gem", &["rubygems.org"], &[], true),
+    public("golang", &["proxy.golang.org"], &[], false),
+    public(
+        "maven",
+        &["repo.maven.apache.org", "repo1.maven.org"],
+        &["/maven2"],
+        false,
+    ),
+    public(
+        "nuget",
+        &["api.nuget.org", "www.nuget.org", "nuget.org"],
+        &["/v3/index.json", "/api/v2"],
+        false,
+    ),
+    public(
+        "composer",
+        &["repo.packagist.org", "packagist.org"],
+        &[],
+        true,
+    ),
+    public("hex", &["hex.pm", "repo.hex.pm"], &[], true),
+    public("pub", &["pub.dev"], &[], true),
+    public("conda", &["conda.anaconda.org", "anaconda.org"], &[], true),
+    public(
+        "cran",
+        &["cran.r-project.org", "cloud.r-project.org"],
+        &[],
+        true,
+    ),
+    public("clojars", &["clojars.org", "repo.clojars.org"], &[], false),
+    public("jsr", &["jsr.io"], &[], true),
+    public("terraform", &["registry.terraform.io"], &[], true),
+    public("huggingface", &["huggingface.co"], &[], false),
+    public("alpm", &["archlinux.org", "aur.archlinux.org"], &[], false),
+    public(
+        "vscode-extension",
+        &["marketplace.visualstudio.com", "open-vsx.org"],
+        &[],
+        false,
+    ),
 ];
 
-/// Whether `purl` names bytes the registry lookup does not read: any
-/// `download_url`, or a `repository_url` that is not the type's public
-/// registry ([`repository_is_public`]).
-fn off_registry(purl: &Purl) -> bool {
-    purl.qualifier("download_url").is_some()
-        || purl
-            .qualifier("repository_url")
-            .is_some_and(|url| !repository_is_public(purl.typ(), url))
+const fn public(
+    typ: &'static str,
+    hosts: &'static [&'static str],
+    paths: &'static [&'static str],
+    dates_every_version: bool,
+) -> PublicRegistry {
+    PublicRegistry {
+        typ,
+        hosts,
+        paths,
+        dates_every_version,
+    }
+}
+
+impl PublicRegistry {
+    /// Whether `host` is one of this registry's hosts.
+    fn serves(&self, host: &str) -> bool {
+        self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+    }
+}
+
+fn public_registry(typ: &str) -> Option<&'static PublicRegistry> {
+    PUBLIC_REGISTRIES
+        .iter()
+        .find(|registry| registry.typ == typ)
+}
+
+/// Whether `host` is one of a type's public registry hosts — a host fletch
+/// reads registry documents from.
+pub(crate) fn is_public_registry_host(host: &str) -> bool {
+    PUBLIC_REGISTRIES
+        .iter()
+        .any(|registry| registry.serves(host))
 }
 
 /// Whether `url`, a `repository_url` qualifier on a PURL of type `typ`, names
@@ -210,44 +305,42 @@ fn off_registry(purl: &Purl) -> bool {
 ///
 /// Deny by default: a type absent from the table has no public repository URL
 /// fletch recognizes, so any `repository_url` on it names somewhere else. For
-/// the rest, the URL must be absolute `http`/`https` and its host exactly one
-/// of the type's registry hosts; the path is not consulted, since each of
-/// these hosts serves one registry. A Cargo `sparse+` prefix is the same
-/// registry over the sparse protocol, so `sparse+https://index.crates.io/`
-/// is public. An OCI `repository_url` is a `host/path` reference rather than
-/// a URL; it is public when its host is Docker Hub or Quay, the registries
-/// whose metadata fletch reads.
+/// the rest, the URL must be absolute `http`/`https`, its host exactly one of
+/// the type's [`PUBLIC_REGISTRIES`] hosts, and it must name the registry
+/// itself: no credentials, port, query or fragment, and a path that is the
+/// root or one of the type's index paths. The fetcher builds on the URL — npm,
+/// PyPI, RubyGems and the Go proxy append their own paths to it — so a URL
+/// naming a document on the registry reads another package there:
+/// `https://registry.npmjs.org/@evil` fetches `@evil/lodash` for `lodash`,
+/// and a trailing `?` or `#` turns the appended path into noise. A Cargo
+/// `sparse+` prefix is the same registry over the sparse protocol, so
+/// `sparse+https://index.crates.io/` is public. An OCI `repository_url` is a
+/// `host/path` reference rather than a URL; it is public when its host is
+/// Docker Hub or Quay, the registries whose metadata fletch reads.
 pub(crate) fn repository_is_public(typ: &str, url: &str) -> bool {
     if matches!(typ, "oci" | "docker") {
         return container::public_repository(url);
     }
-    let hosts: &[&str] = match typ {
-        "npm" => &["registry.npmjs.org"],
-        "pypi" => &["pypi.org", "files.pythonhosted.org"],
-        "cargo" => &["crates.io", "index.crates.io", "static.crates.io"],
-        "gem" => &["rubygems.org"],
-        "golang" => &["proxy.golang.org"],
-        "maven" => &["repo.maven.apache.org", "repo1.maven.org"],
-        "nuget" => &["api.nuget.org", "www.nuget.org", "nuget.org"],
-        "composer" => &["repo.packagist.org", "packagist.org"],
-        "hex" => &["hex.pm", "repo.hex.pm"],
-        "pub" => &["pub.dev"],
-        "conda" => &["conda.anaconda.org", "anaconda.org"],
-        "cran" => &["cran.r-project.org", "cloud.r-project.org"],
-        "clojars" => &["clojars.org", "repo.clojars.org"],
-        "jsr" => &["jsr.io"],
-        "terraform" => &["registry.terraform.io"],
-        "huggingface" => &["huggingface.co"],
-        "alpm" => &["archlinux.org", "aur.archlinux.org"],
-        "vscode-extension" => &["marketplace.visualstudio.com", "open-vsx.org"],
-        _ => &[],
+    let Some(registry) = public_registry(typ) else {
+        return false;
     };
     let url = if typ == "cargo" {
         url.strip_prefix("sparse+").unwrap_or(url)
     } else {
         url
     };
-    is_http_url(url) && hosts.iter().any(|host| url_host_is(url, host))
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    let path = url.path().trim_end_matches('/');
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|host| registry.serves(host))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && (path.is_empty() || registry.paths.contains(&path))
 }
 
 /// One registry lookup: dispatch on the PURL type to its backend. The OS
@@ -284,11 +377,13 @@ fn dispatch(
         ("clojars", _) => clojars::lookup(c, net, cache),
         ("jsr", _) => jsr::lookup(c, net, cache),
         ("terraform", _) => terraform::lookup(c, net, cache),
-        ("alpm", Some("aur")) => arch::user(c, net, cache),
-        ("alpm", Some(repo)) if arch::REPOSITORIES.contains(&repo) => arch::official(c, net, cache),
+        ("alpm", Some("aur")) => at_requested(c, arch::user(c, net, cache)),
+        ("alpm", Some(repo)) if arch::REPOSITORIES.contains(&repo) => {
+            at_requested(c, arch::official(c, net, cache))
+        }
         ("deb", Some("debian")) => at_requested(c, distro::debian(c.name(), net, cache)),
         ("deb", Some("ubuntu")) => at_requested(c, distro::ubuntu(c.name(), net, cache)),
-        ("rpm", Some("fedora")) => fedora::lookup(c, net, cache),
+        ("rpm", Some("fedora")) => at_requested(c, fedora::lookup(c, net, cache)),
         ("rpm", Some("opensuse")) => at_requested(c, distro::opensuse(c.name(), net, cache)),
         ("rpm", Some("rpmfusion")) => at_requested(c, distro::rpmfusion(c.name(), net, cache)),
         ("apk", Some("alpine")) => at_requested(c, distro::alpine(c.name(), net, cache)),
@@ -301,16 +396,19 @@ fn dispatch(
             );
             Err(RegistryError::OffRegistry)
         }
-        ("netbsd", _) => c
-            .bare_name(&[])
-            .and_then(|_| at_requested(c, distro::netbsd(c.name(), net, cache))),
-        ("freebsd", _) => c
-            .bare_name(&[])
-            .and_then(|_| at_requested(c, distro::freebsd(c.name(), net, cache))),
-        ("openbsd", _) => c
-            .bare_name(&[])
-            .and_then(|_| at_requested(c, distro::openbsd(c.name(), net, cache))),
-        ("brew" | "homebrew", _) => homebrew::lookup(c, net, cache),
+        ("netbsd", _) => {
+            c.bare_name(&[])?;
+            at_requested(c, distro::netbsd(c.name(), net, cache))
+        }
+        ("freebsd", _) => {
+            c.bare_name(&[])?;
+            at_requested(c, distro::freebsd(c.name(), net, cache))
+        }
+        ("openbsd", _) => {
+            c.bare_name(&[])?;
+            at_requested(c, distro::openbsd(c.name(), net, cache))
+        }
+        ("brew", _) => homebrew::lookup(c, net, cache),
         ("snap", _) => snap::lookup(c, net, cache),
         ("wordpress", _) => wordpress::lookup(c, net, cache),
         ("clawhub", _) => clawhub::lookup(c, net, cache),
@@ -336,22 +434,23 @@ fn dispatch(
     }
 }
 
-/// A distro index lists only each package's current build, which becomes the
-/// record's `latest_version`. A requested version other than that build is
-/// still the version the record describes — undated, since the index does not
-/// say when it was built.
+/// A distro index (or a repository API that, like one, knows only the current
+/// build) lists each package's current build, which becomes the record's
+/// `latest_version`. A requested version other than that build is still the
+/// version the record describes — undated, since the index does not say when
+/// it was built.
 fn at_requested(
     c: &Coordinates<'_>,
     record: Result<Registry, RegistryError>,
 ) -> Result<Registry, RegistryError> {
     let mut record = record?;
-    record.latest_version = Some(record.version.clone());
+    record.latest_version = (!record.version.is_empty()).then(|| record.version.clone());
     if let Some(requested) = c.version()
         && requested != record.version
     {
         tracing::debug!(
             requested = %requested.escape_debug(),
-            current = %record.version,
+            current = %record.version.escape_debug(),
             "requested build is not the index's current one; leaving it undated"
         );
         record.version = requested.to_string();
@@ -364,6 +463,9 @@ fn at_requested(
 mod tests {
     use super::*;
     use filefacts::Ecosystem;
+    use std::sync::PoisonError;
+
+    use crate::purl::SyntaxError;
 
     use crate::fetch::{BlobCache, Fixtures};
 
@@ -415,43 +517,18 @@ mod tests {
         assert_eq!(sources[0].bytes, None);
     }
 
+    /// The document URL can carry a `repository_url` from the scanned file,
+    /// so the error's text escapes it rather than letting a newline forge a
+    /// log line.
     #[test]
-    fn pinned_metadata_outlives_unpinned_and_honours_the_override() {
-        // A pinned coordinate cannot come back holding different bytes on any
-        // registry we support, so its packument is held for months; a versionless
-        // lookup resolves through mutable dist-tags and keeps a tight bound.
-        let cache = BlobCache::disabled();
-        assert!(cache.meta_ttl_pinned() > cache.meta_ttl_unpinned());
-        assert!(cache.meta_ttl_pinned() >= std::time::Duration::from_secs(30 * 86_400));
-
-        // An explicit operator override still wins on both tiers, so asking for
-        // tight revalidation is never silently ignored.
-        let minute = std::time::Duration::from_secs(60);
-        let cache = cache.with_registry_ttl(Some(minute));
-        assert_eq!(cache.meta_ttl_pinned(), minute);
-        assert_eq!(cache.meta_ttl_unpinned(), minute);
-    }
-
-    #[test]
-    fn an_unsupported_or_unreachable_locator_has_no_record() {
-        let net = Fixtures::default();
-        let cache = BlobCache::disabled();
-        assert!(
-            lookup(
-                &RefLocator::Url("https://x.test/a.tgz".into()),
-                &net,
-                &cache
-            )
-            .is_err()
-        );
-        assert!(
-            lookup(
-                &RefLocator::Purl("pkg:gem/rails@7.0.0".into()),
-                &net,
-                &cache
-            )
-            .is_err()
-        );
+    fn a_malformed_error_escapes_its_url() {
+        let error = RegistryError::Malformed {
+            url: "https://r.test/\nFORGED line".into(),
+            reason: "bad\u{1b}[31m".into(),
+        };
+        let text = error.to_string();
+        assert!(!text.contains(['\n', '\u{1b}']), "{text}");
+        assert!(text.contains("https://r.test/\\nFORGED line"), "{text}");
     }
 
     #[test]
@@ -472,7 +549,9 @@ mod tests {
         );
         assert_eq!(
             why(&none, "not a purl"),
-            Some(RegistryError::InvalidPurl(PurlError::Syntax("no scheme")))
+            Some(RegistryError::InvalidPurl(PurlError::Syntax(
+                SyntaxError::NoScheme
+            )))
         );
         assert_eq!(
             why(&none, "pkg:pypi/w@..%2F..%2Fx"),
@@ -714,9 +793,11 @@ mod tests {
         ] {
             assert_eq!(look(purl), Err(RegistryError::OffRegistry), "{purl}");
         }
+        // A scope the registry cannot hold is a coordinate shape it does not
+        // use, refused before any read — not a registry that answered badly.
         assert_eq!(
             look("pkg:jsr/%40%40%40std/path"),
-            Err(RegistryError::NoRecord)
+            Err(RegistryError::UnsafeCoordinate)
         );
     }
 
@@ -892,6 +973,50 @@ mod tests {
             ("swift", "https://github.com"),
             ("oci", "ghcr.io/owner/img"),
             ("oci", "https://docker.io/library/nginx"),
+        ] {
+            assert!(!repository_is_public(typ, url), "{typ} {url}");
+        }
+    }
+
+    /// A `repository_url` on the public host that names a document there,
+    /// rather than the registry, re-roots the fetch onto another package
+    /// (`…/@evil` + `/lodash` is `@evil/lodash`; `…/evil/-/evil-1.0.0.tgz?`
+    /// swallows the appended path). Those bytes must never borrow the named
+    /// package's record.
+    #[test]
+    fn a_document_on_the_public_host_is_not_the_public_registry() {
+        let (net, cache) = (Fixtures::default(), BlobCache::disabled());
+        for purl in [
+            "pkg:npm/lodash@4.17.21?repository_url=https://registry.npmjs.org/@evil",
+            "pkg:npm/lodash@4.17.21?repository_url=https://registry.npmjs.org/evil/-/evil-1.0.0.tgz%3F",
+            "pkg:npm/lodash@4.17.21?repository_url=https://registry.npmjs.org%23",
+            "pkg:npm/lodash@4.17.21?repository_url=https://registry.npmjs.org:8443",
+            "pkg:npm/lodash@4.17.21?repository_url=https://u:p@registry.npmjs.org",
+            "pkg:pypi/requests@2.31.0?repository_url=https://pypi.org/pypi/evil/1.0/json%3F",
+            "pkg:gem/rails@7.0.0?repository_url=https://rubygems.org/downloads/evil-7.0.0.gem%3F",
+            "pkg:golang/github.com/a/b@v1.0.0?repository_url=https://proxy.golang.org/evil.test/m",
+        ] {
+            assert_eq!(
+                lookup(&RefLocator::Purl(purl.into()), &net, &cache),
+                Err(RegistryError::OffRegistry),
+                "{purl}"
+            );
+        }
+        for (typ, url) in [
+            ("npm", "https://registry.npmjs.org/"),
+            ("npm", "https://registry.npmjs.org:443"),
+            ("pypi", "https://pypi.org/simple/"),
+            ("maven", "https://repo.maven.apache.org/maven2/"),
+            ("nuget", "https://api.nuget.org/v3/index.json"),
+            ("pypi", "https://pypi.org/x/.."),
+        ] {
+            assert!(repository_is_public(typ, url), "{typ} {url}");
+        }
+        for (typ, url) in [
+            ("pypi", "https://pypi.org/simple/evil"),
+            ("maven", "https://repo1.maven.org/maven2/../evil"),
+            ("npm", "https://registry.npmjs.org/%40evil"),
+            ("npm", "https://registry.npmjs.org?"),
         ] {
             assert!(!repository_is_public(typ, url), "{typ} {url}");
         }

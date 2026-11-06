@@ -7,12 +7,12 @@ use serde::de::IgnoredAny;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ecosystem::{
-    Coordinates, email_domain, fetch_json, for_version, lenient, non_empty, null_default, optional,
-    set_timeline, unix_secs,
+    Coordinates, count, email_domain, fetch_json, for_version, lenient, non_empty, null_default,
+    optional, set_timeline, unix_secs,
 };
 use crate::fetch::{
     ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, file_name_from_url,
-    repository_base,
+    is_file_name, repository_base,
 };
 use crate::registry::RegistryError;
 
@@ -42,80 +42,68 @@ pub(crate) fn pypi_artifacts(
     // not, so a pinned release revalidates on the pinned window.
     let doc: Project =
         fetch_json(&api, net, &for_version(cache, version)).inspect_err(|error| {
-            tracing::debug!(url = %api, %error, "pypi artifacts unresolved: document unreadable");
+            tracing::debug!(url = %api.escape_debug(), %error, "pypi artifacts unresolved: document unreadable");
         })?;
     let Some(resolved) = purl
         .version()
         .or_else(|| doc.info.as_ref()?.version.as_deref())
     else {
-        tracing::debug!(url = %api, "pypi artifacts unresolved: no version named");
+        tracing::debug!(url = %api.escape_debug(), "pypi artifacts unresolved: no version named");
         return Ok(Vec::new());
     };
     let mut candidates: Vec<_> = doc
         .urls
-        .iter()
+        .into_iter()
         .filter_map(|file| pypi_candidate(file, purl.name(), resolved))
         .collect();
     let exact = purl.qualifier("file_name");
     let kind = purl.qualifier("kind");
-    candidates.sort_by_key(|candidate| {
-        (
-            pypi_rank(candidate, exact, kind),
-            candidate.file_name.clone(),
-        )
+    candidates.sort_by(|a, b| {
+        (pypi_rank(a, exact, kind), &a.file_name).cmp(&(pypi_rank(b, exact, kind), &b.file_name))
     });
-    let preferred = if let Some(file_name) = exact {
-        candidates
-            .iter()
-            .position(|candidate| candidate.file_name == file_name)
-    } else {
-        (!candidates.is_empty()).then_some(0)
-    };
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        candidate.preferred = Some(index) == preferred;
+    // The rank sorts an exact `file_name` match first, so the first candidate
+    // is the preferred one unless that match is missing.
+    if let Some(first) = candidates.first_mut() {
+        first.preferred = exact.is_none_or(|file_name| first.file_name == file_name);
     }
     Ok(candidates)
 }
 
 /// One uploaded file as an artifact candidate; `None` for a file record with
 /// no URL.
-fn pypi_candidate(file: &DistFile, name: &str, version: &str) -> Option<ArtifactCandidate> {
-    let url = file.url.clone()?;
+fn pypi_candidate(file: DistFile, name: &str, version: &str) -> Option<ArtifactCandidate> {
+    let url = file.url?;
+    // The registry's name stands only when it is one path component.
     let file_name = file
         .filename
-        .clone()
+        .filter(|name| is_file_name(name))
         .unwrap_or_else(|| file_name_from_url(&url));
     let kind = match file.packagetype.as_deref() {
         Some("bdist_wheel") => ArtifactKind::Wheel,
         Some("sdist") => ArtifactKind::Sdist,
         _ => ArtifactKind::Other,
     };
-    let mut qualifiers = BTreeMap::new();
-    qualifiers.insert("file_name".into(), file_name.clone());
-    let mut attributes = BTreeMap::new();
-    if kind == ArtifactKind::Wheel {
-        attributes.extend(wheel_attributes(&file_name, name, version));
-    }
+    let mut attributes = if kind == ArtifactKind::Wheel {
+        wheel_attributes(&file_name, name, version)
+    } else {
+        BTreeMap::new()
+    };
     for (key, value) in [
-        ("python_version", &file.python_version),
-        ("requires_python", &file.requires_python),
-        ("yanked_reason", &file.yanked_reason),
+        ("python_version", file.python_version),
+        ("requires_python", file.requires_python),
+        ("yanked_reason", file.yanked_reason),
     ] {
         if let Some(value) = value {
-            attributes.insert(key.to_string(), value.clone());
+            attributes.insert(key.to_string(), value);
         }
     }
     let checksums = file
         .digests
-        .iter()
+        .into_iter()
         .flatten()
-        .map(|(algorithm, digest)| {
-            (
-                algorithm.to_ascii_lowercase().replace('_', "-"),
-                digest.clone(),
-            )
-        })
+        .map(|(algorithm, digest)| (algorithm.to_ascii_lowercase().replace('_', "-"), digest))
         .collect();
+    let qualifiers = BTreeMap::from([("file_name".to_string(), file_name.clone())]);
     Some(ArtifactCandidate {
         file_name,
         version: Some(version.to_string()),
@@ -181,29 +169,18 @@ fn pypi_rank(
     if let Some(file_name) = exact {
         return u8::from(candidate.file_name != file_name);
     }
-    let kind = candidate.kind;
-    let natural = if kind == ArtifactKind::Wheel {
-        let python = candidate.attributes.get("python").map(String::as_str);
-        let abi = candidate.attributes.get("abi").map(String::as_str);
-        let platform = candidate.attributes.get("platform").map(String::as_str);
-        if python == Some("py3") && abi == Some("none") && platform == Some("any") {
-            0
-        } else if abi == Some("none") && platform == Some("any") {
-            1
-        } else {
-            3
-        }
-    } else if kind == ArtifactKind::Sdist {
-        2
-    } else {
-        4
+    let tag = |key: &str| candidate.attributes.get(key).map(String::as_str);
+    let natural = match candidate.kind {
+        ArtifactKind::Wheel => match (tag("python"), tag("abi"), tag("platform")) {
+            (Some("py3"), Some("none"), Some("any")) => 0,
+            (_, Some("none"), Some("any")) => 1,
+            _ => 3,
+        },
+        ArtifactKind::Sdist => 2,
+        _ => 4,
     };
-    let requested = if requested_kind.is_some_and(|requested| kind.as_str() != requested) {
-        10 + natural
-    } else {
-        natural
-    };
-    requested + if candidate.yanked { 20 } else { 0 }
+    let unrequested = requested_kind.is_some_and(|requested| candidate.kind.as_str() != requested);
+    natural + 10 * u8::from(unrequested) + 20 * u8::from(candidate.yanked)
 }
 
 /// Look up the package `c` names on PyPI. The project document carries the
@@ -219,22 +196,17 @@ pub(crate) fn lookup(
 ) -> Result<Registry, RegistryError> {
     let name = c.encoded_name();
     let doc: Project = fetch_json(&format!("https://pypi.org/pypi/{name}/json"), net, cache)?;
-    let Some(info) = &doc.info else {
-        return Err(RegistryError::NoRecord);
-    };
+    let info = doc.info.ok_or(RegistryError::NoRecord)?;
     let latest = info.version.as_deref();
     let target = c.target(latest);
     let target_is_latest = Some(target) == latest;
-    let vulnerability_count =
-        |v: &Option<Vec<IgnoredAny>>| v.as_ref().and_then(|v| u32::try_from(v.len()).ok());
+    let vulnerability_count = |v: Option<Vec<IgnoredAny>>| v.map(|v| count(v.len()));
 
     // `urls` lists the latest release's files, so it stands in for the
     // target's `releases` entry only when the target is the latest. A
     // requested version the timeline lacks gets no date or yank status
     // rather than the latest's.
-    let target_files = doc
-        .releases
-        .get(target)
+    let target_files = release_files(&doc.releases, target)
         .or_else(|| target_is_latest.then_some(&doc.urls))
         .filter(|files| !files.is_empty());
     // PyPI yanks a release by yanking its files; a release whose every file
@@ -249,29 +221,27 @@ pub(crate) fn lookup(
         );
     }
 
-    let mut p = Registry::new(Ecosystem::Pypi, c.name().to_string());
-    p.version = target.to_string();
-    p.published_at = target_files.and_then(|files| publish_time(files));
-    p.latest_version = latest.map(str::to_string);
-    p.author = info.author.clone().or_else(|| info.maintainer.clone());
-    p.description = info.summary.clone();
-    p.homepage = info.home_page.clone();
-    p.license = info.license.clone();
-    p.version_removed = version_removed;
+    let mut record = c.record(Ecosystem::Pypi, c.name(), latest.map(str::to_string));
+    record.published_at = target_files.and_then(|files| publish_time(files));
+    record.author = info.author.or(info.maintainer);
+    record.description = info.summary;
+    record.homepage = info.home_page;
+    record.license = info.license;
+    record.version_removed = version_removed;
     // The project document's `vulnerabilities` are the latest release's;
     // any other listed version's come from its own document.
-    p.vulnerability_count = match (target_is_latest, c.encoded_version(), target_files) {
-        (true, _, _) => vulnerability_count(&doc.vulnerabilities),
+    record.vulnerability_count = match (target_is_latest, c.encoded_version(), target_files) {
+        (true, _, _) => vulnerability_count(doc.vulnerabilities),
         (false, Some(v), Some(_)) => {
             let url = format!("https://pypi.org/pypi/{name}/{v}/json");
             optional(fetch_json::<Project>(&url, net, cache), &url)
-                .and_then(|release| vulnerability_count(&release.vulnerabilities))
+                .and_then(|release| vulnerability_count(release.vulnerabilities))
         }
         _ => None,
     };
     // Custody: the owning account (PyPI exposes roles, not a per-version
     // publisher), and the email domain from the author or maintainer.
-    p.publisher = doc.ownership.as_ref().and_then(|o| {
+    record.publisher = doc.ownership.as_ref().and_then(|o| {
         o.roles
             .iter()
             .find(|r| r.role.as_deref() == Some("Owner"))
@@ -279,18 +249,38 @@ pub(crate) fn lookup(
             .user
             .clone()
     });
-    p.publisher_email_domain = info
+    record.publisher_email_domain = info
         .author_email
         .as_deref()
         .or(info.maintainer_email.as_deref())
         .and_then(email_domain);
     set_timeline(
-        &mut p,
+        &mut record,
         doc.releases
             .values()
             .filter_map(|files| publish_time(files)),
     );
-    Ok(p)
+    Ok(record)
+}
+
+/// The files `releases` lists for `version`: under that key, else under the
+/// one key PEP 440 holds to be the same release (`1.0` for `1.0.0`, `1.0RC1`
+/// for `1.0rc1`) — the release pip installs for `==1.0.0` and PyPI's API
+/// serves for it, so its yank and date must not be lost to the spelling.
+/// Several equal keys (which PyPI never lists) resolve to the least, so the
+/// answer does not depend on map order.
+fn release_files<'a>(
+    releases: &'a HashMap<String, Vec<DistFile>>,
+    version: &str,
+) -> Option<&'a Vec<DistFile>> {
+    releases.get(version).or_else(|| {
+        let want = version.parse::<pep440_rs::Version>().ok()?;
+        releases
+            .iter()
+            .filter(|(key, _)| key.parse::<pep440_rs::Version>().is_ok_and(|v| v == want))
+            .min_by_key(|(key, _)| *key)
+            .map(|(_, files)| files)
+    })
 }
 
 /// A release's publish time: the earliest upload among its files.
@@ -380,13 +370,22 @@ struct Role {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::coordinates;
-
+    use crate::ecosystem::{coordinates, look};
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
-    fn look(purl: &str, net: &Fixtures) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
+    #[test]
+    fn a_registry_file_name_that_is_a_path_is_not_trusted() {
+        let candidate = pypi_candidate(
+            DistFile {
+                url: Some("https://files.pythonhosted.org/packages/w-1.0.tar.gz".into()),
+                filename: Some("../../.bashrc".into()),
+                ..DistFile::default()
+            },
+            "w",
+            "1.0",
+        )
+        .expect("candidate");
+        assert_eq!(candidate.file_name, "w-1.0.tar.gz");
     }
 
     #[test]
@@ -473,6 +472,34 @@ mod tests {
         assert_eq!(old.version_removed, Some(false));
         assert_eq!(old.deprecated, None);
         assert_eq!(old.vulnerability_count, Some(2));
+    }
+
+    /// `==1.0.0` installs the release PyPI lists as `1.0`; a spelling PEP 440
+    /// holds equal must not hide that release's yank or date.
+    #[test]
+    fn an_equal_pep440_spelling_finds_the_listed_release() {
+        let doc = serde_json::json!({
+            "info": {"version": "2.0"},
+            "releases": {
+                "1.0": [{"upload_time_iso_8601": "2021-01-01T00:00:00Z", "yanked": true, "yanked_reason": "malware"}],
+                "2.0RC1": [{"upload_time_iso_8601": "2022-01-01T00:00:00Z", "yanked": false}],
+                "2.0": [{"upload_time_iso_8601": "2024-01-01T00:00:00Z", "yanked": false}]
+            }
+        })
+        .to_string();
+        let net = Fixtures::default().with("https://pypi.org/pypi/w/json", doc.as_bytes());
+        for spelling in ["1.0", "1.0.0", "1.0.0.0", "v1.0"] {
+            let r = look(&format!("pkg:pypi/w@{spelling}"), &net).expect("record");
+            assert_eq!(r.version_removed, Some(true), "{spelling}");
+            assert_eq!(r.published_at, Some(1_609_459_200), "{spelling}");
+        }
+        let rc = look("pkg:pypi/w@2.0rc1", &net).expect("record");
+        assert_eq!(rc.published_at, Some(1_640_995_200));
+        assert_eq!(rc.version_removed, Some(false));
+        // A different release is still unlisted, not borrowed.
+        let other = look("pkg:pypi/w@1.0.1", &net).expect("record");
+        assert_eq!(other.published_at, None);
+        assert_eq!(other.version_removed, None);
     }
 
     #[test]

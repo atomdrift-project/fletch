@@ -14,7 +14,8 @@ use super::builtins::{is_host_provided, is_node_builtin, is_python_stdlib};
 use super::found::{Found, dedup};
 use super::purl_token::{Eco, npm_purl_token, pypi_purl_token};
 use super::shell::{Place, commands};
-use super::urls::{git_refs, urls};
+use super::urls::{git_refs, url_locator, urls};
+use crate::fetch::is_http_url;
 
 /// AST nodes one walk may visit. The walk visits the file's end first, so a
 /// budget small enough for padding to exhaust would hide the calls and
@@ -79,21 +80,22 @@ pub(super) fn execution_call(lang: Lang, callee: &str) -> bool {
         }
         Lang::JavaScript => {
             let (module, method) = callee.rsplit_once('.').unwrap_or(("", callee));
-            let module = required_module(module).unwrap_or(module);
+            // `require('m').exec` names `m`'s member.
+            let module = module
+                .strip_prefix("require(")
+                .and_then(|call| call.strip_suffix(')'))
+                .and_then(|quoted| {
+                    ['\'', '"']
+                        .iter()
+                        .find_map(|&q| quoted.strip_prefix(q)?.strip_suffix(q))
+                })
+                .unwrap_or(module);
             let known = JS_PROCESS_MODULES.contains(&module)
                 || (module.is_empty() && JS_BARE_EXEC.contains(&method));
             known && JS_EXEC_METHODS.contains(&method)
         }
         Lang::Shell | Lang::Dockerfile | Lang::PowerShell => false,
     }
-}
-
-/// The module a `require('m')` expression loads.
-fn required_module(expression: &str) -> Option<&str> {
-    let quoted = expression.strip_prefix("require(")?.strip_suffix(')')?;
-    ['\'', '"']
-        .iter()
-        .find_map(|&q| quoted.strip_prefix(q)?.strip_suffix(q))
 }
 
 /// Whether `callee` is a package manager's programmatic install API.
@@ -226,21 +228,7 @@ fn normalize_call(text: &str, base: usize) -> (String, Vec<(usize, usize)>) {
         if let Some(delimiter) = quote {
             in_word = false;
             if c == '\\' {
-                let tail = &text[at..];
-                let consumed = match continuation_len(tail) {
-                    0 => match escape_at(tail) {
-                        Some((decoded, consumed)) => {
-                            normalized.push(decoded);
-                            consumed
-                        }
-                        None => {
-                            normalized.push('\\');
-                            1
-                        }
-                    },
-                    consumed => consumed,
-                };
-                at += consumed;
+                at += decode_one(&text[at..], &mut normalized);
                 remap.push((normalized.len(), base + at));
                 continue;
             }
@@ -321,8 +309,10 @@ pub(super) const fn import_source(eco: Eco) -> &'static str {
 pub(super) fn import_locator(eco: Eco, spec: &str) -> Option<(RefLocator, RefKind)> {
     let decoded = decode_escapes(spec);
     let spec = decoded.as_deref().unwrap_or(spec);
+    // Only an HTTP(S) URL is a fetch; a `file:` or `ftp:` one is not a
+    // package either.
     if spec.contains("://") {
-        return Some((RefLocator::Url(spec.to_owned()), RefKind::UrlFetch));
+        return is_http_url(spec).then(|| (url_locator(spec), RefKind::UrlFetch));
     }
     if spec.starts_with('.') || spec.starts_with('/') {
         return None;
@@ -360,9 +350,8 @@ pub(super) fn import_locator(eco: Eco, spec: &str) -> Option<(RefLocator, RefKin
 /// plausible package name.
 fn npm_import_package(spec: &str) -> Option<String> {
     if let Some(rest) = spec.strip_prefix('@') {
-        let mut parts = rest.splitn(2, '/');
-        let scope = parts.next()?;
-        let name = parts.next()?.split('/').next()?;
+        let (scope, rest) = rest.split_once('/')?;
+        let name = rest.split('/').next()?;
         (is_package_name(scope) && is_package_name(name)).then(|| format!("@{scope}/{name}"))
     } else {
         let name = spec.split('/').next()?;
@@ -401,36 +390,41 @@ pub(super) fn decode_escapes(spec: &str) -> Option<String> {
     while let Some(at) = rest.find('\\') {
         out.push_str(&rest[..at]);
         let tail = &rest[at..];
-        let consumed = match continuation_len(tail) {
-            0 => match escape_at(tail) {
-                Some((c, consumed)) => {
-                    out.push(c);
-                    consumed
-                }
-                None => {
-                    out.push('\\');
-                    1
-                }
-            },
-            consumed => consumed,
-        };
-        rest = &tail[consumed..];
+        rest = &tail[decode_one(tail, &mut out)..];
     }
     out.push_str(rest);
     Some(out)
 }
 
+/// Decode the escape at the head of `tail`, which starts with a backslash,
+/// onto `out`, returning how many bytes of `tail` it spans. A line
+/// continuation decodes to nothing; a backslash that starts no escape is
+/// itself.
+fn decode_one(tail: &str, out: &mut String) -> usize {
+    if let Some(consumed) = continuation_len(tail) {
+        return consumed;
+    }
+    match escape_at(tail) {
+        Some((c, consumed)) => {
+            out.push(c);
+            consumed
+        }
+        None => {
+            out.push('\\');
+            1
+        }
+    }
+}
+
 /// The length of a line continuation at the head of `src`: a backslash before
 /// a line terminator, which both languages drop, so it must not split a
-/// command in two. Zero when there is none.
-fn continuation_len(src: &str) -> usize {
-    let Some(rest) = src.strip_prefix('\\') else {
-        return 0;
-    };
-    match rest.chars().next() {
-        Some('\r') if rest[1..].starts_with('\n') => 3,
-        Some(c @ ('\n' | '\r' | '\u{2028}' | '\u{2029}')) => 1 + c.len_utf8(),
-        _ => 0,
+/// command in two.
+fn continuation_len(src: &str) -> Option<usize> {
+    let rest = src.strip_prefix('\\')?;
+    match rest.chars().next()? {
+        '\r' if rest[1..].starts_with('\n') => Some(3),
+        c @ ('\n' | '\r' | '\u{2028}' | '\u{2029}') => Some(1 + c.len_utf8()),
+        _ => None,
     }
 }
 
@@ -597,43 +591,38 @@ fn import_aliases(symbols: &[Symbol]) -> HashMap<&str, String> {
 /// (`import subprocess as sp`).
 pub(super) fn scan_python(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
     let lang = Lang::Python;
-    let Some(ast) = parsed.source_ast() else {
-        if let Some(text) = out.text {
-            git_refs(text, lang.label(), out);
-            urls(text, lang.label(), out);
-        }
-        return;
-    };
-    let text = ast.source;
-    let aliases = import_aliases(parsed.symbols().as_slice());
-    let mut stack = vec![ast.tree.root_node()];
-    let mut visited = 0;
-    let mut spans = Vec::new();
-    let mut comments = Vec::new();
-    while let Some(node) = stack.pop() {
-        visited += 1;
-        if visited > AST_NODE_BUDGET {
-            out.cut_off(lang.label(), "AST node budget");
-            break;
-        }
-        match node.kind() {
-            "comment" => comments.push(node.byte_range()),
-            "call" => {
-                if let Some(span) = python_call(text, &aliases, node, out) {
-                    spans.push(span);
-                }
+    let mut text = out.text();
+    if let Some(ast) = parsed.source_ast() {
+        let source = ast.source;
+        let aliases = import_aliases(parsed.symbols().as_slice());
+        let mut stack = vec![ast.tree.root_node()];
+        let mut visited = 0;
+        let mut spans = Vec::new();
+        let mut comments = Vec::new();
+        // One cursor serves every node; `named_children` resets it.
+        let mut cursor = ast.tree.walk();
+        while let Some(node) = stack.pop() {
+            visited += 1;
+            if visited > AST_NODE_BUDGET {
+                out.cut_off(lang.label(), "AST node budget");
+                break;
             }
-            _ => {}
+            match node.kind() {
+                "comment" => comments.push(node.byte_range()),
+                "call" => spans.extend(python_call(source, &aliases, node, out)),
+                _ => {}
+            }
+            stack.extend(node.named_children(&mut cursor));
         }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
+        run_spans(source, spans, comments, lang, out);
+        text = text.or(Some(source));
     }
-    run_spans(text, spans, comments, lang, out);
     // The text scans read the file's own text, so each line is placed where
     // it sits rather than searched for.
-    let text = out.text.unwrap_or(text);
-    git_refs(text, lang.label(), out);
-    urls(text, lang.label(), out);
+    if let Some(text) = text {
+        git_refs(text, lang.label(), out);
+        urls(text, lang.label(), out);
+    }
 }
 
 /// Recognize one Python call: push a dynamic import it makes, and return its
@@ -729,6 +718,21 @@ mod tests {
         ] {
             assert!(!all.contains(&absent), "{absent}: {all:?}");
         }
+    }
+
+    #[test]
+    fn only_http_specifiers_are_url_fetches() {
+        let syms = [
+            require("file:///etc/passwd"),
+            require("ftp://x.test/a"),
+            require("HTTPS://x.test/a.js"),
+        ];
+        assert_eq!(
+            locators(&import_calls(FileType::JavaScript, &syms)),
+            ["https://x.test/a.js"]
+        );
+        let js = b"require('file:///etc/passwd'); import('ftp://x.test/a');\n";
+        assert!(references_in_bytes(js, "a.js").references.is_empty());
     }
 
     #[test]

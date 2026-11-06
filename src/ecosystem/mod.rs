@@ -1,5 +1,5 @@
 //! What fletch knows about each package ecosystem. Every module reads its
-//! registry's metadata into a [`Registry`](filefacts::Registry) record through
+//! registry's metadata into a [`Registry`] record through
 //! a `lookup` entry point; the modules for registries fletch downloads from
 //! also resolve artifact URLs. This module holds the coordinates and the
 //! document helpers they share.
@@ -36,7 +36,7 @@ pub(crate) mod terraform;
 pub(crate) mod vscode;
 pub(crate) mod wordpress;
 
-use filefacts::Registry;
+use filefacts::{Ecosystem, Registry};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
@@ -58,13 +58,6 @@ pub(crate) struct Coordinates<'a> {
     purl: &'a Purl,
     path: String,
     version: Option<String>,
-}
-
-/// Test coordinates for `raw`, a PURL with safe coordinates.
-#[cfg(test)]
-pub(crate) fn coordinates(raw: &str) -> Coordinates<'static> {
-    let purl = Box::leak(Box::new(Purl::parse(raw).expect("purl")));
-    Coordinates::new(purl).expect("safe coordinates")
 }
 
 impl<'a> Coordinates<'a> {
@@ -116,9 +109,12 @@ impl<'a> Coordinates<'a> {
     /// The decoded namespace and name, `/`-joined (`@scope/name`): how a
     /// registry names the package in its own documents.
     pub(crate) fn full_name(&self) -> String {
-        let mut segments = self.namespace().to_vec();
-        segments.push(self.name().to_string());
-        segments.join("/")
+        let mut full = self.namespace().join("/");
+        if !full.is_empty() {
+            full.push('/');
+        }
+        full.push_str(self.name());
+        full
     }
 
     /// The requested version, decoded.
@@ -135,6 +131,21 @@ impl<'a> Coordinates<'a> {
     /// registry's `latest`, else empty — the record's documented "no version".
     pub(crate) fn target<'b>(&'b self, latest: Option<&'b str>) -> &'b str {
         self.version().or(latest).unwrap_or_default()
+    }
+
+    /// A record of `name` in `ecosystem` describing the release
+    /// [`target`](Self::target) names, the registry's `latest` its
+    /// `latest_version`; every other field unknown.
+    pub(crate) fn record(
+        &self,
+        ecosystem: Ecosystem,
+        name: impl Into<String>,
+        latest: Option<String>,
+    ) -> Registry {
+        let mut record = Registry::new(ecosystem, name);
+        record.version = self.target(latest.as_deref()).to_string();
+        record.latest_version = latest;
+        record
     }
 
     /// The encoded `(namespace, name)` of a registry that addresses packages
@@ -163,10 +174,28 @@ impl<'a> Coordinates<'a> {
     }
 }
 
+/// Test coordinates for `raw`, a PURL with safe coordinates.
+#[cfg(test)]
+pub(crate) fn coordinates(raw: &str) -> Coordinates<'static> {
+    let purl = Box::leak(Box::new(Purl::parse(raw).expect("purl")));
+    Coordinates::new(purl).expect("safe coordinates")
+}
+
+/// The registry record for `purl`, read through `net` with no cache: the
+/// whole lookup path a scanned PURL takes.
+#[cfg(test)]
+pub(crate) fn look(purl: &str, net: &dyn Fetch) -> Result<Registry, RegistryError> {
+    crate::registry::lookup(
+        &filefacts::RefLocator::Purl(purl.into()),
+        net,
+        &BlobCache::disabled(),
+    )
+}
+
 /// `owner/name` split at its one `/`, both halves non-empty. Anything longer
 /// could reach another endpoint of a registry that addresses packages by
 /// pair, so it is refused as [`RegistryError::UnsafeCoordinate`].
-pub(crate) fn split_pair(path: &str) -> Result<(&str, &str), RegistryError> {
+fn split_pair(path: &str) -> Result<(&str, &str), RegistryError> {
     match path.split_once('/') {
         Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
             Ok((owner, name))
@@ -204,8 +233,8 @@ fn email_domain(email: &str) -> Option<String> {
     let domain: String = after
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
-        .collect::<String>()
-        .to_ascii_lowercase();
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
     (!domain.is_empty()).then_some(domain)
 }
 
@@ -300,13 +329,18 @@ impl Localized {
     }
 }
 
+/// The deprecation notice for a registry that flags a deprecation without
+/// saying why.
+const DEPRECATED: &str = "deprecated";
+
 /// A boolean flag the registry sets → its `label` when set, else `None`.
 fn flag(set: Option<bool>, label: &str) -> Option<String> {
-    set.and_then(|f| f.then(|| label.to_string()))
+    (set == Some(true)).then(|| label.to_string())
 }
 
 /// A marketplace rating on a `0..=max` scale, as stars out of five. `None`
-/// for a value off its scale, so every record's `rating` reads the same way.
+/// for a value off its scale, so every marketplace's rating reads the same
+/// way. (The AUR's popularity score has no scale; it is stored as reported.)
 fn five_star(value: f64, max: f64) -> Option<f32> {
     (value.is_finite() && (0.0..=max).contains(&value)).then(|| (value * 5.0 / max) as f32)
 }
@@ -329,6 +363,79 @@ fn immutable_or_fresh<T>(
     }
 }
 
+/// A count as a record's `u32`, saturating: a list too long to count exactly
+/// is at least that long, never unknown.
+fn count(n: impl TryInto<u32>) -> u32 {
+    n.try_into().unwrap_or(u32::MAX)
+}
+
+/// `time`, which dates `release`, when `record` describes that release; else
+/// `None`, logged. For a registry document that dates only one release (its
+/// current one): that date must never stand for another.
+fn release_time(record: &Registry, release: Option<&str>, time: Option<u64>) -> Option<u64> {
+    if release == Some(record.version.as_str()) {
+        return time;
+    }
+    tracing::debug!(
+        ecosystem = ?record.ecosystem,
+        package = %record.name.escape_debug(),
+        version = %record.version.escape_debug(),
+        "not the release the registry dates; undated"
+    );
+    None
+}
+
+/// `release`, the registry's entry for `version` of `package`. Without one
+/// the record describes `version` undated — never dated by another release —
+/// and the log says so.
+fn listed<T>(release: Option<T>, package: &str, version: &str) -> Option<T> {
+    if release.is_none() {
+        tracing::debug!(
+            package = %package.escape_debug(),
+            version = %version.escape_debug(),
+            "release not listed; undated"
+        );
+    }
+    release
+}
+
+/// Whether a listing in standing `status` is held for security: any status
+/// but `active`, the registry's good standing, is a ban, deletion, or
+/// takedown. `None` when the registry gives no status.
+fn held(status: Option<&str>, active: &str, package: &str) -> Option<bool> {
+    let status = status?;
+    let held = status != active;
+    if held {
+        tracing::debug!(
+            package = %package.escape_debug(),
+            status = %status.escape_debug(),
+            "listing is not active: security hold"
+        );
+    }
+    Some(held)
+}
+
+/// A person or organization as registries name one: a bare string, or an
+/// object with a `name` (npm's `author` and maintainers, JetBrains'
+/// `vendor`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Person {
+    Name(String),
+    Object { name: Option<String> },
+}
+
+impl Person {
+    /// The name, unless blank.
+    fn name(&self) -> Option<&str> {
+        match self {
+            Self::Name(name) => Some(name.as_str()),
+            Self::Object { name } => name.as_deref(),
+        }
+        .filter(|name| !name.trim().is_empty())
+    }
+}
+
 /// The final `/`-separated segment of `path`; all of `path` when it has none.
 fn last_seg(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -340,8 +447,9 @@ pub(crate) fn strip_email(s: &str) -> String {
     s.split('<').next().unwrap_or(s).trim().to_string()
 }
 
-/// The text of a one-line HTML fragment, its tags dropped and the rest
-/// trimmed (WordPress wraps an author in an `<a>`).
+/// The text of a one-line HTML fragment, its tags dropped, its character
+/// references decoded, and the rest trimmed (WordPress wraps an author in an
+/// `<a>`).
 fn strip_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
@@ -353,7 +461,57 @@ fn strip_html(s: &str) -> String {
             _ => {}
         }
     }
-    out.trim().to_string()
+    decode_entities(out.trim())
+}
+
+/// HTML text with its character references decoded: the named ones a page
+/// escapes text with (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, `&nbsp;`)
+/// and numeric ones (`&#39;`, `&#x27;`). An unknown or unterminated
+/// reference, or one naming a control character, is kept as written. XML's
+/// predefined entities are a subset, so XML text decodes here too.
+pub(crate) fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        // A reference is short: look for its `;` only that far, so a page of
+        // bare ampersands costs linear time.
+        let decoded = rest
+            .bytes()
+            .take(10)
+            .position(|b| b == b';')
+            .and_then(|end| Some((char_reference(&rest[..end])?, end)));
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => out.push('&'),
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The character an HTML reference body (`amp`, `#39`, `#x27`) names.
+fn char_reference(body: &str) -> Option<char> {
+    let (digits, radix) = match body {
+        "amp" => return Some('&'),
+        "lt" => return Some('<'),
+        "gt" => return Some('>'),
+        "quot" => return Some('"'),
+        "apos" => return Some('\''),
+        "nbsp" => return Some('\u{a0}'),
+        _ => match body.strip_prefix('#')? {
+            hex if hex.starts_with(['x', 'X']) => (&hex[1..], 16),
+            decimal => (decimal, 10),
+        },
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    char::from_u32(u32::from_str_radix(digits, radix).ok()?).filter(|c| !c.is_control())
 }
 
 /// Record a package's release timeline from every release's publish time, in
@@ -368,11 +526,11 @@ fn set_timeline(record: &mut Registry, times: impl IntoIterator<Item = u64>) {
         return;
     }
     times.sort_unstable();
-    record.release_count = record.release_count.or(u32::try_from(times.len()).ok());
+    record.release_count = record.release_count.or(Some(count(times.len())));
     record.first_published_at = record.first_published_at.or(times.first().copied());
     if let Some(this) = record.published_at {
         let earlier = times.partition_point(|&t| t < this);
-        record.previous_published_at = earlier.checked_sub(1).map(|i| times[i]);
+        record.previous_published_at = times[..earlier].last().copied();
     }
     record.release_times = times;
 }
@@ -463,9 +621,13 @@ fn rfc3339_secs(s: &str) -> Option<u64> {
 }
 
 /// Unix seconds at UTC midnight of a proleptic-Gregorian civil date. `None`
-/// for a month or day that does not exist (`2021-02-29`, `2021-04-31`) or a
-/// date before the epoch.
+/// for a month or day that does not exist (`2021-02-29`, `2021-04-31`), a
+/// date before the epoch, or a year past RFC 3339's four digits — a scraped
+/// year has no width limit, and an absurd one would overflow the arithmetic.
 fn civil_secs(year: i64, month: i64, day: i64) -> Option<u64> {
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
     let days_in_month = match month {
         2 if leap => 29,
@@ -477,13 +639,14 @@ fn civil_secs(year: i64, month: i64, day: i64) -> Option<u64> {
     if !(1..=days_in_month).contains(&day) {
         return None;
     }
-    // Days since 1970-01-01 (Howard Hinnant's `days_from_civil`).
+    // Days since 1970-01-01 (Howard Hinnant's `days_from_civil`, its
+    // negative-year branch dropped: the year is past 1969).
     let y = if month <= 2 { year - 1 } else { year };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let era = y / 400;
     let yoe = y - era * 400;
     let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    u64::try_from((era * 146_097 + doe - 719_468).checked_mul(86_400)?).ok()
+    u64::try_from((era * 146_097 + doe - 719_468) * 86_400).ok()
 }
 
 #[cfg(test)]
@@ -565,6 +728,16 @@ mod tests {
         }
     }
 
+    /// A scraped year has no width limit (`June 9, 99999999999999999`), so
+    /// an absurd one must be unknown, not an arithmetic overflow.
+    #[test]
+    fn an_absurd_year_is_unknown_not_an_overflow() {
+        for year in [10_000, 99_999_999_999_999_999, i64::MAX] {
+            assert_eq!(civil_secs(year, 6, 9), None, "{year}");
+        }
+        assert!(civil_secs(9999, 12, 31).is_some());
+    }
+
     #[test]
     fn millisecond_times_never_become_the_epoch() {
         assert_eq!(secs_from_millis(1_619_172_000_123.0), Some(1_619_172_000));
@@ -627,6 +800,52 @@ mod tests {
         assert_eq!(five_star(101.0, 100.0), None);
         assert_eq!(five_star(-1.0, 5.0), None);
         assert_eq!(five_star(f64::NAN, 5.0), None);
+    }
+
+    #[test]
+    fn character_references_decode_or_stay_as_written() {
+        assert_eq!(
+            decode_entities("A &amp; B &lt;c&gt; &quot;d&quot; &apos;e&#39; &#x2014;&nbsp;f"),
+            "A & B <c> \"d\" 'e' \u{2014}\u{a0}f"
+        );
+        for kept in [
+            "AT&T",
+            "&unknown;",
+            "&#;",
+            "&#x;",
+            "&#+65;",
+            "&#0;",
+            "&#1114112;",
+            "&amp",
+            "a & b",
+            "&verylongname;",
+        ] {
+            assert_eq!(decode_entities(kept), kept, "{kept}");
+        }
+        assert_eq!(decode_entities("&&amp;"), "&&");
+        assert_eq!(
+            strip_html("<a href=\"x\">Smith &amp; Sons</a>"),
+            "Smith & Sons"
+        );
+    }
+
+    #[test]
+    fn counts_saturate() {
+        assert_eq!(count(3usize), 3);
+        assert_eq!(count(u64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn a_record_describes_the_target_beside_the_latest() {
+        let record =
+            coordinates("pkg:npm/p@1.0.0").record(Ecosystem::Npm, "p", Some("2.0.0".to_string()));
+        assert_eq!(record.version, "1.0.0");
+        assert_eq!(record.latest_version.as_deref(), Some("2.0.0"));
+        assert_eq!(release_time(&record, Some("2.0.0"), Some(7)), None);
+        assert_eq!(release_time(&record, Some("1.0.0"), Some(7)), Some(7));
+        let record = coordinates("pkg:npm/p").record(Ecosystem::Npm, "p", None);
+        assert_eq!(record.version, "");
+        assert_eq!(release_time(&record, None, Some(7)), None);
     }
 
     #[test]

@@ -31,7 +31,7 @@ pub(crate) fn lookup(
     // ranks, and another artifact's release must not stand in for this one.
     let want_group = c.namespace().join("/");
     let Some(d) =
-        doc.response.docs.iter().find(|d| {
+        doc.response.docs.into_iter().find(|d| {
             d.g.as_deref() == Some(want_group.as_str()) && d.a.as_deref() == Some(c.name())
         })
     else {
@@ -43,17 +43,15 @@ pub(crate) fn lookup(
         return Err(RegistryError::NotFound);
     };
 
-    let mut registry = Registry::new(Ecosystem::Maven, format!("{want_group}:{}", c.name()));
-    registry.version = c.target(d.v.as_deref()).to_string();
-    registry.published_at = d.timestamp.and_then(secs_from_millis);
     // With a version filter the result set is that one version, so "latest"
     // is only meaningful for an unversioned query.
-    registry.latest_version = if c.version().is_none() {
-        d.v.clone()
-    } else {
-        None
-    };
-    Ok(registry)
+    let mut record = c.record(
+        Ecosystem::Maven,
+        format!("{want_group}:{}", c.name()),
+        d.v.filter(|_| c.version().is_none()),
+    );
+    record.published_at = d.timestamp.and_then(secs_from_millis);
+    Ok(record)
 }
 
 /// A Maven Central solrsearch answer.
@@ -80,15 +78,12 @@ struct SolrDoc {
 
 #[cfg(test)]
 mod tests {
-    use crate::fetch::{BlobCache, Fixtures};
-    use crate::registry::{RegistryError, lookup};
-    use filefacts::{Ecosystem, RefLocator, Registry};
+    use crate::ecosystem::look;
+    use crate::fetch::Fixtures;
+    use crate::registry::RegistryError;
+    use filefacts::Ecosystem;
 
     const GUAVA: &str = "https://search.maven.org/solrsearch/select?q=g:%22com.google.guava%22+AND+a:%22guava%22&core=gav&rows=20&wt=json";
-
-    fn look(net: &Fixtures, purl: &str) -> Result<Registry, RegistryError> {
-        lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
 
     #[test]
     fn only_the_requested_coordinates_answer() {
@@ -98,7 +93,7 @@ mod tests {
         ]}})
         .to_string();
         let net = Fixtures::default().with(GUAVA, doc.as_bytes());
-        let r = look(&net, "pkg:maven/com.google.guava/guava").expect("registry");
+        let r = look("pkg:maven/com.google.guava/guava", &net).expect("registry");
         assert_eq!(r.version, "33.4.8-jre");
 
         let only_other = serde_json::json!({"response": {"docs": [
@@ -107,7 +102,7 @@ mod tests {
         .to_string();
         let net = Fixtures::default().with(GUAVA, only_other.as_bytes());
         assert_eq!(
-            look(&net, "pkg:maven/com.google.guava/guava").err(),
+            look("pkg:maven/com.google.guava/guava", &net).err(),
             Some(RegistryError::NotFound)
         );
     }
@@ -119,7 +114,7 @@ mod tests {
         ]}})
         .to_string();
         let net = Fixtures::default().with(GUAVA, doc.as_bytes());
-        let r = look(&net, "pkg:maven/com.google.guava/guava").expect("registry");
+        let r = look("pkg:maven/com.google.guava/guava", &net).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Maven);
         assert_eq!(r.name, "com.google.guava:guava");
         assert_eq!(r.version, "33.4.8-jre");
@@ -134,7 +129,7 @@ mod tests {
         ]}})
         .to_string();
         let net = Fixtures::default().with(GUAVA, doc.as_bytes());
-        let r = look(&net, "pkg:maven/com.google.guava/guava").expect("registry");
+        let r = look("pkg:maven/com.google.guava/guava", &net).expect("registry");
         assert_eq!(r.published_at, None);
     }
 
@@ -143,7 +138,7 @@ mod tests {
         let net = Fixtures::default();
         for purl in ["pkg:maven/com/google/guava", "pkg:maven/a/b/c/guava"] {
             assert_eq!(
-                look(&net, purl),
+                look(purl, &net),
                 Err(RegistryError::UnsafeCoordinate),
                 "{purl}"
             );

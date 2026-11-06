@@ -3,7 +3,10 @@
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
-use crate::ecosystem::{Coordinates, civil_secs, fetch_json, five_star, non_empty, strip_html};
+use crate::ecosystem::{
+    Coordinates, civil_secs, decode_entities, fetch_json, five_star, non_empty, release_time,
+    strip_html,
+};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
@@ -21,39 +24,31 @@ pub(crate) fn lookup(
         net,
         cache,
     )?;
-    let version = c.target(doc.version.as_deref());
-    // `last_updated` dates the current version only.
-    let published_at = if doc.version.as_deref() == Some(version) {
-        doc.last_updated.as_deref().and_then(utc_date)
-    } else {
-        tracing::debug!(
-            slug,
-            version = %version.escape_debug(),
-            "not the directory's current version; undated"
-        );
-        None
-    };
-
-    let mut registry = Registry::new(
+    let mut record = c.record(
         Ecosystem::Wordpress,
         doc.slug.unwrap_or_else(|| c.name().to_string()),
+        doc.version,
     );
-    registry.version = version.to_string();
-    registry.published_at = published_at;
-    registry.first_published_at = doc.added.as_deref().and_then(utc_date);
-    // The directory wraps the author in an `<a>`.
-    registry.author = doc
+    // `last_updated` dates the current version only.
+    record.published_at = release_time(
+        &record,
+        record.latest_version.as_deref(),
+        doc.last_updated.as_deref().and_then(utc_date),
+    );
+    record.first_published_at = doc.added.as_deref().and_then(utc_date);
+    // The directory wraps the author in an `<a>`, and escapes text as HTML.
+    record.author = doc
         .author
         .as_deref()
         .map(strip_html)
         .filter(|a| !a.is_empty());
-    registry.title = doc.name;
-    registry.homepage = doc.homepage;
-    registry.downloads_total = doc.downloaded;
+    record.title = doc.name.as_deref().map(decode_entities);
+    record.homepage = doc.homepage;
+    record.downloads_total = doc.downloaded;
     // The directory reports rating as a 0–100 percentage.
-    registry.rating = doc.rating.and_then(|r| five_star(r, 100.0));
-    registry.rating_count = doc.num_ratings;
-    Ok(registry)
+    record.rating = doc.rating.and_then(|r| five_star(r, 100.0));
+    record.rating_count = doc.num_ratings;
+    Ok(record)
 }
 
 /// Unix seconds at UTC midnight of the date a directory timestamp starts with
@@ -80,7 +75,9 @@ fn utc_date(timestamp: &str) -> Option<u64> {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct PluginInfo {
+    #[serde(deserialize_with = "non_empty")]
     slug: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     version: Option<String>,
     last_updated: Option<String>,
     added: Option<String>,
@@ -97,14 +94,15 @@ struct PluginInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
     const AKISMET: &str = "https://api.wordpress.org/plugins/info/1.0/akismet.json";
 
-    fn lookup(purl: &str, doc: &serde_json::Value) -> Result<Registry, RegistryError> {
+    /// The record for `purl` when the directory answers `doc` for akismet.
+    fn answering(purl: &str, doc: &serde_json::Value) -> Result<Registry, RegistryError> {
         let net = Fixtures::default().with(AKISMET, doc.to_string().as_bytes());
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled())
+        look(purl, &net)
     }
 
     fn akismet(last_updated: &str) -> serde_json::Value {
@@ -119,8 +117,8 @@ mod tests {
 
     #[test]
     fn wordpress_plugin_normalizes() {
-        let r =
-            lookup("pkg:wordpress/akismet", &akismet("2021-04-23 10:34pm GMT")).expect("registry");
+        let r = answering("pkg:wordpress/akismet", &akismet("2021-04-23 10:34pm GMT"))
+            .expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Wordpress);
         assert_eq!(r.version, "5.7");
         assert_eq!(r.author.as_deref(), Some("Automattic"));
@@ -141,7 +139,7 @@ mod tests {
             "2021-04 10:34pm GMT",
             "garbage",
         ] {
-            let r = lookup("pkg:wordpress/akismet", &akismet(bad)).expect("registry");
+            let r = answering("pkg:wordpress/akismet", &akismet(bad)).expect("registry");
             assert_eq!(r.published_at, None, "{bad}");
         }
     }
@@ -151,7 +149,7 @@ mod tests {
         let mut doc = akismet("2021-04-23 10:34pm GMT");
         doc["rating"] = serde_json::json!(140);
         assert_eq!(
-            lookup("pkg:wordpress/akismet", &doc)
+            answering("pkg:wordpress/akismet", &doc)
                 .expect("registry")
                 .rating,
             None
@@ -161,10 +159,21 @@ mod tests {
     #[test]
     fn only_the_current_version_is_dated() {
         let doc = akismet("2021-04-23 10:34pm GMT");
-        let r = lookup("pkg:wordpress/akismet@5.7", &doc).expect("registry");
+        let r = answering("pkg:wordpress/akismet@5.7", &doc).expect("registry");
         assert_eq!(r.published_at, Some(1_619_136_000));
-        let r = lookup("pkg:wordpress/akismet@4.0", &doc).expect("registry");
+        let r = answering("pkg:wordpress/akismet@4.0", &doc).expect("registry");
         assert_eq!(r.version, "4.0");
+        assert_eq!(r.latest_version.as_deref(), Some("5.7"));
         assert_eq!(r.published_at, None);
+    }
+
+    #[test]
+    fn escaped_directory_text_is_decoded() {
+        let mut doc = akismet("2021-04-23 10:34pm GMT");
+        doc["name"] = serde_json::json!("Spam &amp; Abuse &#8211; Filter");
+        doc["author"] = serde_json::json!("<a href=\"x\">Smith &amp; Sons &lt;dev&gt;</a>");
+        let r = answering("pkg:wordpress/akismet", &doc).expect("registry");
+        assert_eq!(r.title.as_deref(), Some("Spam & Abuse \u{2013} Filter"));
+        assert_eq!(r.author.as_deref(), Some("Smith & Sons <dev>"));
     }
 }

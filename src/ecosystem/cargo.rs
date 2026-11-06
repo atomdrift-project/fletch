@@ -4,7 +4,9 @@
 use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
-use crate::ecosystem::{Coordinates, fetch_json, null_default, set_timeline, unix_secs};
+use crate::ecosystem::{
+    Coordinates, fetch_json, listed, non_empty, null_default, set_timeline, unix_secs,
+};
 use crate::fetch::{
     ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, cached_metadata_status,
     deterministic_artifacts, file_name_matches, is_crates_io, is_web_scheme, percent_decode,
@@ -23,12 +25,10 @@ pub(crate) fn cargo_artifacts(
     cache: &BlobCache,
 ) -> Result<Vec<ArtifactCandidate>, RegistryError> {
     let (purl, name, version) = (c.purl(), c.path(), c.encoded_version());
-    let Some(repository) = purl.qualifier("repository_url") else {
-        return Ok(deterministic_artifacts(purl, ArtifactKind::Crate));
+    let repository = match purl.qualifier("repository_url") {
+        Some(repository) if !is_crates_io(repository) => repository,
+        _ => return Ok(deterministic_artifacts(purl, ArtifactKind::Crate)),
     };
-    if is_crates_io(repository) {
-        return Ok(deterministic_artifacts(purl, ArtifactKind::Crate));
-    }
     let repository = repository.trim_end_matches('/');
     let repository = repository.strip_prefix("sparse+").unwrap_or(repository);
     if !is_web_scheme(repository) {
@@ -52,7 +52,7 @@ pub(crate) fn cargo_artifacts(
         &cache.with_meta_ttl(cache.meta_ttl_pinned()),
     )
     .inspect_err(|error| {
-        tracing::debug!(url = %config_url, %error, "cargo artifacts unresolved: no readable index config");
+        tracing::debug!(url = %config_url.escape_debug(), %error, "cargo artifacts unresolved: no readable index config");
     })?;
     let mut checksums = purl_checksums(purl);
     if !checksums.contains_key("sha256") {
@@ -73,7 +73,7 @@ pub(crate) fn cargo_artifacts(
         checksums.get("sha256").map(String::as_str),
     ) else {
         tracing::debug!(
-            url = %config_url,
+            url = %config_url.escape_debug(),
             template = %config.dl.escape_debug(),
             "cargo artifacts unresolved: the download template does not expand to a web URL"
         );
@@ -115,7 +115,7 @@ fn cargo_index_checksum(
         Ok(bytes) => bytes,
         Err(RegistryError::NotFound) => return Ok(None),
         Err(error) => {
-            tracing::debug!(url = %index_url, %error, "cargo index unreadable");
+            tracing::debug!(url = %index_url.escape_debug(), %error, "cargo index unreadable");
             return Err(error);
         }
     };
@@ -197,12 +197,11 @@ pub(crate) fn lookup(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let doc: CrateResponse = fetch_json(
+    let CrateResponse { krate, versions } = fetch_json(
         &format!("https://crates.io/api/v1/crates/{}", c.encoded_name()),
         net,
         cache,
     )?;
-    let krate = &doc.krate;
 
     // A crate with no stable release has a `null` max stable version; its
     // newest pre-release is then the latest there is.
@@ -211,34 +210,33 @@ pub(crate) fn lookup(
         .as_deref()
         .or(krate.max_version.as_deref());
     let version = c.target(latest);
-    let ver = doc
-        .versions
-        .iter()
-        .find(|v| v.num.as_deref() == Some(version));
+    let ver = listed(
+        versions.iter().find(|v| v.num.as_deref() == Some(version)),
+        c.name(),
+        version,
+    );
 
-    let mut p = Registry::new(Ecosystem::Crates, c.name().to_string());
-    p.version = version.to_string();
+    let mut record = c.record(Ecosystem::Crates, c.name(), latest.map(str::to_string));
     // A version the list lacks has no date of its own; the crate's
     // `created_at` is its first release, not this one.
-    p.published_at = ver
+    record.published_at = ver
         .and_then(|v| v.created_at.as_deref())
         .and_then(unix_secs);
-    p.first_published_at = krate.created_at.as_deref().and_then(unix_secs);
-    p.latest_version = latest.map(str::to_string);
-    p.description = krate.description.clone();
-    p.homepage = krate.homepage.clone();
-    p.repository = krate.repository.clone();
-    p.license = ver.and_then(|v| v.license.clone());
-    p.downloads_total = krate.downloads;
-    p.downloads_recent = krate.recent_downloads;
-    p.version_removed = ver.and_then(|v| v.yanked);
+    record.first_published_at = krate.created_at.as_deref().and_then(unix_secs);
+    record.description = krate.description;
+    record.homepage = krate.homepage;
+    record.repository = krate.repository;
+    record.license = ver.and_then(|v| v.license.clone());
+    record.downloads_total = krate.downloads;
+    record.downloads_recent = krate.recent_downloads;
+    record.version_removed = ver.and_then(|v| v.yanked);
     set_timeline(
-        &mut p,
-        doc.versions
+        &mut record,
+        versions
             .iter()
             .filter_map(|v| v.created_at.as_deref().and_then(unix_secs)),
     );
-    Ok(p)
+    Ok(record)
 }
 
 /// The crates.io `/api/v1/crates/{name}` response, as far as the record reads it.
@@ -254,11 +252,16 @@ struct CrateResponse {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Crate {
+    #[serde(deserialize_with = "non_empty")]
     max_stable_version: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     max_version: Option<String>,
     created_at: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     description: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     homepage: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     repository: Option<String>,
     downloads: Option<u64>,
     recent_downloads: Option<u64>,
@@ -270,6 +273,7 @@ struct Crate {
 struct CrateVersion {
     num: Option<String>,
     created_at: Option<String>,
+    #[serde(deserialize_with = "non_empty")]
     license: Option<String>,
     yanked: Option<bool>,
 }
@@ -277,9 +281,8 @@ struct CrateVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
     #[test]
     fn the_crate_document_normalizes() {
@@ -298,10 +301,7 @@ mod tests {
         })
         .to_string();
         let net = Fixtures::default().with("https://crates.io/api/v1/crates/c", doc.as_bytes());
-        let cache = BlobCache::disabled();
-        let look = |purl: &str| {
-            crate::registry::lookup(&RefLocator::Purl(purl.into()), &net, &cache).expect("record")
-        };
+        let look = |purl: &str| look(purl, &net).expect("record");
 
         let latest = look("pkg:cargo/c");
         assert_eq!(latest.ecosystem, Ecosystem::Crates);
@@ -402,5 +402,22 @@ mod tests {
         assert_eq!(checksum("Foo", "1.0.0").as_deref(), Some("bb"));
         assert_eq!(checksum("foo", "0.9.0").as_deref(), Some("aa"));
         assert_eq!(checksum("foo", "2.0.0"), None);
+    }
+
+    #[test]
+    fn blank_crate_fields_are_unknown() {
+        let doc = serde_json::json!({
+            "crate": {"max_stable_version": "", "max_version": "0.1.0-alpha",
+                      "description": " ", "homepage": "", "repository": ""},
+            "versions": [{"num": "0.1.0-alpha", "license": ""}]
+        })
+        .to_string();
+        let net = Fixtures::default().with("https://crates.io/api/v1/crates/c", doc.as_bytes());
+        let r = look("pkg:cargo/c", &net).expect("record");
+        assert_eq!(r.version, "0.1.0-alpha", "a blank stable version is none");
+        assert_eq!(r.description, None);
+        assert_eq!(r.homepage, None);
+        assert_eq!(r.repository, None);
+        assert_eq!(r.license, None);
     }
 }

@@ -32,7 +32,7 @@ pub(crate) use rules::known_type;
 /// qualifier keys are lowercase and sorted, empty qualifier values and
 /// ignorable subpath segments are gone, and component case follows the type's
 /// definition. Parsing that form yields an equal value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Purl {
     #[serde(rename = "type")]
     typ: String,
@@ -53,10 +53,109 @@ pub struct Purl {
 pub enum PurlError {
     /// The generic ECMA-427 structure is malformed.
     #[error("invalid package URL syntax: {0}")]
-    Syntax(&'static str),
+    Syntax(SyntaxError),
     /// The structure is valid but violates its type's definition.
     #[error("package URL violates its type definition: {0}")]
-    Type(&'static str),
+    Type(TypeError),
+}
+
+/// How a package URL breaks the generic ECMA-427 structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum SyntaxError {
+    /// Version is empty.
+    #[error("version is empty")]
+    EmptyVersion,
+    /// Invalid qualifier key.
+    #[error("invalid qualifier key")]
+    InvalidQualifierKey,
+    /// Artifact selector is empty.
+    #[error("artifact selector is empty")]
+    EmptySelector,
+    /// Type is not a letter followed by letters, digits, '.' or '-'.
+    #[error("type is not a letter followed by letters, digits, '.' or '-'")]
+    InvalidType,
+    /// Name is empty.
+    #[error("name is empty")]
+    EmptyName,
+    /// Namespace segment is empty or holds '/'.
+    #[error("namespace segment is empty or holds '/'")]
+    InvalidNamespaceSegment,
+    /// No scheme.
+    #[error("no scheme")]
+    NoScheme,
+    /// Scheme is not pkg.
+    #[error("scheme is not pkg")]
+    NotPkgScheme,
+    /// No type.
+    #[error("no type")]
+    NoType,
+    /// Unencoded '#' or '?'.
+    #[error("unencoded '#' or '?'")]
+    UnencodedDelimiter,
+    /// '@' scope is not closed by '/'.
+    #[error("'@' scope is not closed by '/'")]
+    UnclosedScope,
+    /// Qualifier has no '='.
+    #[error("qualifier has no '='")]
+    QualifierWithoutValue,
+    /// Qualifier key declared by the type is not lowercase.
+    #[error("qualifier key declared by the type is not lowercase")]
+    UppercaseTypeQualifier,
+    /// Duplicate qualifier key.
+    #[error("duplicate qualifier key")]
+    DuplicateQualifierKey,
+    /// Subpath segment holds '/'.
+    #[error("subpath segment holds '/'")]
+    SlashInSubpathSegment,
+    /// Invalid percent-encoding.
+    #[error("invalid percent-encoding")]
+    InvalidPercentEncoding,
+    /// Not UTF-8.
+    #[error("not UTF-8")]
+    NotUtf8,
+}
+
+/// How a well-formed package URL breaks its type's definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum TypeError {
+    /// Namespace is required.
+    #[error("namespace is required")]
+    NamespaceRequired,
+    /// Namespace is not allowed.
+    #[error("namespace is not allowed")]
+    NamespaceNotAllowed,
+    /// A required qualifier is missing.
+    #[error("a required qualifier is missing")]
+    MissingQualifier,
+    /// Cpan name is a distribution, not a module.
+    #[error("cpan name is a distribution, not a module")]
+    CpanDistributionName,
+    /// Chrome-extension id is not 32 letters a-p.
+    #[error("chrome-extension id is not 32 letters a-p")]
+    ChromeExtensionId,
+    /// Chrome-extension version is not 1-4 integers.
+    #[error("chrome-extension version is not 1-4 integers")]
+    ChromeExtensionVersion,
+    /// Swid namespace has more than two segments.
+    #[error("swid namespace has more than two segments")]
+    SwidNamespace,
+    /// Swid tag_version is not an integer.
+    #[error("swid tag_version is not an integer")]
+    SwidTagVersion,
+    /// Swid patch is not a boolean.
+    #[error("swid patch is not a boolean")]
+    SwidPatch,
+    /// Version and vers range are exclusive.
+    #[error("version and vers range are exclusive")]
+    VersionWithVers,
+    /// Checksum is not a list of algorithm:hex.
+    #[error("checksum is not a list of algorithm:hex")]
+    InvalidChecksum,
+    /// Vers is not a version range.
+    #[error("vers is not a version range")]
+    InvalidVers,
 }
 
 /// How literally a package URL is read.
@@ -219,7 +318,7 @@ impl Purl {
     /// with any `vers` range replaced by that version.
     pub fn release(&self, version: &str) -> Result<Self, PurlError> {
         if version.is_empty() {
-            return Err(PurlError::Syntax("version is empty"));
+            return Err(PurlError::Syntax(SyntaxError::EmptyVersion));
         }
         let mut release = self.identity();
         release.version = Some(version.to_owned());
@@ -235,10 +334,10 @@ impl Purl {
         let mut artifact = self.identity();
         for (key, value) in selectors {
             if !valid_qualifier_key(key) {
-                return Err(PurlError::Syntax("invalid qualifier key"));
+                return Err(PurlError::Syntax(SyntaxError::InvalidQualifierKey));
             }
             if value.is_empty() {
-                return Err(PurlError::Syntax("artifact selector is empty"));
+                return Err(PurlError::Syntax(SyntaxError::EmptySelector));
             }
             artifact.qualifiers.insert(key.clone(), value.clone());
         }
@@ -393,20 +492,18 @@ fn finish(mut purl: Purl, mode: Mode) -> Result<Purl, PurlError> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'));
     if !valid_type {
-        return Err(PurlError::Syntax(
-            "type is not a letter followed by letters, digits, '.' or '-'",
-        ));
+        return Err(PurlError::Syntax(SyntaxError::InvalidType));
     }
     purl.typ.make_ascii_lowercase();
     if purl.name.is_empty() {
-        return Err(PurlError::Syntax("name is empty"));
+        return Err(PurlError::Syntax(SyntaxError::EmptyName));
     }
     if purl
         .namespace
         .iter()
         .any(|segment| segment.is_empty() || segment.contains('/'))
     {
-        return Err(PurlError::Syntax("namespace segment is empty or holds '/'"));
+        return Err(PurlError::Syntax(SyntaxError::InvalidNamespaceSegment));
     }
     if mode == Mode::Lenient {
         rules::fold_legacy(&mut purl);
@@ -421,14 +518,14 @@ fn split(raw: &str, mode: Mode) -> Result<Purl, PurlError> {
     let (scheme, body) = raw
         .trim()
         .split_once(':')
-        .ok_or(PurlError::Syntax("no scheme"))?;
+        .ok_or(PurlError::Syntax(SyntaxError::NoScheme))?;
     if !scheme.eq_ignore_ascii_case("pkg") {
-        return Err(PurlError::Syntax("scheme is not pkg"));
+        return Err(PurlError::Syntax(SyntaxError::NotPkgScheme));
     }
     let (typ, remainder) = body
         .trim_start_matches('/')
         .split_once('/')
-        .ok_or(PurlError::Syntax("no type"))?;
+        .ok_or(PurlError::Syntax(SyntaxError::NoType))?;
     let (remainder, subpath) = remainder
         .rsplit_once('#')
         .map_or((remainder, None), |(left, right)| (left, Some(right)));
@@ -438,26 +535,28 @@ fn split(raw: &str, mode: Mode) -> Result<Purl, PurlError> {
     // A delimiter left in an earlier component is not data (data is
     // percent-encoded), so reject it rather than guess which one splits.
     if remainder.contains('#') || coordinate.contains('?') {
-        return Err(PurlError::Syntax("unencoded '#' or '?'"));
+        return Err(PurlError::Syntax(SyntaxError::UnencodedDelimiter));
     }
 
     let (path, version) = split_version(coordinate.trim_matches('/'))?;
     let (version, qualifiers) = match (mode, version, qualifiers.and_then(misplaced_version)) {
         (Mode::Lenient, None, Some((qualifiers, version))) => {
-            tracing::debug!(%version, "read a version misplaced after the qualifiers");
+            tracing::debug!(version = %version.escape_debug(), "read a version misplaced after the qualifiers");
             (Some(version), Some(qualifiers))
         }
         _ => (version, qualifiers),
     };
     if path.ends_with('/') {
-        return Err(PurlError::Syntax("name is empty"));
+        return Err(PurlError::Syntax(SyntaxError::EmptyName));
     }
     let mut namespace = path
         .split('/')
         .filter(|segment| !segment.is_empty())
         .map(decode)
         .collect::<Result<Vec<_>, _>>()?;
-    let name = namespace.pop().ok_or(PurlError::Syntax("name is empty"))?;
+    let name = namespace
+        .pop()
+        .ok_or(PurlError::Syntax(SyntaxError::EmptyName))?;
     Ok(Purl {
         typ: typ.to_owned(),
         namespace,
@@ -479,7 +578,7 @@ fn split_version(coordinate: &str) -> Result<(&str, Option<&str>), PurlError> {
     let start = if coordinate.starts_with('@') {
         coordinate
             .find('/')
-            .ok_or(PurlError::Syntax("'@' scope is not closed by '/'"))?
+            .ok_or(PurlError::Syntax(SyntaxError::UnclosedScope))?
             + 1
     } else {
         0
@@ -532,15 +631,13 @@ fn parse_qualifiers(
     for pair in raw.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair
             .split_once('=')
-            .ok_or(PurlError::Syntax("qualifier has no '='"))?;
+            .ok_or(PurlError::Syntax(SyntaxError::QualifierWithoutValue))?;
         let lower = key.to_ascii_lowercase();
         if mode == Mode::Strict
             && lower != key
             && rules::defines_qualifier(&typ.to_ascii_lowercase(), &lower)
         {
-            return Err(PurlError::Syntax(
-                "qualifier key declared by the type is not lowercase",
-            ));
+            return Err(PurlError::Syntax(SyntaxError::UppercaseTypeQualifier));
         }
         insert_qualifier(&mut qualifiers, lower, decode(value)?)?;
     }
@@ -555,7 +652,7 @@ fn insert_qualifier(
     value: String,
 ) -> Result<(), PurlError> {
     if !valid_qualifier_key(&key) {
-        return Err(PurlError::Syntax("invalid qualifier key"));
+        return Err(PurlError::Syntax(SyntaxError::InvalidQualifierKey));
     }
     if value.is_empty() {
         return Ok(());
@@ -565,7 +662,7 @@ fn insert_qualifier(
             entry.insert(value);
             Ok(())
         }
-        Entry::Occupied(_) => Err(PurlError::Syntax("duplicate qualifier key")),
+        Entry::Occupied(_) => Err(PurlError::Syntax(SyntaxError::DuplicateQualifierKey)),
     }
 }
 
@@ -577,17 +674,19 @@ fn parse_subpath(raw: &str) -> Result<Vec<String>, PurlError> {
             continue;
         }
         if segment.contains('/') {
-            return Err(PurlError::Syntax("subpath segment holds '/'"));
+            return Err(PurlError::Syntax(SyntaxError::SlashInSubpathSegment));
         }
         subpath.push(segment);
     }
     Ok(subpath)
 }
 
+/// ECMA-427: a qualifier key is ASCII letters, digits, `.`, `-` and `_`, and
+/// does not start with a digit. Keys are read lowercased.
 fn valid_qualifier_key(key: &str) -> bool {
     key.bytes()
         .next()
-        .is_some_and(|first| first.is_ascii_alphabetic())
+        .is_some_and(|first| !first.is_ascii_digit())
         && key.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
         })
@@ -607,7 +706,7 @@ pub(crate) fn hex_pair(pair: &[u8]) -> Option<u8> {
 /// Percent-decode one component; every `%` must open a valid escape and the
 /// result must be UTF-8.
 fn decode(value: &str) -> Result<String, PurlError> {
-    const INVALID: PurlError = PurlError::Syntax("invalid percent-encoding");
+    const INVALID: PurlError = PurlError::Syntax(SyntaxError::InvalidPercentEncoding);
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -621,7 +720,7 @@ fn decode(value: &str) -> Result<String, PurlError> {
             index += 1;
         }
     }
-    String::from_utf8(decoded).map_err(|_not_utf8| PurlError::Syntax("not UTF-8"))
+    String::from_utf8(decoded).map_err(|_not_utf8| PurlError::Syntax(SyntaxError::NotUtf8))
 }
 
 #[cfg(test)]
@@ -629,7 +728,7 @@ mod tests {
     use super::*;
 
     /// `normalize` on input that must succeed.
-    fn norm(raw: &str) -> String {
+    pub(super) fn norm(raw: &str) -> String {
         normalize(raw).unwrap_or_else(|| panic!("{raw} must normalize"))
     }
 
@@ -715,19 +814,34 @@ mod tests {
         }
     }
 
+    /// A key may start with any of its characters but a digit.
+    #[test]
+    fn qualifier_keys_follow_the_spec() {
+        for key in ["a", "_private", ".hidden", "-x", "a1.b-c_d"] {
+            assert!(valid_qualifier_key(key), "{key}");
+        }
+        for key in ["", "1st", "in production", "a%20b", "Upper"] {
+            assert!(!valid_qualifier_key(key), "{key}");
+        }
+        assert_eq!(
+            normalize("pkg:npm/a@1?_build=7").as_deref(),
+            Some("pkg:npm/a@1?_build=7")
+        );
+    }
+
     #[test]
     fn errors_name_their_reason() {
         assert!(matches!(
             Purl::parse("not-a-purl"),
-            Err(PurlError::Syntax("no scheme"))
+            Err(PurlError::Syntax(SyntaxError::NoScheme))
         ));
         assert!(matches!(
             Purl::parse("pkg:npm/name@bad%2"),
-            Err(PurlError::Syntax("invalid percent-encoding"))
+            Err(PurlError::Syntax(SyntaxError::InvalidPercentEncoding))
         ));
         assert!(matches!(
             Purl::parse("pkg:pypi/namespace/name"),
-            Err(PurlError::Type(_))
+            Err(PurlError::Type(TypeError::NamespaceNotAllowed))
         ));
         let error = Purl::parse("pkg:npm/a?x").expect_err("qualifier without '='");
         assert_eq!(
@@ -740,7 +854,6 @@ mod tests {
     fn display_and_from_str_are_the_canonical_spelling() {
         let purl: Purl = "pkg:NPM/@babel/core@7.24.0?B=2&a=1#/src/".parse().unwrap();
         assert_eq!(purl.to_string(), "pkg:npm/%40babel/core@7.24.0?a=1&b=2#src");
-        assert_eq!(purl.to_string(), purl.to_string());
         assert_eq!(purl.to_string().parse::<Purl>(), Ok(purl.clone()));
         assert_eq!(purl.encoded_path(), "%40babel/core");
         assert_eq!(purl.encoded_version().as_deref(), Some("7.24.0"));
@@ -921,7 +1034,7 @@ mod tests {
         );
         assert_eq!(
             Purl::build("npm", None, "", Some("1"), [], None),
-            Err(PurlError::Syntax("name is empty"))
+            Err(PurlError::Syntax(SyntaxError::EmptyName))
         );
         assert!(Purl::build("npm", None, "x", None, [("a b", "1")], None).is_err());
     }
@@ -1098,7 +1211,10 @@ mod tests {
             purl.release("2.0.0").unwrap().to_string(),
             "pkg:npm/a@2.0.0"
         );
-        assert_eq!(purl.release(""), Err(PurlError::Syntax("version is empty")));
+        assert_eq!(
+            purl.release(""),
+            Err(PurlError::Syntax(SyntaxError::EmptyVersion))
+        );
         let p = |raw: &str| Purl::parse(raw).unwrap();
         assert_eq!(
             p("pkg:npm/a@1?kind=x").identity().to_string(),

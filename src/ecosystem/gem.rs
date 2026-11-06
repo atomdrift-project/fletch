@@ -8,13 +8,14 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ecosystem::{
-    Coordinates, fetch_json, for_version, non_empty, null_default, optional, set_timeline,
+    Coordinates, fetch_json, for_version, listed, non_empty, null_default, optional, set_timeline,
     unix_secs,
 };
 use crate::fetch::{
     ArtifactCandidate, ArtifactKind, BlobCache, Fetch, artifact_candidate, repository_base,
     safe_filename_part,
 };
+use crate::purl::encode_component;
 use crate::registry::RegistryError;
 
 /// One `.gem` per platform built for `purl`'s release (the newest listed
@@ -38,27 +39,31 @@ pub(crate) fn gem_artifacts(
     let api = format!("{repository}/api/v1/versions/{name}.json");
     let builds: Vec<GemVersion> = fetch_json(&api, net, &for_version(cache, requested_version))
         .inspect_err(|error| {
-            tracing::debug!(url = %api, %error, "gem artifacts unresolved: versions unreadable");
+            tracing::debug!(url = %api.escape_debug(), %error, "gem artifacts unresolved: versions unreadable");
         })?;
-    let Some(version) = purl.version().or_else(|| builds.first()?.number.as_deref()) else {
-        tracing::debug!(url = %api, "gem artifacts unresolved: no version listed");
+    let Some(version) = purl
+        .version()
+        .or_else(|| builds.first()?.number.as_deref())
+        .map(str::to_string)
+    else {
+        tracing::debug!(url = %api.escape_debug(), "gem artifacts unresolved: no version listed");
         return Ok(Vec::new());
     };
     let mut candidates: Vec<_> = builds
-        .iter()
-        .filter(|build| build.number.as_deref() == Some(version))
+        .into_iter()
+        .filter(|build| build.number.as_deref() == Some(version.as_str()))
         .filter(|build| {
             let safe = build.platform.as_deref().is_none_or(safe_filename_part);
             if !safe {
                 tracing::debug!(
-                    url = %api,
+                    url = %api.escape_debug(),
                     platform = ?build.platform,
                     "gem build skipped: platform is not a file-name part"
                 );
             }
             safe
         })
-        .map(|build| gem_candidate(&repository, name, version, build))
+        .map(|build| gem_candidate(&repository, name, &version, build))
         .collect();
     candidates.sort_by(|left, right| left.file_name.cmp(&right.file_name));
     let preferred = match purl.qualifier("file_name") {
@@ -82,31 +87,31 @@ fn gem_candidate(
     repository: &str,
     name: &str,
     version: &str,
-    build: &GemVersion,
+    build: GemVersion,
 ) -> ArtifactCandidate {
     let platform = build.platform.as_deref().unwrap_or("ruby");
-    let suffix = if platform == "ruby" {
-        String::new()
-    } else {
-        format!("-{platform}")
+    let file_name = match platform {
+        "ruby" => format!("{name}-{version}.gem"),
+        _ => format!("{name}-{version}-{platform}.gem"),
     };
-    let file_name = format!("{name}-{version}{suffix}.gem");
-    let mut qualifiers = BTreeMap::new();
-    qualifiers.insert("platform".into(), platform.to_string());
+    let qualifiers = BTreeMap::from([("platform".to_string(), platform.to_string())]);
     let mut attributes = BTreeMap::new();
     for (key, value) in [
-        ("ruby_version", &build.ruby_version),
-        ("rubygems_version", &build.rubygems_version),
+        ("ruby_version", build.ruby_version),
+        ("rubygems_version", build.rubygems_version),
     ] {
         if let Some(value) = value {
-            attributes.insert(key.into(), value.clone());
+            attributes.insert(key.into(), value);
         }
     }
-    let mut checksums = BTreeMap::new();
-    if let Some(sha256) = &build.sha {
-        checksums.insert("sha256".into(), sha256.clone());
-    }
-    let url = format!("{repository}/downloads/{file_name}");
+    let checksums = build
+        .sha
+        .map(|sha256| ("sha256".to_string(), sha256))
+        .into_iter()
+        .collect();
+    // The version is decoded, or the registry's own text when unversioned,
+    // so the file name is encoded: it can only ever be one path segment.
+    let url = format!("{repository}/downloads/{}", encode_component(&file_name));
     ArtifactCandidate {
         file_name,
         version: Some(version.to_string()),
@@ -152,19 +157,17 @@ pub(crate) fn lookup(
             .or_insert(at);
     }
 
-    let mut p = Registry::new(Ecosystem::Gem, c.name().to_string());
-    p.version = version.to_string();
+    let mut record = c.record(Ecosystem::Gem, c.name(), doc.version.clone());
     // A version the list lacks gets no date rather than the newest's.
-    p.published_at = released.get(version).copied();
-    p.latest_version = doc.version.clone();
-    p.author = doc.authors;
-    p.description = doc.info;
-    p.homepage = doc.homepage_uri;
-    p.repository = doc.source_code_uri;
-    p.license = doc.licenses.into_iter().next();
-    p.downloads_total = doc.downloads;
-    set_timeline(&mut p, released.into_values());
-    Ok(p)
+    record.published_at = listed(released.get(version).copied(), c.name(), version);
+    record.author = doc.authors;
+    record.description = doc.info;
+    record.homepage = doc.homepage_uri;
+    record.repository = doc.source_code_uri;
+    record.license = doc.licenses.into_iter().next();
+    record.downloads_total = doc.downloads;
+    set_timeline(&mut record, released.into_values());
+    Ok(record)
 }
 
 /// The RubyGems gem document (`/api/v1/gems/{name}.json`): latest version,
@@ -206,10 +209,8 @@ struct GemVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::coordinates;
-
+    use crate::ecosystem::{coordinates, look};
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
     fn rails() -> Fixtures {
         let gem_doc = serde_json::json!({
@@ -241,12 +242,7 @@ mod tests {
     #[test]
     fn gem_api_normalizes() {
         let net = rails();
-        let r = crate::registry::lookup(
-            &RefLocator::Purl("pkg:gem/rails".into()),
-            &net,
-            &BlobCache::disabled(),
-        )
-        .expect("registry");
+        let r = look("pkg:gem/rails", &net).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Gem);
         assert_eq!(r.version, "8.1.3");
         assert_eq!(r.latest_version.as_deref(), Some("8.1.3"));
@@ -280,6 +276,29 @@ mod tests {
         assert_eq!(
             builds[1].checksums.get("sha256").map(String::as_str),
             Some("aa")
+        );
+    }
+
+    /// The release a download URL names comes from the PURL (decoded) or,
+    /// unversioned, from the registry's own list; either way it fills one
+    /// path segment under `/downloads/`, never climbing out of it.
+    #[test]
+    fn a_version_cannot_restructure_the_download_url() {
+        let versions = br#"[{"number": "1.0/../../../evil?x#y", "platform": "ruby"}]"#;
+        let net = Fixtures::default().with("https://rubygems.org/api/v1/versions/g.json", versions);
+        let cache = BlobCache::disabled();
+        let builds = gem_artifacts(&coordinates("pkg:gem/g"), &net, &cache).expect("listing");
+        assert_eq!(
+            builds[0].url,
+            "https://rubygems.org/downloads/g-1.0%2F..%2F..%2F..%2Fevil%3Fx%23y.gem"
+        );
+        let versions = br#"[{"number": "1%2F..%2Fx", "platform": "ruby"}]"#;
+        let net = Fixtures::default().with("https://rubygems.org/api/v1/versions/g.json", versions);
+        let builds =
+            gem_artifacts(&coordinates("pkg:gem/g@1%252F..%252Fx"), &net, &cache).expect("listing");
+        assert_eq!(
+            builds[0].url,
+            "https://rubygems.org/downloads/g-1%252F..%252Fx.gem"
         );
     }
 }

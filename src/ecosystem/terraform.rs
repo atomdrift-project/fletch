@@ -4,7 +4,7 @@ use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 
 use crate::ecosystem::{
-    Coordinates, fetch_json, non_empty, null_default, set_timeline, split_pair, unix_secs,
+    Coordinates, fetch_json, listed, non_empty, null_default, set_timeline, unix_secs,
 };
 use crate::fetch::{
     ArtifactCandidate, ArtifactKind, BlobCache, Fetch, META_TTL_IMMUTABLE, artifact_candidate,
@@ -31,8 +31,8 @@ pub(crate) fn terraform_artifact(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<ArtifactCandidate, RegistryError> {
-    let (path, version, purl) = (c.path(), c.encoded_version(), c.purl());
-    let (namespace, name) = split_pair(path)?;
+    let (version, purl) = (c.encoded_version(), c.purl());
+    let (namespace, name) = c.pair()?;
     // A value from the registry fills one URL path segment only once encoded
     // and checked, like the PURL's own coordinates.
     let segment = |value: Option<&str>| {
@@ -129,48 +129,52 @@ pub(crate) fn lookup(
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
     let (namespace, name) = c.pair()?;
-    let doc: ProviderDocument = fetch_json(
+    let ProviderDocument {
+        data: Provider { attributes: attrs },
+        included,
+    } = fetch_json(
         &format!("{PROVIDERS}/v2/providers/{namespace}/{name}?include=provider-versions"),
         net,
         cache,
     )?;
-    let attrs = &doc.data.attributes;
-    let releases = doc.releases();
+    let releases: Vec<&VersionAttributes> = included
+        .iter()
+        .filter(|i| i.kind.as_deref() == Some("provider-versions"))
+        .filter_map(|i| i.attributes.as_ref())
+        .collect();
     let latest = latest(releases.iter().filter_map(|r| r.version.as_deref()));
     let version = c.target(latest);
-    let release = releases
-        .iter()
-        .find(|r| r.version.as_deref() == Some(version));
-    if release.is_none() {
-        tracing::debug!(
-            provider = %c.full_name().escape_debug(),
-            version = %version.escape_debug(),
-            "Terraform provider version not listed; leaving it undated"
-        );
-    }
+    let release = listed(
+        releases
+            .iter()
+            .find(|r| r.version.as_deref() == Some(version)),
+        &c.full_name(),
+        version,
+    );
 
-    let mut record = Registry::new(Ecosystem::Terraform, c.full_name());
-    record.version = version.to_string();
+    let mut record = c.record(
+        Ecosystem::Terraform,
+        c.full_name(),
+        latest.map(str::to_string),
+    );
     record.published_at = release
         .and_then(|r| r.published_at.as_deref())
         .and_then(unix_secs);
-    record.latest_version = latest.map(str::to_string);
-    record.author = attrs.owner_name.clone();
+    record.author = attrs.owner_name;
     record.publisher = c.namespace().first().cloned();
     // The provider-level description is often empty where the release's
     // is not.
     record.description = release
         .and_then(|r| r.description.clone())
-        .or_else(|| attrs.description.clone());
-    record.repository = attrs.source.clone();
+        .or(attrs.description);
+    record.repository = attrs.source;
     record.downloads_total = attrs.downloads;
     // `official` and `partner` providers are vetted by HashiCorp; a
     // `community` namespace is anyone's GitHub account.
     record.publisher_verified = attrs
         .tier
-        .as_deref()
-        .map(|t| matches!(t, "official" | "partner"));
-    record.deprecated = attrs.warning.clone();
+        .map(|tier| matches!(tier, Tier::Official | Tier::Partner));
+    record.deprecated = attrs.warning;
     set_timeline(
         &mut record,
         releases
@@ -203,17 +207,6 @@ struct ProviderDocument {
     included: Vec<Included>,
 }
 
-impl ProviderDocument {
-    /// Every included provider-version's attributes.
-    fn releases(&self) -> Vec<&VersionAttributes> {
-        self.included
-            .iter()
-            .filter(|i| i.kind.as_deref() == Some("provider-versions"))
-            .filter_map(|i| i.attributes.as_ref())
-            .collect()
-    }
-}
-
 /// The provider resource itself.
 #[derive(Deserialize)]
 struct Provider {
@@ -231,9 +224,22 @@ struct ProviderAttributes {
     #[serde(deserialize_with = "non_empty")]
     source: Option<String>,
     downloads: Option<u64>,
-    tier: Option<String>,
+    tier: Option<Tier>,
     #[serde(deserialize_with = "non_empty")]
     warning: Option<String>,
+}
+
+/// Who stands behind a provider.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Tier {
+    /// Published by HashiCorp.
+    Official,
+    /// Published by a technology partner HashiCorp has vetted.
+    Partner,
+    /// Published by anyone, or a tier this reader does not know.
+    #[serde(other)]
+    Community,
 }
 
 /// An included resource; the record reads the `provider-versions` ones.
@@ -294,13 +300,8 @@ struct Download {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ecosystem::coordinates;
+    use crate::ecosystem::{coordinates, look};
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
-
-    fn look(net: &Fixtures, purl: &str) -> Result<Registry, RegistryError> {
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
-    }
 
     fn release(v: &str, at: &str, description: &str) -> serde_json::Value {
         serde_json::json!({
@@ -334,7 +335,7 @@ mod tests {
             "acme/vault",
             &[release("1.0.0+ent", "2021-04-23T10:00:00Z", "")],
         );
-        let r = look(&net, "pkg:terraform/acme/vault@1.0.0%2Bent").expect("registry");
+        let r = look("pkg:terraform/acme/vault@1.0.0%2Bent", &net).expect("registry");
         assert_eq!(r.version, "1.0.0+ent");
         assert_eq!(r.published_at, Some(1_619_172_000));
     }
@@ -352,7 +353,7 @@ mod tests {
             ],
         );
         // The mixed-case address routes to the one lowercase provider.
-        let r = look(&net, "pkg:terraform/Kreuzwenker/Docker@4.6.0").expect("registry");
+        let r = look("pkg:terraform/Kreuzwenker/Docker@4.6.0", &net).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Terraform);
         assert_eq!(r.name, "kreuzwenker/docker");
         assert_eq!(r.version, "4.6.0");
@@ -376,12 +377,22 @@ mod tests {
         assert_eq!(r.previous_published_at, r.first_published_at);
 
         // Versionless: the latest release is current.
-        let r = look(&net, "pkg:terraform/kreuzwenker/docker").expect("registry");
+        let r = look("pkg:terraform/kreuzwenker/docker", &net).expect("registry");
         assert_eq!(r.version, "4.7.0");
         assert_eq!(r.description, None);
         assert_eq!(
-            look(&net, "pkg:terraform/a/kreuzwenker/docker"),
+            look("pkg:terraform/a/kreuzwenker/docker", &net),
             Err(RegistryError::UnsafeCoordinate)
+        );
+        // The artifact resolver holds the coordinate to the same shape.
+        assert_eq!(
+            terraform_artifact(
+                &coordinates("pkg:terraform/a/kreuzwenker/docker@4.6.0"),
+                &net,
+                &BlobCache::disabled()
+            )
+            .err(),
+            Some(RegistryError::UnsafeCoordinate)
         );
     }
 
@@ -399,7 +410,7 @@ mod tests {
                 release("nightly", "2026-04-01T00:00:00Z", ""),
             ],
         );
-        let r = look(&net, "pkg:terraform/acme/cloud").expect("registry");
+        let r = look("pkg:terraform/acme/cloud", &net).expect("registry");
         assert_eq!(r.latest_version.as_deref(), Some("5.0.0"));
         assert_eq!(r.version, "5.0.0");
 
@@ -412,7 +423,7 @@ mod tests {
                 release("1.0.0-rc.10", "2025-01-01T00:00:00Z", ""),
             ],
         );
-        let r = look(&net, "pkg:terraform/acme/beta").expect("registry");
+        let r = look("pkg:terraform/acme/beta", &net).expect("registry");
         assert_eq!(r.latest_version.as_deref(), Some("1.0.0-rc.10"));
     }
 

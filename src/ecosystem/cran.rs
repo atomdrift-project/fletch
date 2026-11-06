@@ -4,7 +4,9 @@ use filefacts::{Ecosystem, Registry};
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use crate::ecosystem::{Coordinates, fetch_json, non_empty, null_default, strip_email, unix_secs};
+use crate::ecosystem::{
+    Coordinates, fetch_json, listed, non_empty, null_default, set_timeline, strip_email, unix_secs,
+};
 use crate::fetch::{BlobCache, Fetch};
 use crate::registry::RegistryError;
 
@@ -16,7 +18,7 @@ pub(crate) fn lookup(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let name = c.bare_name(&[])?;
+    let name = c.encoded_name();
     let doc: Package = fetch_json(&format!("https://crandb.r-pkg.org/{name}/all"), net, cache)?;
     let target = c.target(doc.latest.as_deref());
 
@@ -25,14 +27,7 @@ pub(crate) fn lookup(
     // crandb does not list stays undated. The package-level facts come from
     // the release, else from the latest.
     let mut versions = doc.versions;
-    let release = versions.remove(target);
-    if release.is_none() {
-        tracing::debug!(
-            package = %c.name().escape_debug(),
-            version = %target.escape_debug(),
-            "CRAN release not listed; describing it from the latest"
-        );
-    }
+    let release = listed(versions.remove(target), c.name(), target);
     let published_at = release
         .as_ref()
         .and_then(|r| r.date_publication.as_deref())
@@ -42,18 +37,17 @@ pub(crate) fn lookup(
         .or_else(|| doc.latest.as_deref().and_then(|v| versions.remove(v)))
         .unwrap_or_default();
 
-    let mut registry = Registry::new(
+    let mut record = c.record(
         Ecosystem::Cran,
         desc.package.unwrap_or_else(|| c.name().to_string()),
+        doc.latest.clone(),
     );
-    registry.version = target.to_string();
-    registry.published_at = published_at;
-    registry.latest_version = doc.latest.clone();
-    registry.author = desc.maintainer.as_deref().map(strip_email);
-    registry.description = desc.title;
+    record.published_at = published_at;
+    record.author = desc.maintainer.as_deref().map(strip_email);
+    record.description = desc.title;
     // CRAN crowds several URLs into one field, separated by commas or
     // whitespace; keep the first.
-    registry.homepage = desc
+    record.homepage = desc
         .url
         .as_deref()
         .and_then(|urls| {
@@ -61,8 +55,12 @@ pub(crate) fn lookup(
                 .find(|u| !u.is_empty())
         })
         .map(str::to_string);
-    registry.license = desc.license;
-    Ok(registry)
+    record.license = desc.license;
+    set_timeline(
+        &mut record,
+        doc.timeline.values().filter_map(|t| unix_secs(t)),
+    );
+    Ok(record)
 }
 
 /// crandb's all-versions document for a package.
@@ -88,7 +86,7 @@ struct DescriptionFile {
     maintainer: Option<String>,
     #[serde(deserialize_with = "non_empty")]
     title: Option<String>,
-    #[serde(rename = "URL")]
+    #[serde(rename = "URL", deserialize_with = "non_empty")]
     url: Option<String>,
     #[serde(deserialize_with = "non_empty")]
     license: Option<String>,
@@ -96,9 +94,9 @@ struct DescriptionFile {
 
 #[cfg(test)]
 mod tests {
-    use crate::fetch::{BlobCache, Fixtures};
-    use crate::registry::{RegistryError, lookup};
-    use filefacts::{Ecosystem, RefLocator, Registry};
+    use crate::ecosystem::look;
+    use crate::fetch::Fixtures;
+    use filefacts::Ecosystem;
 
     #[test]
     fn cran_crandb_normalizes() {
@@ -113,15 +111,13 @@ mod tests {
                     "Date/Publication": "2021-04-23 10:00:00 UTC"
                 },
                 "0.9.0": {"Package": "jsonlite", "Version": "0.9.0", "Title": "A JSON parser",
-                          "License": ""}
+                          "License": "", "URL": " "}
             },
             "timeline": {"0.9.0": "2013-12-03T00:00:00+00:00", "2.0.0": "2021-04-23T10:00:00+00:00"}
         })
         .to_string();
         let net = Fixtures::default().with("https://crandb.r-pkg.org/jsonlite/all", doc.as_bytes());
-        let look = |purl: &str| -> Result<Registry, RegistryError> {
-            lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled())
-        };
+        let look = |purl: &str| look(purl, &net);
         let r = look("pkg:cran/jsonlite").expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Cran);
         assert_eq!(r.version, "2.0.0");
@@ -141,6 +137,11 @@ mod tests {
         assert_eq!(r.published_at, Some(1_386_028_800));
         assert_eq!(r.latest_version.as_deref(), Some("2.0.0"));
         assert_eq!(r.license, None, "an empty license is unknown");
+        assert_eq!(r.homepage, None, "an empty URL is unknown");
+        // The timeline dates every release.
+        assert_eq!(r.release_count, Some(2));
+        assert_eq!(r.first_published_at, Some(1_386_028_800));
+        assert_eq!(r.previous_published_at, None, "the first release");
 
         // One crandb does not list is still the package, undated.
         let r = look("pkg:cran/jsonlite@9.9.9").expect("registry");

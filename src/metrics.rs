@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use filefacts::Registry;
 
-use crate::fetch::{FetchError, FetchRecord, Outcome, Served, Unresolved};
+use crate::fetch::{FetchError, FetchRecord, Outcome, Served};
 use crate::purl::{Purl, known_type};
 use crate::registry::RegistryError;
 
@@ -38,42 +38,19 @@ pub const TARGET: &str = "fletch::metrics";
 
 /// One reference fetched (or not), as its record says.
 pub(crate) fn fetch(rec: &FetchRecord, elapsed: Duration) {
-    let (outcome, detail) = match &rec.outcome {
-        Outcome::Ok => ("ok", None),
-        Outcome::PinMismatch => ("pin_mismatch", None),
-        Outcome::UnverifiablePin => ("unverifiable_pin", None),
-        Outcome::Unresolved(why) => (
-            "unresolved",
-            Some(match why {
-                Unresolved::InvalidPurl => "invalid_purl",
-                Unresolved::UnsafeCoordinate => "unsafe_coordinate",
-                Unresolved::NoRelease => "no_release",
-                Unresolved::Unsupported => "unsupported",
-            }),
-        ),
-        Outcome::Skipped => ("skipped", None),
-        Outcome::BudgetExceeded => ("budget_exceeded", None),
-        Outcome::Failed(error) => (
-            "failed",
-            Some(match error {
-                FetchError::Refused(_) => "refused",
-                FetchError::Status(_) => "status",
-                FetchError::TooLarge => "too_large",
-                FetchError::Timeout => "timeout",
-                FetchError::Transport(_) => "transport",
-                FetchError::Io(_) => "io",
-                FetchError::Internal(_) => "internal",
-            }),
-        ),
+    let detail = match &rec.outcome {
+        Outcome::Unresolved(why) => Some(why.label()),
+        Outcome::Failed(error) => Some(error.label()),
+        _ => None,
     };
     tracing::debug!(
         target: TARGET,
         event = "fetch",
         ecosystem = ecosystem(&rec.locator),
-        outcome,
+        outcome = rec.outcome.label(),
         detail,
         status = rec.status,
-        served = rec.served.map(served_label),
+        served = rec.served.map(Served::label),
         bytes = rec.size,
         elapsed_ms = millis(elapsed),
     );
@@ -83,18 +60,10 @@ pub(crate) fn fetch(rec: &FetchRecord, elapsed: Duration) {
 pub(crate) fn registry(locator: &str, result: &Result<Registry, RegistryError>, elapsed: Duration) {
     let (result, status) = match result {
         Ok(_) => ("ok", None),
-        Err(RegistryError::NotAPackage) => ("not_a_package", None),
-        Err(RegistryError::InvalidPurl(_)) => ("invalid_purl", None),
-        Err(RegistryError::UnsafeCoordinate) => ("unsafe_coordinate", None),
-        Err(RegistryError::Unsupported(_)) => ("unsupported", None),
-        Err(RegistryError::NotFound) => ("not_found", None),
-        Err(RegistryError::Unavailable(FetchError::Status(status))) => {
-            ("unavailable", Some(*status))
+        Err(error @ RegistryError::Unavailable(FetchError::Status(status))) => {
+            (error.label(), Some(*status))
         }
-        Err(RegistryError::Unavailable(_)) => ("unavailable", None),
-        Err(RegistryError::Malformed { .. }) => ("malformed", None),
-        Err(RegistryError::NoRecord) => ("no_record", None),
-        Err(RegistryError::OffRegistry) => ("off_registry", None),
+        Err(error) => (error.label(), None),
     };
     tracing::debug!(
         target: TARGET,
@@ -113,17 +82,9 @@ pub(crate) fn metadata(url: &str, served: Option<Served>, bytes: Option<usize>) 
         target: TARGET,
         event = "metadata",
         host = host(url).as_deref().unwrap_or_default(),
-        served = served.map_or("failed", served_label),
+        served = served.map_or("failed", Served::label),
         bytes,
     );
-}
-
-fn served_label(served: Served) -> &'static str {
-    match served {
-        Served::Network => "network",
-        Served::Cache => "cache",
-        Served::StaleCache => "stale_cache",
-    }
 }
 
 /// A registry asked to be left alone for `delay`.
@@ -188,6 +149,56 @@ mod tests {
             ("", "url"),
         ] {
             assert_eq!(ecosystem(locator), label, "{locator}");
+        }
+    }
+
+    /// A label is the name a stored record serializes the value under, so
+    /// metrics and records never spell one outcome two ways.
+    #[test]
+    fn labels_are_the_serialized_names() {
+        use crate::fetch::{FetchError, Outcome, Served, Unresolved};
+        let name = |value: serde_json::Value| match value {
+            serde_json::Value::String(name) => name,
+            serde_json::Value::Object(map) => map.into_iter().next().map(|(k, _)| k).unwrap(),
+            other => panic!("unexpected {other}"),
+        };
+        let errors = [
+            FetchError::Refused(String::new()),
+            FetchError::Status(404),
+            FetchError::TooLarge,
+            FetchError::Timeout,
+            FetchError::Transport(String::new()),
+            FetchError::Io(String::new()),
+            FetchError::Internal(String::new()),
+        ];
+        for error in errors {
+            assert_eq!(error.label(), name(serde_json::to_value(&error).unwrap()));
+        }
+        let unresolved = [
+            Unresolved::InvalidPurl,
+            Unresolved::UnsafeCoordinate,
+            Unresolved::NoRelease,
+            Unresolved::Unsupported,
+        ];
+        for why in unresolved {
+            assert_eq!(why.label(), name(serde_json::to_value(why).unwrap()));
+        }
+        for served in [Served::Network, Served::Cache, Served::StaleCache] {
+            assert_eq!(served.label(), name(serde_json::to_value(served).unwrap()));
+        }
+        for outcome in [
+            Outcome::Ok,
+            Outcome::PinMismatch,
+            Outcome::UnverifiablePin,
+            Outcome::Unresolved(Unresolved::NoRelease),
+            Outcome::Skipped,
+            Outcome::BudgetExceeded,
+            Outcome::Failed(FetchError::Timeout),
+        ] {
+            assert_eq!(
+                outcome.label(),
+                name(serde_json::to_value(&outcome).unwrap())
+            );
         }
     }
 

@@ -17,10 +17,7 @@ pub(crate) fn is_web_scheme(url: &str) -> bool {
 /// case-insensitive). The single answer to "does this URL point at X": a
 /// substring test would accept `https://evil.example/aur.archlinux.org`.
 pub(crate) fn url_host_is(url: &str, host: &str) -> bool {
-    url::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.eq_ignore_ascii_case(host)))
-        .unwrap_or(false)
+    url::Url::parse(url).is_ok_and(|u| u.host_str().is_some_and(|h| h.eq_ignore_ascii_case(host)))
 }
 
 /// Whether `url` is an absolute `http`/`https` URL with a host.
@@ -127,5 +124,5 @@ pub(crate) fn percent_decode(s: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }

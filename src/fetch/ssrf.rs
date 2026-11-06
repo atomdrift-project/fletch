@@ -204,6 +204,8 @@ pub(crate) fn guard_host(url: &reqwest::Url, plain_http: bool) -> Result<(), Fet
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_host_keeps_only_its_public_addresses() {
         let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
@@ -222,8 +224,6 @@ mod tests {
             vec![addr("93.184.215.14:0")]
         );
     }
-
-    use super::*;
 
     #[test]
     fn ssrf_blocks_internal_addresses() {

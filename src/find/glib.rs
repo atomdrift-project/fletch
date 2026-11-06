@@ -5,16 +5,11 @@
 
 use filefacts::{Arg, RefKind, RefLocator, Reference, Symbol};
 
-use super::Discovery;
-use super::UnresolvedFetchCall;
+use super::{Discovery, UnresolvedFetchCall};
 use crate::fetch::is_http_url;
 
 /// The file-write API whose body is read.
 const WRITE_API: &str = "GLib.file_set_contents";
-
-/// The longest body read. Each parsed import consumes a whole statement, so
-/// this bounds both the work and the references one body yields.
-const MAX_BODY: usize = 16_384;
 
 /// Read the next simple import's URL token. Escapes, dynamic values and
 /// unsupported token forms remain unresolved; leading comments are skipped.
@@ -32,28 +27,27 @@ fn initial_import(body: &str) -> Option<(&str, &str)> {
         Some(tail) => (tail.trim_start(), true),
         None => (tail, false),
     };
-    let (url, tail) = if tail.starts_with(['\'', '"']) {
-        let quote = tail.chars().next()?;
-        let rest = tail.get(1..)?;
-        let end = rest.find(quote)?;
-        let value = &rest[..end];
-        if value.contains(['\\', '\n', '\r']) {
-            return None;
+    let (url, tail) = match tail.chars().next() {
+        Some(quote @ ('\'' | '"')) => {
+            let (value, rest) = tail[1..].split_once(quote)?;
+            if value.contains(['\\', '\n', '\r']) {
+                return None;
+            }
+            (value, rest)
         }
-        (value, rest.get(end + 1..)?)
-    } else if function {
-        let end = tail.find(')')?;
-        let value = &tail[..end];
-        if value.is_empty()
-            || value
-                .chars()
-                .any(|c| c.is_whitespace() || matches!(c, '\\' | '\'' | '"' | '('))
-        {
-            return None;
+        _ if function => {
+            let end = tail.find(')')?;
+            let value = &tail[..end];
+            if value.is_empty()
+                || value
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '\\' | '\'' | '"' | '('))
+            {
+                return None;
+            }
+            (value, &tail[end..])
         }
-        (value, &tail[end..])
-    } else {
-        return None;
+        _ => return None,
     };
     let tail = tail.trim_start();
     let tail = if function {
@@ -63,10 +57,7 @@ fn initial_import(body: &str) -> Option<(&str, &str)> {
     };
     // Deliberately require a complete simple import. Conditional/media forms
     // need CSS parsing rather than guessing where another statement starts.
-    if !tail.starts_with(';') {
-        return None;
-    }
-    Some((url, &tail[1..]))
+    Some((url, tail.strip_prefix(';')?))
 }
 
 /// Remote stylesheets imported by the bodies a JavaScript file writes, and the
@@ -96,16 +87,9 @@ pub(super) fn discover(symbols: &[Symbol]) -> Discovery {
             }
             None => continue,
         };
-        if value.len() > MAX_BODY {
-            out.truncated = true;
-            tracing::debug!(
-                recognizer = "glib",
-                limit = MAX_BODY,
-                bytes = value.len(),
-                "stylesheet body too long to read"
-            );
-            continue;
-        }
+        // The whole body is read: each import consumes its statement and CSS
+        // puts every import first, so the scan is linear and stops at the
+        // first rule. A length cap would only let padding hide an import.
         let mut rest = value.as_str();
         while let Some((url, tail)) = initial_import(rest) {
             rest = tail;
@@ -201,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn a_runtime_body_is_a_gap_and_an_oversized_one_is_truncation() {
+    fn a_runtime_body_is_a_gap_and_a_large_one_is_read_whole() {
         let dynamic = discovered("GLib.file_set_contents(path, css);");
         assert_eq!(dynamic.unresolved.len(), 1);
         assert_eq!(dynamic.unresolved[0].command, WRITE_API);
@@ -209,9 +193,9 @@ mod tests {
 
         let body = format!(
             "@import url('https://example.invalid/a.css');{}",
-            " ".repeat(MAX_BODY)
+            " ".repeat(1 << 20)
         );
-        let oversized = discover(&[Symbol::Call {
+        let large = discover(&[Symbol::Call {
             target: Some(WRITE_API.to_owned()),
             args: vec![
                 Arg::Identifier {
@@ -221,6 +205,11 @@ mod tests {
             ],
             offset: Some(0),
         }]);
-        assert!(oversized.references.is_empty() && oversized.truncated);
+        assert_eq!(large.references.len(), 1);
+        assert_eq!(
+            large.references[0].locator,
+            RefLocator::Url("https://example.invalid/a.css".into())
+        );
+        assert!(!large.truncated);
     }
 }

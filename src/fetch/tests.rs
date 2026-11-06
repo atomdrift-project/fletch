@@ -6,15 +6,8 @@
 use filefacts::RefLocator;
 
 use super::record::tests::dep;
-use super::resolve::tests::resolved;
+use super::resolve::tests::{matrix, refusal, resolved};
 use super::*;
-use crate::ecosystem::pypi::pypi_artifacts;
-use crate::purl::Purl;
-
-/// `raw`'s artifact matrix, asked of `net`.
-fn matrix(raw: &str, net: &dyn Fetch) -> ArtifactMatrix {
-    resolve_artifacts(&RefLocator::Purl(raw.into()), net, &BlobCache::disabled()).expect("matrix")
-}
 
 // ---------------------------------------------------------------------------
 // Ecosystem resolvers: npm
@@ -57,11 +50,16 @@ fn resolve_npm_unversioned_picks_latest_tarball() {
             "https://registry.npmjs.org/@scope/util/-/util-2.0.0.tgz".to_string()
         ))
     );
-    // Registry unreachable / unknown package → unresolved.
-    assert_eq!(
-        resolved("pkg:npm/nope", &Fixtures::default(), &BlobCache::disabled()),
-        None
-    );
+    // Registry unreachable: a failed read, not a refusal, so a later attempt
+    // may succeed.
+    assert!(matches!(
+        super::resolve::target(
+            &RefLocator::Purl("pkg:npm/nope".into()),
+            &Fixtures::default(),
+            &BlobCache::disabled()
+        ),
+        Err(ResolveError::Failed(_))
+    ));
 }
 
 #[test]
@@ -160,12 +158,11 @@ fn resolve_pypi(
         || format!("{name}@{version}"),
         |value| format!("{name}@{version}?kind={value}"),
     );
-    let purl = Purl::parse(&format!("pkg:pypi/{rest}")).ok()?;
-    pypi_artifacts(&crate::ecosystem::Coordinates::new(&purl).ok()?, net, cache)
+    let locator = RefLocator::Purl(format!("pkg:pypi/{rest}"));
+    resolve_artifacts(&locator, net, cache)
         .ok()?
-        .into_iter()
-        .find(|candidate| candidate.preferred)
-        .map(|candidate| candidate.url)
+        .preferred()
+        .map(|candidate| candidate.url.clone())
 }
 
 #[test]
@@ -195,11 +192,16 @@ fn resolve_pypi_defaults_to_wheel_with_sdist_fallback() {
         resolve_pypi("requests", "2.28.1", Some("sdist"), &net, &cache),
         Some(sdist)
     );
-    // No fixture (registry unreachable / unknown package) → unresolved.
-    assert_eq!(
-        resolve_pypi("nope", "9.9.9", None, &Fixtures::default(), &cache),
-        None
-    );
+    // No fixture: the registry is unreachable, a failed read rather than a
+    // refusal.
+    assert!(matches!(
+        resolve_artifacts(
+            &RefLocator::Purl("pkg:pypi/nope@9.9.9".into()),
+            &Fixtures::default(),
+            &cache
+        ),
+        Err(ResolveError::Failed(_))
+    ));
 }
 
 #[test]
@@ -550,7 +552,10 @@ fn terraform_falls_back_to_the_first_listed_platform() {
             &format!("{TERRAFORM_DOCKER}/3.0.2/download/darwin/arm64"),
             info.as_bytes(),
         );
-    assert_eq!(resolved(locator, &net, &cache), None);
+    assert!(matches!(
+        super::resolve::target(&RefLocator::Purl(locator.into()), &net, &cache),
+        Err(ResolveError::Failed(_))
+    ));
 }
 
 #[test]
@@ -626,7 +631,7 @@ fn resolve_firefox_uses_exact_version_and_refines_latest() {
     })
     .to_string();
     let net = Fixtures::default().with(pinned_api, wrong.as_bytes());
-    assert_eq!(resolved("pkg:firefox/surf-click@1.0.9", &net, &cache), None);
+    assert!(refusal("pkg:firefox/surf-click@1.0.9", &net, &cache).is_some());
 }
 
 #[test]
@@ -663,12 +668,9 @@ fn resolve_comfyui_uses_exact_version_and_refines_latest() {
         serde_json::json!({"node_id": "other-node", "version": "1.3.1", "downloadUrl": zip}),
     ] {
         let net = Fixtures::default().with(&pinned_api, wrong.to_string().as_bytes());
-        assert_eq!(resolved(exact, &net, &cache), None);
+        assert!(refusal(exact, &net, &cache).is_some(), "{wrong}");
     }
-    assert_eq!(
-        resolved("pkg:comfyui/owner/comfyui-loopstrip@1.3.1", &net, &cache),
-        None
-    );
+    assert!(refusal("pkg:comfyui/owner/comfyui-loopstrip@1.3.1", &net, &cache).is_some());
 }
 
 #[test]
@@ -719,9 +721,9 @@ fn resolve_dify_downloads_by_unique_identifier() {
         }}})
         .to_string();
         let net = Fixtures::default().with(&format!("{base}/0.1.1"), doc.as_bytes());
-        assert_eq!(resolved(exact, &net, &cache), None, "{wrong}");
+        assert!(refusal(exact, &net, &cache).is_some(), "{wrong}");
     }
-    assert_eq!(resolved("pkg:dify/eval-loop@0.1.1", &net, &cache), None);
+    assert!(refusal("pkg:dify/eval-loop@0.1.1", &net, &cache).is_some());
 }
 
 #[test]

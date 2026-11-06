@@ -6,9 +6,10 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use std::io::{Cursor, Read};
 
 use crate::ecosystem::{
-    Coordinates, decode, fetch_json, lenient, non_empty, null_default, optional, set_timeline,
-    unix_secs,
+    Coordinates, DEPRECATED, count, decode, fetch_json, lenient, non_empty, null_default, optional,
+    set_timeline, unix_secs,
 };
+use crate::fetch::cache::Capped;
 use crate::fetch::{BlobCache, Fetch, cached_metadata_status};
 use crate::purl::encode_component;
 use crate::registry::RegistryError;
@@ -21,6 +22,11 @@ const NUGET_REGISTRATION: &str = "https://api.nuget.org/v3/registration5-gz-semv
 /// Ceiling on a decompressed registration document, a gzip-bomb guard. Real
 /// indexes are KBs to low MBs even for packages with thousands of versions.
 const NUGET_DECOMP_CAP: u64 = 64 * 1024 * 1024;
+
+/// Ceiling on the registration pages fetched by `@id` for one package. A page
+/// lists up to 64 versions, so this reads 4,096 releases; a longer timeline
+/// is read that far, and the log says so.
+const NUGET_PAGE_CAP: usize = 64;
 
 /// NuGet has no single metadata document, so three sources compose the record.
 /// The uncompressed **search** API gives the package-level facts — latest
@@ -38,7 +44,7 @@ pub(crate) fn lookup(
     net: &dyn Fetch,
     cache: &BlobCache,
 ) -> Result<Registry, RegistryError> {
-    let id = c.bare_name(&[])?.to_lowercase();
+    let id = c.encoded_name().to_lowercase();
     let doc: SearchResults = fetch_json(
         &format!(
             "https://azuresearch-usnc.nuget.org/query?q=packageid:{id}&prerelease=true&semVerLevel=2.0.0"
@@ -49,7 +55,7 @@ pub(crate) fn lookup(
     // An exact `packageid:` query with no hit is NuGet saying there is no such
     // package. Only the hit that *is* that package counts: search is a
     // ranking, and another package's record must not stand in for this one.
-    let Some(hit) = doc.data.iter().find(|hit| {
+    let Some(hit) = doc.data.into_iter().find(|hit| {
         hit.id
             .as_deref()
             .is_some_and(|found| found.eq_ignore_ascii_case(c.name()))
@@ -69,7 +75,7 @@ pub(crate) fn lookup(
             .versions
             .iter()
             .filter_map(|e| e.version.as_deref())
-            .find(|v| nuget_version_key(v) == nuget_version_key(want))
+            .find(|v| same_release(v, want))
             .unwrap_or_else(|| {
                 tracing::debug!(
                     package = %c.name().escape_debug(),
@@ -81,64 +87,61 @@ pub(crate) fn lookup(
         None => latest.unwrap_or_default(),
     };
 
-    let mut reg = Registry::new(
+    let mut record = c.record(
         Ecosystem::Nuget,
-        hit.id.clone().unwrap_or_else(|| c.name().to_string()),
+        hit.id.unwrap_or_else(|| c.name().to_string()),
+        latest.map(str::to_string),
     );
-    reg.version = version.to_string();
-    reg.latest_version = latest.map(str::to_string);
-    reg.author = hit.authors.as_ref().and_then(Authors::first);
-    reg.description = hit.description.clone();
-    reg.homepage = hit.project_url.clone();
-    reg.downloads_total = hit.total_downloads;
+    record.version = version.to_string();
+    record.author = hit.authors.and_then(Authors::first);
+    record.description = hit.description;
+    record.homepage = hit.project_url;
+    record.downloads_total = hit.total_downloads;
     // `deprecation` is an object with a `message`/`reasons` when the package
     // is deprecated, absent otherwise — presence is the signal.
-    reg.deprecated = hit.deprecation.as_ref().map(Deprecation::reason);
+    record.deprecated = hit.deprecation.map(Deprecation::reason);
     // `owners` is the curated custody set (distinct from free-text
     // `authors`); its size is the maintainer count. Absent → unknown.
-    reg.maintainers = hit
-        .owners
-        .as_ref()
-        .and_then(|o| u32::try_from(o.len()).ok());
+    record.maintainers = hit.owners.as_ref().map(|o| count(o.len()));
     // The search doc carries advisories for the queried package inline.
-    reg.vulnerability_count = hit
-        .vulnerabilities
-        .as_ref()
-        .and_then(|v| u32::try_from(v.len()).ok());
+    record.vulnerability_count = hit.vulnerabilities.as_ref().map(|v| count(v.len()));
 
     // Flatcontainer names the manifest `{id}.nuspec` (only the `.nupkg`
     // carries the version); the version lives in the path segment, normalized.
     let url = format!(
         "https://api.nuget.org/v3-flatcontainer/{id}/{v}/{id}.nuspec",
-        v = encode_component(&nuget_version_key(version))
+        v = encode_component(&without_build(version).to_ascii_lowercase())
     );
     if let Some(bytes) = optional(
         cached_metadata_status(&url, &[], net, cache).map_err(RegistryError::from),
         &url,
     ) {
-        nuget_nuspec(&url, &bytes, &mut reg);
+        nuget_nuspec(&url, &bytes, &mut record);
     }
-    nuget_registration(&id, version, &mut reg, net, cache);
-    Ok(reg)
+    nuget_registration(&id, version, &mut record, net, cache);
+    Ok(record)
 }
 
-/// A version as NuGet tells versions apart: case-insensitively, and without
-/// SemVer build metadata, which nuget.org drops when it normalizes a version
-/// (`1.0.0-Beta+abc` and `1.0.0-beta` are one release). Flat-container URLs
-/// spell versions this way.
-fn nuget_version_key(version: &str) -> String {
+/// `version` without its SemVer build metadata, which nuget.org drops when it
+/// normalizes a version.
+fn without_build(version: &str) -> &str {
     version
-        .split('+')
-        .next()
-        .unwrap_or(version)
-        .to_ascii_lowercase()
+        .split_once('+')
+        .map_or(version, |(release, _)| release)
+}
+
+/// Whether NuGet holds `a` and `b` to be one release: it tells versions apart
+/// case-insensitively and without build metadata (`1.0.0-Beta+abc` and
+/// `1.0.0-beta` are one release).
+fn same_release(a: &str, b: &str) -> bool {
+    without_build(a).eq_ignore_ascii_case(without_build(b))
 }
 
 /// Fetch a NuGet registration document and decode it, gunzipping first when
 /// the bytes are gzip. The `-gz-` registration resources are stored compressed
 /// and served with `Content-Encoding: gzip`, which this client (built without
 /// reqwest's `gzip` feature) hands back raw; the magic-byte check also tolerates
-/// a proxy that already decoded them. Decompression is capped against a bomb.
+/// a proxy that already decoded them.
 fn nuget_gz_json<T: DeserializeOwned>(
     url: &str,
     net: &dyn Fetch,
@@ -146,22 +149,52 @@ fn nuget_gz_json<T: DeserializeOwned>(
 ) -> Result<T, RegistryError> {
     let bytes = cached_metadata_status(url, &[], net, cache)?;
     if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut out = Vec::new();
-        flate2::read::MultiGzDecoder::new(Cursor::new(&bytes))
-            .take(NUGET_DECOMP_CAP)
-            .read_to_end(&mut out)
-            .map_err(|e| RegistryError::Malformed {
-                url: url.to_string(),
-                reason: e.to_string(),
-            })?;
-        decode(url, &out)
+        decode(url, &gunzip(url, &bytes, NUGET_DECOMP_CAP)?)
     } else {
         decode(url, &bytes)
     }
 }
 
-/// Fold the registration index into `reg`. The index is paged: each page either
-/// inlines its `items` or names a separate gzip document by `@id`. Every leaf's
+/// The gzip document `bytes` from `url`, decompressed. A document that
+/// decompresses past `cap` bytes — a gzip bomb, not a registration — is
+/// refused whole rather than read truncated.
+fn gunzip(url: &str, bytes: &[u8], cap: u64) -> Result<Vec<u8>, RegistryError> {
+    let mut out = Vec::new();
+    Capped::new(
+        flate2::read::MultiGzDecoder::new(Cursor::new(bytes)),
+        cap,
+        url,
+    )
+    .read_to_end(&mut out)
+    .map_err(|e| {
+        tracing::debug!(url, error = %e, "NuGet registration document refused");
+        RegistryError::Malformed {
+            url: url.to_string(),
+            reason: e.to_string(),
+        }
+    })?;
+    Ok(out)
+}
+
+/// Whether `url`, a page `@id` in `id`'s registration index, is one of that
+/// package's registration pages: NuGet's own origin, no credentials, under
+/// the package's registration path once the URL is parsed (and any `..`
+/// resolved). The index is a registry answer; a page named anywhere else
+/// would have fletch fetch whatever the answer names.
+fn nuget_page_url(url: &str, id: &str) -> bool {
+    let (Ok(page), Ok(base)) = (url::Url::parse(url), url::Url::parse(NUGET_REGISTRATION)) else {
+        return false;
+    };
+    page.origin() == base.origin()
+        && page.username().is_empty()
+        && page.password().is_none()
+        && page.path().starts_with(&format!("{}/{id}/", base.path()))
+}
+
+/// Fold the registration index into `record`. The index is paged: each page
+/// either inlines its `items` or names a separate gzip document by `@id` —
+/// followed only under the package's own registration, and for at most
+/// [`NUGET_PAGE_CAP`] pages. Every leaf's
 /// `catalogEntry` carries a `published` time — the full set is the release
 /// timeline (cadence, package age), and the entry matching `want` supplies this
 /// version's publish time, listing state, and license/deprecation fallbacks.
@@ -172,7 +205,7 @@ fn nuget_gz_json<T: DeserializeOwned>(
 fn nuget_registration(
     id: &str,
     want: &str,
-    reg: &mut Registry,
+    record: &mut Registry,
     net: &dyn Fetch,
     cache: &BlobCache,
 ) {
@@ -180,41 +213,57 @@ fn nuget_registration(
     let Some(index) = optional(nuget_gz_json::<RegistrationIndex>(&url, net, cache), &url) else {
         return;
     };
-    let want = nuget_version_key(want);
+    let pages = index.items.len();
     let mut times = Vec::new();
     let mut found = false;
-    for page in &index.items {
+    let mut pages_fetched = 0;
+    for page in index.items {
         // Inline items, or a page document to fetch and read in their place.
-        let fetched;
-        let items = match (&page.items, &page.id) {
-            (Some(items), _) => items,
-            (None, Some(url)) => {
-                fetched = optional(nuget_gz_json::<RegistrationPage>(url, net, cache), url);
-                match fetched.as_ref().and_then(|d| d.items.as_ref()) {
-                    Some(items) => items,
-                    None => continue,
+        let items = match page {
+            RegistrationPage {
+                items: Some(items), ..
+            } => items,
+            RegistrationPage { id: Some(url), .. } => {
+                if !nuget_page_url(&url, id) {
+                    tracing::debug!(
+                        package = %id.escape_debug(),
+                        page = %url.escape_debug(),
+                        "NuGet registration page refused: not under the package's registration"
+                    );
+                    continue;
                 }
+                if pages_fetched == NUGET_PAGE_CAP {
+                    tracing::debug!(
+                        package = %id.escape_debug(),
+                        pages,
+                        cap = NUGET_PAGE_CAP,
+                        "NuGet registration has more pages than are read; timeline is partial"
+                    );
+                    break;
+                }
+                pages_fetched += 1;
+                let fetched = optional(nuget_gz_json::<RegistrationPage>(&url, net, cache), &url);
+                let Some(items) = fetched.and_then(|page| page.items) else {
+                    continue;
+                };
+                items
             }
-            (None, None) => continue,
+            _ => continue,
         };
-        for ce in items.iter().filter_map(|leaf| leaf.catalog_entry.as_ref()) {
+        for ce in items.into_iter().filter_map(|leaf| leaf.catalog_entry) {
             let published = ce.published.as_deref().and_then(unix_secs);
             times.extend(published);
-            if ce
-                .version
-                .as_deref()
-                .is_some_and(|v| nuget_version_key(v) == want)
-            {
+            if ce.version.as_deref().is_some_and(|v| same_release(v, want)) {
                 found = true;
-                reg.published_at = published;
+                record.published_at = published;
                 // `listed:false` hides a version without removing it — NuGet's
                 // analogue of a yank, and a real custody signal.
-                reg.version_removed = ce.listed.map(|l| !l);
-                reg.license = reg.license.take().or_else(|| ce.license_expression.clone());
-                reg.deprecated = reg
+                record.version_removed = ce.listed.map(|l| !l);
+                record.license = record.license.take().or(ce.license_expression);
+                record.deprecated = record
                     .deprecated
                     .take()
-                    .or_else(|| ce.deprecation.as_ref().map(Deprecation::reason));
+                    .or_else(|| ce.deprecation.map(Deprecation::reason));
             }
         }
     }
@@ -225,15 +274,15 @@ fn nuget_registration(
             "NuGet registration does not list this version; leaving it undated"
         );
     }
-    set_timeline(reg, times);
+    set_timeline(record, times);
 }
 
-/// Fold `.nuspec` `<metadata>` provenance into `reg`: the `<repository>`
+/// Fold `.nuspec` `<metadata>` provenance into `record`: the `<repository>`
 /// URL+commit (the artifact→source pin) and a `<license type="expression">`
 /// SPDX string. Namespace-agnostic (nuspec schemas vary by tooling version);
 /// matches on local tag names. Leaves fields untouched when the element is
 /// absent, so a manifest without a `<repository>` doesn't erase search facts.
-fn nuget_nuspec(url: &str, bytes: &[u8], reg: &mut Registry) {
+fn nuget_nuspec(url: &str, bytes: &[u8], record: &mut Registry) {
     let dom = match std::str::from_utf8(bytes).map(roxmltree::Document::parse) {
         Ok(Ok(dom)) => dom,
         Ok(Err(error)) => {
@@ -249,17 +298,17 @@ fn nuget_nuspec(url: &str, bytes: &[u8], reg: &mut Registry) {
         match node.tag_name().name() {
             "repository" => {
                 if let Some(url) = node.attribute("url").filter(|s| !s.is_empty()) {
-                    reg.repository = Some(url.to_string());
+                    record.repository = Some(url.to_string());
                 }
                 if let Some(commit) = node.attribute("commit").filter(|s| !s.is_empty()) {
-                    reg.repository_commit = Some(commit.to_string());
+                    record.repository_commit = Some(commit.to_string());
                 }
             }
             // A license *expression* is an SPDX id; a `type="file"` license only
             // names a bundled file, so keep it out of the SPDX-shaped field.
             "license" if node.attribute("type") == Some("expression") => {
                 if let Some(expr) = node.text().map(str::trim).filter(|s| !s.is_empty()) {
-                    reg.license = Some(expr.to_string());
+                    record.license = Some(expr.to_string());
                 }
             }
             _ => {}
@@ -311,10 +360,10 @@ enum Authors {
 
 impl Authors {
     /// The first-listed author.
-    fn first(&self) -> Option<String> {
+    fn first(self) -> Option<String> {
         match self {
-            Self::List(names) => names.first().cloned(),
-            Self::One(name) => Some(name.clone()),
+            Self::List(names) => names.into_iter().next(),
+            Self::One(name) => Some(name),
         }
     }
 }
@@ -328,11 +377,9 @@ struct Deprecation {
 }
 
 impl Deprecation {
-    /// The deprecation's `message`, else `deprecated`.
-    fn reason(&self) -> String {
-        self.message
-            .clone()
-            .unwrap_or_else(|| "deprecated".to_string())
+    /// The deprecation's `message`, else [`DEPRECATED`].
+    fn reason(self) -> String {
+        self.message.unwrap_or_else(|| DEPRECATED.to_string())
     }
 }
 
@@ -375,10 +422,9 @@ struct CatalogEntry {
 
 #[cfg(test)]
 mod tests {
-    use crate::ecosystem::unix_secs;
-    use crate::fetch::{BlobCache, Fixtures};
-    use crate::registry::{RegistryError, lookup};
-    use filefacts::{Ecosystem, RefLocator, Registry};
+    use super::*;
+    use crate::ecosystem::look;
+    use crate::fetch::Fixtures;
 
     fn search_url(id: &str) -> String {
         format!(
@@ -388,10 +434,6 @@ mod tests {
 
     fn registration_url(id: &str) -> String {
         format!("https://api.nuget.org/v3/registration5-gz-semver2/{id}/index.json")
-    }
-
-    fn look(net: &Fixtures, purl: &str) -> Result<Registry, RegistryError> {
-        lookup(&RefLocator::Purl(purl.into()), net, &BlobCache::disabled())
     }
 
     /// Gzip a JSON string the way NuGet serves the `-gz-` registration blobs.
@@ -411,7 +453,7 @@ mod tests {
         ]})
         .to_string();
         let net = Fixtures::default().with(&url, doc.as_bytes());
-        let r = look(&net, "pkg:nuget/Newtonsoft.Json").expect("registry");
+        let r = look("pkg:nuget/Newtonsoft.Json", &net).expect("registry");
         assert_eq!(r.version, "13.0.3");
         assert_eq!(r.downloads_total, Some(7));
 
@@ -420,7 +462,7 @@ mod tests {
                 .to_string();
         let net = Fixtures::default().with(&url, other.as_bytes());
         assert_eq!(
-            look(&net, "pkg:nuget/Newtonsoft.Json").err(),
+            look("pkg:nuget/Newtonsoft.Json", &net).err(),
             Some(RegistryError::NotFound)
         );
     }
@@ -438,7 +480,7 @@ mod tests {
         }]})
         .to_string();
         let net = Fixtures::default().with(&search_url("newtonsoft.json"), doc.as_bytes());
-        let r = look(&net, "pkg:nuget/Newtonsoft.Json").expect("registry");
+        let r = look("pkg:nuget/Newtonsoft.Json", &net).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Nuget);
         assert_eq!(r.name, "Newtonsoft.Json");
         assert_eq!(r.version, "13.0.3");
@@ -474,7 +516,7 @@ mod tests {
                 "https://api.nuget.org/v3-flatcontainer/sample.pkg/1.0.0-beta/sample.pkg.nuspec",
                 nuspec.as_bytes(),
             );
-        let r = look(&net, "pkg:nuget/Sample.Pkg@1.0.0-Beta%2Bbuild.7").expect("registry");
+        let r = look("pkg:nuget/Sample.Pkg@1.0.0-Beta%2Bbuild.7", &net).expect("registry");
         assert_eq!(r.version, "1.0.0-beta+build.7", "the release asked for");
         assert_eq!(r.latest_version.as_deref(), Some("2.0.0"));
         assert_eq!(r.license.as_deref(), Some("MIT"), "its own manifest");
@@ -506,7 +548,7 @@ mod tests {
                 "https://api.nuget.org/v3-flatcontainer/llamalibrary/24.525.2252.26/llamalibrary.nuspec",
                 nuspec.as_bytes(),
             );
-        let r = look(&net, "pkg:nuget/LlamaLibrary@24.525.2252.26").expect("registry");
+        let r = look("pkg:nuget/LlamaLibrary@24.525.2252.26", &net).expect("registry");
         assert_eq!(
             r.repository.as_deref(),
             Some("https://github.com/nt153133/__LlamaLibrary.git")
@@ -547,7 +589,7 @@ mod tests {
             .with(&search_url("sample.pkg"), search.as_bytes())
             .with(&registration_url("sample.pkg"), &gzip(&index))
             .with(page2_url, &gzip(&page2));
-        let r = look(&net, "pkg:nuget/Sample.Pkg@2.0.0").expect("registry");
+        let r = look("pkg:nuget/Sample.Pkg@2.0.0", &net).expect("registry");
         assert_eq!(r.version, "2.0.0");
         assert_eq!(r.published_at, unix_secs("2021-06-15T12:30:00+00:00"));
         assert_eq!(r.first_published_at, unix_secs("2020-01-01T00:00:00+00:00"));
@@ -585,7 +627,7 @@ mod tests {
         let net = Fixtures::default()
             .with(&search_url("hidden.pkg"), search.as_bytes())
             .with(&registration_url("hidden.pkg"), &gzip(&index));
-        let r = look(&net, "pkg:nuget/Hidden.Pkg@1.0.0").expect("registry");
+        let r = look("pkg:nuget/Hidden.Pkg@1.0.0", &net).expect("registry");
         assert_eq!(r.version, "1.0.0", "the version asked for, not the latest");
         assert_eq!(r.latest_version.as_deref(), Some("2.0.0"));
         assert_eq!(r.published_at, None);
@@ -600,9 +642,70 @@ mod tests {
         }]})
         .to_string();
         let net = Fixtures::default().with(&search_url("n"), search.as_bytes());
-        let r = look(&net, "pkg:nuget/n@9.9.9").expect("registry");
+        let r = look("pkg:nuget/n@9.9.9", &net).expect("registry");
         assert_eq!(r.version, "9.9.9");
         assert_eq!(r.published_at, None);
         assert_eq!(r.version_removed, None);
+    }
+
+    /// An index that pages to a page per release, `@id`s as `page_url` names them.
+    fn paged(pages: usize, page_url: impl Fn(usize) -> String) -> Fixtures {
+        let search =
+            serde_json::json!({"data": [{"id": "Sample.Pkg", "version": "1.0.0"}]}).to_string();
+        let ids: Vec<_> = (0..pages)
+            .map(|i| serde_json::json!({"@id": page_url(i)}))
+            .collect();
+        let index = serde_json::json!({"items": ids}).to_string();
+        let mut net = Fixtures::default()
+            .with(&search_url("sample.pkg"), search.as_bytes())
+            .with(&registration_url("sample.pkg"), &gzip(&index));
+        for i in 0..pages {
+            let page = serde_json::json!({"items": [{"catalogEntry": {
+                "version": format!("0.0.{i}"),
+                "published": format!("2020-01-01T00:00:{:02}+00:00", i % 60)
+            }}]})
+            .to_string();
+            net = net.with(&page_url(i), &gzip(&page));
+        }
+        net
+    }
+
+    #[test]
+    fn only_the_packages_own_registration_pages_are_followed() {
+        for hostile in [
+            "https://api.nuget.org.evil/v3/registration5-gz-semver2/sample.pkg/page.json",
+            "https://evil.test/v3/registration5-gz-semver2/sample.pkg/page.json",
+            "http://api.nuget.org/v3/registration5-gz-semver2/sample.pkg/page.json",
+            "https://user@api.nuget.org/v3/registration5-gz-semver2/sample.pkg/page.json",
+            "https://api.nuget.org/v3/registration5-gz-semver2/sample.pkg/../other/page.json",
+            "https://api.nuget.org/v3/registration5-gz-semver2/sample.pkgx/page.json",
+            "https://api.nuget.org/v3/other/sample.pkg/page.json",
+        ] {
+            assert!(!nuget_page_url(hostile, "sample.pkg"), "{hostile}");
+            let r =
+                look("pkg:nuget/Sample.Pkg", &paged(1, |_| hostile.to_string())).expect("registry");
+            assert_eq!(r.release_count, None, "{hostile} was fetched");
+        }
+        let own = "https://api.nuget.org/v3/registration5-gz-semver2/sample.pkg/page/1.json";
+        assert!(nuget_page_url(own, "sample.pkg"));
+    }
+
+    #[test]
+    fn registration_pages_are_fetched_up_to_the_cap() {
+        let net = paged(NUGET_PAGE_CAP + 3, |i| {
+            format!("https://api.nuget.org/v3/registration5-gz-semver2/sample.pkg/page/{i}.json")
+        });
+        let r = look("pkg:nuget/Sample.Pkg", &net).expect("registry");
+        assert_eq!(r.release_count, Some(count(NUGET_PAGE_CAP)));
+    }
+
+    #[test]
+    fn a_registration_past_the_decompression_cap_is_refused_not_truncated() {
+        let doc = gzip(&"x".repeat(100));
+        assert_eq!(gunzip("u", &doc, 100).map(|d| d.len()), Ok(100));
+        assert!(matches!(
+            gunzip("u", &doc, 99),
+            Err(RegistryError::Malformed { .. })
+        ));
     }
 }

@@ -3,7 +3,7 @@
 
 use filefacts::{Ecosystem, Registry};
 
-use crate::ecosystem::{Coordinates, civil_secs, five_star};
+use crate::ecosystem::{Coordinates, civil_secs, decode_entities, five_star, release_time};
 use crate::fetch::{BlobCache, Fetch, cached_metadata_status};
 use crate::registry::RegistryError;
 
@@ -43,10 +43,12 @@ pub(crate) fn lookup(
     })?;
 
     // og:title carries the listing name with a `- Chrome Web Store` suffix.
-    let title = meta_content(html, "og:title")
-        .map(|t| t.trim_end_matches(" - Chrome Web Store").trim().to_string());
+    // Both stay HTML-escaped until the header is cut out of the markup, which
+    // repeats them escaped.
+    let title =
+        meta_content(html, "og:title").map(|t| t.trim_end_matches(" - Chrome Web Store").trim());
     let description = meta_content(html, "og:description");
-    let header = header(html, [title.as_deref(), description.as_deref()]);
+    let header = header(html, [title, description]);
     let details = html.find(DETAILS).map(|at| &html[at + DETAILS.len()..]);
     if header.is_none() || details.is_none() {
         tracing::debug!(
@@ -59,42 +61,33 @@ pub(crate) fn lookup(
     let header = header.as_deref();
 
     let listed = details.and_then(|d| text_after(d, "Version"));
-    let version = c.target(listed);
+    let mut record = c.record(Ecosystem::Chrome, c.name(), listed.map(str::to_string));
     // "Updated" dates the listed version only.
-    let published_at = if listed == Some(version) {
+    record.published_at = release_time(
+        &record,
+        listed,
         details
             .and_then(|d| text_after(d, "Updated"))
-            .and_then(parse_month_day_year)
-    } else {
-        tracing::debug!(
-            url,
-            version = %version.escape_debug(),
-            "release is not the version the listing names; undated"
-        );
-        None
-    };
-
-    let mut registry = Registry::new(Ecosystem::Chrome, c.name().to_string());
-    registry.version = version.to_string();
-    registry.published_at = published_at;
-    registry.author = details
+            .and_then(parse_month_day_year),
+    );
+    record.author = details
         .and_then(|d| text_after(d, "Offered by"))
-        .map(str::to_string);
-    registry.title = title;
-    registry.description = description;
-    registry.homepage = Some(url);
+        .map(decode_entities);
+    record.title = title.map(decode_entities);
+    record.description = description.map(decode_entities);
+    record.homepage = Some(url);
     // "N,NNN users": the store's reach figure, a downloads analogue.
-    registry.downloads_total = header
+    record.downloads_total = header
         .and_then(|h| before(h, " users"))
         .and_then(parse_grouped_u64);
-    registry.rating = header
+    record.rating = header
         .and_then(|h| before(h, " out of 5 stars"))
         .and_then(|s| s.parse().ok())
         .and_then(|v| five_star(v, 5.0));
-    registry.rating_count = header
+    record.rating_count = header
         .and_then(|h| before(h, " ratings"))
         .and_then(parse_grouped_u64);
-    Ok(registry)
+    Ok(record)
 }
 
 /// The store's listing header: the markup between the title's `</h1>` and the
@@ -110,13 +103,12 @@ fn header(html: &str, written: [Option<&str>; 2]) -> Option<String> {
     Some(header)
 }
 
-/// Extract a `<meta property="og:NAME" content="VALUE">` value.
-fn meta_content(html: &str, property: &str) -> Option<String> {
+/// Extract a `<meta property="og:NAME" content="VALUE">` value, as written
+/// (HTML-escaped).
+fn meta_content<'a>(html: &'a str, property: &str) -> Option<&'a str> {
     let anchor = format!("property=\"{property}\" content=\"");
-    let start = html.find(&anchor)? + anchor.len();
-    let rest = &html[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    let rest = &html[html.find(&anchor)? + anchor.len()..];
+    rest.split_once('"').map(|(content, _)| content)
 }
 
 /// The first non-empty text run after `marker`, skipping intervening tags:
@@ -187,8 +179,8 @@ fn parse_month_day_year(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ecosystem::look;
     use crate::fetch::Fixtures;
-    use filefacts::RefLocator;
 
     const ID: &str = "dbichmdlbjdeplpkhcejgkakobjbjalc";
 
@@ -210,12 +202,13 @@ mod tests {
         <li><div><a>Flag concern</a></div></li>
         <li><div>Offered by</div><div>Good Dev</div></li>"#;
 
-    fn lookup(purl: &str, html: &str) -> Result<Registry, RegistryError> {
+    /// The record for `purl` when the store serves `html` as its listing.
+    fn listing(purl: &str, html: &str) -> Result<Registry, RegistryError> {
         let net = Fixtures::default().with(
             &format!("https://chromewebstore.google.com/detail/{ID}"),
             html.as_bytes(),
         );
-        crate::registry::lookup(&RefLocator::Purl(purl.into()), &net, &BlobCache::disabled())
+        look(purl, &net)
     }
 
     #[test]
@@ -240,7 +233,7 @@ mod tests {
             <span>40,000 users</span><div>4.9 out of 5 stars</div>
             <div class="x">Updated</div><div>June 9, 2026</div>"#;
         assert_eq!(
-            meta_content(html, "og:title").as_deref(),
+            meta_content(html, "og:title"),
             Some("社媒助手 - Chrome Web Store")
         );
         assert_eq!(
@@ -265,7 +258,7 @@ mod tests {
             "<p>小红书、抖音等社媒平台数据采集工具，批量导出数据</p>",
             DETAILS_LIST,
         );
-        let r = lookup(&format!("pkg:chrome-extension/{ID}"), &html).expect("registry");
+        let r = listing(&format!("pkg:chrome-extension/{ID}"), &html).expect("registry");
         assert_eq!(r.ecosystem, Ecosystem::Chrome);
         assert_eq!(r.name, ID);
         assert_eq!(r.version, "1.2.3");
@@ -285,7 +278,7 @@ mod tests {
         let overview = format!("<p>A helper</p><p>{planted}</p>");
         let head = r#"<meta property="og:title" content="Helper - Chrome Web Store">
             <meta property="og:description" content="A helper">"#;
-        let r = lookup(
+        let r = listing(
             &format!("pkg:chrome-extension/{ID}"),
             &page(head, "Helper", HEADER, &overview, DETAILS_LIST),
         )
@@ -298,7 +291,7 @@ mod tests {
 
         // With the store's own figures missing, the overview's stand in for
         // nothing.
-        let r = lookup(
+        let r = listing(
             &format!("pkg:chrome-extension/{ID}"),
             &page(head, "Helper", "", &overview, ""),
         )
@@ -313,7 +306,7 @@ mod tests {
     #[test]
     fn a_page_without_the_stores_markup_has_unknown_figures() {
         let html = "<body><p>Trusted by 9,999,999 users</p><div>Updated</div><div>January 1, 2010</div></body>";
-        let r = lookup(&format!("pkg:chrome-extension/{ID}"), html).expect("registry");
+        let r = listing(&format!("pkg:chrome-extension/{ID}"), html).expect("registry");
         assert_eq!(r.downloads_total, None);
         assert_eq!(r.published_at, None);
     }
@@ -329,7 +322,7 @@ mod tests {
             "",
             DETAILS_LIST,
         );
-        let r = lookup(&format!("pkg:chrome-extension/{ID}"), &html).expect("registry");
+        let r = listing(&format!("pkg:chrome-extension/{ID}"), &html).expect("registry");
         assert_eq!(r.downloads_total, Some(12));
         assert_eq!(r.rating, Some(2.1));
         assert_eq!(r.rating_count, Some(3));
@@ -342,17 +335,34 @@ mod tests {
             r#"<meta property="og:title" content="AdBlock 9,999,999 users - Chrome Web Store">"#;
         let header = r#"<img alt="Item media 1 (screenshot) for AdBlock 9,999,999 users"><div>12 users</div>"#;
         let html = page(head, "AdBlock 9,999,999 users", header, "", DETAILS_LIST);
-        let r = lookup(&format!("pkg:chrome-extension/{ID}"), &html).expect("registry");
+        let r = listing(&format!("pkg:chrome-extension/{ID}"), &html).expect("registry");
         assert_eq!(r.downloads_total, Some(12));
     }
 
     #[test]
     fn only_the_listed_version_is_dated() {
         let html = page("", "X", HEADER, "", DETAILS_LIST);
-        let r = lookup(&format!("pkg:chrome-extension/{ID}@1.2.3"), &html).expect("registry");
+        let r = listing(&format!("pkg:chrome-extension/{ID}@1.2.3"), &html).expect("registry");
         assert_eq!(r.published_at, Some(1_780_963_200));
-        let r = lookup(&format!("pkg:chrome-extension/{ID}@1.0.0"), &html).expect("registry");
+        let r = listing(&format!("pkg:chrome-extension/{ID}@1.0.0"), &html).expect("registry");
         assert_eq!(r.version, "1.0.0");
+        assert_eq!(r.latest_version.as_deref(), Some("1.2.3"));
         assert_eq!(r.published_at, None);
+    }
+
+    #[test]
+    fn escaped_listing_text_is_decoded() {
+        let head = r#"<meta property="og:title" content="Tabs &amp; Windows - Chrome Web Store">
+            <meta property="og:description" content="Sort &quot;tabs&quot; &#38; more &#x2014; fast">"#;
+        let details = DETAILS_LIST.replace("Good Dev", "Smith &amp; Sons");
+        let html = page(head, "Tabs &amp; Windows", HEADER, "", &details);
+        let r = listing(&format!("pkg:chrome-extension/{ID}"), &html).expect("registry");
+        assert_eq!(r.title.as_deref(), Some("Tabs & Windows"));
+        assert_eq!(
+            r.description.as_deref(),
+            Some("Sort \"tabs\" & more \u{2014} fast")
+        );
+        assert_eq!(r.author.as_deref(), Some("Smith & Sons"));
+        assert_eq!(r.downloads_total, Some(12));
     }
 }

@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 use super::flatten::Encoding;
 use crate::fetch::cache::{Spool, create_private};
+use crate::fetch::digest::{Algorithm, Digest};
 use crate::fetch::{Fetch, FetchError, Fetched, Request};
 
 /// Ceiling on how many layers an image may declare. Real images sit far below
@@ -73,7 +74,7 @@ const BLOB_WORKERS: usize = 4;
 
 /// Wall-clock bound on the whole pull. Each request carries the backend's own
 /// deadline as well, so this can be overrun by at most one request.
-const PULL_DEADLINE: Duration = Duration::from_secs(30 * 60);
+const PULL_DEADLINE: Duration = Duration::from_mins(30);
 
 /// One pulled layer: its blob on disk, and how that blob is encoded.
 pub(super) struct Blob {
@@ -106,7 +107,7 @@ pub(super) fn pull(
     let mut session = Session {
         net,
         image: &image,
-        token: None,
+        authorization: None,
         deadline: Instant::now() + PULL_DEADLINE,
     };
     let (mut manifest, mut digest) = session.manifest(&image.reference)?;
@@ -120,7 +121,7 @@ pub(super) fn pull(
                     .is_some_and(|p| p.os == "linux" && p.architecture == "amd64")
             })
             .ok_or_else(|| FetchError::Refused("no linux/amd64 image in the index".into()))?;
-        if !valid_digest(&entry.digest) {
+        if Digest::parse(&entry.digest).is_none() {
             return Err(FetchError::Refused(format!(
                 "index entry digest {:?} is malformed",
                 entry.digest
@@ -164,17 +165,15 @@ impl ImageRef {
     /// Docker Hub, and a single-segment one under `library/`. The registry
     /// must be on [`ALLOWED_REGISTRIES`].
     fn parse(reference: &str) -> Result<Self, FetchError> {
-        let bad = || FetchError::Refused(format!("bad OCI reference {reference:?}"));
         let (rest, digest) = match reference.split_once('@') {
             Some((rest, digest)) => (rest, Some(digest)),
             None => (reference, None),
         };
         // The tag follows the last ':' after the last '/' — an earlier ':' is
         // a registry port.
-        let last = rest.rfind('/').map_or(0, |i| i + 1);
-        let (name, tag) = match rest[last..].rfind(':') {
-            Some(i) => (&rest[..last + i], Some(&rest[last + i + 1..])),
-            None => (rest, None),
+        let (name, tag) = match rest.rsplit_once(':') {
+            Some((name, tag)) if !tag.contains('/') => (name, Some(tag)),
+            _ => (rest, None),
         };
         let (host, repository) = match name.split_once('/') {
             Some((first, path)) if first.contains(['.', ':']) || first == "localhost" => {
@@ -199,9 +198,11 @@ impl ImageRef {
         };
         if !valid_repository(&repository)
             || tag.is_some_and(|t| !valid_tag(t))
-            || digest.is_some_and(|d| !valid_digest(d))
+            || digest.is_some_and(|d| Digest::parse(d).is_none())
         {
-            return Err(bad());
+            return Err(FetchError::Refused(format!(
+                "bad OCI reference {reference:?}"
+            )));
         }
         Ok(Self {
             host: if docker_hub { DOCKER_HUB } else { host }.to_string(),
@@ -237,60 +238,6 @@ fn valid_tag(tag: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
-/// A digest this module can verify: `sha256:` or `sha512:` and the full
-/// lowercase hex of that hash.
-fn valid_digest(digest: &str) -> bool {
-    let hex = |h: &str, len: usize| {
-        h.len() == len && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    };
-    digest.strip_prefix("sha256:").is_some_and(|h| hex(h, 64))
-        || digest.strip_prefix("sha512:").is_some_and(|h| hex(h, 128))
-}
-
-/// A running digest under one of the algorithms [`valid_digest`] accepts.
-enum Hasher {
-    Sha256(sha2::Sha256),
-    Sha512(sha2::Sha512),
-}
-
-impl Hasher {
-    /// A hasher for `digest`'s algorithm, by its prefix.
-    fn new(digest: &str) -> Option<Self> {
-        use sha2::Digest as _;
-        if digest.starts_with("sha256:") {
-            Some(Self::Sha256(sha2::Sha256::new()))
-        } else if digest.starts_with("sha512:") {
-            Some(Self::Sha512(sha2::Sha512::new()))
-        } else {
-            None
-        }
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        use sha2::Digest as _;
-        match self {
-            Self::Sha256(h) => h.update(bytes),
-            Self::Sha512(h) => h.update(bytes),
-        }
-    }
-
-    /// The digest, spelled `algorithm:hex`.
-    fn finish(self) -> String {
-        use sha2::Digest as _;
-        match self {
-            Self::Sha256(h) => format!("sha256:{}", hex::encode(h.finalize())),
-            Self::Sha512(h) => format!("sha512:{}", hex::encode(h.finalize())),
-        }
-    }
-}
-
-/// The digest of `bytes` under `digest`'s algorithm, spelled like it.
-fn digest_of(digest: &str, bytes: &[u8]) -> Option<String> {
-    let mut hasher = Hasher::new(digest)?;
-    hasher.update(bytes);
-    Some(hasher.finish())
-}
-
 /// A content descriptor: what a manifest says about a layer, or an index
 /// about a platform's manifest.
 #[derive(Debug, Default, Deserialize)]
@@ -319,12 +266,12 @@ struct Manifest {
     layers: Option<Vec<Descriptor>>,
 }
 
-/// One registry, spoken to anonymously through `net`: the bearer token its
-/// challenge led to, once one has been needed, and the pull's deadline.
+/// One registry, spoken to anonymously through `net`: the `Authorization`
+/// its challenge led to, once one has been needed, and the pull's deadline.
 struct Session<'a> {
     net: &'a dyn Fetch,
     image: &'a ImageRef,
-    token: Option<String>,
+    authorization: Option<String>,
     deadline: Instant,
 }
 
@@ -340,13 +287,16 @@ impl Session<'_> {
         spool: Option<&Spool>,
     ) -> Result<Fetched, FetchError> {
         let mut resp = self.send(url, accept, limit, spool)?;
-        if resp.status == 401 && self.token.is_none() {
+        if resp.status == 401 && self.authorization.is_none() {
             let challenge = header(&resp, "www-authenticate")
                 .ok_or_else(|| FetchError::Refused("401 without a challenge".into()))?;
-            self.token = Some(self.pull_token(challenge)?);
-            if let Some(spool) = spool {
-                // The challenge's own body, spooled where the blob goes.
-                discard(spool)?;
+            self.authorization = Some(format!("Bearer {}", self.pull_token(challenge)?));
+            // The challenge's own body, spooled where the blob goes.
+            if let Some(spool) = spool
+                && let Err(e) = std::fs::remove_file(spool.path())
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(FetchError::Io(format!("discard spool: {e}")));
             }
             resp = self.send(url, accept, limit, spool)?;
         }
@@ -363,20 +313,20 @@ impl Session<'_> {
         if Instant::now() >= self.deadline {
             return Err(FetchError::Timeout);
         }
-        let bearer = self.token.as_ref().map(|token| format!("Bearer {token}"));
         let mut headers = Vec::new();
         if let Some(accept) = accept {
             headers.push(("Accept", accept));
         }
         // Dropped by the transport on any hop that leaves the registry's
         // origin, so a blob's CDN redirect never sees it.
-        if let Some(bearer) = &bearer {
-            headers.push(("Authorization", bearer.as_str()));
+        if let Some(authorization) = &self.authorization {
+            headers.push(("Authorization", authorization.as_str()));
         }
         let mut request = Request::get(url)
             .with_headers(&headers)
             .any_status()
-            .max_bytes(limit);
+            .max_bytes(limit)
+            .container_pull();
         if let Some(spool) = spool {
             request = request.spool_to(spool.path());
         }
@@ -418,7 +368,8 @@ impl Session<'_> {
         let resp = self.net.send(
             &Request::get(realm.as_str())
                 .with_headers(&[("Accept", "application/json")])
-                .max_bytes(MAX_TOKEN_REPLY_BYTES),
+                .max_bytes(MAX_TOKEN_REPLY_BYTES)
+                .container_pull(),
         )?;
         #[derive(Deserialize)]
         struct Reply {
@@ -450,20 +401,25 @@ impl Session<'_> {
             self.image.host, self.image.repository
         );
         let resp = self.get(&url, Some(MANIFEST_ACCEPT), MAX_MANIFEST_BYTES, None)?;
-        let pinned = valid_digest(reference).then_some(reference);
-        let expect = pinned.unwrap_or("sha256:");
-        let digest = digest_of(expect, &resp.bytes)
-            .ok_or_else(|| FetchError::Refused(format!("unsupported digest {expect:?}")))?;
+        let pinned = Digest::parse(reference);
+        let computed = pinned
+            .as_ref()
+            .map_or(Algorithm::Sha256, |pinned| pinned.algorithm)
+            .digest(&resp.bytes);
+        let digest = computed.to_string();
         let mismatch = |claimed: &str| {
             FetchError::Refused(format!("manifest digest {digest} does not match {claimed}"))
         };
-        if let Some(pinned) = pinned
-            && pinned != digest
-        {
-            return Err(mismatch(pinned));
+        if pinned.is_some_and(|pinned| pinned != computed) {
+            return Err(mismatch(reference));
         }
+        // The registry's claim, under whichever supported algorithm it names;
+        // one naming another algorithm is no evidence either way.
         if let Some(claimed) = header(&resp, "docker-content-digest")
-            && digest_of(claimed, &resp.bytes).is_some_and(|actual| actual != claimed)
+            && let Some(algorithm) = claimed
+                .split_once(':')
+                .and_then(|(name, _)| Algorithm::parse(name))
+            && algorithm.digest(&resp.bytes).to_string() != claimed
         {
             return Err(mismatch(claimed));
         }
@@ -596,8 +552,9 @@ fn land(desc: &Descriptor, resp: &Fetched, spool: &Spool) -> Result<(), FetchErr
 /// it once from disk.
 fn verify(desc: &Descriptor, spool: &Spool) -> Result<(), FetchError> {
     let io = |e: std::io::Error| FetchError::Io(format!("layer {}: {e}", desc.digest));
-    let mut hasher = Hasher::new(&desc.digest)
+    let expected = Digest::parse(&desc.digest)
         .ok_or_else(|| FetchError::Refused(format!("unsupported digest {:?}", desc.digest)))?;
+    let mut hasher = expected.algorithm.hasher();
     let mut file = std::fs::File::open(spool.path()).map_err(io)?;
     let mut chunk = vec![0u8; 64 << 10];
     let mut size = 0u64;
@@ -617,7 +574,7 @@ fn verify(desc: &Descriptor, spool: &Spool) -> Result<(), FetchError> {
             desc.digest, desc.size
         )));
     }
-    if hasher.finish() != desc.digest {
+    if hasher.finish() != expected {
         return Err(FetchError::Refused(format!(
             "layer {} does not match its digest",
             desc.digest
@@ -625,16 +582,6 @@ fn verify(desc: &Descriptor, spool: &Spool) -> Result<(), FetchError> {
     }
     tracing::debug!(target: "oci", digest = desc.digest, size, "layer verified");
     Ok(())
-}
-
-/// Remove `spool`'s file, if any, so it can be written afresh.
-fn discard(spool: &Spool) -> Result<(), FetchError> {
-    match std::fs::remove_file(spool.path()) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            Err(FetchError::Io(format!("discard spool: {e}")))
-        }
-        _ => Ok(()),
-    }
 }
 
 /// What a panicking thread said, when it said it as text.
@@ -688,9 +635,9 @@ fn bearer_challenge(challenge: &str) -> Option<HashMap<String, String>> {
             rest = &quoted[end + 1..];
             value
         } else {
-            let end = after.find(',').unwrap_or(after.len());
-            rest = &after[end..];
-            after[..end].trim().to_string()
+            let (value, tail) = after.split_once(',').unwrap_or((after, ""));
+            rest = tail;
+            value.trim().to_string()
         };
         params.insert(key.to_ascii_lowercase(), value);
     }
@@ -731,7 +678,7 @@ fn vet_layers(layers: &[Descriptor], cap: u64) -> Result<Vec<Encoding>, FetchErr
                 layer.media_type
             ))
         })?;
-        if !valid_digest(&layer.digest) {
+        if Digest::parse(&layer.digest).is_none() {
             return Err(FetchError::Refused(format!(
                 "layer digest {:?} is malformed",
                 layer.digest
@@ -922,16 +869,5 @@ mod tests {
         assert!(bearer_challenge(r#"Basic realm="x""#).is_none());
         assert!(bearer_challenge(r#"Bearer realm="unterminated"#).is_none());
         assert!(bearer_challenge("Bearer =x").is_none());
-    }
-
-    #[test]
-    fn digests_are_computed_under_the_named_algorithm() {
-        let sha512 = digest_of("sha512:", b"x").unwrap();
-        assert!(sha512.starts_with("sha512:") && valid_digest(&sha512));
-        assert_eq!(
-            digest_of("sha256:", b"").as_deref(),
-            Some("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-        );
-        assert_eq!(digest_of("md5:", b""), None);
     }
 }

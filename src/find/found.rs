@@ -1,9 +1,9 @@
 //! The accumulator every recognizer pushes into: it places each reference in
 //! the file, bounds what one file can produce, and records budget cut-offs.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use filefacts::{RefKind, RefLocator, Reference};
+use filefacts::{DependencyContext, PinnedHash, RefKind, RefLocator, Reference};
 
 use super::{Discovery, UnresolvedFetchCall};
 
@@ -17,8 +17,8 @@ const EVIDENCE_SEARCHES: usize = 64;
 /// cost memory quadratic in the line's length.
 pub(super) const MAX_EVIDENCE_BYTES: usize = 1024;
 
-/// The most references the recognizers here add for one file. Past this, a
-/// file is padding rather than a program.
+/// The most distinct references the recognizers here add for one file. Past
+/// this, a file is padding rather than a program.
 pub(super) const MAX_FOUND_REFS: usize = 50_000;
 
 /// `evidence` cut to [`MAX_EVIDENCE_BYTES`] on a character boundary.
@@ -32,12 +32,43 @@ pub(super) fn position_in(text: &str, part: &str) -> Option<usize> {
     (start + part.len() <= text.len()).then_some(start)
 }
 
+/// What makes two references the same: the locator with its pin and
+/// dependency context. The same URL or package legitimately surfaces through
+/// more than one recognizer (declared, npm hook, decoded string, command
+/// stream), and only its first sighting is kept.
+type Key = (RefLocator, Option<PinnedHash>, Option<DependencyContext>);
+
+/// `reference`'s [`Key`], or `None` for an unclassified fact: those can
+/// describe distinct constraints on one locator (module-tree vs manifest
+/// hashes, conflicting pins, replacement directives) and are never merged.
+fn key(reference: &Reference) -> Option<Key> {
+    (reference.kind != RefKind::Undefined).then(|| {
+        (
+            reference.locator.clone(),
+            reference.pinned_hash.clone(),
+            reference.context.clone(),
+        )
+    })
+}
+
+/// Drop references whose [`Key`] already appeared, keeping the first.
+pub(super) fn dedup(refs: &mut Vec<Reference>) {
+    let mut seen = HashSet::new();
+    refs.retain(|r| key(r).is_none_or(|k| seen.insert(k)));
+}
+
 /// One file's discovery in progress. The file text, when there is one, gives
-/// each pushed reference a citable byte offset.
+/// each pushed reference a citable byte offset. Each reference is kept once,
+/// as it arrives, so a repeated one never spends the file's reference cap.
 #[derive(Debug)]
 pub(super) struct Found<'a> {
-    pub(super) refs: Vec<Reference>,
-    pub(super) text: Option<&'a str>,
+    refs: Vec<Reference>,
+    /// Where each kept reference's [`Key`] sits in `refs`.
+    seen: HashMap<Key, usize>,
+    text: Option<&'a str>,
+    /// The dependency context every reference added during
+    /// [`with_context`](Self::with_context) carries.
+    context: Option<DependencyContext>,
     unresolved: Vec<UnresolvedFetchCall>,
     truncated: bool,
     /// Evidence searches left (see [`EVIDENCE_SEARCHES`]).
@@ -53,43 +84,78 @@ pub(super) struct Found<'a> {
 
 impl<'a> Found<'a> {
     pub(super) fn new(declared: &[Reference], text: Option<&'a str>) -> Self {
-        Self {
-            refs: declared.to_vec(),
+        let mut found = Self {
+            refs: Vec::with_capacity(declared.len()),
+            seen: HashMap::new(),
             text,
+            context: None,
             unresolved: Vec::new(),
             truncated: false,
             searches: EVIDENCE_SEARCHES,
             last_search: None,
             room: MAX_FOUND_REFS,
-            declared: declared.len(),
+            declared: 0,
+        };
+        // Declared references are the file's own and never spend its cap.
+        for reference in declared {
+            found.insert(reference.clone());
         }
+        found.declared = found.refs.len();
+        found
     }
 
-    /// Push an imperative reference (no pin) cited by `evidence`. Evidence cut
-    /// from the file's own text is placed where it sits. Evidence from elsewhere
-    /// — an npm hook read from parsed JSON — is searched for: its first
-    /// occurrence, else the package name's or URL's, else no offset, which is
-    /// also what it gets once the file's searches are spent.
+    /// The file's text, when the recognizers have it.
+    pub(super) fn text(&self) -> Option<&'a str> {
+        self.text
+    }
+
+    /// Whether the file's reference cap is spent, so a recognizer can stop
+    /// working for references that would be dropped.
+    pub(super) fn is_full(&self) -> bool {
+        self.room == 0
+    }
+
+    /// Run `scan` with every reference it adds carrying `context`: the
+    /// packages an npm lifecycle hook installs are build-time dependencies
+    /// that run install scripts.
+    pub(super) fn with_context(
+        &mut self,
+        context: DependencyContext,
+        scan: impl FnOnce(&mut Self),
+    ) {
+        let outer = self.context.replace(context);
+        scan(self);
+        self.context = outer;
+    }
+
+    /// Push an imperative reference (no pin) to each of `locators`, all cited
+    /// by one `evidence` at `at`, or where `evidence` is placed when the
+    /// caller does not know. Evidence cut from the file's own text is placed
+    /// where it sits; evidence from elsewhere (an npm hook read from parsed
+    /// JSON) is searched for (see [`search`](Self::search)). It is placed
+    /// once for all the locators: a long line naming a package per word,
+    /// compared with the text per package, would cost quadratic time.
     pub(super) fn push(
         &mut self,
-        locator: RefLocator,
+        locators: impl IntoIterator<Item = RefLocator>,
         kind: RefKind,
-        source: impl Into<String>,
+        source: &str,
         evidence: &str,
+        at: Option<u64>,
     ) {
-        if self.room == 0 {
+        let mut locators = locators.into_iter();
+        if self.is_full() {
             return;
         }
-        let offset = self.locate(evidence, &locator);
-        self.push_at(locator, kind, source, evidence, offset);
-    }
-
-    /// Where `evidence` sits: its place when it was cut from the file's own
-    /// text, else where a search finds it (see [`search`](Self::search)).
-    pub(super) fn locate(&mut self, evidence: &str, locator: &RefLocator) -> Option<u64> {
-        match self.text.and_then(|t| position_in(t, evidence)) {
+        let Some(first) = locators.next() else {
+            return;
+        };
+        let at = at.or_else(|| match self.text.and_then(|t| position_in(t, evidence)) {
             Some(at) => Some(at as u64),
-            None => self.search(evidence, locator),
+            None => self.search(evidence, &first),
+        });
+        for locator in std::iter::once(first).chain(locators) {
+            self.push_at(locator, kind, source, evidence, at);
         }
     }
 
@@ -134,9 +200,20 @@ impl<'a> Found<'a> {
         self.add(reference);
     }
 
-    /// Add a reference a recognizer built, within the file's reference cap.
+    /// Add a reference a recognizer built, unless it is already here or the
+    /// file's reference cap is spent.
     pub(super) fn add(&mut self, mut reference: Reference) {
-        if self.room == 0 {
+        if self.is_full() {
+            return;
+        }
+        if reference.context.is_none() {
+            reference.context.clone_from(&self.context);
+        }
+        if reference.evidence.len() > MAX_EVIDENCE_BYTES {
+            let keep = clip(&reference.evidence).len();
+            reference.evidence.truncate(keep);
+        }
+        if !self.insert(reference) {
             return;
         }
         self.room -= 1;
@@ -147,11 +224,37 @@ impl<'a> Found<'a> {
                 "reference limit reached; later references in this file are dropped"
             );
         }
-        if reference.evidence.len() > MAX_EVIDENCE_BYTES {
+    }
+
+    /// Add `reference` in place of an earlier one with the same [`Key`] whose
+    /// source is one of `sources`: a citation by the API that uses a value
+    /// outranks the plain string scans that also saw it. Any other earlier
+    /// one keeps its place.
+    pub(super) fn supersede(&mut self, mut reference: Reference, sources: &[&str]) {
+        let Some(earlier) = key(&reference).and_then(|k| self.seen.get(&k).copied()) else {
+            self.add(reference);
+            return;
+        };
+        if let Some(old) = self.refs.get_mut(earlier)
+            && sources.contains(&old.source.as_str())
+        {
             let keep = clip(&reference.evidence).len();
             reference.evidence.truncate(keep);
+            *old = reference;
+        }
+    }
+
+    /// Keep `reference` unless its [`Key`] is already here. Reports whether
+    /// it was kept.
+    fn insert(&mut self, reference: Reference) -> bool {
+        if let Some(key) = key(&reference) {
+            if self.seen.contains_key(&key) {
+                return false;
+            }
+            self.seen.insert(key, self.refs.len());
         }
         self.refs.push(reference);
+        true
     }
 
     /// Take in a sub-recognizer's whole result.
@@ -173,9 +276,8 @@ impl<'a> Found<'a> {
         );
     }
 
-    /// The finished result, each reference once.
-    pub(super) fn into_discovery(mut self) -> Discovery {
-        dedup(&mut self.refs);
+    /// The finished result.
+    pub(super) fn into_discovery(self) -> Discovery {
         let mut by_source = BTreeMap::<&str, usize>::new();
         for reference in &self.refs {
             *by_source.entry(reference.source.as_str()).or_default() += 1;
@@ -194,20 +296,6 @@ impl<'a> Found<'a> {
             truncated: self.truncated,
         }
     }
-}
-
-/// Drop references whose locator already appeared, keeping the first. The same
-/// URL or package legitimately surfaces through more than one recognizer
-/// (declared, npm hook, decoded string, command stream).
-pub(super) fn dedup(refs: &mut Vec<Reference>) {
-    let mut seen = HashSet::new();
-    refs.retain(|r| {
-        // Unclassified facts can describe distinct constraints on the same
-        // locator (module-tree vs manifest hashes, conflicting pins, or
-        // replacement directives). They are not fetch targets to coalesce.
-        r.kind == RefKind::Undefined
-            || seen.insert((r.locator.clone(), r.pinned_hash.clone(), r.context.clone()))
-    });
 }
 
 /// A findable substring for placing a reference whose full evidence isn't
@@ -250,7 +338,7 @@ mod tests {
         let mut found = Found::new(&[], None);
         for i in 0..MAX_FOUND_REFS + 10 {
             let locator = RefLocator::Purl(format!("pkg:npm/p{i}"));
-            found.push(locator, RefKind::Command, "test", "npm install");
+            found.push([locator], RefKind::Command, "test", "npm install", None);
         }
         let discovery = found.into_discovery();
         assert_eq!(discovery.references.len(), MAX_FOUND_REFS);
@@ -310,8 +398,54 @@ mod tests {
             algo: filefacts::HashAlgo::Sha512,
             value: "PIN".into(),
         });
-        let mut refs = vec![a.clone(), a, runtime, pinned];
-        dedup(&mut refs);
-        assert_eq!(refs.len(), 3);
+        let refs = vec![a.clone(), a, runtime, pinned];
+        let mut kept = refs.clone();
+        dedup(&mut kept);
+        assert_eq!(kept.len(), 3);
+        // Declared and discovered references are kept once each the same way.
+        let mut found = Found::new(&refs[..2], None);
+        found.absorb(Discovery {
+            references: refs,
+            ..Discovery::default()
+        });
+        assert_eq!(found.into_discovery().references, kept);
+    }
+
+    #[test]
+    fn a_repeated_reference_does_not_spend_the_cap() {
+        let script = format!(
+            "npm i {}\nnpm i evil\n",
+            "a ".repeat(MAX_FOUND_REFS + 10_000)
+        );
+        let found = super::super::references_in_bytes(script.as_bytes(), "x.sh");
+        assert_eq!(
+            super::super::tests::locators(&found.references),
+            ["pkg:npm/a", "pkg:npm/evil"]
+        );
+        assert!(!found.truncated);
+    }
+
+    #[test]
+    fn a_superseding_citation_replaces_only_the_named_sources() {
+        let url = |source: &str| {
+            Reference::new(
+                RefLocator::Url("https://x.test/p.pac".into()),
+                RefKind::UrlFetch,
+                source,
+                "",
+            )
+        };
+        let mut found = Found::new(&[], None);
+        found.add(url("string"));
+        found.supersede(url("api"), &["string"]);
+        found.supersede(url("again"), &["string"]);
+        found.add(url("text"));
+        let refs = found.into_discovery().references;
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].source, "api");
+
+        let mut found = Found::new(&[url("declared")], None);
+        found.supersede(url("api"), &["string"]);
+        assert_eq!(found.into_discovery().references[0].source, "declared");
     }
 }

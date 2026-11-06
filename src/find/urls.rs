@@ -4,22 +4,16 @@
 use filefacts::{Arg, RefKind, RefLocator, Reference, Symbol};
 
 use super::found::Found;
-use super::shell::tool_name;
+use super::shell::{SEPARATORS, tool_name};
 use super::{Discovery, Lang, UnresolvedFetchCall};
 use crate::fetch::is_http_url;
 
 /// Scan text line by line for `http`/`https` URLs (curl/wget targets, a URL in
 /// a variable) and emit a [`RefKind::UrlFetch`] per URL, cited by its line.
-/// The line is placed once, however many URLs it holds.
 pub(super) fn urls(text: &str, source: &str, out: &mut Found<'_>) {
     for line in text.lines() {
-        let evidence = line.trim();
-        let mut at = None;
-        for url in extract_urls(line) {
-            let locator = url_locator(url);
-            let offset = *at.get_or_insert_with(|| out.locate(evidence, &locator));
-            out.push_at(locator, RefKind::UrlFetch, source, evidence, offset);
-        }
+        let locators = extract_urls(line).map(url_locator);
+        out.push(locators, RefKind::UrlFetch, source, line.trim(), None);
     }
 }
 
@@ -34,35 +28,24 @@ pub(super) fn url_locator(url: &str) -> RefLocator {
 
 /// Each `http`/`https` URL embedded in a string, its scheme matched
 /// case-insensitively as curl and wget accept it. A URL runs until the first
-/// character that cannot appear in one unquoted in a shell command.
-pub(super) fn extract_urls(text: &str) -> UrlScan<'_> {
-    UrlScan { rest: text }
-}
-
-/// The iterator [`extract_urls`] returns. Each step only moves forward through
-/// the text, so a scan costs time linear in its length.
-#[derive(Debug)]
-pub(super) struct UrlScan<'a> {
-    rest: &'a str,
-}
-
-impl<'a> Iterator for UrlScan<'a> {
-    type Item = &'a str;
-
-    fn next(&mut self) -> Option<&'a str> {
+/// character that cannot appear in one unquoted in a shell command. Each step
+/// only moves forward through the text, so a scan costs time linear in its
+/// length.
+pub(super) fn extract_urls(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
         loop {
-            let start = self
-                .rest
+            let start = rest
                 .as_bytes()
                 .windows(4)
                 .position(|w| w.eq_ignore_ascii_case(b"http"))?;
-            let cand = &self.rest[start..];
+            let cand = &rest[start..];
             let prefix = |p: &str| {
                 cand.get(..p.len())
                     .is_some_and(|c| c.eq_ignore_ascii_case(p))
             };
             if !prefix("http://") && !prefix("https://") {
-                self.rest = &cand[4..];
+                rest = &cand[4..];
                 continue;
             }
             let end = cand
@@ -74,19 +57,18 @@ impl<'a> Iterator for UrlScan<'a> {
                         )
                 })
                 .unwrap_or(cand.len());
-            self.rest = &cand[end..];
+            rest = &cand[end..];
             let Some(url) = untemplated(&cand[..end]) else {
                 continue;
             };
             // Drop the bytes that ended the *text*, not the URL: a shell
             // line-continuation backslash, the punctuation closing a sentence,
-            // an empty fragment naming the same resource.
-            let url = url.trim_end_matches(['\\', '#', '.', ',', ';', ':', '!', '?']);
-            if url.len() > "https://".len() {
-                return Some(url);
-            }
+            // an empty fragment naming the same resource. The host
+            // `untemplated` required has a letter or digit, which this never
+            // reaches.
+            return Some(url.trim_end_matches(['\\', '#', '.', ',', ';', ':', '!', '?']));
         }
-    }
+    })
 }
 
 /// `url` cut to what it names before a template takes over, or `None` when
@@ -155,7 +137,6 @@ fn untemplated(url: &str) -> Option<&str> {
 /// (un-normalized) text, so `://` survives.
 pub(super) fn git_refs(text: &str, source: &str, out: &mut Found<'_>) {
     for line in text.lines() {
-        let evidence = line.trim();
         let mut repos = Vec::new();
         let mut rest = line;
         while let Some(i) = rest.find("git+") {
@@ -170,26 +151,57 @@ pub(super) fn git_refs(text: &str, source: &str, out: &mut Found<'_>) {
             rest = &spec[end..];
         }
         repos.extend(git_clone_target(line).and_then(normalize_git_target));
-        let mut at = None;
-        for repo in repos {
-            let locator = RefLocator::Url(repo);
-            let offset = *at.get_or_insert_with(|| out.locate(evidence, &locator));
-            out.push_at(locator, RefKind::Repository, source, evidence, offset);
-        }
+        let locators = repos.into_iter().map(RefLocator::Url);
+        out.push(locators, RefKind::Repository, source, line.trim(), None);
     }
 }
 
-/// The clone target of a `git clone [flags] <target>` line — the first
-/// non-flag argument after `git clone`. `None` if the line is not a clone.
+/// The clone target of a `git clone [options] <target>` line — the first
+/// argument after `git clone` that is neither an option nor an option's value
+/// (`-b main`, `-c http.proxy=…`). `None` if the line is not a clone.
 fn git_clone_target(line: &str) -> Option<&str> {
-    let toks: Vec<&str> = line.split_whitespace().collect();
-    let pos = toks
-        .windows(2)
-        .position(|w| w[0] == "git" && w[1] == "clone")?;
-    toks[pos + 2..]
-        .iter()
-        .find(|t| !t.starts_with('-'))
-        .copied()
+    /// `git clone` options whose value is the next word.
+    const TAKES_VALUE: &[&str] = &[
+        "-b",
+        "--branch",
+        "-c",
+        "--config",
+        "--depth",
+        "-j",
+        "--jobs",
+        "-o",
+        "--origin",
+        "--ref-format",
+        "--reference",
+        "--reference-if-able",
+        "--revision",
+        "--separate-git-dir",
+        "--server-option",
+        "--shallow-exclude",
+        "--shallow-since",
+        "--template",
+        "-u",
+        "--upload-pack",
+    ];
+    if !line.contains("git") {
+        return None;
+    }
+    let mut words = line.split_whitespace();
+    let mut previous = "";
+    while let Some(word) = words.next() {
+        if previous == "git" && word == "clone" {
+            while let Some(word) = words.next() {
+                if TAKES_VALUE.contains(&word) {
+                    words.next();
+                } else if !word.starts_with('-') {
+                    return Some(word);
+                }
+            }
+            return None;
+        }
+        previous = word;
+    }
+    None
 }
 
 /// A validated git target: a URL (`scheme://…`) or SSH shorthand (`git@host:…`),
@@ -198,7 +210,7 @@ fn git_clone_target(line: &str) -> Option<&str> {
 fn normalize_git_target(s: &str) -> Option<String> {
     let s = s.trim_matches(|c| matches!(c, '"' | '\'' | '`' | ')' | ']' | ','));
     let is_git = s.contains("://") || s.starts_with("git@");
-    (is_git && s.len() >= 8).then(|| s.trim_end_matches(".git").to_owned())
+    (is_git && s.len() >= 8).then(|| s.strip_suffix(".git").unwrap_or(s).to_owned())
 }
 
 /// A network fetch command, and which of its options take the next word as
@@ -504,22 +516,17 @@ fn looks_like_protocolless_url(value: &str) -> bool {
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return true;
     }
-    let labels: Vec<&str> = host.split('.').collect();
-    if labels.len() < 2
-        || labels.iter().any(|label| {
-            label.is_empty()
-                || label.starts_with('-')
-                || label.ends_with('-')
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-    {
-        return false;
-    }
-    labels
-        .last()
-        .is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|byte| byte.is_ascii_alphabetic()))
+    // `host` holds a dot, so it has at least two labels.
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) && host.rsplit_once('.').is_some_and(|(_, tld)| {
+        tld.len() >= 2 && tld.bytes().all(|byte| byte.is_ascii_alphabetic())
+    })
 }
 
 /// Find protocol-less host/path arguments to a known network fetch command in
@@ -561,14 +568,8 @@ pub(super) fn bare_fetch_urls(text: &str, lang: Lang, out: &mut Found<'_>) {
                     Target::Word(word) => looks_like_protocolless_url(word).then_some(word),
                     Target::Unknown => None,
                 });
-            if let Some(target) = target {
-                out.push(
-                    RefLocator::Url(format!("https://{target}")),
-                    RefKind::UrlFetch,
-                    lang.label(),
-                    line.trim(),
-                );
-            }
+            let locators = target.map(|target| RefLocator::Url(format!("https://{target}")));
+            out.push(locators, RefKind::UrlFetch, lang.label(), line.trim(), None);
         }
     }
 }
@@ -588,7 +589,7 @@ fn command_words<'a>(tokens: &[&'a str]) -> impl Iterator<Item = &'a str> {
         {
             return None;
         }
-        let word = match raw.find(['|', ';', '&', '>', '<']) {
+        let word = match raw.find(|c| SEPARATORS.contains(&c) || matches!(c, '>' | '<')) {
             Some(at) => {
                 ended = true;
                 &raw[..at]
@@ -790,6 +791,51 @@ xinput test device
         );
         assert_eq!(untemplated("https://a\\.test/x"), None);
         assert_eq!(untemplated("https://a.test/x\\"), Some("https://a.test/"));
+    }
+
+    #[test]
+    fn printed_and_commented_fetches_in_a_script_are_not_targets() {
+        let script = b"#!/bin/sh\n# curl comment.test/no\nprintf %s 'curl printed.test/no'\ncurl real.test/yes\n";
+        assert_eq!(urls(script, "x.sh"), ["https://real.test/yes"]);
+        // A Dockerfile has no call facts, so its text is read.
+        assert_eq!(
+            urls(b"FROM alpine\nRUN curl real.test/yes\n", "Dockerfile"),
+            ["https://real.test/yes"]
+        );
+    }
+
+    #[test]
+    fn short_hosts_and_repeated_git_suffixes_are_kept() {
+        assert_eq!(
+            extract_urls("curl http://a https://b").collect::<Vec<_>>(),
+            ["http://a", "https://b"]
+        );
+        assert_eq!(
+            normalize_git_target("https://h.test/r.git.git").as_deref(),
+            Some("https://h.test/r.git")
+        );
+        assert_eq!(
+            git_clone_target("x git clone -q h.test/r d"),
+            Some("h.test/r")
+        );
+        assert_eq!(git_clone_target("git log; clone"), None);
+    }
+
+    #[test]
+    fn a_git_clone_options_value_is_not_its_target() {
+        assert_eq!(
+            git_clone_target("git clone -b main git@gitlab.test:evil/x.git"),
+            Some("git@gitlab.test:evil/x.git")
+        );
+        assert_eq!(
+            git_clone_target("git clone -c http.proxy=http://proxy.test:3128 https://h.test/r"),
+            Some("https://h.test/r")
+        );
+        assert_eq!(
+            git_clone_target("git clone --depth 1 --branch=v2 https://h.test/r dir"),
+            Some("https://h.test/r")
+        );
+        assert_eq!(git_clone_target("git clone --branch"), None);
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! Package-manager install commands in shell text: scripts, Dockerfiles, npm
 //! lifecycle hooks, and the command strings source code hands to a process.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+
 use filefacts::RefKind;
 
 use super::Lang;
@@ -8,13 +11,8 @@ use super::found::{Found, position_in};
 use super::purl_token::{Eco, pm_token_locator};
 use super::urls;
 
-/// How many global options a manager may carry before its verb
-/// (`apt-get -y -q install`). Bounding the skip keeps a line of nothing but
-/// options from being re-read at every manager name in it.
-const MAX_GLOBAL_OPTIONS: usize = 8;
-
-/// The characters that end one command and start the next on a line.
-const SEPARATORS: [char; 4] = [';', '&', '|', '\r'];
+/// The characters that end one command and start the next.
+pub(super) const SEPARATORS: [char; 5] = [';', '&', '|', '\r', '\n'];
 
 /// Where text handed to [`commands`] sits in the file.
 #[derive(Debug, Clone, Copy)]
@@ -26,19 +24,43 @@ pub(super) enum Place<'r> {
     /// that from each entry's `copy` position on it runs with the file from
     /// the entry's `file` position. An empty map is the file's text itself.
     Mapped(&'r [(usize, usize)]),
-    /// Every command it holds is cited at this offset.
-    At(u64),
+    /// A resolved call's command: every command it holds is cited at the
+    /// call's offset, by the call's source text.
+    Call(u64, &'r str),
+}
+
+impl<'r> Place<'r> {
+    /// Where `part`, a slice of the command text `text` this place
+    /// describes, is cited, and by what evidence.
+    fn cite(self, text: &'r str, part: &'r str) -> (Option<u64>, &'r str) {
+        match self {
+            Place::Search => (None, part),
+            Place::Call(at, call) => (Some(at), call),
+            Place::Mapped(remap) => {
+                let Some(at) = position_in(text, part) else {
+                    return (None, part);
+                };
+                let file = match remap
+                    .partition_point(|&(copy, _)| copy <= at)
+                    .checked_sub(1)
+                {
+                    Some(i) => remap[i].1 + (at - remap[i].0),
+                    None => at,
+                };
+                (Some(file as u64), part)
+            }
+        }
+    }
 }
 
 /// Scan a shell script or Dockerfile for install commands and URLs.
 pub(super) fn scan(lang: Lang, out: &mut Found<'_>) {
-    let Some(text) = out.text else {
+    let Some(text) = out.text() else {
         return;
     };
     commands(text, Place::Mapped(&[]), lang, lang.label(), out);
     urls::git_refs(text, lang.label(), out);
     urls::urls(text, lang.label(), out);
-    urls::bare_fetch_urls(text, lang, out);
 }
 
 /// npm lifecycle hooks: a `postinstall` that `wget … | sh` or `npm install`s a
@@ -48,26 +70,19 @@ pub(super) fn scan(lang: Lang, out: &mut Found<'_>) {
 pub(super) fn npm_hooks(values: &filefacts::Values, out: &mut Found<'_>) {
     for (hook, cmd) in filefacts::values::npm_install_hooks(values) {
         let source = format!("npm.scripts.{hook}");
-        for url in urls::extract_urls(cmd) {
-            out.push(
-                urls::url_locator(url),
-                RefKind::UrlFetch,
-                source.as_str(),
-                cmd,
-            );
-        }
+        let locators = urls::extract_urls(cmd).map(urls::url_locator);
+        out.push(locators, RefKind::UrlFetch, &source, cmd, None);
         // The packages a hook installs are build-time dependencies that run
         // install scripts.
-        let start = out.refs.len();
-        commands(cmd, Place::Search, Lang::Shell, &source, out);
-        for reference in &mut out.refs[start..] {
-            reference.context = Some(filefacts::DependencyContext {
-                scope: filefacts::DependencyScope::Build,
-                optional: false,
-                has_install_script: true,
-                installed_path: None,
-            });
-        }
+        let context = filefacts::DependencyContext {
+            scope: filefacts::DependencyScope::Build,
+            optional: false,
+            has_install_script: true,
+            installed_path: None,
+        };
+        out.with_context(context, |out| {
+            commands(cmd, Place::Search, Lang::Shell, &source, out);
+        });
     }
 }
 
@@ -77,8 +92,10 @@ pub(super) fn npm_hooks(values: &filefacts::Values, out: &mut Found<'_>) {
 ///
 /// In a Dockerfile, a `FROM` sets the base distro, which decides the
 /// ecosystem of the cross-distro managers (`apt` → Debian or Ubuntu, `apk` →
-/// Alpine or Wolfi) in the instructions after it, exec form included. Other
-/// text has no such context and uses each manager's dominant distro.
+/// Alpine or Wolfi) in the instructions after it, exec form included. A
+/// `FROM` naming an earlier stage (`FROM base`) inherits that stage's
+/// distro. Other text has no such context and uses each manager's dominant
+/// distro.
 pub(super) fn commands(
     text: &str,
     place: Place<'_>,
@@ -88,36 +105,36 @@ pub(super) fn commands(
 ) {
     // Continuations become as many spaces as they had bytes, so a position in
     // `joined` is the same position in `text`.
-    let joined = text.replace("\\\r\n", "   ").replace("\\\n", "  ");
-    let locate = |part: &str| -> Option<u64> {
-        match place {
-            Place::Search => None,
-            Place::At(at) => Some(at),
-            Place::Mapped(remap) => {
-                let at = position_in(&joined, part)?;
-                let file = match remap
-                    .partition_point(|&(copy, _)| copy <= at)
-                    .checked_sub(1)
-                {
-                    Some(i) => remap[i].1 + (at - remap[i].0),
-                    None => at,
-                };
-                Some(file as u64)
-            }
-        }
+    let joined: Cow<'_, str> = if text.contains('\\') {
+        text.replace("\\\r\n", "   ").replace("\\\n", "  ").into()
+    } else {
+        text.into()
     };
     let mut distro = None;
+    // Each named build stage's distro, by its lower-cased name.
+    let mut stages = HashMap::new();
     for line in joined.split('\n') {
+        if out.is_full() {
+            return;
+        }
         if lang == Lang::Dockerfile {
             match instruction(line) {
-                Some(Instruction::From(image)) => {
-                    distro = image.and_then(image_distro);
+                Some(Instruction::From { image, stage }) => {
+                    distro = image.and_then(|image| {
+                        stages
+                            .get(&image.to_ascii_lowercase())
+                            .copied()
+                            .unwrap_or_else(|| image_distro(image))
+                    });
+                    if let Some(stage) = stage {
+                        stages.insert(stage.to_ascii_lowercase(), distro);
+                    }
                     continue;
                 }
                 Some(Instruction::Exec(words)) => {
-                    let at = locate(line);
-                    for part in words.split(['\n', ';', '&', '|', '\r']) {
-                        segment(part, at, lang, distro, source, out);
+                    let (at, _) = place.cite(&joined, line);
+                    for part in words.split(SEPARATORS) {
+                        segment(part, (at, part), distro, source, out);
                     }
                     continue;
                 }
@@ -126,33 +143,40 @@ pub(super) fn commands(
         }
         for part in line.split(SEPARATORS) {
             let part = part.trim();
-            segment(part, locate(part), lang, distro, source, out);
+            segment(part, place.cite(&joined, part), distro, source, out);
         }
     }
 }
 
 /// A Dockerfile instruction that is not shell text.
 enum Instruction<'t> {
-    /// `FROM [--platform=…] <image>`; `None` when the image is a build-arg
-    /// placeholder (`$BASE`) or `scratch`, neither of which names a distro.
-    From(Option<&'t str>),
+    /// `FROM [--platform=…] <image> [AS <stage>]`. The image is `None` when
+    /// it is a build-arg placeholder (`$BASE`) or `scratch`, neither of which
+    /// names a distro.
+    From {
+        image: Option<&'t str>,
+        stage: Option<&'t str>,
+    },
     /// `RUN`/`CMD`/`ENTRYPOINT` in exec form (`RUN ["npm","install","x"]`):
     /// the words it runs, joined with spaces. The JSON array is one shell-less
     /// token to a shell reading, which would otherwise see none of its words.
     Exec(String),
 }
 
+/// The instruction `line` holds, when it is one that is not shell text.
 fn instruction(line: &str) -> Option<Instruction<'_>> {
-    let (keyword, rest) = line
-        .trim()
-        .split_once(char::is_whitespace)
-        .unwrap_or((line.trim(), ""));
+    let line = line.trim();
+    let (keyword, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     if keyword.eq_ignore_ascii_case("FROM") {
-        let image = rest
-            .split_whitespace()
-            .find(|t| !t.starts_with('-'))
+        let mut words = rest.split_whitespace().skip_while(|t| t.starts_with('-'));
+        let image = words
+            .next()
             .filter(|t| !t.starts_with('$') && *t != "scratch");
-        return Some(Instruction::From(image));
+        let stage = words
+            .next()
+            .filter(|t| t.eq_ignore_ascii_case("AS"))
+            .and_then(|_| words.next());
+        return Some(Instruction::From { image, stage });
     }
     if !["RUN", "CMD", "ENTRYPOINT"]
         .iter()
@@ -165,11 +189,10 @@ fn instruction(line: &str) -> Option<Instruction<'_>> {
 }
 
 /// Recognize the install command in one separator-delimited `part`, cited at
-/// `at` (searched for when `None`).
+/// `at` (searched for when `None`) by `evidence`.
 fn segment(
     part: &str,
-    at: Option<u64>,
-    lang: Lang,
+    (at, evidence): (Option<u64>, &str),
     distro: Option<Eco>,
     source: &str,
     out: &mut Found<'_>,
@@ -190,75 +213,86 @@ fn segment(
     if toks.first().is_some_and(|t| matches!(*t, "for" | "select")) {
         return;
     }
-    let Some((eco, start, runner)) = invocation(&toks, lang) else {
+    let Some(Invocation { eco, args, runner }) = invocation(&toks) else {
         return;
     };
     let eco = eco.on(distro);
-    let args = argument_list(&toks[start..]);
+    let args = argument_list(&toks[args..]);
     let packages = if runner {
         runner_packages(eco, &args)
     } else {
-        let mut skip_value = false;
-        args.into_iter()
-            .filter(|arg| {
-                if skip_value {
-                    skip_value = false;
-                    return false;
-                }
-                skip_value = takes_value(eco, arg);
-                !skip_value
-            })
-            .collect()
+        // An option's value is not a package; the option itself is
+        // rejected as one below.
+        let mut packages = Vec::with_capacity(args.len());
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            if takes_value(eco, arg) {
+                args.next();
+            } else {
+                packages.push(arg);
+            }
+        }
+        packages
     };
-    let mut locators = packages
+    let locators = packages
         .into_iter()
         .filter_map(|arg| pm_token_locator(eco, arg));
-    let Some(first) = locators.next() else {
-        return;
-    };
-    // One place for the whole command, found once: every package of it
-    // shares the evidence, and comparing a long line per package is
-    // quadratic.
-    let at = match at {
-        Some(at) => Some(at),
-        None => out.locate(part, &first),
-    };
-    for locator in std::iter::once(first).chain(locators) {
-        out.push_at(locator, RefKind::Command, source, part, at);
-    }
+    out.push(locators, RefKind::Command, source, evidence, at);
 }
 
-/// The first package-manager invocation among `toks`: its ecosystem, where
-/// its arguments start, and whether it is a one-shot runner (`npx`, `uvx`,
-/// `pnpm dlx`, `pipx run`, `deno run`), which runs one package and passes it
-/// the rest as arguments.
+/// A package-manager invocation among a command's words.
+#[derive(Debug)]
+struct Invocation {
+    eco: Eco,
+    /// Where its arguments start.
+    args: usize,
+    /// Whether it is a one-shot runner (`npx`, `uvx`, `pnpm dlx`, `pipx run`,
+    /// `deno run`), which runs one package and passes it the rest as
+    /// arguments.
+    runner: bool,
+}
+
+/// The first package-manager invocation among `toks`.
 ///
-/// An option is never a command name, so `-/npm` is not `npm`. In shell text
-/// a manager after `echo`/`printf` is printed, not run; in source code the
-/// call itself is the evidence that the command runs.
-fn invocation(toks: &[&str], lang: Lang) -> Option<(Eco, usize, bool)> {
-    let echo = toks
+/// An option is never a command name, so `-/npm` is not `npm`. A manager
+/// after `echo`/`printf` is printed, not run — in a script, and equally in
+/// the command a program hands to a shell.
+fn invocation(toks: &[&str]) -> Option<Invocation> {
+    let end = toks
         .iter()
-        .position(|token| matches!(*token, "echo" | "printf"));
-    toks.iter()
-        .enumerate()
-        .filter(|(_, tok)| !tok.starts_with('-'))
-        .find_map(|(i, &tok)| {
-            let (eco, consumed) = match_pm(&toks[i..])?;
-            if !lang.is_source() && echo.is_some_and(|at| at < i) {
-                return None;
+        .position(|token| matches!(*token, "echo" | "printf"))
+        .unwrap_or(toks.len());
+    let unprinted = toks.get(..end)?;
+    let mut i = 0;
+    while let Some(&tok) = unprinted.get(i) {
+        if tok.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        let rest = toks.get(i..)?;
+        let (eco, consumed) = match match_pm(rest) {
+            Ok(found) => found,
+            Err(read) => {
+                i += read;
+                continue;
             }
-            let verb = toks[i + consumed - 1];
-            let runner = match eco {
-                Eco::Npm | Eco::Pypi => {
-                    matches!(tool_name(tok), "npx" | "bunx" | "uvx")
-                        || matches!(verb, "dlx" | "x" | "run")
-                }
-                Eco::Deno => verb == "run",
-                _ => false,
-            };
-            Some((eco, i + consumed, runner))
-        })
+        };
+        let verb = rest.get(consumed.checked_sub(1)?)?;
+        let runner = match eco {
+            Eco::Npm | Eco::Pypi => {
+                matches!(tool_name(tok), "npx" | "bunx" | "uvx")
+                    || matches!(*verb, "dlx" | "x" | "run")
+            }
+            Eco::Deno => *verb == "run",
+            _ => false,
+        };
+        return Some(Invocation {
+            eco,
+            args: i + consumed,
+            runner,
+        });
+    }
+    None
 }
 
 /// A command's arguments up to where its argument list ends: a redirect
@@ -431,7 +465,7 @@ const fn value_options(eco: Eco) -> &'static [&'static str] {
         Eco::Arch | Eco::Aur => &[
             "--config", "-b", "--dbpath", "-r", "--root", "--cachedir", "--arch", "--gpgdir",
             "--hookdir", "--logfile", "--assume-installed", "--ignore", "--ignoregroup",
-            "--overwrite", "--print-format",
+            "--overwrite", "--print-format", "--color",
         ],
         Eco::Snap => &["--channel", "--revision"],
         Eco::FreeBsd => &[
@@ -497,57 +531,78 @@ fn image_distro(image: &str) -> Option<Eco> {
 /// (`npm install` → 2, `uv pip install` → 3). A cross-distro manager reports
 /// its dominant distro (`apt` → Debian, `apk` → Alpine); [`Eco::on`] moves it
 /// to the base image's.
-fn match_pm(toks: &[&str]) -> Option<(Eco, usize)> {
-    // A subcommand verb after global options (`apt-get -y install`,
-    // `apk --no-cache add`, `npm --prefix dir install`): skip at most
-    // MAX_GLOBAL_OPTIONS options and their values, then require one of
-    // `verbs`. Skipping options rather than scanning a window keeps a later
-    // argument that merely equals a short verb (`npm run x`) from being read
-    // as an install.
-    let after = |eco: Eco, verbs: &[&str]| -> Option<(Eco, usize)> {
-        let mut i = 1;
-        for _ in 0..MAX_GLOBAL_OPTIONS {
-            let Some(option) = toks.get(i).filter(|t| t.starts_with('-')) else {
-                break;
-            };
+///
+/// When there is no invocation, `Err` says how many tokens were read: the
+/// command word and the options it carries, none of which can start another
+/// command. Searching on from there reads each token once, however many
+/// options a line holds.
+fn match_pm(toks: &[&str]) -> Result<(Eco, usize), usize> {
+    // Where the run of options (and the values they take) from `i` ends.
+    let options = |eco: Eco, mut i: usize| {
+        while let Some(option) = toks.get(i).filter(|t| t.starts_with('-')) {
             i += if takes_value(eco, option) { 2 } else { 1 };
         }
-        verbs.contains(toks.get(i)?).then_some((eco, i + 1))
+        i.min(toks.len())
     };
-    // A verb within the next few words, for forms whose verb follows a
-    // non-option word: `pip main install` (the flattened `pip.main([...])`),
-    // `pacman --noconfirm -Syu`.
-    let within = |eco: Eco, from: usize, words: usize, is_verb: fn(&str) -> bool| {
-        toks.get(from..)?
-            .iter()
-            .take(words)
-            .position(|t| is_verb(t))
-            .map(|i| (eco, from + i + 1))
+    // A subcommand verb after global options (`apt-get -y install`,
+    // `apk --no-cache add`, `npm --prefix dir install`). Skipping options
+    // rather than scanning a window keeps a later argument that merely
+    // equals a short verb (`npm run x`) from being read as an install.
+    let after = |eco: Eco, verbs: &[&str]| {
+        let i = options(eco, 1);
+        match toks.get(i) {
+            Some(verb) if verbs.contains(verb) => Ok((eco, i + 1)),
+            _ => Err(i),
+        }
     };
-    match tool_name(toks.first()?) {
+    // `pip install`, after options, or after the `main` of a flattened
+    // `pip.main([...])` / `pip._internal.main([...])` call.
+    let pip = |from: usize| {
+        let mut i = options(Eco::Pypi, from);
+        if toks.get(i) == Some(&"_internal") {
+            i += 1;
+        }
+        if toks.get(i) == Some(&"main") {
+            i = options(Eco::Pypi, i + 1);
+        }
+        match toks.get(i) {
+            Some(&"install") => Ok((Eco::Pypi, i + 1)),
+            _ => Err(i),
+        }
+    };
+    // pacman's operation is itself an option (`pacman --noconfirm -Syu`).
+    let sync = |eco: Eco| {
+        let mut i = 1;
+        while let Some(option) = toks.get(i).filter(|t| t.starts_with('-')) {
+            if is_pacman_sync(option) {
+                return Ok((eco, i + 1));
+            }
+            i += if takes_value(eco, option) { 2 } else { 1 };
+        }
+        Err(i.min(toks.len()))
+    };
+    let Some((&first, rest)) = toks.split_first() else {
+        return Err(1);
+    };
+    match tool_name(first) {
         // One-shot remote runners fetch and run a package without declaring
         // it; the package follows immediately.
-        "npx" | "bunx" => Some((Eco::Npm, 1)),
-        "uvx" => Some((Eco::Pypi, 1)),
-        "npm" | "pnpm" | "yarn" | "bun" => {
-            if matches!(toks.get(1..3), Some(["global", "add"])) {
-                Some((Eco::Npm, 3))
-            } else {
-                after(Eco::Npm, &["install", "i", "add", "a", "dlx", "x"])
-            }
-        }
-        "pip" | "pip3" => within(Eco::Pypi, 1, 3, |t| t == "install"),
-        "python" | "python3" if matches!(toks.get(1..3), Some(["-m", "pip"])) => {
-            within(Eco::Pypi, 3, 3, |t| t == "install")
-        }
+        "npx" | "bunx" => Ok((Eco::Npm, 1)),
+        "uvx" => Ok((Eco::Pypi, 1)),
+        "npm" | "pnpm" | "yarn" | "bun" => match rest {
+            ["global", "add", ..] => Ok((Eco::Npm, 3)),
+            _ => after(Eco::Npm, &["install", "i", "add", "a", "dlx", "x"]),
+        },
+        "pip" | "pip3" => pip(1),
+        "python" | "python3" if matches!(rest, ["-m", "pip", ..]) => pip(3),
         "pipx" => after(Eco::Pypi, &["install", "run"]),
         "pipenv" => after(Eco::Pypi, &["install"]),
         // Their `install` reads the manifest, so it stays declared-only.
         "poetry" | "pdm" | "rye" => after(Eco::Pypi, &["add"]),
-        "uv" => match *toks.get(1)? {
-            "pip" | "tool" if toks.get(2) == Some(&"install") => Some((Eco::Pypi, 3)),
-            "add" => Some((Eco::Pypi, 2)),
-            _ => None,
+        "uv" => match rest {
+            ["pip" | "tool", "install", ..] => Ok((Eco::Pypi, 3)),
+            ["add", ..] => Ok((Eco::Pypi, 2)),
+            _ => Err(1),
         },
         // The per-token prefix (`npm:`/`jsr:`) picks the registry.
         "deno" => after(Eco::Deno, &["install", "add", "cache", "run"]),
@@ -556,43 +611,39 @@ fn match_pm(toks: &[&str]) -> Option<(Eco, usize)> {
         "gem" => after(Eco::Gem, &["install"]),
         "bundle" | "bundler" => after(Eco::Gem, &["add"]),
         "conda" | "mamba" | "micromamba" => after(Eco::Conda, &["install"]),
-        "composer" => match (toks.get(1), toks.get(2)) {
-            (Some(&"require"), _) => Some((Eco::Composer, 2)),
-            (Some(&"global"), Some(&"require")) => Some((Eco::Composer, 3)),
-            _ => None,
+        "composer" => match rest {
+            ["global", "require", ..] => Ok((Eco::Composer, 3)),
+            ["require", ..] => Ok((Eco::Composer, 2)),
+            _ => Err(1),
         },
         "apt-get" | "apt" | "aptitude" => after(Eco::Debian, &["install"]),
         "apk" => after(Eco::Alpine, &["add"]),
         "dnf" | "dnf5" | "yum" | "microdnf" | "tdnf" => after(Eco::Fedora, &["install"]),
         "zypper" => after(Eco::OpenSuse, &["install", "in"]),
-        "pacman" => within(Eco::Arch, 1, 4, is_pacman_sync),
-        "yay" | "paru" | "pikaur" | "trizen" => within(Eco::Aur, 1, 4, is_pacman_sync),
+        "pacman" => sync(Eco::Arch),
+        "yay" | "paru" | "pikaur" | "trizen" => sync(Eco::Aur),
         "brew" => after(Eco::Homebrew, &["install", "reinstall"]),
         "snap" => after(Eco::Snap, &["install"]),
         "pkg" => after(Eco::FreeBsd, &["install", "add"]),
         "pkgin" => after(Eco::NetBsd, &["install"]),
-        "pkg_add" => Some((Eco::OpenBsd, 1)),
+        "pkg_add" => Ok((Eco::OpenBsd, 1)),
         // `dotnet add package <Id>`, `dotnet tool install -g <Id>`.
-        "dotnet" => matches!(
-            toks.get(1..3),
-            Some(["add", "package"] | ["tool", "install"])
-        )
-        .then_some((Eco::NuGet, 3)),
+        "dotnet" => match rest {
+            ["add", "package", ..] | ["tool", "install", ..] => Ok((Eco::NuGet, 3)),
+            _ => Err(1),
+        },
         "nuget" => after(Eco::NuGet, &["install"]),
         "paket" => after(Eco::NuGet, &["add"]),
-        "cpanm" => Some((Eco::Cpan, 1)),
-        "cpan" => Some((
-            Eco::Cpan,
-            if toks.get(1) == Some(&"install") {
-                2
-            } else {
-                1
-            },
-        )),
-        "dart" | "flutter" => {
-            matches!(toks.get(1..3), Some(["pub", "add"])).then_some((Eco::Pub, 3))
-        }
-        _ => None,
+        "cpanm" => Ok((Eco::Cpan, 1)),
+        "cpan" => match rest {
+            ["install", ..] => Ok((Eco::Cpan, 2)),
+            _ => Ok((Eco::Cpan, 1)),
+        },
+        "dart" | "flutter" => match rest {
+            ["pub", "add", ..] => Ok((Eco::Pub, 3)),
+            _ => Err(1),
+        },
+        _ => Err(1),
     }
 }
 
@@ -820,6 +871,85 @@ mod tests {
                 "pkg:freebsd/curl",
                 "pkg:openbsd/tmux",
             ],
+        );
+    }
+
+    #[test]
+    fn any_number_of_options_may_precede_the_verb() {
+        for (text, name, want) in [
+            (
+                "pip --disable-pip-version-check --no-cache-dir -q install evil1\n",
+                "x.sh",
+                "pkg:pypi/evil1",
+            ),
+            (
+                "npm -q -q -q -q -q -q -q -q -q install evil2\n",
+                "x.sh",
+                "pkg:npm/evil2",
+            ),
+            (
+                "FROM python:3.12\nRUN python -m pip --no-cache-dir -q --disable-pip-version-check install evil3\n",
+                "Dockerfile",
+                "pkg:pypi/evil3",
+            ),
+            (
+                "pacman --noconfirm --needed --color never --noprogressbar -q -q -q -q -S evil4\n",
+                "x.sh",
+                "pkg:arch/evil4",
+            ),
+        ] {
+            let found = references_in_bytes(text.as_bytes(), name);
+            assert_eq!(
+                super::super::tests::locators(&found.references),
+                [want],
+                "{text:?}"
+            );
+            assert!(!found.truncated);
+        }
+    }
+
+    #[test]
+    fn printed_commands_are_not_run_in_source_code_either() {
+        for (text, name) in [
+            (
+                "const cp=require('child_process'); cp.exec(\"echo 'run npm install evil to fix'\");\n",
+                "x.js",
+            ),
+            (
+                "import subprocess\nsubprocess.run('echo pip install evil', shell=True)\n",
+                "x.py",
+            ),
+        ] {
+            assert!(purls(text.as_bytes(), name).is_empty(), "{text:?}");
+        }
+        assert_eq!(
+            purls(
+                b"const cp=require('child_process'); cp.exec('npm i real; echo done');",
+                "x.js"
+            ),
+            ["pkg:npm/real"]
+        );
+    }
+
+    #[test]
+    fn a_stage_keeps_the_distro_of_its_base() {
+        let df = "FROM ubuntu:24.04 AS Base\n\
+            RUN apt-get install -y a\n\
+            FROM base AS next\n\
+            RUN apt-get install -y b\n\
+            FROM next\n\
+            RUN apt-get install -y c\n\
+            FROM scratch AS empty\n\
+            FROM empty\n\
+            RUN apt-get install -y d\n";
+        assert_eq!(
+            sorted(df, "Dockerfile"),
+            [
+                "pkg:debian/d",
+                "pkg:ubuntu/a",
+                "pkg:ubuntu/b",
+                "pkg:ubuntu/c"
+            ]
         );
     }
 
