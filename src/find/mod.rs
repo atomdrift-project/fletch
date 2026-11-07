@@ -174,6 +174,17 @@ fn facts(file_type: FileType, values: &Values, symbols: &[Symbol], out: &mut Fou
         FileType::Ruby => out.absorb(ruby::discover(symbols)),
         FileType::JavaScript | FileType::TypeScript => out.absorb(glib::discover(symbols)),
         FileType::Batch => out.absorb(batch::discover(values)),
+        // filefacts refuses a manifest over its size cap rather than parse
+        // it, so its hooks and declared dependencies go unread: padding must
+        // not pass for a manifest that names nothing.
+        FileType::PackageJson | FileType::ComposerJson | FileType::ChromeManifest
+            if values
+                .get("json.parse.skipped")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true) =>
+        {
+            out.cut_off("manifest", "filefacts manifest size cap");
+        }
         _ => {}
     }
 }
@@ -609,9 +620,10 @@ mod tests {
 
     #[test]
     fn a_run_of_option_words_costs_linear_time() {
+        // Each hook stays under filefacts' 1 MiB manifest cap, so it is parsed.
         for (command, want) in [
-            ("-/npm ".repeat(200_000), None),
-            ("npm --registry npm ".repeat(100_000), None),
+            ("-/npm ".repeat(170_000), None),
+            ("npm --registry npm ".repeat(55_000), None),
             (
                 format!("npm {}install evil", "-x ".repeat(200_000)),
                 Some("pkg:npm/evil"),
@@ -654,9 +666,20 @@ mod tests {
 
     #[test]
     fn an_npm_hook_naming_one_url_many_times_costs_linear_time() {
-        let command = "curl http://a.test/x ".repeat(50_000);
+        // Just under filefacts' 1 MiB manifest cap, so the hook is parsed.
+        let command = "curl http://a.test/x ".repeat(49_000);
         let found = scan_within_bound(&hook(&command), "package.json");
         assert_eq!(locators(&found.references), ["http://a.test/x"]);
+        assert!(!found.truncated);
+    }
+
+    #[test]
+    fn a_manifest_over_the_parse_cap_is_truncated_not_clean() {
+        // Padding a manifest past filefacts' cap hides its hooks from the
+        // parse; the discovery must say it is incomplete.
+        let command = "curl http://a.test/x ".repeat(50_000);
+        let found = references_in_bytes(&hook(&command), "package.json");
+        assert!(found.truncated);
     }
 
     #[test]
