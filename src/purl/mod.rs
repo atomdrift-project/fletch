@@ -275,6 +275,46 @@ impl Purl {
         &self.subpath
     }
 
+    /// Whether the version names one release: a concrete version (`1.2.3`,
+    /// `v0.0.0-2024…`) or a full commit hash. No version, a dist-tag
+    /// (`latest`), a range (`^1.0`, `1.x`) and a branch do not: each can come
+    /// to mean another release.
+    #[must_use]
+    pub fn pins_exact_version(&self) -> bool {
+        let Some(version) = self.version.as_deref() else {
+            return false;
+        };
+        let numeric = version.strip_prefix('v').unwrap_or(version);
+        let commit =
+            matches!(version.len(), 40 | 64) && version.bytes().all(|b| b.is_ascii_hexdigit());
+        (numeric.starts_with(|c: char| c.is_ascii_digit()) || commit)
+            && !version.contains(['*', '^', '~', '<', '>', '=', '|', ',', ' '])
+            && !version
+                .split('.')
+                .any(|part| part.eq_ignore_ascii_case("x"))
+    }
+
+    /// The constraint stated in place of an exact version, as the manifest
+    /// wrote it: the `version_requirement` qualifier (`^1.3.0`), else a `vers`
+    /// range without its `vers:<type>/` scheme (`>=1.0.0`), else a version
+    /// that does not [pin one release](Self::pins_exact_version) (`latest`).
+    /// `None` when the version is exact or nothing is stated.
+    #[must_use]
+    pub fn requirement(&self) -> Option<&str> {
+        if let Some(requirement) = self.qualifier("version_requirement") {
+            return Some(requirement);
+        }
+        if let Some(range) = self.qualifier("vers") {
+            return Some(
+                range
+                    .strip_prefix("vers:")
+                    .and_then(|rest| rest.split_once('/'))
+                    .map_or(range, |(_, constraint)| constraint),
+            );
+        }
+        self.version().filter(|_| !self.pins_exact_version())
+    }
+
     /// The namespace and name as one `/`-joined path, every segment
     /// percent-encoded exactly as in the [`Display`](std::fmt::Display) form
     /// (`%40scope/name`, `vendor/name`): the coordinate a registry URL is
@@ -1106,6 +1146,43 @@ mod tests {
         let id = "dlpngalgnefjeiefhmpklpfiohadpglk";
         let chrome = Purl::parse(&format!("pkg:chrome-extension/{id}")).unwrap();
         assert_eq!(chrome.with_version("1.2-beta"), None);
+    }
+
+    #[test]
+    fn only_a_concrete_version_or_commit_pins_a_release() {
+        for purl in [
+            "pkg:npm/a@1.3.0",
+            "pkg:golang/github.com/a/b@v0.0.0-20240101000000-abcdef123456",
+            "pkg:deb/debian/curl@7.50.3-1",
+            "pkg:github/a/b@0123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(Purl::parse(purl).unwrap().pins_exact_version(), "{purl}");
+        }
+        for purl in [
+            "pkg:npm/a",
+            "pkg:npm/a@latest",
+            "pkg:npm/a@1.x",
+            "pkg:github/a/b@main",
+            "pkg:npm/a?version_requirement=%5E1.0",
+        ] {
+            assert!(!Purl::parse(purl).unwrap().pins_exact_version(), "{purl}");
+        }
+    }
+
+    #[test]
+    fn a_requirement_is_read_as_the_manifest_wrote_it() {
+        let requirement = |purl: &str| Purl::parse(purl).unwrap().requirement().map(str::to_owned);
+        assert_eq!(
+            requirement("pkg:npm/a?version_requirement=%5E1.3.0").as_deref(),
+            Some("^1.3.0")
+        );
+        assert_eq!(
+            requirement("pkg:npm/a?vers=vers:npm%2F%3E%3D1.0.0").as_deref(),
+            Some(">=1.0.0")
+        );
+        assert_eq!(requirement("pkg:npm/a@latest").as_deref(), Some("latest"));
+        assert_eq!(requirement("pkg:npm/a@1.3.0"), None, "an exact version");
+        assert_eq!(requirement("pkg:npm/a"), None, "nothing stated");
     }
 
     #[test]
