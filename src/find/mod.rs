@@ -264,12 +264,34 @@ const STRING_SOURCE: &str = "string";
 fn strings(parsed: &ParsedFile<'_>, out: &mut Found<'_>) {
     for s in parsed.text().iter() {
         for url in urls::extract_urls(&s.value) {
+            // A VSIX absence can become evidence about the specific fetch
+            // which consumes it. Cite the URL itself only when the decoded
+            // text run is byte-for-byte present at the recorded offset.
+            // Encoded or transformed runs remain fetchable, but have no
+            // precise source location suitable for that correlation.
+            let is_vsix = url
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(url)
+                .to_ascii_lowercase()
+                .ends_with(".vsix");
+            let offset = if is_vsix {
+                usize::try_from(s.data_offset).ok().and_then(|start| {
+                    let end = start.checked_add(s.value.len())?;
+                    (parsed.bytes().get(start..end)? == s.value.as_bytes())
+                        .then(|| found::position_in(&s.value, url))
+                        .flatten()
+                        .and_then(|at| s.data_offset.checked_add(at as u64))
+                })
+            } else {
+                Some(s.data_offset)
+            };
             out.push_at(
                 urls::url_locator(url),
                 RefKind::UrlFetch,
                 STRING_SOURCE,
                 &s.value,
-                Some(s.data_offset),
+                offset,
             );
         }
     }
@@ -489,6 +511,41 @@ mod tests {
                 .flat_map(u16::to_be_bytes),
         );
         assert_eq!(purls(&utf16be, "install.sh"), ["pkg:npm/evil"]);
+    }
+
+    #[test]
+    fn vsix_url_locations_distinguish_urls_on_one_line() {
+        let source = b"const a=fetch('https://example.test/first.vsix');fetch('https://example.test/second.vsix');";
+        let found = references_in_bytes(source, "extension.js");
+        for target in [
+            "https://example.test/first.vsix",
+            "https://example.test/second.vsix",
+        ] {
+            let expected = source
+                .windows(target.len())
+                .position(|w| w == target.as_bytes())
+                .unwrap() as u64;
+            let r = found
+                .references
+                .iter()
+                .find(|r| matches!(&r.locator, RefLocator::Url(u) if u == target))
+                .unwrap();
+            assert_eq!(r.offset, Some(expected), "{target}");
+        }
+    }
+
+    #[test]
+    fn encoded_vsix_url_has_no_exact_source_offset() {
+        let source = b"const payload = 'aHR0cHM6Ly9leGFtcGxlLnRlc3QvYS52c2l4';";
+        let found = references_in_bytes(source, "extension.js");
+        let r = found
+            .references
+            .iter()
+            .find(
+                |r| matches!(&r.locator, RefLocator::Url(u) if u == "https://example.test/a.vsix"),
+            )
+            .unwrap();
+        assert_eq!(r.offset, None);
     }
 
     #[test]

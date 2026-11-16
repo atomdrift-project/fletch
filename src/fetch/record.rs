@@ -52,6 +52,8 @@ pub enum Unresolved {
     /// The reference needs its registry to name the release — a range, a
     /// tag, or no version at all — and the registry, asked, named none.
     NoRelease,
+    /// The registry answered, but its response could not establish availability.
+    InvalidResponse,
     /// fletch has no artifact source for this reference: its type has none,
     /// or the reference lacks what that source needs.
     Unsupported,
@@ -93,6 +95,7 @@ impl Unresolved {
             Self::InvalidPurl => "invalid_purl",
             Self::UnsafeCoordinate => "unsafe_coordinate",
             Self::NoRelease => "no_release",
+            Self::InvalidResponse => "invalid_response",
             Self::Unsupported => "unsupported",
         }
     }

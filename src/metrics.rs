@@ -178,6 +178,7 @@ mod tests {
             Unresolved::InvalidPurl,
             Unresolved::UnsafeCoordinate,
             Unresolved::NoRelease,
+            Unresolved::InvalidResponse,
             Unresolved::Unsupported,
         ];
         for why in unresolved {

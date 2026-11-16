@@ -251,14 +251,29 @@ fn marketplace_extension(
     ];
     let bytes = cached_post(MARKETPLACE_QUERY, body.as_bytes(), &headers, net, cache)?;
     let doc: ExtensionQuery = decode(MARKETPLACE_QUERY, &bytes)?;
-    doc.results
+    let result = doc
+        .results
         .into_iter()
         .next()
-        .and_then(|result| result.extensions.into_iter().next())
-        .ok_or_else(|| {
-            tracing::debug!(id = %id.escape_debug(), "the Marketplace has no such extension");
-            RegistryError::NotFound
-        })
+        .ok_or_else(|| RegistryError::Malformed {
+            url: MARKETPLACE_QUERY.to_string(),
+            reason: "query response omitted the result set".to_string(),
+        })?;
+    let extension = result.extensions.into_iter().next().ok_or_else(|| {
+        tracing::debug!(id = %id.escape_debug(), "the Marketplace has no such extension");
+        RegistryError::NotFound
+    })?;
+    if extension
+        .versions
+        .iter()
+        .any(|version| version.version.as_deref().is_none_or(str::is_empty))
+    {
+        return Err(RegistryError::Malformed {
+            url: MARKETPLACE_QUERY.to_string(),
+            reason: "query response contains a release without a version".to_string(),
+        });
+    }
+    Ok(extension)
 }
 
 /// A non-negative whole count from a statistic the Marketplace sends as a
@@ -309,34 +324,29 @@ struct OpenVsxFiles {
 }
 
 /// The Marketplace's `extensionquery` answer: one result set per filter.
-#[derive(Default, Deserialize)]
-#[serde(default)]
+#[derive(Deserialize)]
 struct ExtensionQuery {
-    #[serde(deserialize_with = "null_default")]
     results: Vec<QueryResult>,
 }
 
 /// The extensions one query filter matched.
-#[derive(Default, Deserialize)]
-#[serde(default)]
+#[derive(Deserialize)]
 struct QueryResult {
-    #[serde(deserialize_with = "null_default")]
     extensions: Vec<MarketplaceExtension>,
 }
 
 /// A Marketplace extension with its versions and statistics.
 #[derive(Default, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 struct MarketplaceExtension {
-    #[serde(deserialize_with = "non_empty")]
+    #[serde(default, deserialize_with = "non_empty")]
     display_name: Option<String>,
-    #[serde(deserialize_with = "non_empty")]
+    #[serde(default, deserialize_with = "non_empty")]
     short_description: Option<String>,
     publisher: Option<MarketplacePublisher>,
     published_date: Option<String>,
-    #[serde(deserialize_with = "null_default")]
     versions: Vec<MarketplaceVersion>,
-    #[serde(deserialize_with = "null_default")]
+    #[serde(default, deserialize_with = "null_default")]
     statistics: Vec<Statistic>,
 }
 

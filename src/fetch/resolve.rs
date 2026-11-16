@@ -61,9 +61,8 @@ impl From<RegistryError> for ResolveError {
             RegistryError::NotAPackage
             | RegistryError::Unsupported(_)
             | RegistryError::OffRegistry => Unresolved::Unsupported.into(),
-            RegistryError::NotFound | RegistryError::Malformed { .. } | RegistryError::NoRecord => {
-                Unresolved::NoRelease.into()
-            }
+            RegistryError::Malformed { .. } => Unresolved::InvalidResponse.into(),
+            RegistryError::NotFound | RegistryError::NoRecord => Unresolved::NoRelease.into(),
         }
     }
 }

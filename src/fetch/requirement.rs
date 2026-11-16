@@ -218,7 +218,10 @@ pub(super) fn resolve_requirement(
     let doc = match cached_metadata_status(&url, &[], net, &ttl) {
         Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| {
             tracing::debug!(url, error = %e, "registry document does not parse");
-            refused(Unresolved::NoRelease, "registry document does not parse")
+            refused(
+                Unresolved::InvalidResponse,
+                "registry document does not parse",
+            )
         })?,
         Err(FetchError::Status(404 | 410)) => {
             return Err(refused(
@@ -474,6 +477,12 @@ mod tests {
         assert_eq!(
             resolved("pkg:cargo/codec?version_requirement=%5E1", &gone),
             Err(Unresolved::NoRelease.into())
+        );
+        let malformed =
+            Fixtures::default().with("https://crates.io/api/v1/crates/codec", b"not json");
+        assert_eq!(
+            resolved("pkg:cargo/codec?version_requirement=%5E1", &malformed),
+            Err(Unresolved::InvalidResponse.into())
         );
         assert_eq!(
             resolved(

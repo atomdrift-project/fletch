@@ -727,6 +727,48 @@ fn resolve_dify_downloads_by_unique_identifier() {
 }
 
 #[test]
+fn vscode_missing_release_requires_a_well_formed_marketplace_answer() {
+    let url = "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery";
+    let reference = dep(
+        RefLocator::Purl("pkg:vscode-extension/example/tool".into()),
+        None,
+    );
+    let cache = BlobCache::disabled();
+    for body in [
+        "not json",
+        "{}",
+        r#"{"results":[]}"#,
+        r#"{"results":[{}]}"#,
+        r#"{"results":[{"extensions":null}]}"#,
+        r#"{"results":[{"extensions":[{}]}]}"#,
+        r#"{"results":[{"extensions":[{"versions":[{}]}]}]}"#,
+    ] {
+        let net = Fixtures::default().with(url, body.as_bytes());
+        assert_eq!(
+            fetch_ref(&reference, &net, &cache).outcome,
+            Outcome::Unresolved(Unresolved::InvalidResponse),
+            "{body}"
+        );
+    }
+    for body in [
+        r#"{"results":[{"extensions":[]}]}"#,
+        r#"{"results":[{"extensions":[{"versions":[]}]}]}"#,
+    ] {
+        let net = Fixtures::default().with(url, body.as_bytes());
+        assert_eq!(
+            fetch_ref(&reference, &net, &cache).outcome,
+            Outcome::Unresolved(Unresolved::NoRelease),
+            "{body}"
+        );
+    }
+    let net = Fixtures::default().refusing(url, 503);
+    assert_eq!(
+        fetch_ref(&reference, &net, &cache).outcome,
+        Outcome::Failed(FetchError::Status(503))
+    );
+}
+
+#[test]
 fn a_vscode_publisher_must_be_a_hostname_label() {
     let url = |purl: &str| {
         resolved(purl, &Fixtures::default(), &BlobCache::disabled()).map(|(_, url)| url)
