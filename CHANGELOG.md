@@ -2,7 +2,7 @@
 
 All notable changes to fletch. Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## 3.0.0-beta.1 (unreleased)
+## 3.0.0 (2026-11-17)
 
 ### Security
 
@@ -42,6 +42,7 @@ All notable changes to fletch. Versions follow [semantic versioning](https://sem
 - Bound `.set()` chains and repeated npm hook URLs to linear time.
 - Reject scraped dates with years past 9999 instead of overflowing.
 - Read a whole `GLib.file_set_contents` stylesheet body; bodies over 16 KB were skipped, so padding could hide a leading `@import`.
+- Report a manifest padded past the parse size cap as truncated; oversized padding used to hide its install hooks.
 
 ### Features
 
@@ -59,6 +60,7 @@ All notable changes to fletch. Versions follow [semantic versioning](https://sem
 - Add `BlobCache::load_with`, which streams a cached entry instead of reading it whole.
 - Order `Purl` values, so they can key a `BTreeMap` or `BTreeSet`.
 - Report release timelines for Hex, pub.dev, CRAN, Conda and Composer, and the latest version for nine more registries.
+- Add `Purl::requirement` to read a manifest's version constraint, and tell exact pins from ranges, tags and branches.
 - Breaking: build the `fletch` binary only with the `cli` feature, so library users never compile its dependencies.
 - Breaking: give `PurlError` typed `SyntaxError` and `TypeError` reasons instead of message strings.
 - Breaking: make `RawSink` an opaque handle read with `take`.
@@ -98,6 +100,9 @@ All notable changes to fletch. Versions follow [semantic versioning](https://sem
 - Carry a Dockerfile stage's distro to a later `FROM <stage>`.
 - Stop reporting curl and wget targets from comments and printed text in shell scripts.
 - Skip the values of `git clone` options such as `-b main`, which were read as the repository.
+- Report a garbled registry answer as `InvalidResponse`, not as a missing release.
+- Reject VS Code Marketplace answers that omit results or release versions, instead of guessing the extension is gone.
+- Give each `.vsix` URL on one line its own source offset, and none when the text was decoded.
 
 ### Optimizations
 
