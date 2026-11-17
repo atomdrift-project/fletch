@@ -6,115 +6,68 @@ All notable changes to fletch. Versions follow [semantic versioning](https://sem
 
 ### Security
 
-- Match repository URLs by parsed host, so a URL merely containing aur.archlinux.org can't borrow AUR reputation.
-- Deny registry lookups whose repository URL names anything but the type's public registry.
-- Stop reading OCI layer entries past the tar end marker, as containerd does.
-- Place each flattened OCI entry where an overlay runtime installs it: through its own layer's symlinks (`a -> /etc`, then `a/passwd` lands at `etc/passwd`), but never through a lower layer's, so no layer's bytes are hidden from the scan.
-- Never re-attach the GitHub token after a redirect leaves its origin, and cache authenticated responses separately.
-- Never report private-repository metadata fetched with the GitHub token.
-- Refuse cache shards owned by another user or writable by group or others.
-- Verify the sha512 checksum on openSUSE's `primary.xml` instead of skipping it.
-- Charge every body byte received to a batch's byte budget, including bodies abandoned as too large or timed out.
-- Cap a container image's entry count and name bytes, which the flatten holds in memory.
-- Drop a flattened hard link whose target was not written, such as one beneath a symlink.
-- Never mask a 404, 410, refusal or oversize body with a stale cached artifact; only transient failures fall back.
-- Follow NuGet registration pages only on NuGet's own registration path, at most 64 of them.
-- Keep signed query strings out of transport error messages.
-- Count only distinct references against a file's reference cap, so repeated filler cannot hide later references.
-- Bound the text JavaScript resolution builds per file, so a crafted file cannot take seconds per kilobyte.
-- Find installs behind any number of options, such as `pip --no-cache-dir -q install`.
-- Report the target of an npm alias (`foo@npm:evil`), not its local name.
-- Treat echoed or printed commands as text in source code, as in shell scripts.
-- Only report `http` and `https` URLs from dynamic `require` and `import` calls.
-- Require https for a PURL's `download_url`, as for every registry-named URL.
-- Refuse OCI layer entries that tar-rs and Go's `archive/tar` read differently: a body on a header-only entry, an extension header without a ustar magic, PAX sparse files, and a ustar prefix read two ways. Treat old-style directories as Go does.
-- Trust a cache root only when every directory and symlink on the path to it belongs to this user or root, so another local user cannot redirect the cache, its chmod, or its sweep into the victim's own directories.
-- Check a cache root's trust before the sweep reads its marker, accept only hex cache keys, treat entries dated in the future as stale, and checksum blobs so damage reads as a miss.
-- Count a Go module zip's central-directory entries before the zip reader loads them, so a hostile zip cannot use a gigabyte of memory.
-- Hold back-off per origin and credential, so anonymous rate limiting or a forged plain-http answer cannot stall authenticated or https requests to the same host.
-- Escape and bound peer-chosen error text and attacker-supplied URLs in logs and records, and escape diagnostics the CLI prints.
-- Accept a `repository_url` as the public registry only at its root or documented index path, with no userinfo, port, query or fragment, so `https://registry.npmjs.org/@evil` cannot borrow another package's record.
-- Match a PyPI version by PEP 440 equality, so `1.0.0` cannot hide a yank of the listed `1.0`.
-- Encode gem versions and npm dist-tags as a single URL path segment.
-- Query npm's malware advisories by the decoded package name.
-- Keep artifact `file_name`s to a single path component, whether derived from the URL or named by PyPI.
-- Resolve JavaScript names in one linear pass at any nesting depth; 257 nested braces used to switch off the recognizer, and deep scopes cost quadratic time.
-- Bound `.set()` chains and repeated npm hook URLs to linear time.
-- Reject scraped dates with years past 9999 instead of overflowing.
-- Read a whole `GLib.file_set_contents` stylesheet body; bodies over 16 KB were skipped, so padding could hide a leading `@import`.
-- Report a manifest padded past the parse size cap as truncated; oversized padding used to hide its install hooks.
+- Registry identity comes from the parsed host and path, so look-alike repository URLs cannot borrow another package's reputation.
+- The GitHub token no longer follows redirects off its origin, and private-repository metadata is never reported.
+- OCI flattening now reads tar like containerd, and refuses entries that tar-rs and Go parse differently.
+- Overlay symlinks resolve within their own layer only, so no layer's bytes hide from the scan.
+- Cap container entry counts, name bytes and Go module zip entries before they eat gigabytes of memory.
+- Refuse cache roots and shards that another local user owns or can write, all the way down.
+- Verify openSUSE's sha512 checksums instead of skipping them.
+- Stale cache no longer masks a 404, 410 or refusal; only transient failures fall back.
+- Back-off is held per origin and credential, so forged plain-http answers cannot stall authenticated requests.
+- Every received body byte counts against the batch budget, including downloads abandoned as too large.
+- Escape attacker-supplied URLs and error text in logs and CLI output, and keep signed query strings out of errors.
+- Padding no longer hides hostile code: oversized manifests report truncation, and long stylesheets are read whole.
+- Repeated filler no longer exhausts the reference cap and hides the references behind it.
+- Crafted JavaScript, npm hook and shell input can no longer burn quadratic time or switch off the recognizer.
+- Report an npm alias by its real target, and match PyPI yanks by PEP 440 equality.
+- Encode gem versions, npm dist-tags and artifact file names as a single path segment.
+- Find installs behind any number of options, and treat echoed commands as text, not installs.
+- Report only http and https URLs from dynamic requires, and require https for PURL download URLs.
+- Follow NuGet registration pages only on NuGet's own path, at most 64 of them.
 
 ### Features
 
-- Fetch URLs a scanned file names verbatim over plain HTTP too; address, port and resolver guards still apply.
-- Set `security_hold` on npm versions carrying a malware advisory, even when npm deleted only that version.
-- Report registry favorites: GitHub stars, Hugging Face likes, Docker Hub stars and Packagist favers.
-- Find Ruby process-call downloaders such as `Kernel.exec` running curl.
-- Find mshta and rundll32 remote-program targets in batch scripts.
-- Find browser PAC URLs and remote CSS imported by GNOME extension stylesheets.
-- Find PyPI candidates from Python imports and curl or wget targets in retained archive facts.
-- Add Wolfi and RPM Fusion as distro registries.
-- Record per-reference coverage facts stating what was left unexamined, and why.
-- Give the CLI exit codes, help, version and a log level through `FLETCH_LOG`.
-- Keep file capabilities and other extended attributes, and long owner names, in flattened container images.
-- Add `BlobCache::load_with`, which streams a cached entry instead of reading it whole.
-- Order `Purl` values, so they can key a `BTreeMap` or `BTreeSet`.
-- Report release timelines for Hex, pub.dev, CRAN, Conda and Composer, and the latest version for nine more registries.
-- Add `Purl::requirement` to read a manifest's version constraint, and tell exact pins from ranges, tags and branches.
-- Breaking: build the `fletch` binary only with the `cli` feature, so library users never compile its dependencies.
-- Breaking: give `PurlError` typed `SyntaxError` and `TypeError` reasons instead of message strings.
-- Breaking: make `RawSink` an opaque handle read with `take`.
-- Breaking: name container records by their full repository, such as `docker.io/library/nginx`.
-- Breaking: replace the registry functions with `registry::lookup`, returning a typed error.
-- Breaking: rebuild PURL identity around `Purl::identity`, release and artifact; homebrew PURLs normalize to brew.
-- Breaking: return a `Discovery` of references, unresolved calls and truncation from every finder.
-- Breaking: merge the reference fetchers into one `fetch_references` with per-fetch request and deadline budgets.
-- Breaking: take a `filefacts::FileType` instead of a string wherever a file type is passed.
-- Breaking: remove the pin-verified flag; a mismatched pin is reported as `Outcome::PinMismatch`.
-- Breaking: change lookup keys for PURLs whose identities now keep release-distinguishing qualifiers.
+- Breaking: `registry::lookup` replaces the registry functions and returns a typed error.
+- Breaking: PURL identity is rebuilt around Purl::identity, keeping release qualifiers and normalizing homebrew to brew.
+- Breaking: every finder returns a Discovery listing references, unresolved calls and truncation.
+- Breaking: one fetch_references replaces the reference fetchers, with per-fetch request and deadline budgets.
+- Breaking: PurlError now has typed reasons, RawSink is opaque, and FileType replaces file type strings.
+- Breaking: the pin-verified flag is gone; a mismatched pin is reported as Outcome::PinMismatch.
+- Breaking: the fletch binary builds only with the cli feature, so libraries skip its dependencies.
+- Breaking: container records are named by full repository, such as docker.io/library/nginx.
+- Fetch plain-HTTP URLs named by scanned files too; address, port and resolver guards still apply.
+- Set `security_hold` on npm versions carrying a malware advisory, even when only that version was deleted.
+- Add registry favorites, release timelines, and latest versions for many more registries, plus Wolfi and RPM Fusion.
+- Find Ruby process-call downloaders, mshta and rundll32 targets, browser PAC URLs, and GNOME stylesheet imports.
+- Add Purl::requirement to tell exact pins from ranges, tags and branches.
+- Record per-reference coverage facts stating what went unexamined, and why.
+- The CLI gains exit codes, help, version, and a log level through FLETCH_LOG.
 
 ### Fixes
 
-- Let downloads run past 30 seconds; the per-send timeout was also capping the whole body, so large artifacts and container layers failed as transient errors.
-- Verify SRI sha256 pins, which were always reported as mismatches.
-- Stop overwriting pin mismatches, 404s and unresolved references as `BudgetExceeded` when the budget runs out.
-- Set version removal on yanks, unlists and retractions across Cargo, PyPI, NuGet and six other registries.
+- Downloads may exceed 30 seconds; large artifacts and container layers no longer fail as transient errors.
+- Verify SRI sha256 pins, which always reported a mismatch.
 - Never silently replace a requested version with the latest release.
-- Keep qualifiers such as conda channel and rpm epoch in PURL identities.
-- Stop reading option values as package names, as in `conda -c conda-forge`.
-- Report an unreachable registry as a retryable failure, not a missing release.
+- Report yanks, unlists and retractions as version removal across nine registries.
+- Unreachable registries report a retryable failure and garbled answers InvalidResponse, never a missing release.
+- Budget exhaustion no longer overwrites pin mismatches, 404s and unresolved references as BudgetExceeded.
 - Retry a transient 5xx per request instead of holding the whole host.
-- Preserve ecosystem types for fetched CRAN, crate, Hackage, Hex and pub source packages.
-- Make four find inputs linear that took quadratic time, including backslash runs and nested exec calls.
-- Report the requested version, undated, for Arch, AUR and Fedora lookups instead of the current build's.
-- Report `version_removed` as unknown for an npm version the registry does not list, and Firefox and Homebrew disabling as deprecation.
-- Validate a PURL the same way when downloading as when looking it up, for Firefox, ComfyUI, Terraform, Dify and Composer.
-- Refuse a coordinate shape a registry does not use as `UnsafeCoordinate` everywhere, including JSR and CPAN.
-- Hold metadata reads outside a registry lookup to the one-hour unpinned TTL and honour `with_registry_ttl` for them.
-- Cache artifacts pinned by a PURL checksum for the pinned TTL, and refetch a cached copy that fails its pin.
-- Accept qualifier keys that start with `.`, `-` or `_`, as the spec allows.
-- Decode numeric character references in openSUSE summaries and Chrome and WordPress text.
-- Leave in-progress spools to the cache sweep's age pass, so a size sweep never fails a fetch in flight.
-- Saturate Homebrew and Quay download totals instead of overflowing.
-- Keep apt epochs in versions, and drop range, tag and wildcard versions from npm, pip and distro tokens.
-- Carry a Dockerfile stage's distro to a later `FROM <stage>`.
-- Stop reporting curl and wget targets from comments and printed text in shell scripts.
-- Skip the values of `git clone` options such as `-b main`, which were read as the repository.
-- Report a garbled registry answer as `InvalidResponse`, not as a missing release.
-- Reject VS Code Marketplace answers that omit results or release versions, instead of guessing the extension is gone.
-- Give each `.vsix` URL on one line its own source offset, and none when the text was decoded.
+- Keep qualifiers such as conda channel and rpm epoch in PURL identities.
+- Stop reading option values, comments and printed text as package names or download targets.
+- Cache pinned artifacts for the pinned TTL, and refetch a cached copy that fails its pin.
+- Report the requested version, undated, for Arch, AUR and Fedora instead of the current build's.
+- Reject Marketplace answers missing results or versions instead of guessing the extension is gone.
+- Validate PURLs identically for download and lookup, and refuse unsafe coordinate shapes everywhere.
 
 ### Optimizations
 
 - Spool container layers to disk and stream them instead of holding them in memory.
-- Sweep the cache about daily, or sooner once a process writes a tenth of its budget.
-- Skip reading and re-hashing a cached copy after a definite failure (404, 410, a refusal), since it is never served in place of one.
-- Reuse a parsed distro index without reading it back while the cache still holds the same bytes, known from a digest the cache now records beside each document: a repeat Debian lookup drops from 15 ms to 0.13 ms and no longer allocates the 13 MB index.
-- Store cache entries that are already gzip, bzip2, zip or checked xz (archives, wheels, container exports) as they came instead of zstd-compressing them again: no size gain was lost, and each GB costs about 5 s less to store and 3 s less to load. Their own checksums catch damage. The sidecar's new `raw` flag marks them; older entries read as before, and an older fletch reading a raw entry misses and refetches it.
-- Compress container exports at xz preset 1 instead of 6: about 9x faster on a real rootfs, in a tenth of the memory, for output about a fifth larger.
-- Read each JavaScript AST node's kind once and reuse one tree cursor across the walk, cutting reference finding by about 15%.
-- Drop the `hex` and `anyhow` dependencies; a lowercase-hex helper and a boxed CLI error replace them.
-- Hold parsed distro indices in the `BlobCache` instead of a process-wide map, and remember a failed parse until the index changes.
+- A repeat Debian lookup drops from 15 ms to 0.13 ms by reusing the parsed index.
+- Store already-compressed cache entries as-is, saving about 5 seconds per GB; older fletch refetches them.
+- Compress container exports at xz preset 1: about 9x faster, output about a fifth larger.
+- JavaScript reference finding is about 15% faster.
+- Drop the hex and anyhow dependencies.
 
 ## 2.0.1 (2026-10-10)
 
