@@ -554,7 +554,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#e1b1ad1e3e805e0d726989a971ea30ab3619504d"
+source = "git+https://github.com/atomdrift-project/filefacts.git#29fb23218bef48fb6a7ff558500c20444387454f"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -1755,8 +1755,7 @@ dependencies = [
 [[package]]
 name = "regex-syntax"
 version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d902046e6a28a1e4c3cab97258a0ce11e994903f01c2d97a9447a0b3df85f4f6"
+source = "git+https://github.com/tstromberg/regex#16bee32d661786cdb78dd8dc167fcdacadf4d563"
 
 [[package]]
 name = "reqwest"
@@ -2169,7 +2168,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#fa6d9f10c554550996a9a77d240839ef0f7644de"
+source = "git+https://github.com/atomdrift-project/stng.git#810c9a1ec100259259b5071048270aa6f242b5cb"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2589,7 +2588,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#e1b1ad1e3e805e0d726989a971ea30ab3619504d"
+source = "git+https://github.com/atomdrift-project/filefacts.git#29fb23218bef48fb6a7ff558500c20444387454f"
 dependencies = [
  "cc",
  "tree-sitter-language",

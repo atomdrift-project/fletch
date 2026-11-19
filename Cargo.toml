@@ -120,6 +120,8 @@ fletch = { path = ".", features = ["test-util"] }
 # URLs (one source each); Cargo.lock pins the revisions. Drop it once an
 # upstream tree-sitter release carries the illumos fix.
 [patch.crates-io]
+# Inherited from a sibling by update-deps: [patch] applies only in the root.
+regex-syntax = { git = "https://github.com/tstromberg/regex" }
 tree-sitter-bash = { git = "https://github.com/tstromberg/tree-sitter-bash" }
 tree-sitter = { git = "https://github.com/tstromberg/tree-sitter" }
 tree-sitter-language = { git = "https://github.com/tstromberg/tree-sitter" }
