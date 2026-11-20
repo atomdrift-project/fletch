@@ -533,7 +533,7 @@ impl BlobCache {
     /// The sidecar of `key`'s entry when the entry is fresh by `max_age`,
     /// marking the entry used: what [`cached_metadata_digest`] reads in
     /// place of the blob.
-    fn fresh_sidecar(&self, key: &str, max_age: Duration) -> Option<CachedMeta> {
+    pub(crate) fn fresh_sidecar(&self, key: &str, max_age: Duration) -> Option<CachedMeta> {
         let shard = self.readable_shard(key)?;
         let blob_path = shard.join(disk::blob_name(key));
         let meta_path = shard.join(disk::meta_name(key));

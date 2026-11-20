@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
 
+use crate::fetch::BlobCache;
 use crate::fetch::ssrf::{NonPublicHost, SafeResolver, guard_host};
+use crate::fetch::unanswered::Unanswered;
 
 /// Default per-fetch byte ceiling — a single response is abandoned past this
 /// unless [`HttpFetch::with_max_bytes`] sets another.
@@ -90,6 +92,12 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(600);
 /// The longest one send waits for a response to begin, or one body read for
 /// its next bytes.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The longest one send waits for its connection: the name, the handshake and
+/// TLS. A host that is there answers in well under a second; one that is not
+/// would otherwise hold a worker, and the scan waiting on it, for as long as
+/// this lasts.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// What a [`Request`] does: a GET, which follows redirects, or a POST of a
 /// body, which does not (a redirected query endpoint is an error, not a silent
@@ -363,9 +371,10 @@ impl FetchError {
 /// Why one send failed.
 #[derive(Debug)]
 enum SendFailure {
-    /// Before any response began: the connection failed or timed out.
+    /// Before any response began: the connection failed, or the response
+    /// did not begin in time.
     Connecting(FetchError),
-    /// Anything else.
+    /// Anything else, a host that let [`CONNECT_TIMEOUT`] pass included.
     Other(FetchError),
 }
 
@@ -420,6 +429,8 @@ pub struct HttpFetch {
     backoff: Backoff,
     /// Lifts GitHub's anonymous API rate limit; see [`Self::github_token`].
     github_token: Option<Secret>,
+    /// The hosts that did not answer; see [`Self::remembering_unanswered`].
+    unanswered: Option<Unanswered>,
 }
 
 impl HttpFetch {
@@ -430,7 +441,7 @@ impl HttpFetch {
         let client = reqwest::blocking::Client::builder()
             .user_agent("fletch")
             .timeout(SEND_TIMEOUT)
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(CONNECT_TIMEOUT)
             // Through a proxy, the proxy resolves the target host and
             // SafeResolver only ever sees the proxy's, so `HTTPS_PROXY` in the
             // environment would switch the SSRF guard off.
@@ -445,7 +456,20 @@ impl HttpFetch {
             max_bytes: DEFAULT_MAX_FETCH_BYTES,
             backoff: Backoff::default(),
             github_token: None,
+            unanswered: None,
         })
+    }
+
+    /// This client, keeping in `cache` the hosts that let a connection time
+    /// out, and failing a GET to one of them without asking it again for as
+    /// long as an unpinned URL's bytes are kept (12 hours). Never a host
+    /// fletch chose (see [`chosen_host`]).
+    #[must_use]
+    pub fn remembering_unanswered(self, cache: BlobCache) -> Self {
+        Self {
+            unanswered: Some(Unanswered::new(cache)),
+            ..self
+        }
     }
 
     /// This client, authenticating to the GitHub API with `token`. Anonymous,
@@ -513,6 +537,15 @@ impl HttpFetch {
             }
             let key = backoff_key(&current, authenticated);
             self.backoff.wait(&key, deadline)?;
+            let unanswered = self.unanswered_for(&current);
+            if unanswered.is_some_and(|hosts| hosts.holds(&current)) {
+                tracing::debug!(
+                    target: "transport",
+                    host,
+                    "host did not answer when last asked; failing without asking"
+                );
+                return Err(FetchError::Timeout);
+            }
             let resp = retry_get_send(
                 deadline,
                 || {
@@ -532,7 +565,15 @@ impl HttpFetch {
                         attempt
                     };
                     attempt.send().map_err(|error| {
-                        if error.is_connect() || error.is_timeout() {
+                        // The kernel has already sent its SYN several times
+                        // over: asking again waits as long for the same
+                        // silence.
+                        if error.is_connect() && error.is_timeout() {
+                            if let Some(hosts) = unanswered {
+                                hosts.note(&current);
+                            }
+                            SendFailure::Other(map_send_err(error))
+                        } else if error.is_connect() || error.is_timeout() {
                             SendFailure::Connecting(map_send_err(error))
                         } else {
                             SendFailure::Other(map_send_err(error))
@@ -639,14 +680,17 @@ impl HttpFetch {
         let ceiling = request
             .max_bytes
             .map_or(self.max_bytes, |limit| limit.min(self.max_bytes));
-        let chosen = url.host_str().is_some_and(|host| {
-            REGISTRY_HOSTS.contains(&host) || crate::registry::is_public_registry_host(host)
-        });
-        if request.spool.is_some() || chosen {
+        if request.spool.is_some() || chosen_host(url) {
             ceiling
         } else {
             ceiling.min(MAX_FOREIGN_DOCUMENT_BYTES)
         }
+    }
+
+    /// The memory of unanswered hosts as it applies to `url`: none for a
+    /// host fletch chose, which is asked whatever is remembered of it.
+    fn unanswered_for(&self, url: &reqwest::Url) -> Option<&Unanswered> {
+        self.unanswered.as_ref().filter(|_| !chosen_host(url))
     }
 
     /// The GitHub token for one hop of `request`, when it may carry it — the
@@ -983,6 +1027,14 @@ fn pause(
         },
         _ => None,
     }
+}
+
+/// Whether fletch itself chose the host of `url`: a registry it names, or the
+/// public registry of a package type.
+fn chosen_host(url: &reqwest::Url) -> bool {
+    url.host_str().is_some_and(|host| {
+        REGISTRY_HOSTS.contains(&host) || crate::registry::is_public_registry_host(host)
+    })
 }
 
 /// Hosts that asked to be left alone (`429`, `Retry-After`, an exhausted rate
@@ -1604,6 +1656,47 @@ mod tests {
             delays,
             vec![Duration::from_millis(250), Duration::from_millis(500)]
         );
+    }
+
+    /// A GET to a host remembered as unanswered fails as the timeout it
+    /// would be, at once: the host is not asked, under any path.
+    #[test]
+    fn a_host_that_did_not_answer_is_not_asked_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path());
+        let net = HttpFetch::new()
+            .expect("client")
+            .remembering_unanswered(cache.clone());
+        let dead = reqwest::Url::parse("https://gone.invalid/stage2.js").expect("url");
+        Unanswered::new(cache).note(&dead);
+
+        let started = Instant::now();
+        let result = net.send(&Request::get("https://gone.invalid/another/path"));
+        assert!(matches!(result, Err(FetchError::Timeout)), "{result:?}");
+        assert!(started.elapsed() < CONNECT_TIMEOUT, "it was asked anyway");
+    }
+
+    /// A registry is asked whatever is remembered of it: a network that
+    /// dropped one connection must not switch dependency fetches off, and
+    /// neither must an entry somebody planted.
+    #[test]
+    fn a_host_fletch_chose_is_never_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = BlobCache::with_dir(dir.path());
+        let net = HttpFetch::new()
+            .expect("client")
+            .remembering_unanswered(cache.clone());
+        let url = |text| reqwest::Url::parse(text).expect("url");
+        let registry = url("https://api.github.com/repos/owner/repo");
+        let sample = url("https://gone.invalid/stage2.js");
+        Unanswered::new(cache).note(&registry);
+
+        assert!(net.unanswered_for(&registry).is_none());
+        assert!(net.unanswered_for(&url("https://pypi.org/pypi/x/json")).is_none());
+        assert!(net.unanswered_for(&sample).is_some());
+        // A client that was given no cache remembers nothing.
+        let plain = HttpFetch::new().expect("client");
+        assert!(plain.unanswered_for(&sample).is_none());
     }
 
     #[test]
