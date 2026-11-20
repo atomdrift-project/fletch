@@ -707,12 +707,17 @@ fn self_checked(head: &[u8]) -> bool {
 /// The sidecar at `path` of `key`'s entry, when the entry is fresh by
 /// `max_age` (any age without one).
 fn sidecar(key: &str, path: &Path, max_age: Option<Duration>) -> Option<CachedMeta> {
-    let meta: CachedMeta = match std::fs::File::open(path) {
-        Ok(sidecar) => match serde_json::from_reader(sidecar.take(MAX_SIDECAR_BYTES)) {
-            Ok(meta) => meta,
-            Err(error) => return rejected(key, "corrupt sidecar", &error),
-        },
-        Err(error) => return rejected(key, "blob without a sidecar", &error),
+    // Read whole, then parsed: `serde_json` takes a reader a byte per call,
+    // and on an unbuffered file each is a system call.
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path)
+        .and_then(|sidecar| sidecar.take(MAX_SIDECAR_BYTES).read_to_end(&mut bytes));
+    if let Err(error) = read {
+        return rejected(key, "blob without a sidecar", &error);
+    }
+    let meta: CachedMeta = match serde_json::from_slice(&bytes) {
+        Ok(meta) => meta,
+        Err(error) => return rejected(key, "corrupt sidecar", &error),
     };
     // A fetch dated in the future (a clock set back, a forged sidecar) has
     // no age to judge: stale, rather than fresh until that date.
