@@ -90,7 +90,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "binform"
 version = "0.9.1"
-source = "git+https://github.com/atomdrift-project/binform.git#598642524e7c6ed548872cc307c74b1e53f5af8b"
+source = "git+https://github.com/atomdrift-project/binform.git#8a7713e7e52760ef69fc83301524e698c037f9b8"
 dependencies = [
  "gimli",
  "iced-x86",
@@ -554,7 +554,7 @@ dependencies = [
 [[package]]
 name = "filefacts"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#c90372f228e3d39ea9b4f2d2cefa55886b574317"
+source = "git+https://github.com/atomdrift-project/filefacts.git#1b3593f1f88980f6d675f5762f4d8be426c33f2f"
 dependencies = [
  "aes",
  "aho-corasick",
@@ -2168,7 +2168,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stng"
 version = "3.0.0"
-source = "git+https://github.com/atomdrift-project/stng.git#feb5925587d2967ff8e8b62a2535ecbdf004956b"
+source = "git+https://github.com/atomdrift-project/stng.git#092febb616d15420215659495659f76a6c4a203f"
 dependencies = [
  "aho-corasick",
  "base64 0.22.1",
@@ -2588,7 +2588,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-clojure"
 version = "0.1.0"
-source = "git+https://github.com/atomdrift-project/filefacts.git#c90372f228e3d39ea9b4f2d2cefa55886b574317"
+source = "git+https://github.com/atomdrift-project/filefacts.git#1b3593f1f88980f6d675f5762f4d8be426c33f2f"
 dependencies = [
  "cc",
  "tree-sitter-language",
