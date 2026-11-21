@@ -73,7 +73,7 @@ pub(crate) const META_TTL_IMMUTABLE: Duration = Duration::MAX;
 
 const META_TTL_PINNED_DEFAULT: Duration = Duration::from_hours(90 * 24);
 
-const META_TTL_UNPINNED_DEFAULT: Duration = Duration::from_hours(1);
+const META_TTL_UNPINNED_DEFAULT: Duration = Duration::from_hours(2);
 
 /// The largest sidecar read back. Ours hold a status, a few URLs, and the
 /// response headers (which the HTTP client already bounds), so this is ample;
@@ -287,7 +287,7 @@ impl BlobCache {
 
     /// This cache, with both mutable registry-metadata TTLs replaced by `ttl`:
     /// a long one effectively caches indefinitely (offline, air-gapped), a short
-    /// one revalidates aggressively. `None` keeps the 90-day pinned / 1-hour
+    /// one revalidates aggressively. `None` keeps the 90-day pinned / 2-hour
     /// unpinned defaults. The immutable tier is unaffected — a released
     /// version's file list is never re-fetched regardless.
     #[must_use]
@@ -1184,7 +1184,7 @@ mod tests {
         assert!(cached_metadata(url, &Fixtures::default().with(url, b"old"), &cache).is_some());
         let path = cache.meta_path(&metadata_cache_key(url));
         let mut meta: CachedMeta = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        meta.fetched_at -= 2 * 3600;
+        meta.fetched_at -= 2 * META_TTL_UNPINNED_DEFAULT.as_secs();
         std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
 
         let new = Fixtures::default().with(url, b"new");

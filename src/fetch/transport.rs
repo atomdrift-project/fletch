@@ -1692,7 +1692,10 @@ mod tests {
         Unanswered::new(cache).note(&registry);
 
         assert!(net.unanswered_for(&registry).is_none());
-        assert!(net.unanswered_for(&url("https://pypi.org/pypi/x/json")).is_none());
+        assert!(
+            net.unanswered_for(&url("https://pypi.org/pypi/x/json"))
+                .is_none()
+        );
         assert!(net.unanswered_for(&sample).is_some());
         // A client that was given no cache remembers nothing.
         let plain = HttpFetch::new().expect("client");
