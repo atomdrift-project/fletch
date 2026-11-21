@@ -1336,8 +1336,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = BlobCache::with_dir(dir.path().to_path_buf());
         let url = "https://registry.npmjs.org/foo";
-        // The packument as cached two hours ago, before 1.1.0 was published:
-        // inside the pinned TTL, past the versionless one.
+        // The packument as cached before 1.1.0 was published: inside the
+        // pinned TTL, past the versionless one.
         let old = serde_json::json!({
             "dist-tags": {"latest": "1.0.0"},
             "versions": {"1.0.0": {}},
@@ -1347,7 +1347,7 @@ mod tests {
             &metadata_cache_key(url),
             old.to_string().as_bytes(),
             &CachedMeta {
-                fetched_at: now() - 2 * 3600,
+                fetched_at: now() - 2 * META_TTL_UNPINNED_DEFAULT.as_secs(),
                 status: 200,
                 final_url: url.into(),
                 ..CachedMeta::default()
