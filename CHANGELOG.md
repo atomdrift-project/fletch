@@ -2,6 +2,18 @@
 
 All notable changes to fletch. Versions follow [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.1.0 (2026-11-22)
+
+### Features
+
+- Add `remembering_unanswered` so a dead sample host costs one connect timeout per 12 hours, not one per reference.
+
+### Optimizations
+
+- Give up on connections after 4 seconds instead of 10, so silent hosts stop stalling scans.
+- Revalidate unpinned registry metadata every 2 hours instead of every hour.
+- Read cache sidecars whole before parsing, instead of one system call per byte.
+
 ## 3.0.0 (2026-11-17)
 
 ### Security
