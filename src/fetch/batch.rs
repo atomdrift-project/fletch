@@ -312,6 +312,10 @@ impl Fetch for Metered<'_> {
     fn allows_oci(&self) -> bool {
         self.inner.allows_oci()
     }
+
+    fn has_github_token(&self) -> bool {
+        self.inner.has_github_token()
+    }
 }
 
 #[cfg(test)]

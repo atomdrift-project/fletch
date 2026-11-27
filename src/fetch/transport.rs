@@ -290,6 +290,15 @@ pub trait Fetch: Sync {
     fn allows_oci(&self) -> bool {
         false
     }
+
+    /// Whether a [`Request::github_auth`] request to GitHub's REST API goes
+    /// out with a token, and so draws on that token's quota rather than the
+    /// anonymous one GitHub shares across every client behind an address.
+    /// Lookups that have an unmetered source use it instead when this is
+    /// `false`. Default `false`; a wrapping backend forwards its inner one's.
+    fn has_github_token(&self) -> bool {
+        false
+    }
 }
 
 /// A successful fetch with the provenance the transport observed.
@@ -791,6 +800,10 @@ impl Fetch for HttpFetch {
     fn allows_oci(&self) -> bool {
         true
     }
+
+    fn has_github_token(&self) -> bool {
+        self.github_token.is_some()
+    }
 }
 
 /// A redirect chain's starting origin, and whether the chain has left it.
@@ -1188,6 +1201,8 @@ pub struct Fixtures {
     /// Refusals: the status, and the body served only to an
     /// [`any_status`](Request::any_status) request.
     refusals: HashMap<String, (u16, Vec<u8>)>,
+    /// What [`Fetch::has_github_token`] reports.
+    github_token: bool,
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -1214,6 +1229,16 @@ impl Fixtures {
         self.refusals
             .insert(url.to_string(), (status, body.to_vec()));
         self
+    }
+
+    /// Report a configured GitHub token, as an [`HttpFetch`] built
+    /// [`with_github_token`](HttpFetch::with_github_token) does.
+    #[must_use]
+    pub fn with_github_token(self) -> Self {
+        Self {
+            github_token: true,
+            ..self
+        }
     }
 
     /// Register a 200 response with explicit headers.
@@ -1263,6 +1288,10 @@ impl Fetch for Fixtures {
             .ok_or_else(|| FetchError::Transport(format!("no fixture for {url}")))?;
         count(request, &fetched.bytes);
         Ok(fetched)
+    }
+
+    fn has_github_token(&self) -> bool {
+        self.github_token
     }
 }
 
